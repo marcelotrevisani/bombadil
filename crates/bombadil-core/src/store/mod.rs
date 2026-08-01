@@ -168,7 +168,16 @@ impl Store {
     pub fn save(&self, config: &Config) -> Result<(), StoreError> {
         match &self.writability {
             Writability::Writable => {
-                let text = toml::to_string_pretty(config)
+                // Stamp the current version rather than trusting whatever was
+                // loaded: a v1 file re-saved after a v2 build gains v2-shaped
+                // data, and must not go back out still labelled v1, or an
+                // older build would parse and silently truncate it. Clone so
+                // the caller's `&Config` is never mutated.
+                let config = Config {
+                    schema_version: CURRENT_SCHEMA_VERSION,
+                    ..config.clone()
+                };
+                let text = toml::to_string_pretty(&config)
                     .map_err(|source| StoreError::Serialize { source })?;
                 atomic::write_atomic(&self.path, &text)
             }
@@ -188,8 +197,95 @@ impl Store {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{CURRENT_SCHEMA_VERSION, Config, DefaultVenvLocation, Settings};
+    use crate::model::{
+        CURRENT_SCHEMA_VERSION, Config, DefaultVenvLocation, EnvVar, Index, IndexAuth, IndexKind,
+        Project, Script, Settings, UvSource, VenvLocation,
+    };
     use std::path::PathBuf;
+    use uuid::Uuid;
+
+    /// Hand-authored, not serde-generated (see the file's own header comment):
+    /// a generated fixture would just re-encode whatever bug is already in the
+    /// serializer. Exercises every field of `Config`, including a `Central`
+    /// default venv location, a `Custom` uv source, one `Default` and one
+    /// `Extra` index, `Basic` and `None` auth, global and per-project env vars
+    /// and scripts, and a project with a `Custom` venv location.
+    const GOLDEN_FIXTURE: &str = include_str!("../../tests/fixtures/full.toml");
+
+    #[test]
+    fn deserializes_the_golden_fixture_field_by_field() {
+        let got: Config = toml::from_str(GOLDEN_FIXTURE).expect("golden fixture must parse");
+
+        let expected = Config {
+            schema_version: 1,
+            settings: Settings {
+                uv_source: UvSource::Custom {
+                    path: PathBuf::from("/opt/uv/bin/uv"),
+                },
+                default_venv_location: DefaultVenvLocation::Central {
+                    path: PathBuf::from("/home/t/.venvs"),
+                },
+            },
+            indexes: vec![
+                Index {
+                    name: "priv".into(),
+                    url: "https://nexus.corp/simple".into(),
+                    kind: IndexKind::Default,
+                    default_for_new_projects: true,
+                    auth: IndexAuth::Basic {
+                        username: "alice".into(),
+                    },
+                },
+                Index {
+                    name: "extra".into(),
+                    url: "https://pypi.org/simple".into(),
+                    kind: IndexKind::Extra,
+                    default_for_new_projects: false,
+                    auth: IndexAuth::None,
+                },
+            ],
+            global_env: vec![EnvVar {
+                key: "HTTP_PROXY".into(),
+                value: "http://proxy:8080".into(),
+                secret: false,
+            }],
+            global_scripts: vec![Script {
+                path: PathBuf::from("/etc/bombadil/pre.sh"),
+                args: vec!["--quiet".into()],
+                enabled: true,
+            }],
+            projects: vec![Project {
+                id: Uuid::nil(),
+                label: "my-api".into(),
+                pyproject_path: PathBuf::from("/proj/my-api/pyproject.toml"),
+                index_names: vec!["priv".into(), "extra".into()],
+                venv: VenvLocation::Custom {
+                    path: PathBuf::from("/mnt/envs/my-api"),
+                },
+                env: vec![EnvVar {
+                    key: "DATABASE_PASSWORD".into(),
+                    value: String::new(),
+                    secret: true,
+                }],
+                scripts: vec![Script {
+                    path: PathBuf::from("./scripts/decrypt.sh"),
+                    args: vec![],
+                    enabled: false,
+                }],
+            }],
+        };
+
+        // Field-by-field, not just `assert_eq!(got, expected)` on the whole
+        // struct: a whole-struct assertion failure only says "not equal" and
+        // hides which field renamed or changed shape.
+        assert_eq!(got.schema_version, expected.schema_version);
+        assert_eq!(got.settings, expected.settings);
+        assert_eq!(got.indexes, expected.indexes);
+        assert_eq!(got.global_env, expected.global_env);
+        assert_eq!(got.global_scripts, expected.global_scripts);
+        assert_eq!(got.projects, expected.projects);
+        assert_eq!(got, expected);
+    }
 
     fn temp_config_path(dir: &tempfile::TempDir) -> PathBuf {
         paths::config_file_in(dir.path())
@@ -226,6 +322,22 @@ mod tests {
         let (_, loaded) = Store::open(path);
         assert!(matches!(loaded, Loaded::Ok(_)));
         assert_eq!(loaded.config(), &config);
+    }
+
+    #[test]
+    fn save_always_stamps_the_current_schema_version() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = temp_config_path(&dir);
+        // A file already on disk claiming an old version number, distinct
+        // from whatever CURRENT_SCHEMA_VERSION happens to be today.
+        std::fs::write(&path, "schema_version = 1\n").unwrap();
+
+        let (store, loaded) = Store::open(path.clone());
+        let config = loaded.config().clone();
+        store.save(&config).unwrap();
+
+        let (_, reloaded) = Store::open(path);
+        assert_eq!(reloaded.config().schema_version, CURRENT_SCHEMA_VERSION);
     }
 
     #[test]

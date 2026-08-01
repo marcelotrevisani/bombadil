@@ -14,12 +14,21 @@ use serde::{Deserialize, Serialize};
 
 /// Bumped only when a change cannot be expressed by adding `#[serde(default)]`
 /// fields. A config declaring a higher version opens read-only.
+///
+/// Same-version forward compatibility is NOT preserved: `Store::save`
+/// serializes only the fields `Config` declares today, so an unknown field
+/// written by a *different build at this same version* is silently dropped
+/// on the next save, not retained. Two builds at version 1 with different
+/// field sets will silently lose each other's settings on round-trip. Plan 2
+/// must decide explicitly — retain unknown fields, or bump the version on
+/// every field addition — rather than inherit this hole unexamined.
 pub const CURRENT_SCHEMA_VERSION: u32 = 1;
 
 /// The entire persisted state of the application.
 ///
-/// Field order is load-bearing: TOML requires scalars before tables, and serde
-/// serializes in declaration order.
+/// Field order is not load-bearing for parsing — `toml` 1.1.4 reorders
+/// scalars before tables automatically on serialization. `schema_version` is
+/// declared first purely for human readability of the on-disk file.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Config {
     pub schema_version: u32,
