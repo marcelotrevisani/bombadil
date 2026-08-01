@@ -1,0 +1,28 @@
+[
+  {
+    "key": "cpython-3.15.0b4-linux-x86_64-gnu",
+    "version": "3.15.0b4",
+    "version_parts": { "major": 3, "minor": 15, "patch": 0 },
+    "path": null,
+    "symlink": null,
+    "url": "https://releases.astral.sh/example.tar.gz",
+    "os": "linux",
+    "variant": "default",
+    "implementation": "cpython",
+    "arch": "x86_64",
+    "libc": "gnu"
+  },
+  {
+    "key": "cpython-3.12.4-linux-x86_64-gnu",
+    "version": "3.12.4",
+    "version_parts": { "major": 3, "minor": 12, "patch": 4 },
+    "path": "/usr/bin/python3.12",
+    "symlink": null,
+    "url": null,
+    "os": "linux",
+    "variant": "default",
+    "implementation": "cpython",
+    "arch": "x86_64",
+    "libc": "gnu"
+  }
+]

@@ -1,0 +1,9 @@
+{
+  "schema": { "version": "preview" },
+  "workspace_root": "/proj/jsonprobe",
+  "workspace": { "path": "/proj/jsonprobe", "id": "workspace+/proj/jsonprobe" },
+  "roots": [
+    { "id": "jsonprobe:dev==0.1.0@virtual+/proj/jsonprobe/" },
+    { "id": "jsonprobe==0.1.0@virtual+/proj/jsonprobe/" }
+  ]
+}

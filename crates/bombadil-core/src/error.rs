@@ -90,3 +90,13 @@ pub enum UvResolveError {
         minimum: String,
     },
 }
+
+#[derive(Debug, thiserror::Error)]
+pub enum ResultsError {
+    #[error("could not parse the JSON output of `{command}`: {source}")]
+    Json {
+        command: &'static str,
+        #[source]
+        source: serde_json::Error,
+    },
+}
