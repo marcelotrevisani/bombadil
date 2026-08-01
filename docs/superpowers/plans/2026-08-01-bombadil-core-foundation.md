@@ -22,7 +22,7 @@ Every task's requirements implicitly include this section.
 - **`Index.name` must match `[A-Za-z0-9_-]+`** because it becomes part of an environment variable name (`UV_INDEX_<NAME>_USERNAME`).
 - **Index names are unique case-insensitively**, because uppercasing them to build environment variable names would otherwise collide.
 - **Central-store venv directories are named `<project-dir-name>-<hash>`**, where `<hash>` is the first **6** hex characters of the SHA-256 of the project directory path.
-- **Config file location** is `directories::ProjectDirs::from("", "", "bombadil")` → `config_dir()/config.toml`: `~/.config/bombadil/config.toml` on Linux, `~/Library/Application Support/bombadil/config.toml` on macOS, `%APPDATA%\bombadil\config.toml` on Windows.
+- **Config file location** is `directories::ProjectDirs::from("", "", "bombadil")` → `config_dir()/config.toml`. Verified against `directories` 6.0.0's source: `~/.config/bombadil/config.toml` on Linux, `~/Library/Application Support/bombadil/config.toml` on macOS, and `%APPDATA%\bombadil\config\config.toml` on Windows — Windows' `config_dir()` has an extra `config` path segment the other two platforms don't.
 - **A config with a newer `schema_version` opens read-only.** A config that fails to parse is never overwritten.
 - **`CURRENT_SCHEMA_VERSION = 1`.**
 - CI must pass `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, and `cargo test` on ubuntu-latest, macos-latest and windows-latest.
@@ -87,7 +87,7 @@ Sets up the workspace and defines the entire persisted schema in one go, because
 - Consumes: nothing.
 - Produces: `bombadil_core::model::{Config, Settings, UvSource, DefaultVenvLocation, Project, VenvLocation, Index, IndexKind, IndexAuth, EnvVar, Script, CURRENT_SCHEMA_VERSION}`. `Config: Default` yields `schema_version = CURRENT_SCHEMA_VERSION` and empty collections. All model types derive `Debug, Clone, PartialEq, Eq, Serialize, Deserialize`.
 
-> **Why field order matters:** TOML requires scalar values to appear before tables. `serde` serializes struct fields in declaration order, so reordering the fields below can produce a config that serializes and then fails to parse. Keep the declared order.
+> **Note on field order:** field order in the struct below is not load-bearing for parsing — `toml` 1.1.4 reorders scalars before tables automatically on serialization. `schema_version` is declared first purely so the on-disk file is readable by a human, not because reordering would break anything.
 
 - [ ] **Step 1: Create the workspace manifest**
 
@@ -455,8 +455,9 @@ pub const CURRENT_SCHEMA_VERSION: u32 = 1;
 
 /// The entire persisted state of the application.
 ///
-/// Field order is load-bearing: TOML requires scalars before tables, and serde
-/// serializes in declaration order.
+/// Field order is not load-bearing for parsing — `toml` 1.1.4 reorders
+/// scalars before tables automatically on serialization. `schema_version` is
+/// declared first purely for human readability of the on-disk file.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Config {
     pub schema_version: u32,
@@ -536,8 +537,9 @@ git add Cargo.toml crates/bombadil-core .github/workflows/ci.yml
 git commit -m "feat(core): workspace scaffold and persisted data model
 
 Defines the whole schema at version 1 so no migration is needed before
-the first release. Field order is deliberate: TOML requires scalars
-before tables and serde serializes in declaration order."
+the first release. schema_version is declared first for human
+readability; toml 1.1.4 reorders scalars before tables on its own, so
+field order is not load-bearing for parsing."
 ```
 
 ---

@@ -126,7 +126,8 @@ group, because `uv sync` on a large project is not instantaneous.
 ## 5. Data model and persistence
 
 A single `config.toml` in the platform configuration directory: `~/.config/bombadil/` on
-Linux, `~/Library/Application Support/bombadil/` on macOS, `%APPDATA%\bombadil\` on Windows.
+Linux, `~/Library/Application Support/bombadil/` on macOS, `%APPDATA%\bombadil\config\` on
+Windows — Windows gets an extra `config` path segment the other two platforms don't.
 
 ```
 Config {
@@ -187,7 +188,14 @@ is shown as *missing* with Relocate and Remove actions. It is never silently dro
 
 ### Secrets
 
-Keychain service `bombadil`; entries `index/<name>` and `env/<project-id>/<KEY>`.
+Keychain service `bombadil`; three entry shapes:
+
+- `index/<name>` — credentials for a package index.
+- `env/<project-id>/<KEY>` — a per-project secret environment variable.
+- `env/global/<KEY>` — a global secret environment variable. `global_env`
+  entries have no project id (§2 puts global secrets in scope, but a global
+  `EnvVar` can't be addressed by the per-project shape above), so `global` is
+  reserved as the literal namespace segment for them.
 
 Headless Linux and WSL frequently have no Secret Service running. When the keychain is
 unavailable the app states so plainly and offers session-only entry held in memory for the
