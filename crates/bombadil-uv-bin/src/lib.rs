@@ -4,6 +4,7 @@
 //! megabytes nor need the network.
 
 use sha2::{Digest, Sha256};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 /// The uv release embedded in this build.
@@ -41,6 +42,11 @@ pub fn extraction_path(data_dir: &Path) -> PathBuf {
 ///
 /// Re-extracts when the file is missing or its hash does not match, so a
 /// truncated or tampered extraction repairs itself.
+///
+/// Writes via a temp file in the same directory, chmods it, then renames it
+/// into place — so a concurrent reader sees either no file or the complete,
+/// correctly-permissioned one, never a partial write or a not-yet-executable
+/// one.
 pub fn ensure_extracted(data_dir: &Path) -> Result<PathBuf, ExtractError> {
     let path = extraction_path(data_dir);
 
@@ -55,7 +61,13 @@ pub fn ensure_extracted(data_dir: &Path) -> Result<PathBuf, ExtractError> {
         path: parent.to_path_buf(),
         source,
     })?;
-    std::fs::write(&path, UV_BYTES).map_err(|source| ExtractError::Io {
+
+    let mut tmp = tempfile::NamedTempFile::new_in(parent).map_err(|source| ExtractError::Io {
+        path: parent.to_path_buf(),
+        source,
+    })?;
+
+    tmp.write_all(UV_BYTES).map_err(|source| ExtractError::Io {
         path: path.clone(),
         source,
     })?;
@@ -63,13 +75,18 @@ pub fn ensure_extracted(data_dir: &Path) -> Result<PathBuf, ExtractError> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).map_err(
-            |source| ExtractError::Io {
+        tmp.as_file()
+            .set_permissions(std::fs::Permissions::from_mode(0o755))
+            .map_err(|source| ExtractError::Io {
                 path: path.clone(),
                 source,
-            },
-        )?;
+            })?;
     }
+
+    tmp.persist(&path).map_err(|e| ExtractError::Io {
+        path: path.clone(),
+        source: e.error,
+    })?;
 
     Ok(path)
 }
@@ -105,6 +122,37 @@ mod tests {
         let first = ensure_extracted(dir.path()).unwrap();
         let second = ensure_extracted(dir.path()).unwrap();
         assert_eq!(first, second);
+    }
+
+    #[test]
+    fn extraction_is_atomic_no_temp_file_survives_and_permissions_are_already_set() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = ensure_extracted(dir.path()).unwrap();
+
+        // The file at its final path exists and is already executable: a
+        // reader that finds it at all never observes an unpersisted or
+        // not-yet-chmod'd state, because both happen on the temp file before
+        // the rename that makes it visible at `path`.
+        assert!(path.exists());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+            assert_eq!(mode & 0o111, 0o111, "extracted uv must be executable");
+        }
+
+        // No leftover NamedTempFile survives in the extraction directory: a
+        // rename that silently became a copy would leave two entries here.
+        let extraction_dir = path.parent().unwrap();
+        let entries: Vec<_> = std::fs::read_dir(extraction_dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(
+            entries.len(),
+            1,
+            "expected only the extracted binary, found {entries:?}"
+        );
     }
 
     #[test]

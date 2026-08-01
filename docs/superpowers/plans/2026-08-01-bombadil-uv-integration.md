@@ -32,7 +32,7 @@ Every claim below was checked against a real uv 0.12.1 binary on 2026-08-01, not
 
 Every task's requirements implicitly include this section.
 
-- **Rust edition 2024**, `rust-version = "1.85"`.
+- **Rust edition 2024**, `rust-version = "1.88"`. Raised from 1.85 during task 3: `zip` 8.6.0 declares MSRV 1.88, and `bombadil-uv-bin`'s let-chain in `ensure_extracted` needs it too.
 - **Dependency versions**, verified on crates.io 2026-08-01: `serde_json` 1 (workspace), and build-only: `ureq` 3.3.0, `flate2` 1.1.9, `tar` 0.4.46, `zip` 8.6.0 (**not** 9.0.0-pre2, which is a prerelease). Existing pins from plan 1 are unchanged.
 - **`bombadil-core` must not depend on `iced`.**
 - **`BUNDLED_UV_VERSION = "0.12.1"` and `MIN_UV_VERSION = "0.12.1"`.** The spec named 0.11.32; 0.12.1 has been verified to have an identical relevant CLI surface, so the pin moves forward. `MIN_UV_VERSION` is lowered only when an older version is explicitly re-tested.
