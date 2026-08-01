@@ -785,6 +785,12 @@ loss cannot leave a truncated config."
 
 The store must refuse to destroy data it does not understand. Two cases matter: a config written by a newer build, and a config that does not parse.
 
+> **AMENDED DURING EXECUTION — the code blocks below are superseded. See commit `ca288e6`; `git show ca288e6` is authoritative.**
+>
+> Review of the original implementation found a real defect in this plan's own code. `Store::save` raised `StoreError::ReadOnly { path, found, supported }` for *every* non-writable cause, but that variant's message claims the file "was written by a newer version of Bombadil". For the I/O-error and version-probe-failure branches the plan hardcoded `found_version: CURRENT_SCHEMA_VERSION`, so saving over a *corrupt* config reported "schema version 1, this build supports 1" — false, and self-contradictory. It also contradicted the design spec, which requires a corrupt file to surface its parse error.
+>
+> The shipped code replaces `Store`'s `writable: bool` + `found_version: u32` pair with a private `Writability` enum (`Writable` | `TooNew { found }` | `Unreadable { message }`), adds `StoreError::RefusedUnreadable { path, message }`, and routes `save` to whichever error states the true cause. The seven repeated `Self { .. }` literals in `Store::open` collapse into a single private `Store::new(path, writability)`. The two "never overwritten" tests were strengthened in place: the too-new case now asserts the reported `found` version, and the unparseable case asserts `RefusedUnreadable` with a non-empty message instead of a bare `is_err()`. Branch-to-writability mapping is unchanged — exactly the same two branches remain writable.
+
 **Files:**
 - Modify: `crates/bombadil-core/src/store/mod.rs`
 - Test: inline `#[cfg(test)]` in `store/mod.rs`
