@@ -9,6 +9,10 @@ use std::path::Path;
 /// final rename cannot cross a filesystem boundary. On Windows `persist` maps to
 /// `MoveFileEx` with `MOVEFILE_REPLACE_EXISTING`, so an existing target is
 /// replaced rather than causing an error.
+///
+/// A bare filename (no directory component) resolves against the current
+/// directory, same as any relative path — it is not rejected by the
+/// `BadPath` guard below, which only fires when there is no parent at all.
 pub fn write_atomic(path: &Path, contents: &str) -> Result<(), StoreError> {
     let dir = path.parent().ok_or_else(|| StoreError::BadPath {
         path: path.to_path_buf(),
