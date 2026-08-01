@@ -1,3 +1,4 @@
+pub mod command;
 mod resolve;
 mod version;
 
