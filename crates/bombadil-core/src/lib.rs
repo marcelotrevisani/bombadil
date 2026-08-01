@@ -3,3 +3,4 @@ pub mod model;
 pub mod pyproject;
 pub mod store;
 pub mod validate;
+pub mod venv_path;

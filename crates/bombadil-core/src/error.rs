@@ -50,3 +50,9 @@ pub enum PyProjectError {
         source: toml::de::Error,
     },
 }
+
+#[derive(Debug, thiserror::Error)]
+pub enum VenvPathError {
+    #[error("{pyproject_path} has no parent directory, so the project directory is unknown")]
+    NoProjectDirectory { pyproject_path: PathBuf },
+}
