@@ -1,0 +1,164 @@
+mod env_var;
+mod index;
+mod project;
+mod script;
+mod settings;
+
+pub use env_var::EnvVar;
+pub use index::{Index, IndexAuth, IndexKind};
+pub use project::{Project, VenvLocation};
+pub use script::Script;
+pub use settings::{DefaultVenvLocation, Settings, UvSource};
+
+use serde::{Deserialize, Serialize};
+
+/// Bumped only when a change cannot be expressed by adding `#[serde(default)]`
+/// fields. A config declaring a higher version opens read-only.
+pub const CURRENT_SCHEMA_VERSION: u32 = 1;
+
+/// The entire persisted state of the application.
+///
+/// Field order is load-bearing: TOML requires scalars before tables, and serde
+/// serializes in declaration order.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Config {
+    pub schema_version: u32,
+    #[serde(default)]
+    pub settings: Settings,
+    #[serde(default)]
+    pub indexes: Vec<Index>,
+    #[serde(default)]
+    pub global_env: Vec<EnvVar>,
+    #[serde(default)]
+    pub global_scripts: Vec<Script>,
+    #[serde(default)]
+    pub projects: Vec<Project>,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            schema_version: CURRENT_SCHEMA_VERSION,
+            settings: Settings::default(),
+            indexes: Vec::new(),
+            global_env: Vec::new(),
+            global_scripts: Vec::new(),
+            projects: Vec::new(),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+    use uuid::Uuid;
+
+    fn fully_populated() -> Config {
+        Config {
+            schema_version: CURRENT_SCHEMA_VERSION,
+            settings: Settings {
+                uv_source: UvSource::Custom {
+                    path: PathBuf::from("/opt/uv/bin/uv"),
+                },
+                default_venv_location: DefaultVenvLocation::Central {
+                    path: PathBuf::from("/home/t/.venvs"),
+                },
+            },
+            indexes: vec![
+                Index {
+                    name: "priv".into(),
+                    url: "https://nexus.corp/simple".into(),
+                    kind: IndexKind::Default,
+                    default_for_new_projects: true,
+                    auth: IndexAuth::Basic {
+                        username: "alice".into(),
+                    },
+                },
+                Index {
+                    name: "extra".into(),
+                    url: "https://pypi.org/simple".into(),
+                    kind: IndexKind::Extra,
+                    default_for_new_projects: false,
+                    auth: IndexAuth::None,
+                },
+            ],
+            global_env: vec![EnvVar {
+                key: "HTTP_PROXY".into(),
+                value: "http://proxy:8080".into(),
+                secret: false,
+            }],
+            global_scripts: vec![Script {
+                path: PathBuf::from("/etc/bombadil/pre.sh"),
+                args: vec!["--quiet".into()],
+                enabled: true,
+            }],
+            projects: vec![Project {
+                id: Uuid::nil(),
+                label: "my-api".into(),
+                pyproject_path: PathBuf::from("/proj/my-api/pyproject.toml"),
+                index_names: vec!["priv".into(), "extra".into()],
+                venv: VenvLocation::Custom {
+                    path: PathBuf::from("/mnt/envs/my-api"),
+                },
+                env: vec![EnvVar {
+                    key: "DATABASE_PASSWORD".into(),
+                    value: String::new(),
+                    secret: true,
+                }],
+                scripts: vec![Script {
+                    path: PathBuf::from("./scripts/decrypt.sh"),
+                    args: vec![],
+                    enabled: false,
+                }],
+            }],
+        }
+    }
+
+    #[test]
+    fn fully_populated_config_round_trips_through_toml() {
+        let original = fully_populated();
+        let text = toml::to_string_pretty(&original).expect("serialize");
+        let back: Config = toml::from_str(&text).expect("deserialize");
+        assert_eq!(back, original);
+    }
+
+    #[test]
+    fn default_config_round_trips() {
+        let original = Config::default();
+        let text = toml::to_string_pretty(&original).expect("serialize");
+        let back: Config = toml::from_str(&text).expect("deserialize");
+        assert_eq!(back, original);
+    }
+
+    #[test]
+    fn a_minimal_file_fills_in_every_default() {
+        let back: Config = toml::from_str("schema_version = 1\n").expect("deserialize");
+        assert_eq!(back, Config::default());
+    }
+
+    #[test]
+    fn a_secret_env_var_persists_an_empty_value() {
+        // Struct-update syntax rather than `let mut c = Config::default(); c.x = ..`:
+        // clippy's field_reassign_with_default rejects the latter, and CI denies warnings.
+        let config = Config {
+            global_env: vec![EnvVar {
+                key: "DATABASE_PASSWORD".into(),
+                // What a caller must store for a secret: the real value lives
+                // in the keychain, added in plan 2.
+                value: String::new(),
+                secret: true,
+            }],
+            ..Config::default()
+        };
+
+        let text = toml::to_string_pretty(&config).expect("serialize");
+
+        assert!(text.contains("secret = true"), "got:\n{text}");
+        assert!(text.contains("value = \"\""), "got:\n{text}");
+
+        let back: Config = toml::from_str(&text).expect("deserialize");
+        assert_eq!(back.global_env[0].value, "");
+        assert!(back.global_env[0].secret);
+    }
+}
