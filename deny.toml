@@ -22,7 +22,16 @@ ignore = []
 # alternative, so it applies no matter which of MIT/Apache-2.0 we take. It
 # covers the embedded Unicode character tables, is OSI-approved and
 # permissive, and imposes no obligation beyond attribution.
-allow = ["Apache-2.0", "MIT", "Unicode-3.0"]
+# Reached only through [build-dependencies]: ureq's TLS stack, used by
+# build.rs to download the pinned uv release. These crates compile the
+# build script; they are not linked into Bombadil and are never
+# redistributed. All are permissive with no copyleft obligation, so they
+# are compatible with shipping an Apache-2.0 binary.
+#
+# ISC                  - ring, untrusted, rustls-webpki
+# CDLA-Permissive-2.0  - webpki-roots (Mozilla's CA certificate data)
+# BSD-3-Clause         - subtle
+allow = ["Apache-2.0", "MIT", "Unicode-3.0", "ISC", "CDLA-Permissive-2.0", "BSD-3-Clause"]
 confidence-threshold = 0.93
 
 # Crates whose license is not in the allow list, permitted deliberately.
