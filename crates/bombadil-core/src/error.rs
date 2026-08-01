@@ -44,8 +44,23 @@ pub enum PyProjectError {
         source: std::io::Error,
     },
 
+    /// Produced by [`crate::pyproject::parse`], which has no path to report:
+    /// it only sees text. Kept separate from [`PyProjectError::ParseAt`] so
+    /// that a path-free caller (e.g. parsing an in-memory string) doesn't
+    /// have to invent one.
     #[error("could not parse pyproject.toml: {source}")]
     Parse {
+        #[source]
+        source: toml::de::Error,
+    },
+
+    /// Produced by [`crate::pyproject::load`], which attaches the path it
+    /// read from to whatever [`crate::pyproject::parse`] reported — the app's
+    /// main screen is a list of projects, so a parse error must say which
+    /// project's file failed.
+    #[error("could not parse {path}: {source}")]
+    ParseAt {
+        path: PathBuf,
         #[source]
         source: toml::de::Error,
     },

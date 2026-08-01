@@ -86,7 +86,15 @@ pub fn load(path: &Path) -> Result<PyProject, PyProjectError> {
         path: path.to_path_buf(),
         source,
     })?;
-    parse(&text)
+    parse(&text).map_err(|err| match err {
+        PyProjectError::Parse { source } => PyProjectError::ParseAt {
+            path: path.to_path_buf(),
+            source,
+        },
+        // parse() only ever returns Parse; keep other variants as-is so this
+        // stays correct if that ever changes.
+        other => other,
+    })
 }
 
 #[cfg(test)]
@@ -156,5 +164,41 @@ mod tests {
     fn invalid_toml_is_an_error_naming_the_problem() {
         let err = parse("[project\nname =").unwrap_err();
         assert!(!err.to_string().is_empty());
+    }
+
+    #[test]
+    fn load_reads_and_parses_a_real_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pyproject.toml");
+        std::fs::write(&path, FIXTURE).unwrap();
+
+        let p = load(&path).unwrap();
+        assert_eq!(p.name.as_deref(), Some("my-api"));
+    }
+
+    #[test]
+    fn load_on_a_missing_file_is_an_io_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("does-not-exist.toml");
+
+        let err = load(&path).unwrap_err();
+        match err {
+            PyProjectError::Io { path: p, .. } => assert_eq!(p, path),
+            other => panic!("expected Io, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn load_on_a_malformed_file_names_the_path_that_failed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pyproject.toml");
+        std::fs::write(&path, "[project\nname =").unwrap();
+
+        let err = load(&path).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains(&path.to_string_lossy().to_string()),
+            "got {err}"
+        );
     }
 }
