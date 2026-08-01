@@ -21,13 +21,20 @@ fn sanitize(name: &str) -> String {
 ///
 /// The hash keeps two unrelated projects that happen to share a directory name
 /// from colliding, while the prefix keeps the folder recognisable.
+///
+/// The hash is separator- and case-sensitive: it hashes the path's raw bytes,
+/// not a normalized form, so `C:\proj` and `c:/proj` resolve to different
+/// venvs even though some tools would treat them as the same location.
 pub fn central_dir_name(project_dir: &Path) -> String {
     let stem = project_dir
         .file_name()
         .map(|n| sanitize(&n.to_string_lossy()))
         .unwrap_or_else(|| "project".to_string());
 
-    let digest = Sha256::digest(project_dir.to_string_lossy().as_bytes());
+    // `as_encoded_bytes`, not `to_string_lossy().as_bytes()`: lossy
+    // conversion maps invalid UTF-8 to U+FFFD, so two distinct non-UTF-8
+    // paths could lossy-convert to the same string and collide here.
+    let digest = Sha256::digest(project_dir.as_os_str().as_encoded_bytes());
     let hash: String = digest.iter().take(3).map(|b| format!("{b:02x}")).collect();
 
     format!("{stem}-{hash}")
