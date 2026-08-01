@@ -25,6 +25,21 @@ updates:
       interval: weekly
     commit-message:
       prefix: "chore(ci)"
+    ignore:
+      # dtolnay/rust-toolchain is referenced twice: once as @stable, and once
+      # as @1.85.0 in the msrv job. That second ref is a *Rust* version — the
+      # workspace MSRV — not an action release tag, but Dependabot cannot tell
+      # the difference and updates it like any other version.
+      #
+      # Its very first PR proposed @1.100.0, a Rust release that does not
+      # exist, and the msrv job failed with a 404 from static.rust-lang.org.
+      # Even a real version would be wrong: the whole point of that job is to
+      # hold the toolchain at the MSRV we declare, so a green bump would be
+      # worse than a red one — it would silently stop testing the constraint.
+      #
+      # Dependabot cannot ignore one ref of an action and track another, so
+      # the action is excluded entirely. @stable needs no updates anyway.
+      - dependency-name: "dtolnay/rust-toolchain"
     groups:
       actions:
         patterns:
