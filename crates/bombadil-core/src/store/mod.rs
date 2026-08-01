@@ -36,15 +36,33 @@ impl Loaded {
     }
 }
 
+/// Why a store may (or may not) be written to. Carries the specific cause so
+/// `save` can report it truthfully instead of guessing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Writability {
+    Writable,
+    /// The file declares a schema version newer than this build supports.
+    TooNew {
+        found: u32,
+    },
+    /// The file could not be read or parsed at all.
+    Unreadable {
+        message: String,
+    },
+}
+
 /// Owns the config file path and whether writing to it is permitted.
 #[derive(Debug, Clone)]
 pub struct Store {
     path: PathBuf,
-    writable: bool,
-    found_version: u32,
+    writability: Writability,
 }
 
 impl Store {
+    fn new(path: PathBuf, writability: Writability) -> Self {
+        Self { path, writability }
+    }
+
     /// Read the file at `path`, returning both the store and what was found.
     ///
     /// Never fails: an unreadable or too-new file yields defaults plus a
@@ -53,24 +71,22 @@ impl Store {
         let text = match std::fs::read_to_string(&path) {
             Ok(text) => text,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                let store = Self {
-                    path,
-                    writable: true,
-                    found_version: CURRENT_SCHEMA_VERSION,
-                };
+                let store = Self::new(path, Writability::Writable);
                 return (store, Loaded::Fresh(Config::default()));
             }
             Err(e) => {
-                let store = Self {
+                let message = e.to_string();
+                let store = Self::new(
                     path,
-                    writable: false,
-                    found_version: CURRENT_SCHEMA_VERSION,
-                };
+                    Writability::Unreadable {
+                        message: message.clone(),
+                    },
+                );
                 return (
                     store,
                     Loaded::Unreadable {
                         config: Config::default(),
-                        message: e.to_string(),
+                        message,
                     },
                 );
             }
@@ -81,16 +97,18 @@ impl Store {
         let found = match toml::from_str::<VersionProbe>(&text) {
             Ok(probe) => probe.schema_version,
             Err(e) => {
-                let store = Self {
+                let message = e.to_string();
+                let store = Self::new(
                     path,
-                    writable: false,
-                    found_version: CURRENT_SCHEMA_VERSION,
-                };
+                    Writability::Unreadable {
+                        message: message.clone(),
+                    },
+                );
                 return (
                     store,
                     Loaded::Unreadable {
                         config: Config::default(),
-                        message: e.to_string(),
+                        message,
                     },
                 );
             }
@@ -98,30 +116,18 @@ impl Store {
 
         match toml::from_str::<Config>(&text) {
             Ok(config) if found > CURRENT_SCHEMA_VERSION => {
-                let store = Self {
-                    path,
-                    writable: false,
-                    found_version: found,
-                };
+                let store = Self::new(path, Writability::TooNew { found });
                 (store, Loaded::ReadOnly { config, found })
             }
             Ok(config) => {
-                let store = Self {
-                    path,
-                    writable: true,
-                    found_version: found,
-                };
+                let store = Self::new(path, Writability::Writable);
                 (store, Loaded::Ok(config))
             }
             // Too new to parse at all. The version already explains the
             // situation better than the parse error would, so it is discarded —
             // but the file still must not be overwritten.
             Err(_) if found > CURRENT_SCHEMA_VERSION => {
-                let store = Self {
-                    path,
-                    writable: false,
-                    found_version: found,
-                };
+                let store = Self::new(path, Writability::TooNew { found });
                 (
                     store,
                     Loaded::ReadOnly {
@@ -131,16 +137,18 @@ impl Store {
                 )
             }
             Err(e) => {
-                let store = Self {
+                let message = e.to_string();
+                let store = Self::new(
                     path,
-                    writable: false,
-                    found_version: found,
-                };
+                    Writability::Unreadable {
+                        message: message.clone(),
+                    },
+                );
                 (
                     store,
                     Loaded::Unreadable {
                         config: Config::default(),
-                        message: e.to_string(),
+                        message,
                     },
                 )
             }
@@ -152,22 +160,28 @@ impl Store {
     }
 
     pub fn is_writable(&self) -> bool {
-        self.writable
+        matches!(self.writability, Writability::Writable)
     }
 
     /// Persist `config`, or refuse if this store was opened on a file we must
     /// not modify.
     pub fn save(&self, config: &Config) -> Result<(), StoreError> {
-        if !self.writable {
-            return Err(StoreError::ReadOnly {
+        match &self.writability {
+            Writability::Writable => {
+                let text = toml::to_string_pretty(config)
+                    .map_err(|source| StoreError::Serialize { source })?;
+                atomic::write_atomic(&self.path, &text)
+            }
+            Writability::TooNew { found } => Err(StoreError::ReadOnly {
                 path: self.path.clone(),
-                found: self.found_version,
+                found: *found,
                 supported: CURRENT_SCHEMA_VERSION,
-            });
+            }),
+            Writability::Unreadable { message } => Err(StoreError::RefusedUnreadable {
+                path: self.path.clone(),
+                message: message.clone(),
+            }),
         }
-        let text =
-            toml::to_string_pretty(config).map_err(|source| StoreError::Serialize { source })?;
-        atomic::write_atomic(&self.path, &text)
     }
 }
 
@@ -230,7 +244,10 @@ mod tests {
         assert!(!store.is_writable());
 
         let err = store.save(&Config::default()).unwrap_err();
-        assert!(matches!(err, StoreError::ReadOnly { .. }), "got {err:?}");
+        match err {
+            StoreError::ReadOnly { found, .. } => assert_eq!(found, future),
+            other => panic!("expected ReadOnly, got {other:?}"),
+        }
 
         assert_eq!(
             std::fs::read_to_string(&path).unwrap(),
@@ -254,7 +271,13 @@ mod tests {
         }
         assert_eq!(loaded.config(), &Config::default());
         assert!(!store.is_writable());
-        assert!(store.save(&Config::default()).is_err());
+
+        let err = store.save(&Config::default()).unwrap_err();
+        match err {
+            StoreError::RefusedUnreadable { message, .. } => assert!(!message.is_empty()),
+            other => panic!("expected RefusedUnreadable, got {other:?}"),
+        }
+
         assert_eq!(std::fs::read_to_string(&path).unwrap(), garbage);
     }
 }

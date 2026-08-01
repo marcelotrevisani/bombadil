@@ -30,4 +30,7 @@ pub enum StoreError {
         found: u32,
         supported: u32,
     },
+
+    #[error("{path} could not be read or parsed ({message}); it will not be modified")]
+    RefusedUnreadable { path: PathBuf, message: String },
 }
