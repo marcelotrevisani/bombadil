@@ -190,6 +190,11 @@ mod tests {
 
         assert_eq!(got.origin, UvOrigin::Bundled);
         assert_eq!(got.version, BUNDLED_UV_VERSION);
+        assert!(
+            runner.calls().is_empty(),
+            "Bundled must never probe PATH; got {:?}",
+            runner.calls()
+        );
     }
 
     #[test]
@@ -212,6 +217,31 @@ mod tests {
         let err = resolve(&UvSource::FromPath, &runner, &*bundled_ok()).unwrap_err();
 
         assert!(matches!(err, UvResolveError::TooOld { .. }), "got {err:?}");
+    }
+
+    #[test]
+    fn from_path_uses_a_uv_that_meets_the_minimum() {
+        // Without this, swapping the two Some(version) arms in the FromPath
+        // branch would leave the whole suite green.
+        let runner = FakeCommandRunner::new();
+        runner.expect(
+            "uv",
+            &["--version"],
+            version_outcome("uv 0.12.1 (x86_64-unknown-linux-gnu)"),
+        );
+
+        let got = resolve(&UvSource::FromPath, &runner, &*bundled_ok()).unwrap();
+
+        assert_eq!(got.origin, UvOrigin::Path);
+        assert_eq!(
+            got.version,
+            UvVersion {
+                major: 0,
+                minor: 12,
+                patch: 1
+            }
+        );
+        assert!(!got.newer_than_bundled);
     }
 
     #[test]
@@ -249,6 +279,25 @@ mod tests {
             matches!(err, UvResolveError::ConfiguredUnavailable { .. }),
             "got {err:?}"
         );
+    }
+
+    #[test]
+    fn a_configured_binary_that_is_too_old_fails_loudly() {
+        let runner = FakeCommandRunner::new();
+        runner.expect("uv", &["--version"], version_outcome("uv 0.9.0 (x)"));
+
+        let source = UvSource::Custom {
+            path: PathBuf::from("/opt/uv/bin/uv"),
+        };
+        let err = resolve(&source, &runner, &*bundled_ok()).unwrap_err();
+
+        match err {
+            UvResolveError::TooOld { path, found, .. } => {
+                assert_eq!(path, PathBuf::from("/opt/uv/bin/uv"));
+                assert_eq!(found, "0.9.0");
+            }
+            other => panic!("expected TooOld, got {other:?}"),
+        }
     }
 
     #[test]
