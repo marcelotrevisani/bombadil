@@ -1,0 +1,47 @@
+# Local gate before each commit. Install once with:
+#
+#     pre-commit install
+#
+# Everything here also runs in CI — this exists so a formatting or lint
+# failure costs you a few seconds locally instead of a red pipeline.
+#
+# Deliberately absent: `cargo test`. The suite is fast today, but plan 2 adds
+# integration tests that shell out to a real uv binary, and a pre-commit slow
+# enough to be bypassed with --no-verify protects nothing.
+
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v6.0.0
+    hooks:
+      - id: trailing-whitespace
+      - id: end-of-file-fixer
+      - id: check-yaml
+      - id: check-toml
+      - id: check-merge-conflict
+      - id: check-added-large-files
+      - id: mixed-line-ending
+        args: [--fix=lf]
+
+  - repo: local
+    hooks:
+      # These shell out to the toolchain already installed for the project
+      # rather than pinning a second copy of Rust inside pre-commit, so they
+      # always agree with what `cargo` does in this checkout.
+      #
+      # Both use the exact flags CI uses. If one of these passes and CI fails,
+      # that is a bug in this file.
+      - id: cargo-fmt
+        name: cargo fmt
+        entry: cargo fmt --all --check
+        language: system
+        # Cargo.toml changes can break the build as surely as .rs changes, so
+        # both file types trigger these hooks.
+        types_or: [rust, toml]
+        pass_filenames: false
+
+      - id: cargo-clippy
+        name: cargo clippy
+        entry: cargo clippy --all-targets --all-features --locked -- -D warnings
+        language: system
+        types_or: [rust, toml]
+        pass_filenames: false

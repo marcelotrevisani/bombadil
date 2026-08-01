@@ -25,6 +25,32 @@ jobs:
       - name: Test
         run: cargo test --workspace --locked
 
+  hygiene:
+    # Runs the pre-commit hooks so they are enforced for contributors who
+    # never ran `pre-commit install`. The two cargo hooks are skipped: fmt and
+    # clippy already have dedicated steps in `check`, across three platforms,
+    # and running them twice would only slow the pipeline down.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+      - uses: pre-commit/action@v3.0.1
+        env:
+          SKIP: cargo-fmt,cargo-clippy
+
+  deny:
+    # Security advisories, license compatibility, banned/duplicate crates and
+    # crate sources. Policy lives in deny.toml; run it locally with
+    # `cargo deny check`.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check
+
   msrv:
     # Pins to the workspace's declared rust-version so a dependency bump that
     # needs a newer compiler than 1.85 fails here instead of surfacing only
