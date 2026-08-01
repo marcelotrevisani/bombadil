@@ -34,3 +34,19 @@ pub enum StoreError {
     #[error("{path} could not be read or parsed ({message}); it will not be modified")]
     RefusedUnreadable { path: PathBuf, message: String },
 }
+
+#[derive(Debug, thiserror::Error)]
+pub enum PyProjectError {
+    #[error("could not read {path}: {source}")]
+    Io {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+
+    #[error("could not parse pyproject.toml: {source}")]
+    Parse {
+        #[source]
+        source: toml::de::Error,
+    },
+}
