@@ -102,7 +102,7 @@ pub fn python_install(uv: &ResolvedUv, version: &str) -> CommandSpec {
 mod tests {
     use super::*;
     use crate::uv::{UvOrigin, UvVersion};
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
 
     fn uv() -> ResolvedUv {
         ResolvedUv {
@@ -245,5 +245,53 @@ mod tests {
     fn the_program_is_always_the_resolved_binary() {
         assert_eq!(sync(&uv(), &ctx()).program, PathBuf::from("/data/uv/uv"));
         assert_eq!(python_list(&uv()).program, PathBuf::from("/data/uv/uv"));
+    }
+
+    #[test]
+    fn every_project_scoped_builder_pairs_cwd_with_uv_project_environment() {
+        // The pairing is the entire mechanism by which a venv can live outside
+        // .venv. Asserting it on `sync` alone would let a new builder that
+        // bypasses project_spec through unnoticed, and the failure is silent.
+        let uv = uv();
+        let ctx = ctx();
+        let specs: Vec<(&str, CommandSpec)> = vec![
+            ("sync", sync(&uv, &ctx)),
+            ("sync_with_python", sync_with_python(&uv, &ctx, "3.12")),
+            ("add", add(&uv, &ctx, "httpx", DependencyGroup::Main)),
+            ("remove", remove(&uv, &ctx, "httpx", DependencyGroup::Main)),
+            ("upgrade_package", upgrade_package(&uv, &ctx, "httpx")),
+            ("tree", tree(&uv, &ctx, 2)),
+            ("pip_list", pip_list(&uv, &ctx)),
+        ];
+
+        for (name, spec) in specs {
+            assert_eq!(
+                spec.cwd.as_deref(),
+                Some(Path::new("/proj/my-api")),
+                "{name} must run in the project directory"
+            );
+            assert_eq!(
+                spec.env.get("UV_PROJECT_ENVIRONMENT").map(String::as_str),
+                Some("/envs/my-api-3f9c1a"),
+                "{name} must point uv at the resolved venv"
+            );
+            assert_eq!(spec.program, uv.path, "{name} must run the resolved uv");
+        }
+    }
+
+    #[test]
+    fn machine_wide_builders_carry_no_project_context() {
+        // Interpreter discovery is not project-scoped. Routing these through
+        // project_spec would silently scope them to one project's venv.
+        for (name, spec) in [
+            ("python_list", python_list(&uv())),
+            ("python_install", python_install(&uv(), "3.13")),
+        ] {
+            assert_eq!(spec.cwd, None, "{name} must not be project-scoped");
+            assert!(
+                !spec.env.contains_key("UV_PROJECT_ENVIRONMENT"),
+                "{name} must not carry UV_PROJECT_ENVIRONMENT"
+            );
+        }
     }
 }
