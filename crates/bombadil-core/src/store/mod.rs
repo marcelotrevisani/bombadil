@@ -328,11 +328,22 @@ mod tests {
     fn save_always_stamps_the_current_schema_version() {
         let dir = tempfile::tempdir().unwrap();
         let path = temp_config_path(&dir);
-        // A file already on disk claiming an old version number, distinct
-        // from whatever CURRENT_SCHEMA_VERSION happens to be today.
-        std::fs::write(&path, "schema_version = 1\n").unwrap();
+
+        // The version on disk must differ from CURRENT_SCHEMA_VERSION, or the
+        // test cannot tell a `save` that stamps the version from one that
+        // simply echoes back whatever it loaded — both would leave the same
+        // number in the file. Derived from the constant rather than hardcoded
+        // so it stays meaningful when CURRENT_SCHEMA_VERSION is bumped.
+        let stale = CURRENT_SCHEMA_VERSION - 1;
+        std::fs::write(&path, format!("schema_version = {stale}\n")).unwrap();
 
         let (store, loaded) = Store::open(path.clone());
+        assert_eq!(
+            loaded.config().schema_version,
+            stale,
+            "precondition: an older version should load as-is and stay writable"
+        );
+
         let config = loaded.config().clone();
         store.save(&config).unwrap();
 
