@@ -24,6 +24,7 @@ It runs on Linux, macOS and Windows from a single self-contained binary per plat
 | Virtual environments | Create at a chosen location, or adopt one that already exists. Recreate and delete. |
 | Python interpreters | Choose from interpreters uv can find; install a missing one on demand via `uv python install`. |
 | Dependencies | View declared constraints by group, with installed versions and an expandable transitive tree. Add, remove, change constraint, upgrade, sync. |
+| Monorepo members | Detect every `pyproject.toml` under a registered project, list them, and let the user choose which are installed in editable ("dev") mode — all selected by default. Projects living outside the tree can be added to that list too. |
 | Environment variables | Global set and per-project set, merged with per-project winning. Values may be marked secret and stored in the OS keychain. |
 | Pre-activate scripts | Ordered, enable-able list per project and globally. Their exported variables are captured and applied. |
 | Private indexes | Named indexes defined once globally, opted into per project. Credentials in the OS keychain, never in a file. |
@@ -38,8 +39,7 @@ These are recorded so the implementation plan does not quietly absorb them:
 - No PyPI network features: no package search, no *outdated* column, no package metadata.
 - No standalone Python-version manager screen.
 - No support for pip, Poetry, Conda, PDM or Pipenv projects.
-- No scanning the filesystem for projects; registration is always deliberate.
-- No dedicated UI for uv workspaces — a workspace registers as a single project.
+- No scanning the filesystem to *discover* projects; registering a project is always deliberate. (Scanning *below* an already-registered project to find its monorepo members is in scope — see §5a. The distinction is that the user has already pointed at that tree.)
 - No application auto-update.
 - No writing to `pyproject.toml` or `uv.lock` by Bombadil itself, ever. uv owns both.
 
@@ -200,6 +200,62 @@ Keychain service `bombadil`; three entry shapes:
 Headless Linux and WSL frequently have no Secret Service running. When the keychain is
 unavailable the app states so plainly and offers session-only entry held in memory for the
 lifetime of the process, rather than failing at spawn time with an opaque error.
+
+## 5a. Monorepo members and editable installs
+
+A registered project is often not one package. Bombadil detects the other
+`pyproject.toml` files belonging to it and lets the user choose which are installed in
+editable — "dev" — mode. **All discovered members are selected by default**, because that
+is what someone opening a monorepo almost always wants.
+
+### Two shapes, detected automatically
+
+The mechanism depends on what the repository already is, and the user should not have to
+know which:
+
+| Shape | Detected by | How members are installed |
+| --- | --- | --- |
+| **uv workspace** | `[tool.uv.workspace]` in the root `pyproject.toml` | uv already installs every member editable. Selection drives `uv sync --all-packages` (the default) or `uv sync --package <name>` for a subset. Bombadil adds nothing to any manifest. |
+| **Loose packages** | no `[tool.uv.workspace]`; several `pyproject.toml` found below the root | Each selected member is wired in with `uv add --editable <path>`, which writes through uv. |
+
+Verified against uv 0.12.1: a two-member workspace synced with `--all-packages` produced
+`_editable_impl_<member>.pth` for both, confirming workspace members are editable by
+default and that "dev mode" for a workspace is uv's existing behaviour rather than
+something Bombadil imposes.
+
+### The list is user-editable, not just discovered
+
+Discovery seeds the list; it does not define it. The user can **add any project to the
+dev-install list by path**, whether it sits inside the registered tree or entirely
+outside it — a shared library checked out beside the repo, say. Added entries behave
+exactly like discovered ones: they appear in the same list, carry the same checkbox, and
+are installed with `uv add --editable <path>`. They can also be removed again.
+
+An entry outside the registered tree is shown with its full path rather than a
+tree-relative one, so it is obvious at a glance that it lives elsewhere.
+
+### Discovery rules
+
+Walk downward from the registered project's directory, skipping `.venv`, `.git`,
+`node_modules`, `__pycache__`, `build`, `dist` and `target`, with a depth cap. Discovery
+**never installs anything on its own**: results are always presented for confirmation
+first. The root project's own `pyproject.toml` is not a member of its own list.
+
+This is deliberately narrower than filesystem-wide project discovery, which remains a
+non-goal (§2). The difference is consent: the user has already pointed Bombadil at this
+tree.
+
+### Command mapping
+
+| Action | Workspace | Loose packages |
+| --- | --- | --- |
+| Install all members editable | `uv sync --all-packages` | `uv add --editable <path>` per member, then `uv sync` |
+| Install a subset | `uv sync --package <name>` per selection | `uv add --editable` for selected, `uv remove` for deselected |
+| Add an outside project | `uv add --editable <abs path>` | `uv add --editable <abs path>` |
+
+Deselecting a member in a workspace does not edit `[tool.uv.workspace] members` — that
+list describes the repository, not one user's preference, and rewriting it would put a
+personal choice into a shared file. Selection is expressed at sync time instead.
 
 ## 6. Environment resolution
 
