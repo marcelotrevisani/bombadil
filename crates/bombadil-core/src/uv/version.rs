@@ -29,6 +29,15 @@ pub const MIN_UV_VERSION: UvVersion = UvVersion {
 
 impl UvVersion {
     /// Parse a bare `0.12.1` or a full `uv 0.12.1 (target-triple)` line.
+    ///
+    /// Extracts the first whitespace-separated token that resembles a version number
+    /// and parses it as three dot-separated components (major.minor.patch).
+    /// Any non-digit characters after the patch component are ignored, so
+    /// `0.12.1+local` and `0.12.1-beta` both parse as `Some(0, 12, 1)`.
+    /// This means pre-release versions are treated as their base release version.
+    /// This is acceptable only because uv publishes plain three-component versions
+    /// without pre-release or metadata suffixes. If uv ever ships pre-release
+    /// version strings, this parsing must be revisited to distinguish pre-releases.
     pub fn parse(text: &str) -> Option<Self> {
         // Take the first whitespace-separated token that looks like a version,
         // so this works whether or not the `uv ` prefix is present.
@@ -150,5 +159,26 @@ mod tests {
             .to_string(),
             "0.12.1"
         );
+    }
+
+    #[test]
+    fn a_trailing_suffix_is_treated_as_the_base_release() {
+        // Build metadata and pre-release suffixes are both ignored, so a
+        // pre-release parses as its base release. Acceptable only because uv
+        // publishes plain three-component versions; revisit if that changes.
+        let base = UvVersion {
+            major: 0,
+            minor: 12,
+            patch: 1,
+        };
+        assert_eq!(UvVersion::parse("0.12.1+local"), Some(base));
+        assert_eq!(UvVersion::parse("0.12.1-beta"), Some(base));
+    }
+
+    #[test]
+    fn rejects_a_four_component_version() {
+        // Four components mean this is not a uv version; guessing would be worse
+        // than refusing.
+        assert_eq!(UvVersion::parse("1.2.3.4"), None);
     }
 }
