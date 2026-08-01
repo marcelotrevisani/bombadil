@@ -22,6 +22,21 @@ fn is_valid_index_name(name: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
 }
 
+/// The environment variable name uv derives from an index name.
+///
+/// uv uppercases the name and maps '-' to '_', so `my-index` and `my_index`
+/// collide on one variable. Verified against uv 0.11.32 (real HTTP server,
+/// captured the `Authorization` header sent for an index named `my-index`:
+/// it authenticated from `UV_INDEX_MY_INDEX_USERNAME`).
+pub fn index_credential_var(index_name: &str, suffix: &str) -> String {
+    let normalized = index_name
+        .chars()
+        .map(|c| if c == '-' { '_' } else { c })
+        .collect::<String>()
+        .to_ascii_uppercase();
+    format!("UV_INDEX_{normalized}_{suffix}")
+}
+
 fn check_env(problems: &mut Vec<Problem>, scope: &str, vars: &[EnvVar]) {
     for var in vars {
         if var.key.is_empty() {
@@ -48,7 +63,8 @@ pub fn validate(config: &Config) -> Vec<Problem> {
     let mut problems = Vec::new();
 
     // Index names become part of UV_INDEX_<NAME>_USERNAME, so they must be
-    // usable in an environment variable name and unique once uppercased.
+    // usable in an environment variable name and unique once normalized the
+    // way uv normalizes them (uppercased, '-' mapped to '_').
     let mut seen: HashMap<String, &str> = HashMap::new();
     for index in &config.indexes {
         if !is_valid_index_name(&index.name) {
@@ -57,13 +73,20 @@ pub fn validate(config: &Config) -> Vec<Problem> {
                 index.name
             )));
         }
-        if let Some(first) = seen.insert(index.name.to_ascii_uppercase(), &index.name) {
-            problems.push(Problem::new(format!(
-                "index names {:?} and {:?} collide: both become UV_INDEX_{}_USERNAME",
-                first,
-                index.name,
-                index.name.to_ascii_uppercase()
-            )));
+        let var = index_credential_var(&index.name, "USERNAME");
+        if let Some(first) = seen.insert(var.clone(), &index.name) {
+            let message = if first == index.name.as_str() {
+                format!(
+                    "index name {:?} is used more than once: both become {var}",
+                    index.name
+                )
+            } else {
+                format!(
+                    "index names {first:?} and {:?} collide: both become {var}",
+                    index.name
+                )
+            };
+            problems.push(Problem::new(message));
         }
         if !(index.url.starts_with("http://") || index.url.starts_with("https://")) {
             problems.push(Problem::new(format!(
@@ -80,6 +103,18 @@ pub fn validate(config: &Config) -> Vec<Problem> {
         .iter()
         .map(|i| (i.name.as_str(), i.kind))
         .collect();
+
+    // A duplicated id would make two projects share one keychain namespace
+    // (`env/<project-id>/<KEY>`), serving one project's secrets to another.
+    let mut seen_ids: HashMap<uuid::Uuid, &str> = HashMap::new();
+    for project in &config.projects {
+        if let Some(first) = seen_ids.insert(project.id, &project.label) {
+            problems.push(Problem::new(format!(
+                "projects {first:?} and {:?} share id {}; each project must have a unique id",
+                project.label, project.id
+            )));
+        }
+    }
 
     for project in &config.projects {
         let scope = format!("project {:?}", project.label);
@@ -107,7 +142,7 @@ pub fn validate(config: &Config) -> Vec<Problem> {
 
 #[cfg(test)]
 mod tests {
-    use super::validate;
+    use super::{index_credential_var, validate};
     use crate::model::{Config, EnvVar, Index, IndexAuth, IndexKind, Project, VenvLocation};
     use std::path::PathBuf;
     use uuid::Uuid;
@@ -185,6 +220,36 @@ mod tests {
     }
 
     #[test]
+    fn index_names_collide_when_hyphen_and_underscore_normalize_the_same() {
+        // uv maps '-' to '_' when deriving the env var name, so these two
+        // both become UV_INDEX_MY_INDEX_USERNAME even though neither is a
+        // case-only match of the other.
+        let c = config_with(
+            vec![
+                index("my-index", IndexKind::Extra),
+                index("my_index", IndexKind::Extra),
+            ],
+            vec![],
+            vec![],
+        );
+        assert!(
+            messages(&c)
+                .iter()
+                .any(|m| m.contains("UV_INDEX_MY_INDEX_USERNAME")),
+            "got {:?}",
+            messages(&c)
+        );
+    }
+
+    #[test]
+    fn index_credential_var_maps_hyphen_to_underscore_and_uppercases() {
+        assert_eq!(
+            index_credential_var("my-index", "USERNAME"),
+            "UV_INDEX_MY_INDEX_USERNAME"
+        );
+    }
+
+    #[test]
     fn an_index_url_must_be_http_or_https() {
         let bad = Index {
             url: "ftp://example.com/simple".into(),
@@ -192,6 +257,25 @@ mod tests {
         };
         let c = config_with(vec![bad], vec![], vec![]);
         assert!(messages(&c).iter().any(|m| m.contains("ftp://")));
+    }
+
+    #[test]
+    fn two_projects_cannot_share_an_id() {
+        // `project()` defaults `id` to `Uuid::nil()`, so both share it here.
+        let a = Project {
+            label: "a".into(),
+            ..project(vec![])
+        };
+        let b = Project {
+            label: "b".into(),
+            ..project(vec![])
+        };
+        let c = config_with(vec![], vec![a, b], vec![]);
+        assert!(
+            messages(&c).iter().any(|m| m.contains("share id")),
+            "got {:?}",
+            messages(&c)
+        );
     }
 
     #[test]
