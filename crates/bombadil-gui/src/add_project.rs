@@ -26,6 +26,39 @@ pub enum VenvChoice {
     Chosen(PathBuf),
 }
 
+/// The state of the asynchronous `uv python list` fetch behind the dialog's
+/// interpreter line.
+///
+/// Three states rather than a bare `Vec`: "not fetched yet", "fetched, and
+/// here is what uv sees" and "the fetch could not produce a list at all" are
+/// three different things to tell the user, and a producer that can only
+/// return a `Vec` collapses the third into the first -- which renders as
+/// "(checking available interpreters...)" forever, with no error, no retry
+/// and the install button suppressed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Interpreters {
+    /// The fetch is still in flight.
+    Pending,
+    /// The fetch succeeded. An empty list is a real answer here: uv ran and
+    /// saw no interpreters, which is what the install offer exists for.
+    Loaded(Vec<Interpreter>),
+    /// The fetch failed: no usable uv, a non-zero exit, output this build
+    /// cannot parse, a timeout, or a panicking job. Carries uv's own text
+    /// wherever there is any.
+    Failed(String),
+}
+
+impl Interpreters {
+    /// The interpreters there are to choose from -- empty while pending and
+    /// after a failure, since neither state knows of any.
+    pub fn available(&self) -> &[Interpreter] {
+        match self {
+            Self::Loaded(interpreters) => interpreters,
+            Self::Pending | Self::Failed(_) => &[],
+        }
+    }
+}
+
 /// The state of the add-project dialog for one chosen manifest.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Draft {
@@ -33,12 +66,10 @@ pub struct Draft {
     pub name: Option<String>,
     pub requires_python: Option<String>,
     pub venv_choice: VenvChoice,
-    /// The interpreters uv can see, fetched asynchronously by `app.rs` once
-    /// the manifest is loaded (`uv python list`). Starts empty -- before the
-    /// fetch lands, [`interpreter_status`] shows that as "checking" rather
-    /// than "none found", which would be indistinguishable from a genuinely
-    /// empty machine and would show the install offer prematurely.
-    pub interpreters: Vec<Interpreter>,
+    /// What `uv python list` has said so far, fetched asynchronously by
+    /// `app.rs` once the manifest is loaded. See [`Interpreters`] for why
+    /// this is not a plain `Vec`.
+    pub interpreters: Interpreters,
 }
 
 /// Builds a `Draft` from the chosen manifest's path and text.
@@ -59,34 +90,43 @@ pub fn draft_from(path: &Path, text: &str) -> Draft {
         name: parsed.as_ref().and_then(|p| p.name.clone()),
         requires_python: parsed.as_ref().and_then(|p| p.requires_python.clone()),
         venv_choice: VenvChoice::SettingsDefault,
-        interpreters: Vec::new(),
+        interpreters: Interpreters::Pending,
     }
 }
 
 /// The interpreter line for the dialog. Spec §8: pre-selected to satisfy
 /// `requires-python`, with an offer to install one when none qualifies.
 ///
-/// Three states, not two: before `draft.interpreters` is populated this
-/// must read as "still looking," not "nothing found" -- the two look
-/// identical to `interpreter::preselect` (`None` either way), but only one
-/// of them should ever prompt the user to install something.
+/// Four states, not two: "still looking", "the lookup failed", "found one"
+/// and "found none" all read differently, and only one of them should ever
+/// prompt the user to install something. `interpreter::preselect` answers
+/// `None` for the first three alike, which is why the distinction has to
+/// live in [`Interpreters`] rather than be inferred from an empty list.
 fn interpreter_status(draft: &Draft) -> String {
-    match interpreter::preselect(&draft.interpreters, draft.requires_python.as_deref()) {
-        Some(interpreter) => format!("python: {}", interpreter.version),
-        None if draft.interpreters.is_empty() => {
-            "python: (checking available interpreters...)".to_string()
+    match &draft.interpreters {
+        Interpreters::Pending => "python: (checking available interpreters...)".to_string(),
+        Interpreters::Failed(why) => format!("python: could not list interpreters -- {why}"),
+        Interpreters::Loaded(interpreters) => {
+            match interpreter::preselect(interpreters, draft.requires_python.as_deref()) {
+                Some(interpreter) => format!("python: {}", interpreter.version),
+                None => "python: no compatible interpreter found".to_string(),
+            }
         }
-        None => "python: no compatible interpreter found".to_string(),
     }
 }
 
-/// Whether the dialog should offer to install a suitable interpreter: a
-/// list has actually been fetched, and nothing in it satisfies
-/// `requires_python`. Never true while `interpreters` is still empty from
-/// not having been fetched yet -- see `interpreter_status`.
+/// Whether the dialog should offer to install a suitable interpreter: uv
+/// actually answered, and nothing it reported satisfies `requires_python`.
+/// Never true while the fetch is still in flight or has failed -- in neither
+/// case is "no compatible interpreter" known to be true, and the failed case
+/// would install through the very uv that just could not be run.
 fn needs_install_offer(draft: &Draft) -> bool {
-    !draft.interpreters.is_empty()
-        && interpreter::preselect(&draft.interpreters, draft.requires_python.as_deref()).is_none()
+    match &draft.interpreters {
+        Interpreters::Loaded(interpreters) => {
+            interpreter::preselect(interpreters, draft.requires_python.as_deref()).is_none()
+        }
+        Interpreters::Pending | Interpreters::Failed(_) => false,
+    }
 }
 
 /// Builds the `Project` a draft describes. Used both for resolving its venv
@@ -334,26 +374,52 @@ requires-python = ">=3.11"
     }
 
     #[test]
-    fn the_default_interpreter_list_is_empty_until_fetched() {
+    fn the_interpreter_list_starts_pending_rather_than_empty() {
         let draft = draft_from(Path::new("/p/my-api/pyproject.toml"), MANIFEST);
-        assert!(draft.interpreters.is_empty());
+        assert_eq!(draft.interpreters, Interpreters::Pending);
+        assert!(draft.interpreters.available().is_empty());
     }
 
     #[test]
     fn before_the_fetch_lands_the_status_reads_as_checking_not_missing() {
-        // interpreters is empty both before the fetch and when the fetch
-        // genuinely finds nothing -- interpreter_status must not conflate
-        // "still looking" with "none found," which would show the install
-        // offer prematurely.
+        // Pending and Loaded(empty) both have nothing to preselect --
+        // interpreter_status must not conflate "still looking" with "none
+        // found," which would show the install offer prematurely.
         let draft = draft_from(Path::new("/p/my-api/pyproject.toml"), MANIFEST);
         assert!(interpreter_status(&draft).contains("checking"));
         assert!(!needs_install_offer(&draft));
     }
 
     #[test]
+    fn a_failed_fetch_says_what_went_wrong_instead_of_checking_forever() {
+        // The dead end this state exists for: with a producer that could
+        // only return a `Vec`, an unresolvable uv arrived as `vec![]` and
+        // the dialog read "(checking available interpreters...)" for the
+        // rest of its life -- no error, no retry, and the install button
+        // suppressed because an empty list also means "not fetched yet".
+        let mut draft = draft_from(Path::new("/p/my-api/pyproject.toml"), MANIFEST);
+        draft.interpreters =
+            Interpreters::Failed("no uv binary is available at /nope/uv".to_string());
+
+        let status = interpreter_status(&draft);
+        assert!(
+            !status.contains("checking"),
+            "a failed fetch must not keep claiming to be in progress; got {status}"
+        );
+        assert!(
+            status.contains("/nope/uv"),
+            "the failure's own text must survive to the dialog; got {status}"
+        );
+        assert!(
+            !needs_install_offer(&draft),
+            "installing through the very uv that could not be run is not an offer worth making"
+        );
+    }
+
+    #[test]
     fn a_satisfying_interpreter_is_named_in_the_status_line() {
         let mut draft = draft_from(Path::new("/p/my-api/pyproject.toml"), MANIFEST);
-        draft.interpreters = vec![interp("3.10.13"), interp("3.11.9")];
+        draft.interpreters = Interpreters::Loaded(vec![interp("3.10.13"), interp("3.11.9")]);
         assert_eq!(interpreter_status(&draft), "python: 3.11.9");
         assert!(!needs_install_offer(&draft));
     }
@@ -361,11 +427,21 @@ requires-python = ">=3.11"
     #[test]
     fn nothing_satisfying_offers_to_install_instead_of_naming_the_wrong_one() {
         let mut draft = draft_from(Path::new("/p/my-api/pyproject.toml"), MANIFEST);
-        draft.interpreters = vec![interp("3.9.18")];
+        draft.interpreters = Interpreters::Loaded(vec![interp("3.9.18")]);
         assert_eq!(
             interpreter_status(&draft),
             "python: no compatible interpreter found"
         );
+        assert!(needs_install_offer(&draft));
+    }
+
+    #[test]
+    fn a_machine_uv_finds_nothing_on_is_offered_the_install_button() {
+        // `Loaded(vec![])` is a real answer -- uv ran and saw nothing -- and
+        // is exactly the case the install offer exists for. Only `Pending`
+        // and `Failed` must suppress it.
+        let mut draft = draft_from(Path::new("/p/my-api/pyproject.toml"), MANIFEST);
+        draft.interpreters = Interpreters::Loaded(Vec::new());
         assert!(needs_install_offer(&draft));
     }
 

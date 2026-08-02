@@ -156,7 +156,12 @@ pub enum Message {
     /// `requires-python`, computed fresh from this list every render by
     /// `interpreter::preselect` rather than stored -- the same "recompute,
     /// don't cache" trick `resolved_venv_path_display` uses.
-    AddProjectInterpretersLoaded(Vec<Interpreter>),
+    ///
+    /// A `Result`, not a bare `Vec`: an empty list and a failed fetch are
+    /// different things to show. Collapsing both to `vec![]` left the dialog
+    /// reading "(checking available interpreters...)" forever with the
+    /// install button suppressed -- no error, no retry.
+    AddProjectInterpretersLoaded(Result<Vec<Interpreter>, String>),
     /// The dialog's "Install compatible interpreter" button was pressed:
     /// spec §8's offer to install one through uv when none is available.
     AddProjectInstallInterpreterRequested,
@@ -371,9 +376,12 @@ pub fn update(app: &mut App, message: Message, runner: Arc<dyn CommandRunner>) -
                 Message::AddProjectInterpretersLoaded,
             );
         }
-        Message::AddProjectInterpretersLoaded(interpreters) => {
+        Message::AddProjectInterpretersLoaded(result) => {
             if let Some(draft) = &mut app.add_project {
-                draft.interpreters = interpreters;
+                draft.interpreters = match result {
+                    Ok(interpreters) => add_project::Interpreters::Loaded(interpreters),
+                    Err(why) => add_project::Interpreters::Failed(why),
+                };
             }
         }
         Message::AddProjectInstallInterpreterRequested => {
@@ -408,9 +416,11 @@ pub fn update(app: &mut App, message: Message, runner: Arc<dyn CommandRunner>) -
         Message::AddProjectConfirmed => {
             if let Some(draft) = app.add_project.take() {
                 let project = add_project::to_project(&draft);
-                let python_version =
-                    interpreter::preselect(&draft.interpreters, draft.requires_python.as_deref())
-                        .map(|i| i.version.clone());
+                let python_version = interpreter::preselect(
+                    draft.interpreters.available(),
+                    draft.requires_python.as_deref(),
+                )
+                .map(|i| i.version.clone());
 
                 // In-memory first, synchronously -- criterion 3's other
                 // failure mode is a dialog that looks like it worked but
@@ -644,38 +654,58 @@ fn resolve_uv_for(config: &Config, runner: &dyn CommandRunner) -> Result<uv::Res
 }
 
 /// The blocking half of interpreter discovery: resolve uv, run
-/// `uv python list --output-format json`, and parse it. Any failure -- no
-/// usable uv, a non-zero exit, JSON this build cannot parse -- degrades to
-/// an empty list rather than propagating an error: the dialog already has a
-/// way to show "nothing found yet" that is indistinguishable from, and no
-/// worse than, a genuine failure here.
-fn list_interpreters_blocking(config: &Config, runner: &dyn CommandRunner) -> Vec<Interpreter> {
-    let Ok(resolved) = resolve_uv_for(config, runner) else {
-        return Vec::new();
-    };
+/// `uv python list --output-format json`, and parse it.
+///
+/// Every failure -- no usable uv, a non-zero exit, output this build cannot
+/// parse -- comes back as `Err` carrying uv's own text where there is any.
+/// Degrading to an empty list instead is what left the dialog stuck on
+/// "(checking available interpreters...)" forever: the empty list is
+/// indistinguishable from a fetch that has not landed yet, so the dialog
+/// showed neither an error nor the install offer, and there was nothing the
+/// user could do but cancel.
+fn list_interpreters_blocking(
+    config: &Config,
+    runner: &dyn CommandRunner,
+) -> Result<Vec<Interpreter>, String> {
+    let resolved = resolve_uv_for(config, runner)?;
     let spec = uv::command::python_list(&resolved);
     match runner.run(&spec) {
-        Ok(outcome) if outcome.success() => {
-            uv::results::parse_python_list(&outcome.stdout).unwrap_or_default()
-        }
-        _ => Vec::new(),
+        Ok(outcome) if outcome.success() => uv::results::parse_python_list(&outcome.stdout)
+            .map_err(|err| format!("could not read uv's interpreter list: {err}")),
+        // uv ran and refused. Its stderr is the actionable part; the exit
+        // code alone tells the user nothing.
+        Ok(outcome) => Err(match outcome.stderr.trim() {
+            "" => "uv python list failed".to_string(),
+            stderr => stderr.to_string(),
+        }),
+        Err(err) => Err(err.to_string()),
     }
 }
 
 /// Fetches the interpreters uv can see, off the render thread -- the same
-/// seam `probe_venv` uses. `VENV_PROBE_TIMEOUT`, not `SYNC_TIMEOUT`: `uv
-/// python list` only reads uv's own installed-interpreter cache, the same
-/// quick shape of call as a `pyvenv.cfg` read, not a `sync` that can
-/// download and build packages.
-async fn list_interpreters(config: Config, runner: Arc<dyn CommandRunner>) -> Vec<Interpreter> {
+/// seam `probe_venv` uses.
+///
+/// `SYNC_TIMEOUT`, not `VENV_PROBE_TIMEOUT`: `uv python list` itself only
+/// reads uv's own interpreter cache, but this is also the first call that
+/// resolves uv at all, and on a machine with nothing usable on PATH --
+/// exactly the case the bundled uv exists for -- resolving means extracting
+/// and hashing a ~35 MB binary and then executing a freshly written
+/// executable, which on Windows means waiting for Defender to scan it. Three
+/// seconds does not cover that, and a timeout here is not a hollow sidebar
+/// row: it is a dialog with no interpreter to offer.
+async fn list_interpreters(
+    config: Config,
+    runner: Arc<dyn CommandRunner>,
+) -> Result<Vec<Interpreter>, String> {
     match job::run(
         move || list_interpreters_blocking(&config, runner.as_ref()),
-        VENV_PROBE_TIMEOUT,
+        SYNC_TIMEOUT,
     )
     .await
     {
-        job::JobResult::Done(interpreters) => interpreters,
-        job::JobResult::TimedOut | job::JobResult::Failed => Vec::new(),
+        job::JobResult::Done(result) => result,
+        job::JobResult::TimedOut => Err("listing interpreters timed out".to_string()),
+        job::JobResult::Failed => Err("listing interpreters failed unexpectedly".to_string()),
     }
 }
 
@@ -705,7 +735,7 @@ async fn install_and_relist(
     version: String,
     config: Config,
     runner: Arc<dyn CommandRunner>,
-) -> Vec<Interpreter> {
+) -> Result<Vec<Interpreter>, String> {
     let install_config = config.clone();
     let install_runner = runner.clone();
     let _ = job::run(
@@ -1703,13 +1733,91 @@ mod tests {
 
         let _ = update(
             &mut app,
-            Message::AddProjectInterpretersLoaded(interpreters.clone()),
+            Message::AddProjectInterpretersLoaded(Ok(interpreters.clone())),
             unused_runner(),
         );
 
         assert_eq!(
             app.add_project.as_ref().map(|d| d.interpreters.clone()),
-            Some(interpreters)
+            Some(add_project::Interpreters::Loaded(interpreters))
+        );
+    }
+
+    #[test]
+    fn a_failed_interpreter_fetch_reaches_the_draft_as_a_failure_not_an_empty_list() {
+        // The dead end this fix exists for: every failure used to arrive as
+        // `vec![]`, which the dialog cannot tell apart from a fetch that has
+        // not landed yet -- so it showed "(checking available
+        // interpreters...)" forever, with no error and no way forward.
+        let mut app = App::new(Config::default());
+        app.add_project = Some(manifest_draft(""));
+
+        let _ = update(
+            &mut app,
+            Message::AddProjectInterpretersLoaded(Err("no uv binary is available".to_string())),
+            unused_runner(),
+        );
+
+        assert_eq!(
+            app.add_project.as_ref().map(|d| d.interpreters.clone()),
+            Some(add_project::Interpreters::Failed(
+                "no uv binary is available".to_string()
+            )),
+            "a failed fetch must be representable on the draft, not collapse into Pending"
+        );
+    }
+
+    #[test]
+    fn an_unresolvable_uv_fails_the_interpreter_fetch_with_its_own_message() {
+        // The producer half: `list_interpreters_blocking` is what could not
+        // express failure before. A `Custom` pin the fake runner has no rule
+        // for fails to probe -- `uv::resolve`'s actionable text is what has
+        // to survive, the same discipline `run_sync` follows.
+        let config = Config {
+            settings: bombadil_core::model::Settings {
+                uv_source: bombadil_core::model::UvSource::Custom {
+                    path: PathBuf::from("/definitely/not/a/real/uv"),
+                },
+                ..Default::default()
+            },
+            ..Config::default()
+        };
+
+        let got = list_interpreters_blocking(&config, &FakeCommandRunner::new());
+
+        let err = got.expect_err("an unresolvable uv must not look like an empty machine");
+        assert!(
+            err.contains("/definitely/not/a/real/uv"),
+            "the resolve error's own text must survive; got {err}"
+        );
+    }
+
+    #[test]
+    fn unparseable_interpreter_output_fails_rather_than_reading_as_no_interpreters() {
+        // uv ran and exited zero but this build cannot read what it printed
+        // -- a version skew, not an empty machine, and the two must not look
+        // the same to the user.
+        let config = Config {
+            settings: fake_uv_settings(),
+            ..Config::default()
+        };
+        let runner = FakeCommandRunner::new();
+        version_probe(&runner);
+        runner.expect(
+            "uv",
+            &["python", "list", "--output-format", "json"],
+            bombadil_core::process::CommandOutcome {
+                status: Some(0),
+                stdout: "not json at all".into(),
+                stderr: String::new(),
+            },
+        );
+
+        let got = list_interpreters_blocking(&config, &runner);
+
+        assert!(
+            got.is_err(),
+            "unparseable output must be reported, not silently emptied; got {got:?}"
         );
     }
 
@@ -1722,7 +1830,7 @@ mod tests {
 
         let _ = update(
             &mut app,
-            Message::AddProjectInterpretersLoaded(vec![interpreter("3.12.4")]),
+            Message::AddProjectInterpretersLoaded(Ok(vec![interpreter("3.12.4")])),
             unused_runner(),
         );
 
@@ -1734,7 +1842,7 @@ mod tests {
         let mut app = App::new(Config::default());
         let mut draft =
             manifest_draft("[project]\nname = \"my-api\"\nrequires-python = \">=3.11\"\n");
-        draft.interpreters = vec![interpreter("3.9.18")];
+        draft.interpreters = add_project::Interpreters::Loaded(vec![interpreter("3.9.18")]);
         app.add_project = Some(draft);
         let fake = Arc::new(FakeCommandRunner::new());
 
