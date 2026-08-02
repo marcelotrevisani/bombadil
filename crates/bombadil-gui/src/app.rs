@@ -44,6 +44,19 @@ pub struct App {
     /// streams a running sync's output and collapses to a status line once
     /// it finishes.
     pub drawer: drawer::Drawer,
+    /// The id of the project whose `uv sync` is in flight, if any.
+    ///
+    /// Spec line 121 requires at most one mutating uv command per project.
+    /// A single slot rather than a set per project is deliberate and is
+    /// slightly stricter than the spec: there is one shared output drawer,
+    /// so a second concurrent sync -- even for a different project -- would
+    /// interleave its transcript into the first one's. One at a time is what
+    /// the UI can actually represent.
+    ///
+    /// A `String` rather than a `Uuid` because `uuid` is a dev-dependency of
+    /// this crate, not a dependency, and adding one for an equality check is
+    /// not worth it.
+    pub syncing: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -82,6 +95,7 @@ impl App {
             selected,
             entries,
             drawer: drawer::Drawer::default(),
+            syncing: None,
         }
     }
 
@@ -141,12 +155,24 @@ pub fn update(app: &mut App, message: Message, runner: Arc<dyn CommandRunner>) -
         }
         // A stale probe result for a project that no longer exists.
         Message::VenvProbed(_, _) => {}
+        // A sync already in flight swallows the press. Without this the
+        // button dispatches unconditionally, and a 300-second timeout makes
+        // two concurrent `uv sync` processes on the same project easy to
+        // reach: the job times out, the user presses Sync again, and the
+        // abandoned child is still running.
+        Message::SyncRequested if app.syncing.is_some() => {}
         Message::SyncRequested => {
             if let Some(project) = app.selected_project().cloned() {
                 let settings = app.config.settings.clone();
-                // Fresh drawer per run: `push_line` will re-expand it as
-                // soon as the first line of the new run's output lands.
-                app.drawer = drawer::Drawer::default();
+                app.syncing = Some(project.id.to_string());
+                // Fresh drawer per run, but showing a *running* status rather
+                // than the default "idle": for the whole duration of the sync
+                // this collapsed line is all the user has, and "idle" makes a
+                // running sync look like a button that did nothing.
+                app.drawer = drawer::Drawer {
+                    status: format!("syncing {}...", project.label),
+                    ..drawer::Drawer::default()
+                };
                 return Task::perform(
                     sync_project(project, settings, runner),
                     |(success, lines)| Message::SyncFinished { success, lines },
@@ -154,11 +180,14 @@ pub fn update(app: &mut App, message: Message, runner: Arc<dyn CommandRunner>) -
             }
         }
         Message::SyncFinished { success, lines } => {
-            // No secrets to redact yet: `run_sync` builds its spec with
-            // `uv::command::sync` directly rather than through
-            // `envspec::compose`, so nothing keychain-sourced flows through
-            // this path today. `push_line` still redacts on the way in, so a
-            // future caller that does compose one cannot forget to.
+            app.syncing = None;
+            // Already redacted on the job thread, where the composed
+            // environment (and therefore the set of secret values) exists.
+            // It cannot be done here: threading a secrets list through
+            // `Message` would make a `Debug`-deriving type a carrier of
+            // keychain material. `push_line` redacts again with an empty set,
+            // which is a no-op -- kept so nothing that reaches the drawer by
+            // some other route can skip redaction.
             for line in &lines {
                 drawer::push_line(&mut app.drawer, line, &[]);
             }
@@ -168,6 +197,17 @@ pub fn update(app: &mut App, message: Message, runner: Arc<dyn CommandRunner>) -
                 "sync failed".to_string()
             };
             drawer::set_idle(&mut app.drawer, status);
+            // Collapsing is right on success -- spec §8 asks for exactly that
+            // status line. On failure spec §9 asks for a banner *plus the
+            // full transcript*, and `set_idle` has just collapsed it: without
+            // re-expanding here, iced only ever renders after `update`
+            // returns, so `expanded` is never observably true and the user
+            // sees "sync failed" with no exit code and no reason. Done at
+            // the call site rather than inside `set_idle`, which means one
+            // thing and should keep meaning it.
+            if !success && !app.drawer.lines.is_empty() {
+                app.drawer.expanded = true;
+            }
         }
     }
     Task::none()
@@ -388,6 +428,152 @@ mod tests {
         assert!(
             task.units() > 0,
             "Sync must still dispatch work for a project with no venv"
+        );
+    }
+
+    #[test]
+    fn a_failed_sync_keeps_the_transcript_visible() {
+        // `push_line` expands the drawer and `set_idle` collapses it, both
+        // inside one `update`. iced renders only after `update` returns, so
+        // without re-expanding on failure `expanded` is never observably
+        // true and the user sees "sync failed" with no exit code and no
+        // reason -- spec §9 asks for a banner plus the full transcript.
+        let mut app = App::new(Config {
+            projects: vec![project("api")],
+            ..Config::default()
+        });
+
+        let _ = update(
+            &mut app,
+            Message::SyncFinished {
+                success: false,
+                lines: vec![
+                    "Resolved 12 packages".to_string(),
+                    "error: no solution found".to_string(),
+                ],
+            },
+            unused_runner(),
+        );
+
+        assert!(
+            app.drawer.expanded,
+            "a failed sync must leave the transcript on screen; drawer was collapsed showing only {:?}",
+            app.drawer.status
+        );
+        assert!(
+            !app.drawer.lines.is_empty(),
+            "the transcript must survive the collapse-to-status step"
+        );
+        assert!(
+            app.drawer
+                .lines
+                .iter()
+                .any(|l| l.contains("no solution found")),
+            "the actionable line must be among them; got {:?}",
+            app.drawer.lines
+        );
+    }
+
+    #[test]
+    fn a_successful_sync_collapses_to_a_status_line() {
+        // The other half: collapsing IS right on success (spec §8), so the
+        // failure fix must not turn into "always expanded".
+        let mut app = App::new(Config {
+            projects: vec![project("api")],
+            ..Config::default()
+        });
+
+        let _ = update(
+            &mut app,
+            Message::SyncFinished {
+                success: true,
+                lines: vec!["Installed 12 packages".to_string()],
+            },
+            unused_runner(),
+        );
+
+        assert!(!app.drawer.expanded, "a successful sync must collapse");
+        assert_eq!(app.drawer.status, "sync succeeded");
+    }
+
+    #[test]
+    fn a_sync_in_flight_shows_a_running_status_not_idle() {
+        // For the whole duration of the sync this collapsed line is all the
+        // user has. Leaving it at the default "idle" makes a running sync
+        // indistinguishable from a button that did nothing.
+        let mut app = App::new(Config {
+            projects: vec![project("api")],
+            ..Config::default()
+        });
+
+        let _ = update(&mut app, Message::SyncRequested, unused_runner());
+
+        assert!(
+            app.drawer.status.contains("syncing"),
+            "a dispatched sync must show a running status; got {:?}",
+            app.drawer.status
+        );
+        assert_ne!(app.drawer.status, "idle");
+    }
+
+    #[test]
+    fn a_second_sync_while_one_is_in_flight_dispatches_nothing() {
+        // Spec line 121: at most one mutating uv command per project at a
+        // time. With a 300-second timeout this is easy to hit -- the job
+        // times out, the user presses Sync again, and the abandoned child is
+        // still running.
+        //
+        // `units()` is the observable that matters: it counts the work the
+        // returned Task will actually perform, so a second `update` that
+        // still dispatched would report a non-zero count here regardless of
+        // what any flag on `App` says. The runner assertion below covers the
+        // other shape of the bug -- an `update` that gave up on the Task and
+        // ran uv inline instead.
+        let mut app = App::new(Config {
+            projects: vec![project("api")],
+            ..Config::default()
+        });
+        let fake = Arc::new(FakeCommandRunner::new());
+
+        let first = update(&mut app, Message::SyncRequested, fake.clone());
+        assert!(first.units() > 0, "the first Sync must dispatch work");
+
+        let second = update(&mut app, Message::SyncRequested, fake.clone());
+
+        assert_eq!(
+            second.units(),
+            0,
+            "a second Sync while one is in flight must dispatch nothing"
+        );
+        assert!(
+            fake.calls().is_empty(),
+            "no uv command may be issued by the ignored press; got {:?}",
+            fake.calls()
+        );
+    }
+
+    #[test]
+    fn a_sync_that_finishes_releases_the_in_flight_slot() {
+        // The guard above is a deadlock if it is never cleared: Sync would
+        // work exactly once per launch.
+        let mut app = App::new(Config {
+            projects: vec![project("api")],
+            ..Config::default()
+        });
+        let _ = update(&mut app, Message::SyncRequested, unused_runner());
+        let _ = update(
+            &mut app,
+            Message::SyncFinished {
+                success: true,
+                lines: vec![],
+            },
+            unused_runner(),
+        );
+
+        let again = update(&mut app, Message::SyncRequested, unused_runner());
+        assert!(
+            again.units() > 0,
+            "Sync must dispatch again once the previous run has finished"
         );
     }
 
