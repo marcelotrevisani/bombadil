@@ -10,6 +10,12 @@ use std::path::{Component, Path, PathBuf};
 ///
 /// Pure: operates on path components and never touches the filesystem, so it
 /// works for paths that do not exist yet.
+///
+/// Note: The fallback for differing `Component::Prefix` values (Windows drive
+/// letters) is reachable only on Windows. On Unix, all absolute paths share
+/// one `RootDir` component which cancels during prefix-stripping, so the check
+/// at line 35-40 does not apply. This is intentional and correct — it is the
+/// detection mechanism for an unrelateable pair.
 pub fn path_for_manifest(project_dir: &Path, target: &Path) -> PathBuf {
     if !target.is_absolute() || !project_dir.is_absolute() {
         return target.to_path_buf();
@@ -97,13 +103,15 @@ mod tests {
     }
 
     #[test]
-    fn paths_with_no_common_root_stay_absolute() {
-        // On Windows this is a different drive letter; there is no relative
-        // path between C:\ and D:\, so the manifest has to carry an absolute
-        // one even though that is not portable.
+    fn a_relative_project_dir_is_returned_unchanged() {
+        // Nothing sensible to compute against, so the target is handed to uv as
+        // given. NOTE: this does NOT exercise the Prefix/RootDir branch — it
+        // short-circuits on the relative project_dir before reaching it.
         let target = Path::new("/elsewhere/lib");
-        let got = path_for_manifest(Path::new("relative/project"), target);
-        assert_eq!(got, target);
+        assert_eq!(
+            path_for_manifest(Path::new("relative/project"), target),
+            target
+        );
     }
 
     #[test]
@@ -112,6 +120,31 @@ mod tests {
         assert_eq!(
             path_for_manifest(Path::new("/work/repo"), Path::new("../lib")),
             PathBuf::from("../lib")
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn paths_on_different_windows_drives_stay_absolute() {
+        // The branch at line 35-40 is unreachable on Unix: every absolute Unix
+        // path shares one RootDir component, which cancels in the
+        // prefix-stripping loop. Only a differing drive Prefix leaves one
+        // behind. This runs on the windows-latest CI job.
+        let target = Path::new(r"D:\shared\lib");
+        assert_eq!(
+            path_for_manifest(Path::new(r"C:\work\repo"), target),
+            target
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn paths_on_the_same_windows_drive_are_relative() {
+        // The positive counterpart: same drive must still relativise, or the
+        // fallback above would be masking a total failure to compute anything.
+        assert_eq!(
+            path_for_manifest(Path::new(r"C:\work\repo"), Path::new(r"C:\work\shared-lib")),
+            PathBuf::from("..").join("shared-lib")
         );
     }
 }
