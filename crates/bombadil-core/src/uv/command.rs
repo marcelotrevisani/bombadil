@@ -90,8 +90,19 @@ pub fn tree(uv: &ResolvedUv, ctx: &ProjectContext, depth: u32) -> CommandSpec {
     ])
 }
 
+/// Lists what is actually installed in the project's virtual environment.
+///
+/// `--python` is required and not redundant: `uv pip` commands are a
+/// pip-compatibility surface and do NOT honour `UV_PROJECT_ENVIRONMENT` the
+/// way project commands do. Without it, uv resolves an environment the way
+/// pip would and reports whatever it finds first — the user's system or
+/// conda environment. Verified against uv 0.12.1. The directory form is used
+/// so no platform-specific interpreter path has to be constructed.
 pub fn pip_list(uv: &ResolvedUv, ctx: &ProjectContext) -> CommandSpec {
-    project_spec(uv, ctx).args(["pip", "list", "--format", "json"])
+    project_spec(uv, ctx)
+        .args(["pip", "list", "--python"])
+        .arg(ctx.venv_path.to_string_lossy())
+        .args(["--format", "json"])
 }
 
 /// Interpreter discovery is machine-wide, not project-scoped, so it carries
@@ -222,10 +233,19 @@ mod tests {
     }
 
     #[test]
-    fn pip_list_requests_json() {
+    fn pip_list_requests_json_and_pins_the_venv_explicitly() {
+        // `uv pip` ignores UV_PROJECT_ENVIRONMENT, so --python must carry the
+        // venv directory directly or this lists the wrong environment.
         assert_eq!(
             pip_list(&uv(), &ctx()).args,
-            vec!["pip", "list", "--format", "json"]
+            vec![
+                "pip",
+                "list",
+                "--python",
+                "/envs/my-api-3f9c1a",
+                "--format",
+                "json"
+            ]
         );
     }
 
