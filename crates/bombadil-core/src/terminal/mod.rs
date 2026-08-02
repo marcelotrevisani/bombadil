@@ -94,8 +94,12 @@ mod tests {
 
     #[test]
     fn kinds_for_an_os_are_only_that_oss_kinds() {
-        for kind in TerminalKind::for_os(Os::Linux) {
-            assert_eq!(kind.os(), Os::Linux, "{kind:?} is not a Linux terminal");
+        // Counts alone would not catch a variant swapped between two lists,
+        // which would offer a terminal on a platform where its argv cannot run.
+        for os in [Os::Linux, Os::MacOs, Os::Windows] {
+            for kind in TerminalKind::for_os(os) {
+                assert_eq!(kind.os(), os, "{kind:?} is listed under {os:?}");
+            }
         }
         assert!(TerminalKind::for_os(Os::MacOs).contains(&TerminalKind::TerminalApp));
         assert!(!TerminalKind::for_os(Os::MacOs).contains(&TerminalKind::Konsole));
