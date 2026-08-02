@@ -10,21 +10,21 @@
 //! the keychain -- never to `Config`, and never through this crate's own
 //! `Debug`-deriving `Message` in a form that could print it.
 //!
-//! # Why this is not the same shape as `env_editor`'s secret handling
+//! # Where `env_editor` follows this module, and where it still differs
 //!
-//! Task 2 solved "get a typed secret to the keychain without it entering a
-//! `Debug`-deriving `Message`" for `EnvVar`: the plaintext sits in
-//! `EnvVar::value` -- an ordinary `Config` field -- for as long as the row is
-//! *not yet* marked secret, and `Message::EnvVarValueChanged` carries that
-//! plaintext only while it is still, by construction, not a secret. Marking
-//! secret is what moves it out of `Config` and into the keychain.
+//! `env_editor` now holds an in-progress value in `App::env_value_drafts` for
+//! the same reason this module holds a credential in
+//! `App::index_credential_drafts`: typed text that might be about to become a
+//! secret must not be written to `config.toml` while the user is still typing
+//! it. Both commit on an explicit action rather than per keystroke.
 //!
-//! `IndexAuth` has no equivalent field. Its variants are `None`, `Basic {
-//! username }` and `Token` -- there is no "plaintext password" case, ever, so
-//! there is no "not yet secret" phase to typed credential text the way an
-//! `EnvVar`'s value has one. Every character typed into the credential
-//! textbox is already the credential, from the first keystroke, and it must
-//! never enter `Config` even transiently.
+//! The remaining difference is what a commit means. An `EnvVar`'s value has a
+//! genuine plaintext phase -- `HTTP_PROXY` is not a secret and belongs in
+//! `Config` -- so committing one writes it there. `IndexAuth` has no
+//! equivalent field: its variants are `None`, `Basic { username }` and
+//! `Token`, so there is no "plaintext password" case, ever. Every character
+//! typed into the credential textbox is already the credential, from the first
+//! keystroke, and the only commit it has is the keychain.
 //!
 //! Two consequences follow:
 //!
@@ -300,10 +300,15 @@ fn index_row<'a>(
     config: &Config,
     draft: &str,
 ) -> iced::Element<'a, Message> {
+    // Enter commits, the same as the row's save button below: typing itself
+    // neither persists nor moves the keychain credential -- see
+    // `app::commit_index_edit`.
     let name_input = iced::widget::text_input("name", &index.name)
-        .on_input(move |v| Message::IndexNameChanged(i, v));
+        .on_input(move |v| Message::IndexNameChanged(i, v))
+        .on_submit(Message::IndexEditCommitted(i));
     let url_input = iced::widget::text_input("https://...", &index.url)
-        .on_input(move |v| Message::IndexUrlChanged(i, v));
+        .on_input(move |v| Message::IndexUrlChanged(i, v))
+        .on_submit(Message::IndexEditCommitted(i));
 
     let kind_button = iced::widget::button(iced::widget::text(match index.kind {
         IndexKind::Default => "default index (replaces PyPI) -- click for extra",
@@ -344,7 +349,8 @@ fn index_row<'a>(
 
     if let IndexAuth::Basic { username } = &index.auth {
         let username_input = iced::widget::text_input("username", username)
-            .on_input(move |v| Message::IndexUsernameChanged(i, v));
+            .on_input(move |v| Message::IndexUsernameChanged(i, v))
+            .on_submit(Message::IndexEditCommitted(i));
         row = row.push(username_input);
     }
 
@@ -363,9 +369,13 @@ fn index_row<'a>(
         row = row.push(credential_input).push(save_button);
     }
 
+    // The typed fields (name, URL, username) reach `config.toml` through this
+    // press or through Enter, never per keystroke.
+    let save =
+        iced::widget::button(iced::widget::text("save")).on_press(Message::IndexEditCommitted(i));
     let remove =
         iced::widget::button(iced::widget::text("remove")).on_press(Message::IndexRemoved(i));
-    row = row.push(remove);
+    row = row.push(save).push(remove);
 
     let mut column = iced::widget::column![row].spacing(2);
     if let Some(message) = collision {
