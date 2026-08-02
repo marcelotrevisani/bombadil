@@ -3,6 +3,7 @@ pub mod members;
 pub mod model;
 pub mod process;
 pub mod pyproject;
+pub mod secrets;
 pub mod store;
 pub mod uv;
 pub mod validate;

@@ -117,3 +117,12 @@ pub enum CommandError {
     #[error("no fake outcome was programmed for {program} {args:?}")]
     Unexpected { program: PathBuf, args: Vec<String> },
 }
+
+#[derive(Debug, thiserror::Error)]
+pub enum SecretError {
+    #[error("the OS keychain is not available on this machine: {message}")]
+    Unavailable { message: String },
+
+    #[error("could not read or write the secret for {account}: {message}")]
+    Backend { account: String, message: String },
+}
