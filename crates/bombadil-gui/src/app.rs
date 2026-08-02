@@ -1,3 +1,4 @@
+use crate::add_project;
 use crate::banner;
 use crate::detail;
 use crate::drawer;
@@ -20,7 +21,8 @@ use std::time::Duration;
 /// that project as hollow instead of waiting on it. Reading a small local
 /// file is normally sub-millisecond; a few seconds already covers a slow
 /// disk, and nothing here is worth making the user stare at a frozen sidebar
-/// for longer than that.
+/// for longer than that. Reused by `load_manifest_draft` for the same reason:
+/// a `pyproject.toml` read is the same shape of small local file read.
 const VENV_PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// How long a `uv sync` gets before it is treated as failed. Sync can
@@ -63,10 +65,14 @@ pub struct App {
     /// interleave its transcript into the first one's. One at a time is what
     /// the UI can actually represent.
     ///
-    /// A `String` rather than a `Uuid` because `uuid` is a dev-dependency of
-    /// this crate, not a dependency, and adding one for an equality check is
-    /// not worth it.
+    /// A `String` rather than a `Uuid`: this predates `uuid` becoming a real
+    /// dependency of this crate (added for `add_project::to_project`), and an
+    /// equality check has no need for the typed form.
     pub syncing: Option<String>,
+    /// The in-progress add-project dialog, if the user has picked a manifest.
+    /// `None` before a manifest is chosen and after Cancel -- there is
+    /// nothing else for the dialog to show in either state.
+    pub add_project: Option<add_project::Draft>,
 }
 
 #[derive(Debug, Clone)]
@@ -89,6 +95,21 @@ pub enum Message {
         success: bool,
         lines: Vec<String>,
     },
+    /// The "Add project" button was pressed: open the async file picker for
+    /// a `pyproject.toml`.
+    AddProjectPickManifestRequested,
+    /// The manifest picker finished. `None` when the user cancelled it.
+    AddProjectManifestPicked(Option<PathBuf>),
+    /// The chosen manifest has been read and parsed into a `Draft`.
+    AddProjectManifestLoaded(add_project::Draft),
+    /// A venv option other than "chosen folder" was picked directly.
+    AddProjectVenvChoiceSelected(add_project::VenvChoice),
+    /// "Choose folder..." was pressed: open the async folder picker.
+    AddProjectPickVenvFolderRequested,
+    /// The folder picker finished. `None` when the user cancelled it.
+    AddProjectVenvFolderPicked(Option<PathBuf>),
+    /// The dialog was dismissed without adding a project.
+    AddProjectCancelled,
 }
 
 impl App {
@@ -107,6 +128,7 @@ impl App {
             drawer: drawer::Drawer::default(),
             load_problems: Vec::new(),
             syncing: None,
+            add_project: None,
         }
     }
 
@@ -224,8 +246,78 @@ pub fn update(app: &mut App, message: Message, runner: Arc<dyn CommandRunner>) -
                 app.drawer.expanded = true;
             }
         }
+        Message::AddProjectPickManifestRequested => {
+            return Task::perform(pick_pyproject(), Message::AddProjectManifestPicked);
+        }
+        // The dialog was cancelled -- nothing chosen, nothing to do.
+        Message::AddProjectManifestPicked(None) => {}
+        Message::AddProjectManifestPicked(Some(path)) => {
+            return Task::perform(load_manifest_draft(path), Message::AddProjectManifestLoaded);
+        }
+        Message::AddProjectManifestLoaded(draft) => {
+            app.add_project = Some(draft);
+        }
+        Message::AddProjectVenvChoiceSelected(choice) => {
+            if let Some(draft) = &mut app.add_project {
+                draft.venv_choice = choice;
+            }
+        }
+        Message::AddProjectPickVenvFolderRequested => {
+            return Task::perform(pick_folder(), Message::AddProjectVenvFolderPicked);
+        }
+        // Folder picker cancelled -- leave the previous choice untouched.
+        Message::AddProjectVenvFolderPicked(None) => {}
+        Message::AddProjectVenvFolderPicked(Some(path)) => {
+            if let Some(draft) = &mut app.add_project {
+                draft.venv_choice = add_project::VenvChoice::Chosen(path);
+            }
+        }
+        Message::AddProjectCancelled => {
+            app.add_project = None;
+        }
     }
     Task::none()
+}
+
+/// Opens the async manifest picker. Never the blocking `rfd::FileDialog`: a
+/// modal dialog on the render thread would freeze the window exactly like a
+/// synchronous `CommandRunner::run` call would.
+async fn pick_pyproject() -> Option<PathBuf> {
+    rfd::AsyncFileDialog::new()
+        .add_filter("pyproject.toml", &["toml"])
+        .pick_file()
+        .await
+        .map(|handle| handle.path().to_path_buf())
+}
+
+/// Opens the async folder picker for a chosen venv location. Same reasoning
+/// as `pick_pyproject`: async only.
+async fn pick_folder() -> Option<PathBuf> {
+    rfd::AsyncFileDialog::new()
+        .pick_folder()
+        .await
+        .map(|handle| handle.path().to_path_buf())
+}
+
+/// Reads the chosen manifest off the render thread via `job::run` -- the
+/// same seam `probe_venv` uses for `pyvenv.cfg` -- then hands the text to
+/// `add_project::draft_from`, which is pure. A read failure (permissions, the
+/// file vanishing between pick and read) degrades to empty text rather than
+/// losing the chosen path: `draft_from` already treats unparseable text as
+/// "no fields parsed, path kept", so an empty string lands in exactly that
+/// path with no separate error case to wire up.
+async fn load_manifest_draft(path: PathBuf) -> add_project::Draft {
+    let read_path = path.clone();
+    let text = match job::run(
+        move || std::fs::read_to_string(&read_path).unwrap_or_default(),
+        VENV_PROBE_TIMEOUT,
+    )
+    .await
+    {
+        job::JobResult::Done(text) => text,
+        job::JobResult::TimedOut | job::JobResult::Failed => String::new(),
+    };
+    add_project::draft_from(&path, &text)
 }
 
 /// Runs off the render thread via `job::run` -- resolving uv and running
@@ -375,10 +467,31 @@ pub fn view(app: &App) -> iced::Element<'_, Message> {
 
     let detail_and_drawer = iced::widget::column![detail, drawer::view(&app.drawer)].spacing(8);
 
+    let add_project_button = iced::widget::button(iced::widget::text("Add project"))
+        .on_press(Message::AddProjectPickManifestRequested);
+    let sidebar_and_controls = iced::widget::column![
+        add_project_button,
+        sidebar::view(&app.entries, app.selected)
+    ]
+    .spacing(8);
+
     let body = iced::widget::row![
-        iced::widget::container(sidebar::view(&app.entries, app.selected)).width(240),
+        iced::widget::container(sidebar_and_controls).width(240),
         iced::widget::container(detail_and_drawer).padding(12),
     ];
+
+    // Recomputed fresh on every render from `app.add_project`'s current
+    // `venv_choice`, the same trick `banner::problems` uses to stay live --
+    // this is what makes the resolved path track a venv choice the user just
+    // changed, per spec §8, rather than a value cached from when the
+    // manifest was first picked.
+    let add_project_dialog: iced::Element<'_, Message> = match &app.add_project {
+        Some(draft) => {
+            let resolved = add_project::resolved_venv_path_display(draft, &app.config.settings);
+            add_project::view(draft, &resolved)
+        }
+        None => iced::widget::text("").into(),
+    };
 
     // The config problems are recomputed from `app.config` on every call,
     // not cached anywhere on `App` -- see `banner`'s module doc for why that
@@ -388,7 +501,7 @@ pub fn view(app: &App) -> iced::Element<'_, Message> {
     let mut problems = app.load_problems.clone();
     problems.extend(banner::problems(&app.config));
     let footer = iced::widget::text(crate::about::attribution()).size(11);
-    iced::widget::column![banner::view(&problems), body, footer].into()
+    iced::widget::column![banner::view(&problems), body, add_project_dialog, footer].into()
 }
 
 #[cfg(test)]

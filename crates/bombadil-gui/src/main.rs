@@ -1,4 +1,5 @@
 mod about;
+mod add_project;
 mod app;
 mod banner;
 mod detail;

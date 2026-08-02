@@ -1,0 +1,250 @@
+//! The add-project dialog: pick a `pyproject.toml`, show what it declares,
+//! and choose where its virtual environment lives.
+//!
+//! Spec §8: a file picker for the manifest, showing the parsed project name
+//! and `requires-python` once chosen, and a three-way venv control --
+//! settings default, alongside the manifest, or a chosen folder -- with the
+//! resolved path always displayed.
+
+use crate::app::Message;
+use bombadil_core::error::VenvPathError;
+use bombadil_core::model::{Project, Settings, VenvLocation};
+use bombadil_core::{pyproject, venv_path};
+use std::path::{Path, PathBuf};
+use uuid::Uuid;
+
+/// Where the new project's virtual environment will live.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum VenvChoice {
+    /// Follow `Settings::default_venv_location`.
+    SettingsDefault,
+    /// `<project dir>/.venv`.
+    Alongside,
+    /// A directory the user picked explicitly.
+    Chosen(PathBuf),
+}
+
+/// The state of the add-project dialog for one chosen manifest.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Draft {
+    pub pyproject_path: PathBuf,
+    pub name: Option<String>,
+    pub requires_python: Option<String>,
+    pub venv_choice: VenvChoice,
+}
+
+/// Builds a `Draft` from the chosen manifest's path and text.
+///
+/// Takes the text, not just the path, so this stays pure and testable
+/// without touching the filesystem -- reading the file is `app.rs`'s job,
+/// inside `job::run`.
+///
+/// A parse failure yields `None` fields rather than propagating the error:
+/// the user already picked this file, and telling them nothing *and*
+/// forgetting which file they picked is worse than showing an empty name. A
+/// manifest with no `[project]` table (a uv workspace root) parses cleanly
+/// to the same `None` name, which is why it is still addable.
+pub fn draft_from(path: &Path, text: &str) -> Draft {
+    let parsed = pyproject::parse(text).ok();
+    Draft {
+        pyproject_path: path.to_path_buf(),
+        name: parsed.as_ref().and_then(|p| p.name.clone()),
+        requires_python: parsed.as_ref().and_then(|p| p.requires_python.clone()),
+        venv_choice: VenvChoice::SettingsDefault,
+    }
+}
+
+/// A throwaway `Project` carrying just enough of `draft` for
+/// `venv_path::resolve` -- id and label are display-only for that call, so a
+/// nil id and the (possibly absent) name are fine here.
+fn to_project(draft: &Draft) -> Project {
+    Project {
+        id: Uuid::nil(),
+        label: draft.name.clone().unwrap_or_default(),
+        pyproject_path: draft.pyproject_path.clone(),
+        index_names: Vec::new(),
+        venv: match &draft.venv_choice {
+            VenvChoice::SettingsDefault => VenvLocation::Default,
+            VenvChoice::Alongside => VenvLocation::Alongside,
+            VenvChoice::Chosen(path) => VenvLocation::Custom { path: path.clone() },
+        },
+        env: Vec::new(),
+        scripts: Vec::new(),
+        members: Default::default(),
+    }
+}
+
+/// The venv path the dialog would resolve to right now, for display.
+///
+/// Reuses `venv_path::resolve` rather than re-deriving its central-store
+/// hashing and alongside logic here -- the same resolution a real `Project`
+/// gets once this draft is confirmed. A fresh call per render (see
+/// `app::view`) is what makes this track `venv_choice` as the user changes
+/// it, the same trick `banner::problems` uses to stay live.
+pub fn resolved_venv_path(draft: &Draft, settings: &Settings) -> Result<PathBuf, VenvPathError> {
+    venv_path::resolve(&to_project(draft), settings)
+}
+
+/// Formats the resolved path for display, or the reason it could not be
+/// resolved -- only possible when the manifest path has no parent directory.
+pub fn resolved_venv_path_display(draft: &Draft, settings: &Settings) -> String {
+    match resolved_venv_path(draft, settings) {
+        Ok(path) => path.display().to_string(),
+        Err(err) => err.to_string(),
+    }
+}
+
+/// Renders the dialog for an already-chosen manifest. Deliberately dumb: all
+/// the logic worth testing lives in `draft_from` and `resolved_venv_path`.
+/// `resolved` is computed by the caller (`app::view`) so it is recomputed
+/// fresh on every render rather than something `view` would have to know how
+/// to derive.
+pub fn view<'a>(draft: &Draft, resolved: &str) -> iced::Element<'a, Message> {
+    let name = draft
+        .name
+        .clone()
+        .unwrap_or_else(|| "(no [project] table)".to_string());
+    let requires_python = draft
+        .requires_python
+        .clone()
+        .unwrap_or_else(|| "(none)".to_string());
+
+    let venv_row = iced::widget::row![
+        iced::widget::button(iced::widget::text("Settings default")).on_press(
+            Message::AddProjectVenvChoiceSelected(VenvChoice::SettingsDefault)
+        ),
+        iced::widget::button(iced::widget::text("Alongside manifest"))
+            .on_press(Message::AddProjectVenvChoiceSelected(VenvChoice::Alongside)),
+        iced::widget::button(iced::widget::text("Choose folder..."))
+            .on_press(Message::AddProjectPickVenvFolderRequested),
+    ]
+    .spacing(8);
+
+    iced::widget::column![
+        iced::widget::text(draft.pyproject_path.display().to_string()),
+        iced::widget::text(format!("name: {name}")),
+        iced::widget::text(format!("requires-python: {requires_python}")),
+        venv_row,
+        iced::widget::text(format!("venv: {resolved}")),
+        iced::widget::button(iced::widget::text("Cancel")).on_press(Message::AddProjectCancelled),
+    ]
+    .spacing(4)
+    .into()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bombadil_core::model::DefaultVenvLocation;
+
+    const MANIFEST: &str = r#"
+[project]
+name = "my-api"
+version = "0.1.0"
+requires-python = ">=3.11"
+"#;
+
+    #[test]
+    fn a_chosen_manifest_shows_its_name_and_python_requirement() {
+        let draft = draft_from(Path::new("/p/my-api/pyproject.toml"), MANIFEST);
+        assert_eq!(draft.name.as_deref(), Some("my-api"));
+        assert_eq!(draft.requires_python.as_deref(), Some(">=3.11"));
+    }
+
+    #[test]
+    fn a_manifest_without_a_name_is_still_addable() {
+        // A workspace root often has no [project] table at all. Refusing it
+        // would make the monorepo case unaddable through the UI.
+        let draft = draft_from(
+            Path::new("/p/root/pyproject.toml"),
+            "[tool.uv.workspace]\nmembers = []\n",
+        );
+        assert_eq!(draft.name, None);
+        assert_eq!(draft.pyproject_path, Path::new("/p/root/pyproject.toml"));
+    }
+
+    #[test]
+    fn unparseable_toml_does_not_lose_the_chosen_path() {
+        // The user picked a file; telling them nothing and forgetting which
+        // one they picked is the worst of both.
+        let draft = draft_from(Path::new("/p/bad/pyproject.toml"), "this is not toml {{{");
+        assert_eq!(draft.pyproject_path, Path::new("/p/bad/pyproject.toml"));
+        assert_eq!(draft.name, None);
+    }
+
+    #[test]
+    fn the_default_venv_choice_is_the_settings_default() {
+        let draft = draft_from(Path::new("/p/my-api/pyproject.toml"), MANIFEST);
+        assert_eq!(draft.venv_choice, VenvChoice::SettingsDefault);
+    }
+
+    fn settings(default_venv_location: DefaultVenvLocation) -> Settings {
+        Settings {
+            default_venv_location,
+            ..Settings::default()
+        }
+    }
+
+    #[test]
+    fn settings_default_follows_the_alongside_setting() {
+        let draft = draft_from(Path::new("/p/my-api/pyproject.toml"), MANIFEST);
+        let path = resolved_venv_path(&draft, &settings(DefaultVenvLocation::Alongside)).unwrap();
+        assert_eq!(path, PathBuf::from("/p/my-api/.venv"));
+    }
+
+    #[test]
+    fn settings_default_follows_the_central_setting() {
+        let draft = draft_from(Path::new("/p/my-api/pyproject.toml"), MANIFEST);
+        let path = resolved_venv_path(
+            &draft,
+            &settings(DefaultVenvLocation::Central {
+                path: PathBuf::from("/home/t/.venvs"),
+            }),
+        )
+        .unwrap();
+        assert!(
+            path.starts_with("/home/t/.venvs"),
+            "got {path:?}; the central setting must be honoured"
+        );
+    }
+
+    #[test]
+    fn alongside_ignores_the_settings_default() {
+        // The point of the three-way control: choosing "alongside" explicitly
+        // must win over a central `default_venv_location`, not just mirror it.
+        let mut draft = draft_from(Path::new("/p/my-api/pyproject.toml"), MANIFEST);
+        draft.venv_choice = VenvChoice::Alongside;
+        let path = resolved_venv_path(
+            &draft,
+            &settings(DefaultVenvLocation::Central {
+                path: PathBuf::from("/home/t/.venvs"),
+            }),
+        )
+        .unwrap();
+        assert_eq!(path, PathBuf::from("/p/my-api/.venv"));
+    }
+
+    #[test]
+    fn a_chosen_folder_is_used_verbatim() {
+        let mut draft = draft_from(Path::new("/p/my-api/pyproject.toml"), MANIFEST);
+        draft.venv_choice = VenvChoice::Chosen(PathBuf::from("/mnt/fast/envs/api"));
+        let path = resolved_venv_path(&draft, &settings(DefaultVenvLocation::Alongside)).unwrap();
+        assert_eq!(path, PathBuf::from("/mnt/fast/envs/api"));
+    }
+
+    #[test]
+    fn the_resolved_path_updates_as_the_choice_changes() {
+        let mut draft = draft_from(Path::new("/p/my-api/pyproject.toml"), MANIFEST);
+        let settings = settings(DefaultVenvLocation::Alongside);
+
+        let before = resolved_venv_path(&draft, &settings).unwrap();
+        draft.venv_choice = VenvChoice::Chosen(PathBuf::from("/mnt/fast/envs/api"));
+        let after = resolved_venv_path(&draft, &settings).unwrap();
+
+        assert_ne!(
+            before, after,
+            "changing venv_choice must change the resolved path"
+        );
+        assert_eq!(after, PathBuf::from("/mnt/fast/envs/api"));
+    }
+}

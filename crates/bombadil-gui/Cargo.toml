@@ -10,9 +10,13 @@ bombadil-core = { path = "../bombadil-core", version = "0.1.0" }
 bombadil-uv-bin = { path = "../bombadil-uv-bin", version = "0.1.0" }
 iced = "0.14"
 rfd = "0.17"
+# Already a workspace dependency (bombadil-core depends on it); promoted from
+# dev-dependencies here because `add_project::to_project` builds a throwaway
+# `Project`, whose `id` field is a `Uuid`, for display-only calls into
+# `venv_path::resolve`. Not a new entry in Cargo.lock.
+uuid.workspace = true
 
 [dev-dependencies]
-uuid.workspace = true
 # Enables `bombadil_core::process::FakeCommandRunner` for this crate's own
 # tests. Cargo unifies features across [dependencies] and [dev-dependencies]
 # for the same path dependency during test builds only, so `test-support`
