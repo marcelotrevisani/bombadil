@@ -1124,6 +1124,11 @@ pub fn update(app: &mut App, message: Message, runner: Arc<dyn CommandRunner>) -
             // what it did.
             app.members = None;
             app.confirm_member_sync = None;
+            // A pending Recreate venv confirmation describes the list as it
+            // was. Its `project_id` already refuses to resolve to a different
+            // project, but the sentence on screen still names one the user is
+            // no longer looking at, so it goes too.
+            app.confirm_recreate = None;
             app.selected = match app.selected {
                 Some(s) if s == i => (!app.config.projects.is_empty())
                     .then_some(i.min(app.config.projects.len().saturating_sub(1))),
@@ -1152,7 +1157,7 @@ pub fn update(app: &mut App, message: Message, runner: Arc<dyn CommandRunner>) -
                 && let Ok(venv_path) = venv_path::resolve(project, &app.config.settings)
             {
                 app.confirm_recreate = Some(context_menu::ConfirmRecreate {
-                    project_index: i,
+                    project_id: project.id,
                     label: project.label.clone(),
                     venv_path,
                 });
@@ -1164,9 +1169,18 @@ pub fn update(app: &mut App, message: Message, runner: Arc<dyn CommandRunner>) -
         Message::RecreateVenvConfirmed => {
             // `take` unconditionally: whether or not the work is dispatched,
             // the user has answered the question and the dialog is done.
+            // Re-resolved by id, not by the index the press carried: the
+            // list can have shifted underneath the open confirmation (see
+            // `ConfirmRecreate`), and a project that no longer exists
+            // resolves to nothing rather than to whoever took its place.
             if let Some(confirm) = app.confirm_recreate.take()
                 && app.syncing.is_none()
-                && let Some(project) = app.config.projects.get(confirm.project_index).cloned()
+                && let Some(project) = app
+                    .config
+                    .projects
+                    .iter()
+                    .find(|p| p.id == confirm.project_id)
+                    .cloned()
             {
                 let config = app.config.clone();
                 app.syncing = Some(project.id.to_string());
@@ -4590,13 +4604,56 @@ mod tests {
         let _ = update(&mut app, Message::RecreateVenvRequested(1), unused_runner());
 
         let confirm = app.confirm_recreate.as_ref().expect("must be pending");
-        assert_eq!(confirm.project_index, 1);
+        assert_eq!(confirm.project_id, app.config.projects[1].id);
         assert_eq!(confirm.label, "web");
         assert_eq!(
             confirm.venv_path,
             PathBuf::from("/p/web/.venv"),
             "the confirmation must state the right-clicked project's resolved venv path"
         );
+    }
+
+    #[test]
+    fn a_pending_recreate_never_deletes_a_project_the_user_did_not_name() {
+        // Nothing here is modal, so the whole sequence is reachable with the
+        // mouse: right-click B, pick Recreate venv, then right-click A and
+        // pick Remove from list, then press Confirm. `RemoveProjectRequested`
+        // clears `deps`, `members` and `confirm_member_sync` -- with a comment
+        // naming exactly this hazard -- and used to leave `confirm_recreate`
+        // holding an index that every later project had just shifted out of.
+        // C's environment was what got deleted. `venv_path::delete`'s
+        // refusals all still held; it was handed the wrong project.
+        let mut app = App::new(Config {
+            projects: vec![project("a"), project("b"), project("c")],
+            ..Config::default()
+        });
+        let c_id = app.config.projects[2].id.to_string();
+
+        let _ = update(&mut app, Message::RecreateVenvRequested(1), unused_runner());
+        assert!(
+            app.confirm_recreate.is_some(),
+            "the confirmation for b must be pending"
+        );
+
+        let _ = update(
+            &mut app,
+            Message::RemoveProjectRequested(0),
+            unused_runner(),
+        );
+
+        let task = update(&mut app, Message::RecreateVenvConfirmed, unused_runner());
+
+        assert_ne!(
+            app.syncing.as_deref(),
+            Some(c_id.as_str()),
+            "confirming a recreate for b must never delete c's environment"
+        );
+        assert_eq!(
+            task.units(),
+            0,
+            "a confirmation whose list shifted underneath it must dispatch nothing"
+        );
+        assert!(app.syncing.is_none());
     }
 
     #[test]

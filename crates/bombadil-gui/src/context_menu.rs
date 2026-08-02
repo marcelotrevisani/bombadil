@@ -21,6 +21,7 @@ use crate::app::Message;
 use bombadil_core::model::TerminalChoice;
 use bombadil_core::terminal::{ActivationSupport, TerminalKind};
 use std::path::{Path, PathBuf};
+use uuid::Uuid;
 
 /// One entry in the "Open terminal" submenu: a detected kind, or the
 /// always-present Custom entry (spec §8).
@@ -135,8 +136,17 @@ pub struct ContextMenu {
 /// here rather than re-resolved by `view`: the text the user agreed to and
 /// the path that gets deleted must be the same string, not two derivations
 /// that could drift.
+///
+/// `project_id`, not a `project_index`: an index is only meaningful against
+/// the list as it stood when the confirmation opened, and nothing here is
+/// modal. Right-click B and pick Recreate venv, then right-click A and pick
+/// Remove from list, then press Confirm -- with an index this deleted C's
+/// environment, because every project after A had shifted down one.
+/// `venv_path::delete`'s refusals all held; it was handed the wrong project.
+/// A `Uuid` makes that class unrepresentable rather than needing each
+/// removal path to remember one more `= None`.
 pub struct ConfirmRecreate {
-    pub project_index: usize,
+    pub project_id: Uuid,
     pub label: String,
     pub venv_path: PathBuf,
 }
