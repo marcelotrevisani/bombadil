@@ -858,6 +858,15 @@ pub fn update(app: &mut App, message: Message, runner: Arc<dyn CommandRunner>) -
             if app.syncing.is_none()
                 && let Some(project) = sync_target(app, i)
             {
+                // A workspace root's plain `uv sync` installs no members at
+                // all, so this button produced an environment with none of
+                // the workspace's own packages in it and member-aware sync
+                // was reachable only from the Members tab. `members_context`
+                // answers `None` for an ordinary project, which is what keeps
+                // the substitution a no-op for everyone else.
+                if let Some((kind, discovered)) = members_context(app, i) {
+                    return dispatch_members_sync(app, project, kind, discovered, runner);
+                }
                 let config = app.config.clone();
                 app.syncing = Some(project.id.to_string());
                 // Fresh drawer per run, but showing a *running* status rather
@@ -1575,6 +1584,38 @@ fn sync_target(app: &App, i: usize) -> Option<Project> {
     // editor writes, so an edit made a moment ago is in the environment the
     // sync composes. See `App::config`.
     app.config.projects.get(i).cloned()
+}
+
+/// The member context a Sync press for `projects[i]` must use, or `None` when
+/// the plain `uv sync` `run_sync` builds is already the right command.
+///
+/// `None` covers two cases that behave the same and must not be conflated
+/// with each other in the drawer: no Members fetch for this project in hand
+/// yet, and a fetch whose plan is `SyncPlan::Plain` -- `members_editor`'s own
+/// way of saying an ordinary, non-monorepo project's sync command must not be
+/// touched by the member machinery at all.
+///
+/// This exists because plain `uv sync` in a workspace *root* installs no
+/// members -- verified against a real uv, which is why
+/// `uv::command::sync_all_members` exists. Without this the Sync button
+/// produced an environment with none of the workspace's own packages in it,
+/// and member-aware sync was reachable only from the Members tab.
+fn members_context(
+    app: &App,
+    i: usize,
+) -> Option<(
+    bombadil_core::members::WorkspaceKind,
+    Vec<bombadil_core::members::DiscoveredMember>,
+)> {
+    let (fetched_for, fetch) = app.members.as_ref()?;
+    if *fetched_for != i {
+        return None;
+    }
+    let project = app.config.projects.get(i)?;
+    match members_editor::sync_plan(&project.members, &fetch.kind, &fetch.discovered) {
+        members_editor::SyncPlan::Plain => None,
+        _ => Some((fetch.kind.clone(), fetch.discovered.clone())),
+    }
 }
 
 /// Dispatches a background persist of `app.config` as it stands right now,
@@ -5875,6 +5916,129 @@ mod tests {
             "nothing must be synced before the user confirms"
         );
         assert!(app.syncing.is_none());
+    }
+
+    #[test]
+    fn the_sync_button_in_a_workspace_root_installs_its_members() {
+        // Plain `uv sync` in a workspace root installs *no* members --
+        // verified against a real uv, which is why
+        // `uv::command::sync_all_members` exists at all. The header's Sync
+        // button ran the bare `["sync"]` anyway, so member-aware sync was
+        // reachable only from the Members tab and the obvious button quietly
+        // produced an environment with none of the workspace's own packages
+        // in it.
+        //
+        // `app.members` is already populated by the time Sync is pressable:
+        // `ProjectSelected` dispatches the deps and members fetches together.
+        let mut app = App::new(Config {
+            projects: vec![project("api")],
+            settings: fake_uv_settings(),
+            ..Config::default()
+        });
+        app.members = Some((
+            0,
+            MembersFetch {
+                kind: workspace_kind(&["packages/*"]),
+                discovered: vec![discovered_member("packages/alpha", Some("alpha"), true)],
+                installed: vec![],
+            },
+        ));
+
+        let task = update(&mut app, Message::SyncRequested(0), unused_runner());
+        assert!(task.units() > 0, "the Sync press must dispatch real work");
+        assert!(
+            app.drawer.status.contains("members"),
+            "the dispatched job must be the member-aware one -- the plain path \
+             names no members; got {:?}",
+            app.drawer.status
+        );
+
+        let target = sync_target(&app, 0).expect("the press must resolve a project");
+        let (kind, discovered) = members_context(&app, 0)
+            .expect("a Sync press must route through this project's member-aware plan");
+
+        let store = bombadil_core::secrets::InMemorySecretStore::new();
+        let runner = FakeCommandRunner::new();
+        version_probe(&runner);
+        runner.expect(
+            "uv",
+            &["sync", "--all-packages"],
+            bombadil_core::process::CommandOutcome {
+                status: Some(0),
+                stdout: String::new(),
+                stderr: String::new(),
+            },
+        );
+
+        let (success, lines) =
+            run_members_sync(&target, &app.config, &kind, &discovered, &store, &runner);
+        assert!(success, "got {lines:?}");
+
+        let calls = runner.calls();
+        assert!(
+            calls
+                .iter()
+                .any(|c| c.args.iter().any(|a| a == "--all-packages")),
+            "a workspace root's Sync must install its members; got {:?}",
+            calls.iter().map(|c| c.args.clone()).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn an_ordinary_project_sync_is_left_exactly_as_it_was() {
+        // The other half: `SyncPlan::Plain` is what makes routing every Sync
+        // through the member machinery a no-op for a project that is not a
+        // workspace at all. If this ever became `--all-packages` or
+        // `--no-install-workspace`, every everyday sync would change shape.
+        let mut app = App::new(Config {
+            projects: vec![project("api")],
+            settings: fake_uv_settings(),
+            ..Config::default()
+        });
+        // A landed fetch for a project that is not a workspace at all: the
+        // case `SyncPlan::Plain` exists for, and the one that makes routing
+        // every Sync through the member machinery safe.
+        app.members = Some((
+            0,
+            MembersFetch {
+                kind: bombadil_core::members::WorkspaceKind::Loose,
+                discovered: vec![],
+                installed: vec![],
+            },
+        ));
+        let target = sync_target(&app, 0).expect("the press must resolve a project");
+
+        let store = bombadil_core::secrets::InMemorySecretStore::new();
+        let runner = FakeCommandRunner::new();
+        version_probe(&runner);
+        runner.expect(
+            "uv",
+            &["sync"],
+            bombadil_core::process::CommandOutcome {
+                status: Some(0),
+                stdout: String::new(),
+                stderr: String::new(),
+            },
+        );
+
+        assert!(
+            members_context(&app, 0).is_none(),
+            "a project whose plan is Plain must take the plain path, argv and \
+             status line included"
+        );
+        let (success, lines) = run_sync(&target, &app.config, &store, &runner);
+        assert!(success, "got {lines:?}");
+
+        let calls = runner.calls();
+        let sync = calls
+            .iter()
+            .find(|c| c.args.iter().any(|a| a == "sync"))
+            .expect("uv sync must have been run");
+        assert_eq!(
+            sync.args,
+            vec!["sync".to_string()],
+            "an ordinary project's sync must stay a bare `uv sync`"
+        );
     }
 
     #[test]
