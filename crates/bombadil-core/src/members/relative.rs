@@ -69,6 +69,16 @@ mod tests {
     use super::*;
     use std::path::{Path, PathBuf};
 
+    // The four tests below assert Unix path semantics using Unix-style
+    // absolute paths (a leading `/` with no drive prefix). On Windows,
+    // `Path::new("/work/repo").is_absolute()` is false — Windows absoluteness
+    // requires a drive prefix (`C:\`) or UNC — so `path_for_manifest` takes
+    // its early-return branch and hands back `target` unchanged, which is
+    // not what these tests expect. Gate them to Unix; the `#[cfg(windows)]`
+    // pair below (`paths_on_different_windows_drives_stay_absolute` and
+    // `paths_on_the_same_windows_drive_are_relative`) exercises the same
+    // logic on Windows with real drive-letter paths.
+    #[cfg(unix)]
     #[test]
     fn a_child_of_the_project_is_relative() {
         assert_eq!(
@@ -80,6 +90,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_sibling_checkout_walks_up_and_back_down() {
         // The case that matters: a shared library checked out beside the repo.
@@ -89,6 +100,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_distant_relative_is_still_expressed_relatively() {
         assert_eq!(
@@ -97,6 +109,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn the_project_itself_is_the_current_directory() {
         assert_eq!(
@@ -110,6 +123,13 @@ mod tests {
         // Nothing sensible to compute against, so the target is handed to uv as
         // given. NOTE: this does NOT exercise the Prefix/RootDir branch — it
         // short-circuits on the relative project_dir before reaching it.
+        //
+        // Platform-neutral, deliberately ungated: "relative/project" has no
+        // drive prefix or root, so `is_absolute()` is false on both Unix and
+        // Windows — the same early-return branch fires either way, and
+        // `target` ("/elsewhere/lib", itself not Windows-absolute either) is
+        // returned unchanged on both platforms. It passed on windows-latest
+        // in this run.
         let target = Path::new("/elsewhere/lib");
         assert_eq!(
             path_for_manifest(Path::new("relative/project"), target),
