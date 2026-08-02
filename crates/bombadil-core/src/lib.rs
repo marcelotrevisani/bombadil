@@ -1,3 +1,4 @@
+pub mod envspec;
 pub mod error;
 pub mod members;
 pub mod model;
