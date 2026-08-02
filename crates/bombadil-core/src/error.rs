@@ -135,11 +135,11 @@ pub enum EnvError {
         message: String,
     },
 
-    #[error("the pre-activate script {script} failed (exit {status:?}): {output}")]
+    #[error("the pre-activate script {script} failed (exit {status:?}): {stderr}")]
     ScriptFailed {
         script: std::path::PathBuf,
         status: Option<i32>,
-        output: String,
+        stderr: String,
     },
 
     #[error(
@@ -150,4 +150,14 @@ pub enum EnvError {
 
     #[error("could not read a secret while composing the environment: {message}")]
     Secret { message: String },
+
+    #[error(
+        "indexes {first:?} and {second:?} both use the credential variable {var}, \
+         so one index's password would be sent to the other's server"
+    )]
+    IndexCredentialCollision {
+        first: String,
+        second: String,
+        var: String,
+    },
 }
