@@ -10,17 +10,17 @@
 //! ordering the detected list, labelling a kind by how much of the composed
 //! environment it actually delivers, and the dumb `view` that renders it.
 //!
-//! Spec §8 also lists Open folder and Recreate venv on this menu. Neither is
-//! built here: this branch has no interface for opening a file manager, and
-//! `bombadil-core` has no function that deletes a venv at all (confirmed by
-//! grep -- the only `fs::remove_*` call in the whole crate is inside
-//! `venv_path`'s own test fixture teardown). Recreate venv would have to
-//! invent destructive filesystem code with no test coverage backing it;
-//! noted here rather than built speculatively.
+//! Spec §8's other two entries, Open folder and Recreate venv, are here too.
+//! Both spawn or delete through core (`folder::open`, `venv_path::delete`)
+//! and are dispatched from `app.rs`. Recreate venv is the one action on this
+//! menu that destroys something, so the button does not perform it: it opens
+//! the confirmation `recreate_confirmation` writes, and only
+//! `Message::RecreateVenvConfirmed` reaches the delete.
 
 use crate::app::Message;
 use bombadil_core::model::TerminalChoice;
 use bombadil_core::terminal::{ActivationSupport, TerminalKind};
+use std::path::{Path, PathBuf};
 
 /// One entry in the "Open terminal" submenu: a detected kind, or the
 /// always-present Custom entry (spec §8).
@@ -126,6 +126,50 @@ pub struct ContextMenu {
     pub terminals: Vec<TerminalKind>,
 }
 
+/// The pending Recreate venv confirmation (spec §8). Held while the user
+/// decides; nothing is deleted until `Message::RecreateVenvConfirmed`
+/// arrives. Same "starts as `None`, exists only while it is on screen" shape
+/// as `ContextMenu` itself.
+///
+/// `venv_path` is resolved once, when the confirmation opens, and carried
+/// here rather than re-resolved by `view`: the text the user agreed to and
+/// the path that gets deleted must be the same string, not two derivations
+/// that could drift.
+pub struct ConfirmRecreate {
+    pub project_index: usize,
+    pub label: String,
+    pub venv_path: PathBuf,
+}
+
+/// What the confirmation says before anything is deleted.
+///
+/// Recreating is delete-then-sync, and only the delete is certain to work.
+/// Both facts the user is agreeing to -- *which* directory disappears, and
+/// that a failed rebuild leaves them with nothing -- have to be on screen
+/// before they agree, so this states them rather than asking "are you sure?".
+pub fn recreate_confirmation(label: &str, venv_path: &Path) -> String {
+    format!(
+        "Recreate the environment for {label}?\n\n\
+         {} will be deleted, then rebuilt with uv sync.\n\n\
+         If the rebuild fails -- no network, a lock file that no longer resolves -- \
+         the old environment has already been deleted and cannot be restored.",
+        venv_path.display()
+    )
+}
+
+/// Renders the pending Recreate venv confirmation. Deliberately dumb, like
+/// `view`: the sentence worth testing is `recreate_confirmation`'s.
+pub fn confirm_view<'a>(confirm: &ConfirmRecreate) -> iced::Element<'a, Message> {
+    iced::widget::column![
+        iced::widget::text(recreate_confirmation(&confirm.label, &confirm.venv_path)),
+        iced::widget::button(iced::widget::text("Delete and recreate"))
+            .on_press(Message::RecreateVenvConfirmed),
+        iced::widget::button(iced::widget::text("Cancel")).on_press(Message::RecreateVenvCancelled),
+    ]
+    .spacing(8)
+    .into()
+}
+
 /// Renders the open context menu. Deliberately dumb: all the logic worth
 /// testing lives in `ordered`, `activation_warning` and `submenu`.
 pub fn view<'a>(
@@ -168,6 +212,16 @@ pub fn view<'a>(
         .push(
             iced::widget::button(iced::widget::text("Sync"))
                 .on_press(Message::SyncRequested(index)),
+        )
+        .push(
+            iced::widget::button(iced::widget::text("Open folder"))
+                .on_press(Message::OpenFolderRequested(index)),
+        )
+        // Opens the confirmation, never the deletion -- see
+        // `Message::RecreateVenvRequested`.
+        .push(
+            iced::widget::button(iced::widget::text("Recreate venv"))
+                .on_press(Message::RecreateVenvRequested(index)),
         )
         .push(
             iced::widget::button(iced::widget::text("Remove from list"))
@@ -302,5 +356,37 @@ mod tests {
         let label = menu_label(TerminalKind::TerminalApp);
         assert!(label.starts_with("Terminal.app"), "got {label}");
         assert!(label.contains("not activated"), "got {label}");
+    }
+
+    #[test]
+    fn the_recreate_confirmation_names_the_exact_directory_that_will_be_deleted() {
+        // "Are you sure?" is not a confirmation of anything. The user has to
+        // be able to see, before pressing yes, which directory is about to
+        // stop existing -- a central-store venv is a hashed folder name they
+        // have never seen, and the project label alone does not identify it.
+        let text = recreate_confirmation("api", Path::new("/home/t/.venvs/api-1f2e3d"));
+
+        assert!(
+            text.contains("/home/t/.venvs/api-1f2e3d"),
+            "the resolved venv path must be stated verbatim; got {text}"
+        );
+        assert!(text.contains("api"), "got {text}");
+    }
+
+    #[test]
+    fn the_recreate_confirmation_states_that_a_failed_rebuild_leaves_nothing() {
+        // Recreating is delete-then-sync, and the sync is the half that can
+        // fail (no network, an unresolvable lock file). The user is agreeing
+        // to that risk, so it has to be on screen before they agree.
+        let text = recreate_confirmation("api", Path::new("/p/api/.venv"));
+
+        assert!(
+            text.contains("deleted"),
+            "the destructive half must be named; got {text}"
+        );
+        assert!(
+            text.to_lowercase().contains("cannot be restored"),
+            "a failed rebuild leaving nothing must be stated; got {text}"
+        );
     }
 }

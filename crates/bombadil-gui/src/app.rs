@@ -115,6 +115,11 @@ pub struct App {
     /// nothing else for the menu to show in either state, the same shape
     /// `add_project` uses for its own dialog.
     pub context_menu: Option<context_menu::ContextMenu>,
+    /// The pending Recreate venv confirmation (spec §8), if any. Deleting an
+    /// environment cannot be undone, so the press that starts the action only
+    /// fills this in -- `RecreateVenvConfirmed` is the only message that
+    /// reaches `venv_path::delete`.
+    pub confirm_recreate: Option<context_menu::ConfirmRecreate>,
     /// Whether the footer is showing the bundled uv licence in full.
     /// Apache-2.0 section 4 obliges the text to be reachable, and
     /// `bombadil_uv_bin::UV_LICENSE` is compiled in -- this is what reaches
@@ -225,13 +230,35 @@ pub enum Message {
     /// removes the project from `config`/`projects`/`entries` in memory,
     /// synchronously, and dispatches a background persist -- the same
     /// in-memory-first shape `AddProjectConfirmed` uses. Never touches the
-    /// venv on disk: nothing in this path calls a `CommandRunner`, and
-    /// `bombadil-core` has no function that could delete one anyway.
+    /// venv on disk -- "Remove from list" unregisters a project, it does not
+    /// destroy anything. That is now a rule this arm has to keep rather than
+    /// one the crate enforces: `venv_path::delete` exists, and it needs no
+    /// `CommandRunner`, so nothing outside this arm's own body prevents a
+    /// future edit from wiring it in. `RecreateVenvConfirmed` is the only
+    /// message that may reach it.
     RemoveProjectRequested(usize),
     /// The background persist for a removal finished.
     RemoveProjectFinished {
         success: bool,
     },
+    /// "Recreate venv" was picked for `projects[usize]` (spec §8). Opens the
+    /// confirmation and dispatches *nothing*: recreating is delete-then-sync,
+    /// the delete cannot be undone, and if the sync then fails the user has
+    /// no environment at all. `context_menu::recreate_confirmation` is the
+    /// sentence they get to read first.
+    RecreateVenvRequested(usize),
+    /// The confirmation was accepted: delete the environment and rebuild it.
+    /// The only message that reaches `venv_path::delete`.
+    RecreateVenvConfirmed,
+    /// The confirmation was dismissed. Nothing has been deleted.
+    RecreateVenvCancelled,
+    /// "Open folder" was picked for `projects[usize]` (spec §8): show the
+    /// project's directory in the platform's file manager. Non-destructive,
+    /// and dispatched as background work like every other process spawn here.
+    OpenFolderRequested(usize),
+    /// The background open finished. `Err` carries the spawn failure --
+    /// nothing composed reaches this path, so there is nothing to redact.
+    OpenFolderFinished(Result<(), String>),
     /// The footer's licence control was pressed: show or hide the bundled uv
     /// licence text. Apache-2.0 section 4 obliges the text to be reachable,
     /// and this is what reaches it.
@@ -257,6 +284,7 @@ impl App {
             add_project: None,
             persist: Arc::new(NullPersist),
             context_menu: None,
+            confirm_recreate: None,
             about_expanded: false,
         }
     }
@@ -609,6 +637,65 @@ pub fn update(app: &mut App, message: Message, runner: Arc<dyn CommandRunner>) -
                 drawer::set_idle(&mut app.drawer, "remove failed to persist".to_string());
             }
         }
+        // Opens the confirmation and nothing else. The menu closes either
+        // way, like every other action taken from it.
+        Message::RecreateVenvRequested(i) => {
+            app.context_menu = None;
+            if let Some(project) = app.projects.get(i)
+                && let Ok(venv_path) = venv_path::resolve(project, &app.config.settings)
+            {
+                app.confirm_recreate = Some(context_menu::ConfirmRecreate {
+                    project_index: i,
+                    label: project.label.clone(),
+                    venv_path,
+                });
+            }
+        }
+        Message::RecreateVenvCancelled => {
+            app.confirm_recreate = None;
+        }
+        Message::RecreateVenvConfirmed => {
+            // `take` unconditionally: whether or not the work is dispatched,
+            // the user has answered the question and the dialog is done.
+            if let Some(confirm) = app.confirm_recreate.take()
+                && app.syncing.is_none()
+                && let Some(project) = app.projects.get(confirm.project_index).cloned()
+            {
+                let config = app.config.clone();
+                app.syncing = Some(project.id.to_string());
+                app.drawer = drawer::Drawer {
+                    status: format!("recreating {}...", project.label),
+                    ..drawer::Drawer::default()
+                };
+                // Reuses `SyncFinished`: a recreate ends in the same `uv sync`
+                // with the same single-slot release, the same transcript and
+                // the same expand-on-failure. What it does NOT reuse is the
+                // status text's meaning -- `run_recreate_venv` appends a line
+                // saying the environment was deleted and not rebuilt, which
+                // is the part "sync failed" cannot express on its own.
+                return Task::perform(
+                    recreate_venv(project, config, runner),
+                    |(success, lines)| Message::SyncFinished { success, lines },
+                );
+            }
+        }
+        Message::OpenFolderRequested(i) => {
+            app.context_menu = None;
+            if let Some(project) = app.projects.get(i).cloned() {
+                return Task::perform(
+                    open_folder(Os::host(), project, runner),
+                    Message::OpenFolderFinished,
+                );
+            }
+        }
+        Message::OpenFolderFinished(Ok(())) => {}
+        Message::OpenFolderFinished(Err(message)) => {
+            drawer::push_line(&mut app.drawer, &message, &[]);
+            drawer::set_idle(&mut app.drawer, "open folder failed".to_string());
+            if !app.drawer.lines.is_empty() {
+                app.drawer.expanded = true;
+            }
+        }
         Message::AboutLicenseToggled => {
             app.about_expanded = !app.about_expanded;
         }
@@ -890,6 +977,84 @@ fn run_sync(
     compose_and_run(spec, project, config, &venv_path, store, runner)
 }
 
+/// The blocking half of a recreate: delete the project's environment, then
+/// rebuild it with the same `uv sync` an ordinary Sync runs.
+///
+/// `delete` is a parameter, not `venv_path::delete` called directly, for the
+/// same reason `run_confirm_add_project` takes its `probe`: it is the one
+/// call in this file that removes a directory tree, and a GUI test must not
+/// touch the filesystem. The real caller supplies
+/// `bombadil_core::venv_path::delete`, which independently re-derives the
+/// project's venv location and refuses anything that is not exactly it -- so
+/// this function's `resolve` deciding wrongly cannot make it delete the
+/// wrong thing.
+///
+/// A refused delete stops the recreate rather than falling through to the
+/// sync: syncing anyway would silently do something other than what the user
+/// confirmed, and the reason core refused is what they need to see.
+fn run_recreate_venv(
+    project: &Project,
+    config: &Config,
+    store: &dyn SecretStore,
+    runner: &dyn CommandRunner,
+    delete: impl Fn(&Path) -> Result<(), String>,
+) -> (bool, Vec<String>) {
+    let venv_path = match venv_path::resolve(project, &config.settings) {
+        Ok(path) => path,
+        Err(err) => return (false, vec![err.to_string()]),
+    };
+
+    if let Err(err) = delete(&venv_path) {
+        return (false, vec![err, "nothing was deleted".to_string()]);
+    }
+
+    let (success, mut lines) = run_sync(project, config, store, runner);
+    if !success {
+        // The outcome the confirmation warned about. "sync failed" on its own
+        // leaves the user unaware that the environment they had is gone.
+        lines.push(format!(
+            "{} was deleted and could not be rebuilt; the environment no longer exists",
+            venv_path.display()
+        ));
+    }
+    (success, lines)
+}
+
+/// Runs a recreate off the render thread -- same shape as `sync_project`,
+/// including `SYNC_TIMEOUT`, since the rebuild half *is* a `uv sync`.
+async fn recreate_venv(
+    project: Project,
+    config: Config,
+    runner: Arc<dyn CommandRunner>,
+) -> (bool, Vec<String>) {
+    match job::run(
+        move || {
+            let settings = config.settings.clone();
+            let target = &project;
+            run_recreate_venv(
+                &project,
+                &config,
+                &KeyringSecretStore::new(),
+                runner.as_ref(),
+                |path| venv_path::delete(target, &settings, path).map_err(|err| err.to_string()),
+            )
+        },
+        SYNC_TIMEOUT,
+    )
+    .await
+    {
+        job::JobResult::Done(result) => result,
+        job::JobResult::TimedOut => (
+            false,
+            vec!["recreating the environment timed out".to_string()],
+        ),
+        job::JobResult::Failed => (
+            false,
+            vec!["recreating the environment failed unexpectedly".to_string()],
+        ),
+    }
+}
+
 /// The blocking half of confirming the add-project dialog: persist the
 /// updated config, then decide whether the chosen location already holds a
 /// venv (adopt it, run nothing) or needs one created
@@ -1074,12 +1239,19 @@ async fn detect_terminals(os: Os, runner: Arc<dyn CommandRunner>) -> Vec<Termina
 /// commonly is on Windows) degrades to an unrecognised shell family, which
 /// `terminal::open::open` already handles by opening without the
 /// re-assertion rather than refusing to open at all.
+/// `scratch_dir` is a parameter rather than derived from
+/// `std::env::temp_dir()` in here: `terminal::open::open` *writes* the
+/// re-assertion init file into it, and a test that reached this function
+/// therefore wrote into the machine's real temp directory -- the exact
+/// no-filesystem constraint these tests exist to honour. The real caller
+/// (`open_terminal`) supplies the Bombadil-owned temp directory.
 fn run_open_terminal(
     choice: &TerminalChoice,
     project: &Project,
     config: &Config,
     store: &dyn SecretStore,
     runner: &dyn CommandRunner,
+    scratch_dir: &Path,
 ) -> Result<(), String> {
     let venv_path = venv_path::resolve(project, &config.settings).map_err(|e| e.to_string())?;
     let inputs = EnvInputs {
@@ -1089,11 +1261,6 @@ fn run_open_terminal(
         venv_path,
     };
     let shell = std::env::var("SHELL").unwrap_or_default();
-    // A Bombadil-owned scratch directory for the re-assertion init file
-    // `terminal::open::open` writes -- namespaced per-project underneath by
-    // `open` itself, so two concurrent opens for different projects cannot
-    // collide (see its own doc comment).
-    let scratch_dir = std::env::temp_dir().join("bombadil-terminal-init");
     terminal::open::open(
         choice,
         Os::host(),
@@ -1101,7 +1268,7 @@ fn run_open_terminal(
         &shell,
         store,
         runner,
-        &scratch_dir,
+        scratch_dir,
     )
     .map_err(|err| err.to_string())
 }
@@ -1115,12 +1282,19 @@ async fn open_terminal(
 ) -> Result<(), String> {
     match job::run(
         move || {
+            // A Bombadil-owned scratch directory for the re-assertion init
+            // file `terminal::open::open` writes -- namespaced per-project
+            // underneath by `open` itself, so two concurrent opens for
+            // different projects cannot collide (see its own doc comment).
+            // Built here, at the boundary, so no test ever reaches it.
+            let scratch_dir = std::env::temp_dir().join("bombadil-terminal-init");
             run_open_terminal(
                 &choice,
                 &project,
                 &config,
                 &KeyringSecretStore::new(),
                 runner.as_ref(),
+                &scratch_dir,
             )
         },
         VENV_PROBE_TIMEOUT,
@@ -1130,6 +1304,51 @@ async fn open_terminal(
         job::JobResult::Done(result) => result,
         job::JobResult::TimedOut => Err("opening the terminal timed out".to_string()),
         job::JobResult::Failed => Err("opening the terminal failed unexpectedly".to_string()),
+    }
+}
+
+/// The blocking half of Open folder: show the project's own directory --
+/// where `pyproject.toml` lives, the same place Open terminal opens in -- in
+/// the platform's file manager.
+///
+/// `os` is a parameter, never `Os::host()` read in here, for the reason the
+/// whole `terminal` module states: it is the only thing that lets the macOS
+/// and Windows commands be covered by tests running on Linux.
+///
+/// Nothing composed is involved: `folder::open` attaches no environment, so
+/// there is no secret to redact and no keychain to reach. That is why this
+/// takes no `SecretStore` while `run_open_terminal` does.
+fn run_open_folder(os: Os, project: &Project, runner: &dyn CommandRunner) -> Result<(), String> {
+    let dir = project
+        .pyproject_path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .ok_or_else(|| {
+            format!(
+                "{} has no directory to open",
+                project.pyproject_path.display()
+            )
+        })?;
+    bombadil_core::folder::open(os, dir, runner).map_err(|err| err.to_string())
+}
+
+/// Runs Open folder off the render thread. `VENV_PROBE_TIMEOUT`, like
+/// `open_terminal`: this only launches a file manager and returns, so a wait
+/// measured in seconds already means something is wrong.
+async fn open_folder(
+    os: Os,
+    project: Project,
+    runner: Arc<dyn CommandRunner>,
+) -> Result<(), String> {
+    match job::run(
+        move || run_open_folder(os, &project, runner.as_ref()),
+        VENV_PROBE_TIMEOUT,
+    )
+    .await
+    {
+        job::JobResult::Done(result) => result,
+        job::JobResult::TimedOut => Err("opening the folder timed out".to_string()),
+        job::JobResult::Failed => Err("opening the folder failed unexpectedly".to_string()),
     }
 }
 
@@ -1213,6 +1432,14 @@ pub fn view(app: &App) -> iced::Element<'_, Message> {
         None => iced::widget::text("").into(),
     };
 
+    // The Recreate venv confirmation (spec §8). Rendered from the resolved
+    // path captured when it opened, not re-resolved here: the sentence the
+    // user agrees to and the path that gets deleted must be the same one.
+    let confirm_recreate_view: iced::Element<'_, Message> = match &app.confirm_recreate {
+        Some(confirm) => context_menu::confirm_view(confirm),
+        None => iced::widget::text("").into(),
+    };
+
     let mut problems = app.load_problems.clone();
     problems.extend(banner::problems(&app.config));
     let footer = crate::about::view(app.about_expanded);
@@ -1221,6 +1448,7 @@ pub fn view(app: &App) -> iced::Element<'_, Message> {
         body,
         add_project_dialog,
         context_menu_view,
+        confirm_recreate_view,
         footer
     ]
     .into()
@@ -2621,13 +2849,15 @@ mod tests {
 
     #[test]
     fn removing_a_project_never_touches_the_venv_on_disk() {
-        // bombadil-core has no function capable of deleting a venv at all --
-        // confirmed by inspection: the only `fs::remove_*` call in the whole
-        // crate lives inside `venv_path`'s own test fixture teardown, not in
-        // any code `update` can reach. So this proves the removal path we
-        // built calls no `CommandRunner` at all, which is everything there
-        // is to guard against today; there is no delete-venv primitive for a
-        // future regression to accidentally wire up removal into yet.
+        // What this proves: the removal path runs and spawns nothing at all,
+        // so it cannot reach uv or any other process.
+        //
+        // What it cannot prove any more: `venv_path::delete` now exists and
+        // needs no `CommandRunner`, so a regression that called it from this
+        // arm would leave `fake.calls()` empty and still destroy the user's
+        // environment. Closing that in a GUI test would mean giving this test
+        // a real venv on disk to watch, which the no-filesystem constraint
+        // forbids -- the guard is the arm's own body, which touches no path.
         let mut app = App::new(Config {
             projects: vec![project("api")],
             ..Config::default()
@@ -2776,17 +3006,46 @@ mod tests {
             );
         }
 
+        // A scratch directory of this test's own: `terminal::open::open`
+        // WRITES the shell re-assertion init file into whatever it is given,
+        // and this test used to hand it `std::env::temp_dir()` by way of
+        // `run_open_terminal` -- leaving files on the machine running the
+        // suite, which is exactly what the no-filesystem constraint forbids.
+        let scratch = tempfile::tempdir().unwrap();
+
         let result = run_open_terminal(
             &TerminalChoice::Detected(host_terminal_kind()),
             &project,
             &config,
             &store,
             &runner,
+            scratch.path(),
         );
 
         assert!(result.is_ok(), "got {result:?}");
         let calls = runner.calls();
         assert_eq!(calls.len(), 1, "the terminal must actually be spawned");
+        // Whether an init file is written at all depends on `$SHELL`, which
+        // is not this test's to control -- but if one was, every reference to
+        // it must live under `scratch`. "bombadil-terminal-init" is the real
+        // temp directory's name and must appear nowhere.
+        // `terminal::open::open` namespaces the init file by project id, so
+        // the id is what identifies an init path among argv and a composed
+        // environment that legitimately mentions plenty of other paths.
+        let marker = project.id.to_string();
+        let referenced: Vec<&String> = calls[0]
+            .args
+            .iter()
+            .chain(calls[0].env.values())
+            .filter(|v| v.contains(&marker))
+            .collect();
+        let scratch_prefix = scratch.path().to_string_lossy().into_owned();
+        for value in referenced {
+            assert!(
+                value.starts_with(&scratch_prefix),
+                "an init file was written outside the scratch dir {scratch_prefix}: {value}"
+            );
+        }
         assert!(
             calls[0].clear_env,
             "the composition must be authoritative, not layered on the ambient environment"
@@ -2811,12 +3070,15 @@ mod tests {
         let store = bombadil_core::secrets::InMemorySecretStore::new();
         let runner = FakeCommandRunner::new();
 
+        let scratch = tempfile::tempdir().unwrap();
+
         let result = run_open_terminal(
             &TerminalChoice::Detected(host_terminal_kind()),
             &project("api"),
             &config,
             &store,
             &runner,
+            scratch.path(),
         );
 
         let err =
@@ -2830,6 +3092,416 @@ mod tests {
             !err.contains("not a terminal available"),
             "the failure must come from the spawn, not the wrong-OS guard; got {err}"
         );
+    }
+
+    // --- 7b: Recreate venv ---
+    //
+    // No test here touches the filesystem: `run_recreate_venv` takes the
+    // delete as a parameter, the way `run_confirm_add_project` takes its
+    // probe, so the destructive half is exercised as a recorded call. The
+    // real deletion is `bombadil_core::venv_path::delete`, tested against
+    // `tempfile` in the crate that owns it.
+
+    /// Records every path it was asked to delete and answers with `outcome`.
+    fn recording_delete(
+        log: &std::sync::Mutex<Vec<PathBuf>>,
+        outcome: Result<(), String>,
+    ) -> impl Fn(&Path) -> Result<(), String> + '_ {
+        move |path: &Path| {
+            log.lock().unwrap().push(path.to_path_buf());
+            outcome.clone()
+        }
+    }
+
+    #[test]
+    fn requesting_a_recreate_only_asks_for_confirmation_and_deletes_nothing_yet() {
+        // The whole point of the confirmation. A press that went straight to
+        // work would delete an environment the user has not agreed to lose,
+        // and there is no undo.
+        let mut app = App::new(Config {
+            projects: vec![project("api")],
+            ..Config::default()
+        });
+        let fake = Arc::new(FakeCommandRunner::new());
+        let _ = update(&mut app, Message::ContextMenuOpened(0), fake.clone());
+
+        let task = update(&mut app, Message::RecreateVenvRequested(0), fake.clone());
+
+        assert_eq!(
+            task.units(),
+            0,
+            "requesting a recreate must dispatch NOTHING until it is confirmed"
+        );
+        assert!(
+            fake.calls().is_empty(),
+            "nothing may run before the user confirms; got {:?}",
+            fake.calls()
+        );
+        assert!(
+            app.confirm_recreate.is_some(),
+            "the confirmation must be on screen"
+        );
+        assert!(
+            app.context_menu.is_none(),
+            "the menu should close once an action is taken from it"
+        );
+    }
+
+    #[test]
+    fn the_confirmation_names_the_right_clicked_projects_own_venv_path() {
+        // Two projects with the FIRST selected and the SECOND right-clicked:
+        // a confirmation resolved against the selection would name -- and
+        // then delete -- an environment the user never pointed at.
+        let mut app = App::new(Config {
+            projects: vec![project("api"), project("web")],
+            ..Config::default()
+        });
+        assert_eq!(app.selected, Some(0));
+
+        let _ = update(&mut app, Message::RecreateVenvRequested(1), unused_runner());
+
+        let confirm = app.confirm_recreate.as_ref().expect("must be pending");
+        assert_eq!(confirm.project_index, 1);
+        assert_eq!(confirm.label, "web");
+        assert_eq!(
+            confirm.venv_path,
+            PathBuf::from("/p/web/.venv"),
+            "the confirmation must state the right-clicked project's resolved venv path"
+        );
+    }
+
+    #[test]
+    fn cancelling_a_recreate_dispatches_nothing_and_clears_the_confirmation() {
+        let mut app = App::new(Config {
+            projects: vec![project("api")],
+            ..Config::default()
+        });
+        let fake = Arc::new(FakeCommandRunner::new());
+        let _ = update(&mut app, Message::RecreateVenvRequested(0), fake.clone());
+
+        let task = update(&mut app, Message::RecreateVenvCancelled, fake.clone());
+
+        assert_eq!(task.units(), 0);
+        assert!(fake.calls().is_empty(), "got {:?}", fake.calls());
+        assert!(app.confirm_recreate.is_none());
+    }
+
+    #[test]
+    fn confirming_a_recreate_dispatches_background_work_without_running_anything_inline() {
+        // Deleting a directory tree and then running `uv sync` both block;
+        // doing either inside `update` freezes the window.
+        let mut app = App::new(Config {
+            projects: vec![project("api")],
+            ..Config::default()
+        });
+        let fake = Arc::new(FakeCommandRunner::new());
+        let _ = update(&mut app, Message::RecreateVenvRequested(0), fake.clone());
+
+        let task = update(&mut app, Message::RecreateVenvConfirmed, fake.clone());
+
+        assert!(
+            fake.calls().is_empty(),
+            "runner.run must not be called synchronously inside update; got {:?}",
+            fake.calls()
+        );
+        assert!(
+            task.units() > 0,
+            "a confirmed recreate must dispatch real background work"
+        );
+        assert!(
+            app.confirm_recreate.is_none(),
+            "the confirmation must close once it has been acted on"
+        );
+        assert!(
+            app.syncing.is_some(),
+            "a recreate runs uv sync, so it must claim the single in-flight slot"
+        );
+    }
+
+    #[test]
+    fn a_recreate_deletes_the_projects_venv_and_then_rebuilds_it() {
+        let project = project("api");
+        let config = Config {
+            projects: vec![project.clone()],
+            settings: fake_uv_settings(),
+            ..Config::default()
+        };
+        let store = bombadil_core::secrets::InMemorySecretStore::new();
+        let runner = FakeCommandRunner::new();
+        version_probe(&runner);
+        runner.expect(
+            "uv",
+            &["sync"],
+            bombadil_core::process::CommandOutcome {
+                status: Some(0),
+                stdout: String::new(),
+                stderr: String::new(),
+            },
+        );
+        let deleted = std::sync::Mutex::new(Vec::new());
+
+        let (success, _lines) = run_recreate_venv(
+            &project,
+            &config,
+            &store,
+            &runner,
+            recording_delete(&deleted, Ok(())),
+        );
+
+        assert!(success);
+        assert_eq!(
+            deleted.lock().unwrap().as_slice(),
+            [PathBuf::from("/p/api/.venv")],
+            "exactly the project's own resolved venv path must be deleted, once"
+        );
+        assert!(
+            runner
+                .calls()
+                .iter()
+                .any(|c| c.args.iter().any(|a| a == "sync")),
+            "the environment must be rebuilt after being deleted; got {:?}",
+            runner.calls()
+        );
+    }
+
+    #[test]
+    fn a_recreate_whose_delete_is_refused_never_runs_uv_sync() {
+        // Also the ordering proof: if the rebuild ran before the delete, a
+        // refused delete would still leave a `uv sync` call recorded here.
+        // And a refusal is not "just sync instead" -- that would silently do
+        // something other than what the user confirmed.
+        let project = project("api");
+        let config = Config {
+            projects: vec![project.clone()],
+            settings: fake_uv_settings(),
+            ..Config::default()
+        };
+        let store = bombadil_core::secrets::InMemorySecretStore::new();
+        let runner = FakeCommandRunner::new();
+        version_probe(&runner);
+        runner.expect(
+            "uv",
+            &["sync"],
+            bombadil_core::process::CommandOutcome {
+                status: Some(0),
+                stdout: String::new(),
+                stderr: String::new(),
+            },
+        );
+        let deleted = std::sync::Mutex::new(Vec::new());
+
+        let (success, lines) = run_recreate_venv(
+            &project,
+            &config,
+            &store,
+            &runner,
+            recording_delete(
+                &deleted,
+                Err("/p/api/.venv holds no pyvenv.cfg".to_string()),
+            ),
+        );
+
+        assert!(!success);
+        assert!(
+            runner.calls().is_empty(),
+            "a refused delete must stop the recreate dead; got {:?}",
+            runner.calls()
+        );
+        assert!(
+            lines.iter().any(|l| l.contains("pyvenv.cfg")),
+            "core's own refusal text must reach the user; got {lines:?}"
+        );
+    }
+
+    #[test]
+    fn a_recreate_whose_rebuild_fails_says_the_environment_is_gone() {
+        // The worst outcome of this action, and the one the confirmation
+        // warned about: the delete worked and the sync did not. "sync failed"
+        // alone leaves the user unaware that their environment no longer
+        // exists.
+        let project = project("api");
+        let config = Config {
+            projects: vec![project.clone()],
+            settings: fake_uv_settings(),
+            ..Config::default()
+        };
+        let store = bombadil_core::secrets::InMemorySecretStore::new();
+        let runner = FakeCommandRunner::new();
+        version_probe(&runner);
+        runner.expect(
+            "uv",
+            &["sync"],
+            bombadil_core::process::CommandOutcome {
+                status: Some(1),
+                stdout: String::new(),
+                stderr: "error: no solution found".into(),
+            },
+        );
+        let deleted = std::sync::Mutex::new(Vec::new());
+
+        let (success, lines) = run_recreate_venv(
+            &project,
+            &config,
+            &store,
+            &runner,
+            recording_delete(&deleted, Ok(())),
+        );
+
+        assert!(!success);
+        let joined = lines.join("\n");
+        assert!(
+            joined.contains("no solution found"),
+            "uv's own reason must survive; got {joined}"
+        );
+        assert!(
+            joined.contains("/p/api/.venv") && joined.contains("deleted"),
+            "the user must be told the environment was deleted and not rebuilt; got {joined}"
+        );
+    }
+
+    #[test]
+    fn a_recreate_confirmed_while_a_sync_is_in_flight_dispatches_nothing() {
+        // Same single-slot rule `SyncRequested` follows: one mutating uv
+        // command at a time, one shared drawer.
+        let mut app = App::new(Config {
+            projects: vec![project("api")],
+            ..Config::default()
+        });
+        let fake = Arc::new(FakeCommandRunner::new());
+        let _ = update(&mut app, Message::SyncRequested(0), fake.clone());
+        let _ = update(&mut app, Message::RecreateVenvRequested(0), fake.clone());
+
+        let task = update(&mut app, Message::RecreateVenvConfirmed, fake.clone());
+
+        assert_eq!(
+            task.units(),
+            0,
+            "a recreate must not start while a sync is already running"
+        );
+        assert!(fake.calls().is_empty(), "got {:?}", fake.calls());
+    }
+
+    #[test]
+    fn requesting_a_recreate_for_an_out_of_range_project_asks_nothing() {
+        let mut app = App::new(Config {
+            projects: vec![project("api")],
+            ..Config::default()
+        });
+
+        let task = update(
+            &mut app,
+            Message::RecreateVenvRequested(99),
+            unused_runner(),
+        );
+
+        assert_eq!(task.units(), 0);
+        assert!(app.confirm_recreate.is_none());
+    }
+
+    // --- 7c: Open folder ---
+
+    #[test]
+    fn opening_a_folder_never_calls_the_runner_synchronously() {
+        let mut app = App::new(Config {
+            projects: vec![project("api")],
+            ..Config::default()
+        });
+        let fake = Arc::new(FakeCommandRunner::new());
+        let _ = update(&mut app, Message::ContextMenuOpened(0), fake.clone());
+
+        let task = update(&mut app, Message::OpenFolderRequested(0), fake.clone());
+
+        assert!(
+            fake.calls().is_empty(),
+            "runner.spawn must not be called synchronously inside update; got {:?}",
+            fake.calls()
+        );
+        assert!(
+            task.units() > 0,
+            "opening a folder must dispatch real background work, not Task::none()"
+        );
+        assert!(
+            app.context_menu.is_none(),
+            "the menu should close once an action is taken from it"
+        );
+    }
+
+    #[test]
+    fn opening_a_folder_shows_the_project_directory_not_the_venv() {
+        // Spec §8's Open folder is the folder the user recognises -- where
+        // `pyproject.toml` lives, the same directory Open terminal opens in.
+        // A central-store venv is a hashed directory somewhere else entirely.
+        let runner = FakeCommandRunner::new();
+        runner.expect(
+            "xdg-open",
+            &[],
+            bombadil_core::process::CommandOutcome {
+                status: Some(0),
+                stdout: String::new(),
+                stderr: String::new(),
+            },
+        );
+
+        let result = run_open_folder(Os::Linux, &project("api"), &runner);
+
+        assert!(result.is_ok(), "got {result:?}");
+        let calls = runner.calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].args, vec!["/p/api"]);
+        assert_eq!(
+            runner.blocking_calls(),
+            0,
+            "the file manager must be spawned, not waited on"
+        );
+    }
+
+    #[test]
+    fn opening_a_folder_uses_each_platforms_own_file_manager() {
+        // `Os` is a parameter, never `cfg!`, exactly so all three are covered
+        // wherever CI runs. A test that paired one hardcoded program with
+        // `Os::host()` would silently cover one platform out of three.
+        for (os, program) in [
+            (Os::Linux, "xdg-open"),
+            (Os::MacOs, "open"),
+            (Os::Windows, "explorer"),
+        ] {
+            let runner = FakeCommandRunner::new();
+            runner.expect(
+                program,
+                &[],
+                bombadil_core::process::CommandOutcome {
+                    status: Some(0),
+                    stdout: String::new(),
+                    stderr: String::new(),
+                },
+            );
+
+            run_open_folder(os, &project("api"), &runner)
+                .unwrap_or_else(|e| panic!("{os:?} must open with {program}: {e}"));
+
+            assert_eq!(
+                runner.calls()[0].program.to_string_lossy(),
+                program,
+                "{os:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_project_whose_manifest_has_no_directory_reports_rather_than_opening_nothing() {
+        let mut project = project("api");
+        project.pyproject_path = PathBuf::from("pyproject.toml");
+        let runner = FakeCommandRunner::new();
+
+        let err = run_open_folder(Os::Linux, &project, &runner)
+            .expect_err("there is no directory to open");
+
+        assert!(
+            runner.calls().is_empty(),
+            "nothing may be spawned; got {:?}",
+            runner.calls()
+        );
+        assert!(err.contains("pyproject.toml"), "got {err}");
     }
 
     #[test]
