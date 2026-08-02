@@ -4,10 +4,10 @@
 #![cfg(feature = "uv-integration")]
 
 use bombadil_core::model::UvSource;
-use bombadil_core::process::{CommandRunner, SystemCommandRunner};
+use bombadil_core::process::{CommandRunner, CommandSpec, SystemCommandRunner};
 use bombadil_core::uv::command::{self, DependencyGroup, ProjectContext};
 use bombadil_core::uv::results::{parse_pip_list, parse_tree};
-use bombadil_core::uv::{ResolvedUv, locate_on_path, resolve};
+use bombadil_core::uv::{ResolvedUv, UvVersion, locate_on_path, resolve};
 
 fn write_project(dir: &std::path::Path) {
     std::fs::write(
@@ -75,4 +75,67 @@ fn sync_add_and_list_agree_with_a_real_uv() {
     let outcome = runner.run(&command::tree(&uv, &ctx, 2)).unwrap();
     assert!(outcome.success(), "tree failed: {}", outcome.stderr);
     parse_tree(&outcome.stdout).expect("tree JSON parses or degrades, never errors on valid JSON");
+}
+
+#[test]
+fn clear_env_still_runs_uv_and_reports_the_same_version() {
+    // Plan 2b's whole design rests on `clear_env: true` actually clearing the
+    // child's environment (so an ambient UV_INDEX_* etc. cannot leak into a
+    // command). This is the only place that is exercised, because
+    // `SystemCommandRunner` cannot be unit-tested without spawning.
+    let runner = SystemCommandRunner;
+    let uv = resolve_uv(&runner);
+
+    // Only reassigned under cfg(windows); allowed rather than cfg-gating the
+    // `mut` itself, which would need duplicating the binding.
+    #[allow(unused_mut)]
+    let mut spec = CommandSpec::new(&uv.path).arg("--version").clear_env();
+
+    // A genuinely empty environment can break process creation on Windows
+    // (CreateProcess needs at least SYSTEMROOT to find system DLLs, and a
+    // relative or missing PATH can stop it finding uv.exe at all), so carry
+    // those two over there. On unix this is unneeded but harmless: uv only
+    // needs argv[0] to be runnable, which cwd/exec path already guarantee.
+    #[cfg(windows)]
+    {
+        if let Ok(systemroot) = std::env::var("SYSTEMROOT") {
+            spec = spec.env("SYSTEMROOT", systemroot);
+        }
+        if let Ok(path) = std::env::var("PATH") {
+            spec = spec.env("PATH", path);
+        }
+    }
+
+    let outcome = runner.run(&spec).unwrap();
+    assert!(
+        outcome.success(),
+        "uv --version failed under a cleared environment: {}",
+        outcome.stderr
+    );
+    assert_eq!(
+        UvVersion::parse(&outcome.stdout),
+        Some(uv.version),
+        "a cleared environment must not change which uv answers or what version it reports"
+    );
+}
+
+#[test]
+fn an_unknown_subcommand_is_reported_as_a_failed_outcome() {
+    // `success()` is exercised as true throughout this file and the unit
+    // tests only ever hand-construct a failing `CommandOutcome`; this proves
+    // a real non-zero exit from uv is actually observed as failure.
+    let runner = SystemCommandRunner;
+    let uv = resolve_uv(&runner);
+
+    let spec = CommandSpec::new(&uv.path).arg("definitely-not-a-subcommand");
+    let outcome = runner.run(&spec).unwrap();
+
+    assert!(
+        !outcome.success(),
+        "an unknown subcommand must not report success"
+    );
+    assert!(
+        !outcome.stderr.is_empty(),
+        "uv must explain the failure on stderr"
+    );
 }
