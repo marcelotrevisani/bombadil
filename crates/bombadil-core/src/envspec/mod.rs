@@ -727,6 +727,55 @@ mod tests {
     }
 
     #[test]
+    fn a_failing_pre_activate_script_never_leaks_a_global_secret_in_its_error() {
+        // The global-env loop and the project-env loop in compose are two
+        // textually distinct `secrets.push(value)` sites -- a test sourcing
+        // its secret from ProjectEnv (as above) cannot catch a regression
+        // that deletes the push inside the global loop specifically.
+        let config = Config {
+            global_env: vec![EnvVar {
+                key: "GLOBAL_TOKEN".into(),
+                value: String::new(),
+                secret: true,
+            }],
+            ..Config::default()
+        };
+        let project = Project {
+            scripts: vec![Script {
+                path: PathBuf::from("/p/pre.sh"),
+                args: vec![],
+                enabled: true,
+            }],
+            ..project()
+        };
+        let store = InMemorySecretStore::new();
+        store
+            .set(
+                &SecretKey::GlobalEnv {
+                    key: "GLOBAL_TOKEN".into(),
+                },
+                "g1obal-s3cr3t",
+            )
+            .unwrap();
+        let runner = FakeCommandRunner::new();
+        runner.expect(
+            shell(),
+            &[],
+            CommandOutcome {
+                status: Some(1),
+                stdout: String::new(),
+                stderr: "+ curl -H 'Authorization: Bearer g1obal-s3cr3t'".into(),
+            },
+        );
+
+        let err = compose(&inputs(config, project), &store, &runner).unwrap_err();
+
+        let rendered = err.to_string();
+        assert!(rendered.contains("***"), "got {rendered}");
+        assert!(!rendered.contains("g1obal-s3cr3t"), "got {rendered}");
+    }
+
+    #[test]
     fn a_failing_pre_activate_script_never_leaks_an_index_password_in_its_error() {
         // The redaction set is built from project/global env secrets AND from
         // the index passwords compose reads back after inject -- deleting

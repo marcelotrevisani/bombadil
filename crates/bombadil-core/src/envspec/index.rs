@@ -423,4 +423,70 @@ mod tests {
         assert!(rendered.contains("my-index"), "got {rendered}");
         assert!(rendered.contains("my_index"), "got {rendered}");
     }
+
+    #[test]
+    fn a_colliding_index_with_credentials_first_still_blocks_the_no_auth_one_second() {
+        // Same pairing as the test above with the order reversed. The
+        // collision set is precomputed over the whole input before either
+        // index is processed, so which one comes first must not matter --
+        // pinned so a future switch to an incrementally-built map (which
+        // would only know about indexes already visited) breaks a test
+        // instead of silently reopening the bypass.
+        let with_auth = index(
+            "my-index",
+            IndexKind::Extra,
+            IndexAuth::Basic {
+                username: "alice".into(),
+            },
+        );
+        let no_auth = index("my_index", IndexKind::Extra, IndexAuth::None);
+        let store = InMemorySecretStore::new();
+        store
+            .set(
+                &SecretKey::Index {
+                    name: "my-index".into(),
+                },
+                "alice-secret",
+            )
+            .unwrap();
+        let mut env = BTreeMap::new();
+
+        let err = inject(&[&with_auth, &no_auth], &store, &mut env).unwrap_err();
+
+        let rendered = err.to_string();
+        assert!(rendered.contains("my-index"), "got {rendered}");
+        assert!(rendered.contains("my_index"), "got {rendered}");
+    }
+
+    #[test]
+    fn the_same_index_name_listed_twice_does_not_collide_with_itself() {
+        // The `!contains` dedup in the precompute loop is what keeps a name
+        // appearing twice in `indexes` from finding itself as "another" name
+        // sharing its credential variable.
+        let a = index(
+            "priv",
+            IndexKind::Extra,
+            IndexAuth::Basic {
+                username: "alice".into(),
+            },
+        );
+        let b = a.clone();
+        let store = InMemorySecretStore::new();
+        store
+            .set(
+                &SecretKey::Index {
+                    name: "priv".into(),
+                },
+                "hunter2",
+            )
+            .unwrap();
+        let mut env = BTreeMap::new();
+
+        inject(&[&a, &b], &store, &mut env).unwrap();
+
+        assert_eq!(
+            env.get("UV_INDEX_PRIV_PASSWORD").map(String::as_str),
+            Some("hunter2")
+        );
+    }
 }
