@@ -1243,6 +1243,21 @@ mod tests {
             .map(|p| p.label.as_str())
     }
 
+    /// The first terminal kind the *host* OS supports.
+    ///
+    /// `run_open_terminal` builds argv for `Os::host()`, and `argv::build`
+    /// correctly refuses a kind belonging to another OS -- so a test pairing
+    /// a hardcoded Linux kind with the host either fails outright on macOS
+    /// and Windows or, worse, passes off the wrong-OS guard instead of the
+    /// behaviour it claims to cover. `Os` is a parameter everywhere in
+    /// `terminal`, never a `cfg!`, precisely so this is derivable rather
+    /// than something to compile the test away over.
+    fn host_terminal_kind() -> TerminalKind {
+        *TerminalKind::for_os(Os::host())
+            .first()
+            .expect("every supported OS has at least one terminal kind")
+    }
+
     /// A runner for tests that don't care about it -- most of them, since
     /// most messages here never touch a `CommandRunner` at all.
     fn unused_runner() -> Arc<dyn CommandRunner> {
@@ -2502,22 +2517,25 @@ mod tests {
 
     #[test]
     fn the_configured_default_is_read_from_config_for_the_hosts_os() {
+        // The kind is derived from the host rather than hardcoded: a default
+        // keyed to this OS but naming a terminal that cannot exist on it is
+        // not a configuration the app could ever have written. This one never
+        // reaches `argv::build`, so it passed everywhere either way -- but
+        // leaving the pattern here is how it gets copied into a test that
+        // does.
+        let kind = host_terminal_kind();
         let config = Config {
             projects: vec![project("api")],
             terminal_defaults: std::collections::BTreeMap::from([(
-                bombadil_core::terminal::Os::host(),
-                TerminalChoice::Detected(bombadil_core::terminal::TerminalKind::Kitty),
+                Os::host(),
+                TerminalChoice::Detected(kind),
             )]),
             ..Config::default()
         };
         let app = App::new(config);
         assert_eq!(
-            app.config
-                .terminal_defaults
-                .get(&bombadil_core::terminal::Os::host()),
-            Some(&TerminalChoice::Detected(
-                bombadil_core::terminal::TerminalKind::Kitty
-            )),
+            app.config.terminal_defaults.get(&Os::host()),
+            Some(&TerminalChoice::Detected(kind)),
             "the configured default for this OS must be reachable for view to order by"
         );
     }
@@ -2741,18 +2759,25 @@ mod tests {
         };
         let store = bombadil_core::secrets::InMemorySecretStore::new();
         let runner = FakeCommandRunner::new();
-        runner.expect(
-            "gnome-terminal",
-            &[],
-            bombadil_core::process::CommandOutcome {
-                status: Some(0),
-                stdout: String::new(),
-                stderr: String::new(),
-            },
-        );
+        // One rule per host's first kind: `expect` matches on the program's
+        // file stem, so exactly one of these can ever fire -- `gnome-terminal`
+        // on Linux, `open -a Terminal` on macOS, `wt.exe` on Windows. Naming
+        // all three keeps this test running the real path on every platform
+        // instead of only the one CI happens to be generous with.
+        for program in ["gnome-terminal", "open", "wt"] {
+            runner.expect(
+                program,
+                &[],
+                bombadil_core::process::CommandOutcome {
+                    status: Some(0),
+                    stdout: String::new(),
+                    stderr: String::new(),
+                },
+            );
+        }
 
         let result = run_open_terminal(
-            &TerminalChoice::Detected(bombadil_core::terminal::TerminalKind::GnomeTerminal),
+            &TerminalChoice::Detected(host_terminal_kind()),
             &project,
             &config,
             &store,
@@ -2761,7 +2786,7 @@ mod tests {
 
         assert!(result.is_ok(), "got {result:?}");
         let calls = runner.calls();
-        assert_eq!(calls.len(), 1);
+        assert_eq!(calls.len(), 1, "the terminal must actually be spawned");
         assert!(
             calls[0].clear_env,
             "the composition must be authoritative, not layered on the ambient environment"
@@ -2787,14 +2812,24 @@ mod tests {
         let runner = FakeCommandRunner::new();
 
         let result = run_open_terminal(
-            &TerminalChoice::Detected(bombadil_core::terminal::TerminalKind::Kitty),
+            &TerminalChoice::Detected(host_terminal_kind()),
             &project("api"),
             &config,
             &store,
             &runner,
         );
 
-        assert!(result.is_err());
+        let err =
+            result.expect_err("a terminal that will not spawn must not be reported as opened");
+        // With a hardcoded Linux kind this assertion passed on macOS and
+        // Windows for the wrong reason: `argv::build` refused the kind before
+        // anything was ever spawned, so spec §9's "the terminal has
+        // disappeared" case went unexercised on exactly the two platforms
+        // where it is least verified.
+        assert!(
+            !err.contains("not a terminal available"),
+            "the failure must come from the spawn, not the wrong-OS guard; got {err}"
+        );
     }
 
     #[test]
