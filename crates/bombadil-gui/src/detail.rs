@@ -70,7 +70,7 @@ fn project_dir(project: &Project) -> PathBuf {
 /// in `header`. The Sync button is unconditional -- it does not read
 /// `venv_status` at all.
 ///
-/// `index` is the project's position in `App::projects`, carried into
+/// `index` is the project's position in `App::config.projects`, carried into
 /// `Message::SyncRequested` so one message shape serves this button and the
 /// context menu's Sync entry -- see that message's own doc for why resolving
 /// against the selection instead is a bug.

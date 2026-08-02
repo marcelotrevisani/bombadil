@@ -82,15 +82,21 @@ impl ConfigPersist for NullPersist {
 /// Everything the window shows. Deliberately plain data: `update` is the only
 /// place it changes, which is what makes the logic testable without a display.
 pub struct App {
-    // `projects`, `selected` and `entries` are what most of `view` and
-    // `update` need; `config` as a whole is also read directly by `view`,
-    // which recomputes `banner::problems(&app.config)` on every render
-    // rather than caching it on this struct -- see `banner`'s module doc.
-    // Kept whole rather than trimmed to just the projects, because
-    // settings/index/save features in later tasks need the rest of the
-    // config and re-deriving `App` then would be needless churn.
+    /// The whole config, and the *only* copy of the project list.
+    ///
+    /// There was once an `App::projects` beside this, a clone taken in
+    /// `App::new` and described as a convenience view. It was not one: every
+    /// editor writes `config.projects`, while Sync, Open terminal and
+    /// Recreate venv read the clone -- so a variable, script, index selection
+    /// or member choice edited in a session reached nothing Bombadil ran
+    /// until the app was restarted. Deleting the field is what makes that
+    /// whole class unrepresentable; `entries` below stays because it is
+    /// genuinely derived state (probe results) that no config field carries.
+    ///
+    /// `view` reads `config` as a whole too, recomputing
+    /// `banner::problems(&app.config)` on every render rather than caching it
+    /// here -- see `banner`'s module doc.
     pub config: Config,
-    pub projects: Vec<Project>,
     pub selected: Option<usize>,
     /// One row per project, in `sidebar::entries` order. Starts all-hollow;
     /// `boot`'s probe tasks fill in real venv status as they complete.
@@ -267,7 +273,7 @@ pub enum Message {
     /// config, persist it, and adopt or create its venv.
     AddProjectConfirmed,
     /// The background half of `AddProjectConfirmed` finished. `index` is
-    /// where the project landed in `projects`/`entries`, so the venv status
+    /// where the project landed in `config.projects`/`entries`, so the venv status
     /// can be refreshed the same way `boot`'s probes fill it in.
     AddProjectConfirmFinished {
         success: bool,
@@ -296,7 +302,7 @@ pub enum Message {
     /// secret the composed environment resolved.
     OpenTerminalFinished(Result<(), String>),
     /// "Remove from list" was picked for `projects[usize]`. Criterion 4:
-    /// removes the project from `config`/`projects`/`entries` in memory,
+    /// removes the project from `config.projects`/`entries` in memory,
     /// synchronously, and dispatches a background persist -- the same
     /// in-memory-first shape `AddProjectConfirmed` uses. Never touches the
     /// venv on disk -- "Remove from list" unregisters a project, it does not
@@ -417,7 +423,7 @@ pub enum Message {
         success: bool,
     },
     /// A project index checkbox was toggled: `usize` is the project's index
-    /// in `app.projects`/`app.config.projects`, `String` the index name
+    /// in `app.config.projects`/`app.config.projects`, `String` the index name
     /// (criterion 3). Adds or removes the association only -- never reaches
     /// `Config::indexes`, so the index itself is untouched either way.
     ProjectIndexToggled(usize, String),
@@ -498,8 +504,7 @@ pub struct MembersFetch {
 
 impl App {
     pub fn new(config: Config) -> Self {
-        let projects = config.projects.clone();
-        let selected = (!projects.is_empty()).then_some(0);
+        let selected = (!config.projects.is_empty()).then_some(0);
         // No probe yet at construction time -- every project starts hollow;
         // `boot` kicks off the real probes and `update` fills results in as
         // they land.
@@ -518,7 +523,6 @@ impl App {
         };
         Self {
             config,
-            projects,
             selected,
             entries,
             drawer: drawer::Drawer::default(),
@@ -553,6 +557,7 @@ pub fn boot(loaded: Loaded) -> (App, Task<Message>) {
     let mut app = App::new(loaded.config().clone());
     app.load_problems = banner::load_problems(&loaded);
     let mut probes = app
+        .config
         .projects
         .iter()
         .enumerate()
@@ -801,16 +806,21 @@ pub fn update(app: &mut App, message: Message, runner: Arc<dyn CommandRunner>) -
     match message {
         // A stale index can arrive from a message queued before a project was
         // removed; ignoring it is better than taking the window down.
-        Message::ProjectSelected(i) if i < app.projects.len() => {
+        Message::ProjectSelected(i) if i < app.config.projects.len() => {
             app.selected = Some(i);
             return Task::batch([
                 fetch_deps_task(
                     i,
-                    app.projects[i].clone(),
+                    app.config.projects[i].clone(),
                     app.config.clone(),
                     runner.clone(),
                 ),
-                fetch_members_task(i, app.projects[i].clone(), app.config.clone(), runner),
+                fetch_members_task(
+                    i,
+                    app.config.projects[i].clone(),
+                    app.config.clone(),
+                    runner,
+                ),
             ]);
         }
         Message::ProjectSelected(_) => {}
@@ -820,7 +830,7 @@ pub fn update(app: &mut App, message: Message, runner: Arc<dyn CommandRunner>) -
         }
         // A stale probe result for a project that no longer exists.
         Message::VenvProbed(_, _) => {}
-        Message::DepsLoaded(i, fetch) if i < app.projects.len() => {
+        Message::DepsLoaded(i, fetch) if i < app.config.projects.len() => {
             let tab = deps::build(&fetch.pyproject, &fetch.installed, fetch.tree);
             app.deps = Some((i, tab));
         }
@@ -828,7 +838,7 @@ pub fn update(app: &mut App, message: Message, runner: Arc<dyn CommandRunner>) -
         // user has since moved away from -- `view` only ever reads
         // `app.deps` when its index still matches the current selection.
         Message::DepsLoaded(_, _) => {}
-        Message::MembersLoaded(i, fetch) if i < app.projects.len() => {
+        Message::MembersLoaded(i, fetch) if i < app.config.projects.len() => {
             app.members = Some((i, fetch));
         }
         // A stale fetch for a project that no longer exists, or that the
@@ -846,7 +856,7 @@ pub fn update(app: &mut App, message: Message, runner: Arc<dyn CommandRunner>) -
         Message::SyncRequested(i) => {
             app.context_menu = None;
             if app.syncing.is_none()
-                && let Some(project) = app.projects.get(i).cloned()
+                && let Some(project) = sync_target(app, i)
             {
                 let config = app.config.clone();
                 app.syncing = Some(project.id.to_string());
@@ -991,13 +1001,12 @@ pub fn update(app: &mut App, message: Message, runner: Arc<dyn CommandRunner>) -
                 // thread below, the same as every other blocking call in
                 // this file.
                 app.config.projects.push(project.clone());
-                app.projects.push(project.clone());
                 app.entries.push(sidebar::Entry {
                     label: project.label.clone(),
                     venv_exists: false,
                     python_version: None,
                 });
-                let index = app.projects.len() - 1;
+                let index = app.config.projects.len() - 1;
                 app.selected = Some(index);
                 // This path runs `uv sync -p <version>` too, so it claims the
                 // same single in-flight slot `SyncRequested` does. Without
@@ -1046,7 +1055,7 @@ pub fn update(app: &mut App, message: Message, runner: Arc<dyn CommandRunner>) -
             // Refreshes the sidebar entry the same way `boot` fills in every
             // other project's venv status, rather than trusting `success` to
             // imply a venv now exists.
-            if let Some(project) = app.projects.get(index).cloned()
+            if let Some(project) = app.config.projects.get(index).cloned()
                 && let Ok(path) = venv_path::resolve(&project, &app.config.settings)
             {
                 return Task::perform(probe_venv(path), move |version| {
@@ -1055,7 +1064,7 @@ pub fn update(app: &mut App, message: Message, runner: Arc<dyn CommandRunner>) -
             }
         }
         // A stale index can arrive the same way `ProjectSelected`'s can.
-        Message::ContextMenuOpened(i) if i < app.projects.len() => {
+        Message::ContextMenuOpened(i) if i < app.config.projects.len() => {
             app.context_menu = Some(context_menu::ContextMenu {
                 project_index: i,
                 terminals: Vec::new(),
@@ -1075,9 +1084,9 @@ pub fn update(app: &mut App, message: Message, runner: Arc<dyn CommandRunner>) -
                 menu.terminals = terminals;
             }
         }
-        Message::OpenTerminalRequested(i, choice) if i < app.projects.len() => {
+        Message::OpenTerminalRequested(i, choice) if i < app.config.projects.len() => {
             app.context_menu = None;
-            if let Some(project) = app.projects.get(i).cloned() {
+            if let Some(project) = app.config.projects.get(i).cloned() {
                 let config = app.config.clone();
                 return Task::perform(
                     open_terminal(choice, project, config, runner),
@@ -1097,13 +1106,12 @@ pub fn update(app: &mut App, message: Message, runner: Arc<dyn CommandRunner>) -
                 app.drawer.expanded = true;
             }
         }
-        Message::RemoveProjectRequested(i) if i < app.projects.len() => {
+        Message::RemoveProjectRequested(i) if i < app.config.projects.len() => {
             // In-memory first, synchronously -- the same discipline
             // `AddProjectConfirmed` uses, so the sidebar reflects the removal
             // the instant `update` returns rather than only once the
             // background persist lands.
             app.config.projects.remove(i);
-            app.projects.remove(i);
             app.entries.remove(i);
             // Indices shift on removal; `deps` is tagged with one, and a
             // shifted-but-uncleared tag would show a stale tab against
@@ -1117,8 +1125,8 @@ pub fn update(app: &mut App, message: Message, runner: Arc<dyn CommandRunner>) -
             app.members = None;
             app.confirm_member_sync = None;
             app.selected = match app.selected {
-                Some(s) if s == i => (!app.projects.is_empty())
-                    .then_some(i.min(app.projects.len().saturating_sub(1))),
+                Some(s) if s == i => (!app.config.projects.is_empty())
+                    .then_some(i.min(app.config.projects.len().saturating_sub(1))),
                 Some(s) if s > i => Some(s - 1),
                 other => other,
             };
@@ -1140,7 +1148,7 @@ pub fn update(app: &mut App, message: Message, runner: Arc<dyn CommandRunner>) -
         // way, like every other action taken from it.
         Message::RecreateVenvRequested(i) => {
             app.context_menu = None;
-            if let Some(project) = app.projects.get(i)
+            if let Some(project) = app.config.projects.get(i)
                 && let Ok(venv_path) = venv_path::resolve(project, &app.config.settings)
             {
                 app.confirm_recreate = Some(context_menu::ConfirmRecreate {
@@ -1158,7 +1166,7 @@ pub fn update(app: &mut App, message: Message, runner: Arc<dyn CommandRunner>) -
             // the user has answered the question and the dialog is done.
             if let Some(confirm) = app.confirm_recreate.take()
                 && app.syncing.is_none()
-                && let Some(project) = app.projects.get(confirm.project_index).cloned()
+                && let Some(project) = app.config.projects.get(confirm.project_index).cloned()
             {
                 let config = app.config.clone();
                 app.syncing = Some(project.id.to_string());
@@ -1180,7 +1188,7 @@ pub fn update(app: &mut App, message: Message, runner: Arc<dyn CommandRunner>) -
         }
         Message::OpenFolderRequested(i) => {
             app.context_menu = None;
-            if let Some(project) = app.projects.get(i).cloned() {
+            if let Some(project) = app.config.projects.get(i).cloned() {
                 return Task::perform(
                     open_folder(Os::host(), project, runner),
                     Message::OpenFolderFinished,
@@ -1228,12 +1236,11 @@ pub fn update(app: &mut App, message: Message, runner: Arc<dyn CommandRunner>) -
             // Resolved before the mutable borrow of `app.config` below, and
             // before this row's own current state (secret or not) is known
             // -- a `Project` scope's `SecretKey` needs the project's *id*,
-            // not its index, and `App::projects` is the only place that id
-            // lives once a stale index can no longer be trusted to resolve
-            // against `app.config.projects` (a removal shifts indices).
+            // not its index, since a removal shifts every later index while
+            // the id is stable.
             let project_id = match scope {
                 env_editor::EnvScope::Global => None,
-                env_editor::EnvScope::Project(i) => match app.projects.get(i) {
+                env_editor::EnvScope::Project(i) => match app.config.projects.get(i) {
                     Some(project) => Some(project.id),
                     // A stale index for a project that no longer exists.
                     None => return Task::none(),
@@ -1541,6 +1548,19 @@ pub fn update(app: &mut App, message: Message, runner: Arc<dyn CommandRunner>) -
         }
     }
     Task::none()
+}
+
+/// The project a Sync press for `projects[i]` acts on.
+///
+/// A function rather than an inline `.get(i)` so a test can assert the exact
+/// `Project` a press resolves to and hand it to `run_sync` -- the composed
+/// environment only exists on the job thread, so the resolution is the last
+/// point at which what the sync will run in is observable at all.
+fn sync_target(app: &App, i: usize) -> Option<Project> {
+    // `app.config.projects`, never a copy of it: this is the list every
+    // editor writes, so an edit made a moment ago is in the environment the
+    // sync composes. See `App::config`.
+    app.config.projects.get(i).cloned()
 }
 
 /// Dispatches a background persist of `app.config` as it stands right now,
@@ -2529,7 +2549,7 @@ pub fn view(app: &App) -> iced::Element<'_, Message> {
     // selected index has to survive as far as the button.
     let selected = app
         .selected
-        .and_then(|i| app.projects.get(i).map(|project| (i, project)));
+        .and_then(|i| app.config.projects.get(i).map(|project| (i, project)));
     let detail: iced::Element<'_, Message> = match selected {
         // The probe answers from the already-probed `entries` cache rather
         // than touching disk again on every frame -- `boot`'s background
@@ -2700,7 +2720,7 @@ mod tests {
     /// project, because the header's Sync button has to name what it acts on.
     fn selected_label(app: &App) -> Option<&str> {
         app.selected
-            .and_then(|i| app.projects.get(i))
+            .and_then(|i| app.config.projects.get(i))
             .map(|p| p.label.as_str())
     }
 
@@ -2731,7 +2751,7 @@ mod tests {
         // first frame, so the empty case has to be representable.
         let app = App::new(Config::default());
         assert!(app.selected.is_none());
-        assert!(app.projects.is_empty());
+        assert!(app.config.projects.is_empty());
     }
 
     #[test]
@@ -2950,7 +2970,7 @@ mod tests {
             message: "expected `=` at line 4".into(),
         });
 
-        assert!(app.projects.is_empty());
+        assert!(app.config.projects.is_empty());
         assert!(
             app.load_problems
                 .iter()
@@ -3098,7 +3118,7 @@ mod tests {
             ..Config::default()
         });
         assert_eq!(app.selected, Some(0), "api must be the selected project");
-        let web_id = app.projects[1].id.to_string();
+        let web_id = app.config.projects[1].id.to_string();
 
         let _ = update(&mut app, Message::ContextMenuOpened(1), unused_runner());
         assert_eq!(
@@ -3331,6 +3351,70 @@ mod tests {
             app.drawer.lines.iter().any(|l| l.contains("***")),
             "the failing line must still be shown, redacted; got {:?}",
             app.drawer.lines
+        );
+    }
+
+    #[test]
+    fn a_project_env_var_typed_this_session_reaches_the_very_next_sync() {
+        // `App` used to hold a startup clone of `config.projects` alongside
+        // `config.projects` itself. Every editor wrote the config; Sync, Open
+        // terminal and Recreate venv read the clone -- so a variable typed
+        // this session was simply absent from the environment uv ran in, an
+        // index credential was never injected (a 401 the drawer could not
+        // explain), and a pre-activate script never ran. Restarting "fixed"
+        // all of it, which is exactly why manual testing never caught it.
+        //
+        // Nothing in `App` distinguishes the two: `syncing` holds the same
+        // id and the drawer the same label either way. The resolution itself
+        // is the last observable point, so this asserts on the `Project` the
+        // press resolves and hands it to the same `run_sync` the dispatched
+        // job runs.
+        let config = Config {
+            projects: vec![project("api")],
+            settings: fake_uv_settings(),
+            ..Config::default()
+        };
+        let mut app = App::new(config);
+
+        for message in [
+            Message::EnvVarAdded(env_editor::EnvScope::Project(0)),
+            Message::EnvVarKeyChanged(env_editor::EnvScope::Project(0), 0, "MARKER".into()),
+            Message::EnvVarValueChanged(env_editor::EnvScope::Project(0), 0, "set".into()),
+        ] {
+            let _ = update(&mut app, message, unused_runner());
+        }
+
+        let task = update(&mut app, Message::SyncRequested(0), unused_runner());
+        assert!(task.units() > 0, "the Sync press must dispatch real work");
+
+        let target = sync_target(&app, 0).expect("the press must resolve a project");
+        let store = bombadil_core::secrets::InMemorySecretStore::new();
+        let runner = FakeCommandRunner::new();
+        version_probe(&runner);
+        runner.expect(
+            "uv",
+            &["sync"],
+            bombadil_core::process::CommandOutcome {
+                status: Some(0),
+                stdout: String::new(),
+                stderr: String::new(),
+            },
+        );
+
+        let (success, lines) = run_sync(&target, &app.config, &store, &runner);
+        assert!(success, "got {lines:?}");
+
+        let calls = runner.calls();
+        let sync = calls
+            .iter()
+            .find(|c| c.args.iter().any(|a| a == "sync"))
+            .expect("uv sync must have been run");
+        assert_eq!(
+            sync.env.get("MARKER").map(String::as_str),
+            Some("set"),
+            "a variable typed this session must be in the environment the very next sync \
+             runs in, not only after a restart; got {:?}",
+            sync.env.keys().collect::<Vec<_>>()
         );
     }
 
@@ -3717,8 +3801,8 @@ mod tests {
             "got {:?}",
             app.config.projects
         );
-        assert_eq!(app.projects.len(), 1);
-        assert_eq!(app.projects[0].label, "my-api");
+        assert_eq!(app.config.projects.len(), 1);
+        assert_eq!(app.config.projects[0].label, "my-api");
         assert_eq!(app.entries.len(), 1);
         assert!(
             app.add_project.is_none(),
@@ -4136,8 +4220,8 @@ mod tests {
             app.config.projects
         );
         assert_eq!(app.config.projects[0].label, "web");
-        assert_eq!(app.projects.len(), 1);
-        assert_eq!(app.projects[0].label, "web");
+        assert_eq!(app.config.projects.len(), 1);
+        assert_eq!(app.config.projects[0].label, "web");
         assert_eq!(app.entries.len(), 1);
         assert!(
             task.units() > 0,
@@ -4188,7 +4272,7 @@ mod tests {
             unused_runner(),
         );
 
-        assert!(app.projects.is_empty());
+        assert!(app.config.projects.is_empty());
         assert!(app.selected.is_none());
     }
 
@@ -4232,7 +4316,7 @@ mod tests {
         );
 
         assert_eq!(
-            app.projects.len(),
+            app.config.projects.len(),
             1,
             "an invalid index must change nothing"
         );
@@ -6032,7 +6116,7 @@ mod tests {
             },
             ..Config::default()
         });
-        let before = venv_path::resolve(&app.projects[0], &app.config.settings).unwrap();
+        let before = venv_path::resolve(&app.config.projects[0], &app.config.settings).unwrap();
         assert_eq!(before, dir.path().join(".venv"));
 
         let central = tempfile::tempdir().unwrap();
@@ -6048,7 +6132,7 @@ mod tests {
                 path: central.path().to_path_buf()
             }
         );
-        let after = venv_path::resolve(&app.projects[0], &app.config.settings).unwrap();
+        let after = venv_path::resolve(&app.config.projects[0], &app.config.settings).unwrap();
         assert_ne!(
             after, before,
             "the resolved path for a Default project must change with the setting"
@@ -6102,7 +6186,7 @@ mod tests {
             fake.clone(),
         );
 
-        let new_path = venv_path::resolve(&app.projects[0], &app.config.settings).unwrap();
+        let new_path = venv_path::resolve(&app.config.projects[0], &app.config.settings).unwrap();
         assert!(
             old_venv.exists() && old_venv.join("pyvenv.cfg").exists(),
             "the venv at the OLD resolved location must survive the settings change untouched"

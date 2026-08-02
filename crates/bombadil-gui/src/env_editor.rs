@@ -48,7 +48,8 @@ use uuid::Uuid;
 const REDACTED: &str = "(secret -- stored in the keychain)";
 
 /// Which list of variables a row edits: `Config::global_env`, or one
-/// project's `Project::env` addressed by its position in `App::projects`.
+/// project's `Project::env` addressed by its position in
+/// `App::config.projects`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EnvScope {
     Global,
@@ -68,9 +69,9 @@ pub fn vars_mut(config: &mut Config, scope: EnvScope) -> Option<&mut Vec<EnvVar>
 /// The keychain account a scope's variable named `key` lives under -- spec
 /// §5's two account shapes, `SecretKey::GlobalEnv` and `SecretKey::ProjectEnv`.
 /// `project_id` is the project's own id, not its index, so it must be
-/// resolved by the caller (`app::update`, which alone has both `App::config`
-/// and `App::projects` at hand); `None` for a `Global` scope is fine, since
-/// that branch never reads it.
+/// resolved by the caller (`app::update`, which reads it from
+/// `App::config.projects`); `None` for a `Global` scope is fine, since that
+/// branch never reads it.
 pub fn secret_key(scope: EnvScope, project_id: Option<Uuid>, key: &str) -> SecretKey {
     match scope {
         EnvScope::Global => SecretKey::GlobalEnv {

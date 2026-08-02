@@ -29,7 +29,8 @@ use bombadil_core::model::{Config, Script};
 use std::path::PathBuf;
 
 /// Which list of scripts a row edits: `Config::global_scripts`, or one
-/// project's `Project::scripts` addressed by its position in `App::projects`.
+/// project's `Project::scripts` addressed by its position in
+/// `App::config.projects`.
 /// Mirrors `env_editor::EnvScope`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ScriptScope {
