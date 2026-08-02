@@ -6,6 +6,7 @@
 use sha2::{Digest, Sha256};
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 /// The uv release embedded in this build.
 pub const BUNDLED_VERSION: &str = env!("BOMBADIL_UV_VERSION");
@@ -31,10 +32,22 @@ fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
+/// The embedded binary's digest, hashed once per process rather than on every
+/// call: `UV_BYTES` is a `~35 MB` `const`, so it cannot change within a
+/// process, and re-hashing it on every `extraction_path`/`ensure_extracted`
+/// call added up to well over 100 MB of hashing per app launch. This is
+/// deliberately distinct from the digest of the *extracted* file on disk in
+/// `ensure_extracted`, which must stay live: self-repair of a truncated or
+/// tampered extraction depends on that one being recomputed every time.
+fn embedded_digest() -> &'static [u8] {
+    static DIGEST: OnceLock<Vec<u8>> = OnceLock::new();
+    DIGEST.get_or_init(|| Sha256::digest(UV_BYTES).to_vec())
+}
+
 /// Where the extracted binary lives, keyed by version and content hash so a
 /// new build never reuses an old extraction.
 pub fn extraction_path(data_dir: &Path) -> PathBuf {
-    let digest = hex(&Sha256::digest(UV_BYTES));
+    let digest = hex(embedded_digest());
     data_dir
         .join("uv")
         .join(format!("{BUNDLED_VERSION}-{}", &digest[..12]))
@@ -55,7 +68,7 @@ pub fn ensure_extracted(data_dir: &Path) -> Result<PathBuf, ExtractError> {
     let path = extraction_path(data_dir);
 
     if let Ok(existing) = std::fs::read(&path)
-        && Sha256::digest(&existing) == Sha256::digest(UV_BYTES)
+        && Sha256::digest(&existing).as_slice() == embedded_digest()
     {
         return Ok(path);
     }
