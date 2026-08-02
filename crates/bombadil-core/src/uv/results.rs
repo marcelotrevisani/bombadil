@@ -62,7 +62,11 @@ pub enum TreeOutcome {
 
 #[derive(Deserialize)]
 struct RawSchema {
-    version: String,
+    /// Optional so that a schema object which is present but restructured by a
+    /// future uv degrades like any other unrecognised schema, instead of
+    /// failing deserialization of the whole document.
+    #[serde(default)]
+    version: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -80,9 +84,12 @@ pub fn parse_tree(json: &str) -> Result<TreeOutcome, ResultsError> {
     })?;
 
     match raw.schema {
-        Some(schema) if schema.version == TESTED_TREE_SCHEMA => Ok(TreeOutcome::Parsed(raw.roots)),
-        Some(schema) => Ok(TreeOutcome::UnsupportedSchema {
-            found: schema.version,
+        Some(schema) if schema.version.as_deref() == Some(TESTED_TREE_SCHEMA) => {
+            Ok(TreeOutcome::Parsed(raw.roots))
+        }
+        Some(RawSchema { version: Some(v) }) => Ok(TreeOutcome::UnsupportedSchema { found: v }),
+        Some(RawSchema { version: None }) => Ok(TreeOutcome::UnsupportedSchema {
+            found: "<no version field>".to_string(),
         }),
         None => Ok(TreeOutcome::UnsupportedSchema {
             found: "<absent>".to_string(),
@@ -169,5 +176,37 @@ mod tests {
     #[test]
     fn malformed_tree_json_is_an_error() {
         assert!(parse_tree("{{{").is_err());
+    }
+
+    #[test]
+    fn a_schema_object_without_a_version_degrades_too() {
+        // A future uv could restructure the schema object while still emitting the
+        // key. That must degrade like any unknown schema, not kill the app.
+        match parse_tree(r#"{"schema":{},"roots":[]}"#).unwrap() {
+            TreeOutcome::UnsupportedSchema { found } => assert_eq!(found, "<no version field>"),
+            other => panic!("expected UnsupportedSchema, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn valid_json_of_the_wrong_shape_is_an_error() {
+        // Degrading is for unrecognised *schemas*, not for input that is not a
+        // tree document at all.
+        assert!(
+            parse_tree(r#""string""#).is_err(),
+            "string should not deserialize as tree"
+        );
+        assert!(
+            parse_tree("123").is_err(),
+            "number should not deserialize as tree"
+        );
+        assert!(
+            parse_pip_list("true").is_err(),
+            "boolean should not deserialize as pip list"
+        );
+        assert!(
+            parse_pip_list("null").is_err(),
+            "null should not deserialize as pip list"
+        );
     }
 }
