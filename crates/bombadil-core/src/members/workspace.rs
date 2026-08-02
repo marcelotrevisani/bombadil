@@ -4,7 +4,10 @@ use serde::Deserialize;
 /// as members.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WorkspaceKind {
-    Workspace { member_globs: Vec<String> },
+    Workspace {
+        member_globs: Vec<String>,
+        exclude_globs: Vec<String>,
+    },
     Loose,
 }
 
@@ -12,6 +15,8 @@ pub enum WorkspaceKind {
 struct RawWorkspace {
     #[serde(default)]
     members: Vec<String>,
+    #[serde(default)]
+    exclude: Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -43,6 +48,7 @@ pub fn parse_workspace(pyproject_text: &str) -> WorkspaceKind {
     match raw.tool.and_then(|t| t.uv).and_then(|u| u.workspace) {
         Some(ws) => WorkspaceKind::Workspace {
             member_globs: ws.members,
+            exclude_globs: ws.exclude,
         },
         None => WorkspaceKind::Loose,
     }
@@ -84,8 +90,27 @@ version = "0.1.0"
 members = ["packages/*", "services/*"]
 "#;
         match parse_workspace(text) {
-            WorkspaceKind::Workspace { member_globs } => {
+            WorkspaceKind::Workspace { member_globs, .. } => {
                 assert_eq!(member_globs, vec!["packages/*", "services/*"]);
+            }
+            other => panic!("expected Workspace, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_workspace_root_reports_its_exclude_globs() {
+        let text = r#"
+[project]
+name = "root"
+version = "0.1.0"
+
+[tool.uv.workspace]
+members = ["packages/*"]
+exclude = ["packages/skipme"]
+"#;
+        match parse_workspace(text) {
+            WorkspaceKind::Workspace { exclude_globs, .. } => {
+                assert_eq!(exclude_globs, vec!["packages/skipme"]);
             }
             other => panic!("expected Workspace, got {other:?}"),
         }
@@ -104,7 +129,7 @@ members = ["packages/*", "services/*"]
         // start adding editable path dependencies to a real workspace.
         let text = "[project]\nname = \"root\"\nversion = \"0.1.0\"\n\n[tool.uv.workspace]\n";
         match parse_workspace(text) {
-            WorkspaceKind::Workspace { member_globs } => assert!(member_globs.is_empty()),
+            WorkspaceKind::Workspace { member_globs, .. } => assert!(member_globs.is_empty()),
             other => panic!("expected Workspace, got {other:?}"),
         }
     }
@@ -114,6 +139,17 @@ members = ["packages/*", "services/*"]
         // Discovery must never be the thing that makes the app unusable; a
         // malformed root manifest surfaces elsewhere, through pyproject::load.
         assert_eq!(parse_workspace("{{{ not toml"), WorkspaceKind::Loose);
+    }
+
+    #[test]
+    fn a_tool_uv_table_without_a_workspace_key_is_loose() {
+        // The common shape for a plain project: `[tool.uv]` present (e.g. to
+        // set `package = false`) but no `[tool.uv.workspace]` table. If this
+        // regressed, every non-workspace project would be misclassified as a
+        // workspace.
+        let text =
+            "[project]\nname = \"solo\"\nversion = \"0.1.0\"\n\n[tool.uv]\npackage = false\n";
+        assert_eq!(parse_workspace(text), WorkspaceKind::Loose);
     }
 
     #[test]

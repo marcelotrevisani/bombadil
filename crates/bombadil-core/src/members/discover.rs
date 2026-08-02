@@ -3,13 +3,19 @@ use std::path::{Path, PathBuf};
 
 /// How far below the project directory discovery walks.
 ///
+/// The depth check runs before a directory's own entries are read, so
+/// directories are examined at depths `0..=MAX_DISCOVERY_DEPTH` and a
+/// `pyproject.toml` can be found at depth `MAX_DISCOVERY_DEPTH + 1` (5 with
+/// the current value) — one level deeper than the constant's value suggests.
 /// Deep enough for `services/api/` and one level of nesting beyond it,
 /// shallow enough that a pathological tree cannot make Bombadil crawl a disk.
 pub const MAX_DISCOVERY_DEPTH: usize = 4;
 
 /// Directories never worth walking into: virtual environments, VCS metadata,
 /// dependency caches and build output. A `pyproject.toml` inside any of these
-/// belongs to something else.
+/// belongs to something else. Matching is case-insensitive, so `Build` and
+/// `.VENV` are skipped too. Every dot-prefixed directory is also skipped,
+/// regardless of whether its name appears in this list.
 pub const SKIPPED_DIRS: &[&str] = &[
     ".venv",
     "venv",
@@ -48,14 +54,33 @@ pub fn discover(project_dir: &Path, kind: &WorkspaceKind) -> Vec<DiscoveredMembe
     walk(project_dir, project_dir, 0, &mut found);
     found.sort_by(|a, b| a.relative_path.cmp(&b.relative_path));
 
-    if let WorkspaceKind::Workspace { member_globs } = kind {
+    if let WorkspaceKind::Workspace {
+        member_globs,
+        exclude_globs,
+    } = kind
+    {
         for member in &mut found {
-            let as_str = member.relative_path.to_string_lossy().replace('\\', "/");
-            member.is_workspace_member = member_globs.iter().any(|g| glob_matches(g, &as_str));
+            let as_str = as_forward_slash(&member.relative_path);
+            member.is_workspace_member = member_globs.iter().any(|g| glob_matches(g, &as_str))
+                && !exclude_globs.iter().any(|g| glob_matches(g, &as_str));
         }
     }
 
     found
+}
+
+/// Render a relative path as forward-slash-joined segments for glob matching.
+///
+/// Building the string from `components()` rather than
+/// `to_string_lossy().replace('\\', "/")` matters on Unix, where a directory
+/// can legitimately contain a literal backslash in its name: the naive
+/// replace would mangle `weird\name` into `weird/name`, which could then
+/// falsely match a glob like `weird/*`.
+fn as_forward_slash(path: &Path) -> String {
+    path.components()
+        .map(|c| c.as_os_str().to_string_lossy())
+        .collect::<Vec<_>>()
+        .join("/")
 }
 
 fn walk(root: &Path, dir: &Path, depth: usize, found: &mut Vec<DiscoveredMember>) {
@@ -75,7 +100,11 @@ fn walk(root: &Path, dir: &Path, depth: usize, found: &mut Vec<DiscoveredMember>
         }
         let name = entry.file_name();
         let name = name.to_string_lossy();
-        if SKIPPED_DIRS.contains(&name.as_ref()) || name.starts_with('.') {
+        if SKIPPED_DIRS
+            .iter()
+            .any(|skip| name.eq_ignore_ascii_case(skip))
+            || name.starts_with('.')
+        {
             continue;
         }
 
@@ -165,6 +194,46 @@ mod tests {
     }
 
     #[test]
+    fn a_manifest_at_the_deepest_reachable_level_is_found() {
+        // Pins the actual boundary: the depth guard sits before `read_dir`, so
+        // members are found one level deeper than MAX_DISCOVERY_DEPTH's value
+        // suggests. Level 5 here (a/b/c/d/e) must be found; one level deeper
+        // (a/b/c/d/e/f) must not be -- that is `stops_at_the_depth_cap` above.
+        let dir = tree(&[("a/b/c/d/e/pyproject.toml", "deep")]);
+        let found = discover(dir.path(), &WorkspaceKind::Loose);
+        assert_eq!(found.len(), 1, "got {found:?}");
+        assert_eq!(found[0].name.as_deref(), Some("deep"));
+    }
+
+    #[test]
+    fn a_hidden_directory_not_named_in_skipped_dirs_is_still_skipped() {
+        // SKIPPED_DIRS is not the whole rule: every dot-prefixed directory is
+        // skipped regardless of whether its name appears in the list.
+        let dir = tree(&[
+            ("packages/alpha/pyproject.toml", "alpha"),
+            (".internal/pyproject.toml", "hidden"),
+        ]);
+        let found = discover(dir.path(), &WorkspaceKind::Loose);
+        assert_eq!(found.len(), 1, "got {found:?}");
+        assert_eq!(found[0].name.as_deref(), Some("alpha"));
+    }
+
+    #[test]
+    fn skipped_dirs_matching_is_case_insensitive() {
+        // On macOS/Windows a directory named `.VENV` is the same directory as
+        // `.venv` and must be skipped too, or every vendored pyproject.toml
+        // under site-packages would be reported as a member.
+        let dir = tree(&[
+            ("packages/alpha/pyproject.toml", "alpha"),
+            (".VENV/lib/site-packages/evil/pyproject.toml", "evil"),
+            ("Build/tmp/pyproject.toml", "nope"),
+        ]);
+        let found = discover(dir.path(), &WorkspaceKind::Loose);
+        assert_eq!(found.len(), 1, "got {found:?}");
+        assert_eq!(found[0].name.as_deref(), Some("alpha"));
+    }
+
+    #[test]
     fn classifies_workspace_members_against_the_globs() {
         let dir = tree(&[
             ("packages/alpha/pyproject.toml", "alpha"),
@@ -172,6 +241,7 @@ mod tests {
         ]);
         let kind = WorkspaceKind::Workspace {
             member_globs: vec!["packages/*".to_string()],
+            exclude_globs: Vec::new(),
         };
 
         let found = discover(dir.path(), &kind);
@@ -189,6 +259,38 @@ mod tests {
             !helper.is_workspace_member,
             "a package outside the declared globs is present in the tree but is \
              not a workspace member, and uv sync --package would reject it"
+        );
+    }
+
+    #[test]
+    fn an_excluded_directory_matching_members_is_not_a_workspace_member() {
+        let dir = tree(&[
+            ("packages/alpha/pyproject.toml", "alpha"),
+            ("packages/skipme/pyproject.toml", "skipme"),
+        ]);
+        let kind = WorkspaceKind::Workspace {
+            member_globs: vec!["packages/*".to_string()],
+            exclude_globs: vec!["packages/skipme".to_string()],
+        };
+
+        let found = discover(dir.path(), &kind);
+
+        let alpha = found
+            .iter()
+            .find(|m| m.name.as_deref() == Some("alpha"))
+            .unwrap();
+        let skipme = found
+            .iter()
+            .find(|m| m.name.as_deref() == Some("skipme"))
+            .unwrap();
+        assert!(
+            alpha.is_workspace_member,
+            "matches members and no exclude glob"
+        );
+        assert!(
+            !skipme.is_workspace_member,
+            "matches members but is also excluded, and uv sync --package \
+             would reject it -- discovery must not mark it a member"
         );
     }
 
