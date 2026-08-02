@@ -52,7 +52,7 @@ jobs:
         with:
           version: "0.12.1"
       - name: Integration test
-        run: cargo test -p bombadil-core --locked --features uv-integration,test-support --test uv_integration
+        run: cargo test -p bombadil-core --locked --features uv-integration --test uv_integration
 
   deny:
     # Security advisories, license compatibility, banned/duplicate crates and

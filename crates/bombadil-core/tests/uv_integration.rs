@@ -1,6 +1,6 @@
 //! Proves the command builders and parsers agree with a real uv.
 //!
-//! Run with: cargo test -p bombadil-core --features uv-integration,test-support --test uv_integration
+//! Run with: cargo test -p bombadil-core --features uv-integration --test uv_integration
 #![cfg(feature = "uv-integration")]
 
 use bombadil_core::model::UvSource;
@@ -41,6 +41,11 @@ fn sync_add_and_list_agree_with_a_real_uv() {
     assert!(
         ctx.venv_path.join("pyvenv.cfg").exists(),
         "UV_PROJECT_ENVIRONMENT must place the venv where we asked"
+    );
+    assert!(
+        !project_dir.join(".venv").exists(),
+        "uv must not also create a venv inside the project directory; \
+         if it did, UV_PROJECT_ENVIRONMENT is being ignored"
     );
 
     // Add a tiny, dependency-free package.
