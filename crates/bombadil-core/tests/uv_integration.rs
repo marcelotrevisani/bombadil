@@ -543,18 +543,21 @@ fn which_zsh() -> Option<std::path::PathBuf> {
 
 /// Write `file` under `tmp`, launch `shell` with the `InitFile`'s
 /// `shell_args`/`env` (substituting `{file}`/`{dir}` for the file actually
-/// written, exactly as a real caller must), and return the first entry of
-/// the resulting `PATH`.
+/// written, exactly as a real caller must), and return the whole resulting
+/// `PATH`.
+///
+/// Returns `PATH` unsplit on purpose. An earlier version split on `':'` and
+/// compared the first field, which is wrong on Windows: a venv path is
+/// `C:\Users\...`, so the first field is the drive letter `C` and the test
+/// failed with `left: "C"`. `PATH`'s separator is not the same character on
+/// every platform and production code never splits it, so the parsing is
+/// removed rather than made conditional -- see `assert_venv_is_first`.
 ///
 /// The child inherits the ambient environment rather than a cleared one, and
 /// `HOME` is left untouched, so the shell really does read this machine's own
 /// rc files -- that is the whole point of this test file over the hermetic
 /// unit tests in `activation.rs`.
-fn first_path_entry_via_init_file(
-    shell: &std::path::Path,
-    tmp: &std::path::Path,
-    file: &InitFile,
-) -> String {
+fn path_via_init_file(shell: &std::path::Path, tmp: &std::path::Path, file: &InitFile) -> String {
     let path = tmp.join(&file.relative_path);
     std::fs::write(&path, &file.contents).unwrap();
     let dir = path.parent().unwrap().to_string_lossy().into_owned();
@@ -576,7 +579,28 @@ fn first_path_entry_via_init_file(
 
     let outcome = SystemCommandRunner.run(&spec).unwrap();
     assert!(outcome.success(), "shell failed: {}", outcome.stderr);
-    outcome.stdout.split(':').next().unwrap_or_default().into()
+    outcome.stdout
+}
+
+/// Assert `venv_bin` is the first entry of `path`, separator-agnostically.
+///
+/// A prefix test alone is not enough: a venv at `/a/b` would be satisfied by
+/// a `PATH` beginning `/a/bc`, so the character immediately after the prefix
+/// must actually end the entry -- `:` on unix, `;` on Windows, or end of
+/// string when the venv is the only entry.
+fn assert_venv_is_first(path: &str, venv_bin: &std::path::Path) {
+    let venv_str = venv_bin.to_string_lossy().to_string();
+    assert!(
+        path.starts_with(&venv_str),
+        "the venv must be first after the user's rc has run; got {path}"
+    );
+    match path[venv_str.len()..].chars().next() {
+        None | Some(':') | Some(';') => {}
+        Some(other) => panic!(
+            "the venv must be a whole PATH entry, not a prefix of a longer one; \
+             {venv_str} is followed by {other:?} in {path}"
+        ),
+    }
 }
 
 #[test]
@@ -604,12 +628,7 @@ fn the_generated_init_file_puts_the_venv_first_in_a_real_interactive_bash_shell(
 
     let file = init_file(ShellFamily::Bash, &venv_bin).expect("bash is a known shell");
 
-    let first = first_path_entry_via_init_file(&bash, tmp.path(), &file);
-    assert_eq!(
-        first,
-        venv_bin.to_string_lossy(),
-        "the venv must be first after the user's rc has run; got {first}"
-    );
+    assert_venv_is_first(&path_via_init_file(&bash, tmp.path(), &file), &venv_bin);
 }
 
 #[test]
@@ -635,10 +654,8 @@ fn the_generated_init_file_puts_the_venv_first_in_a_real_interactive_zsh_shell()
 
     let file = init_file(ShellFamily::Zsh, &venv_bin).expect("zsh is a known shell");
 
-    let first = first_path_entry_via_init_file(&zsh, tmp.path(), &file);
-    assert_eq!(
-        first,
-        venv_bin.to_string_lossy(),
-        "the venv must be first after the user's rc has run; got {first}"
-    );
+    // Same separator-agnostic assertion as the bash case: this one passes
+    // today only because macOS paths contain no colon, which is luck rather
+    // than correctness.
+    assert_venv_is_first(&path_via_init_file(&zsh, tmp.path(), &file), &venv_bin);
 }

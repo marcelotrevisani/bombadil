@@ -62,6 +62,18 @@ fn sq(path: &Path) -> String {
 pub fn init_file(family: ShellFamily, venv_bin: &Path) -> Option<InitFile> {
     let bin = sq(venv_bin);
     match family {
+        // TODO(windows): a Windows-style venv path is unusable in a Git Bash
+        // `PATH`. Inside Git Bash the separator IS `:`, and a Windows path
+        // contains one right after the drive letter, so
+        // `export PATH='C:\Users\...\Scripts':"$PATH"` is read as two
+        // entries -- `C` and `\Users\...\Scripts` -- neither of which exists.
+        // The path would have to be converted to POSIX form
+        // (`/c/Users/.../Scripts`) first. Not reachable in production today:
+        // `GitBash` is in the `PathOnly` bucket and its argv arm drops
+        // `shell_args` entirely, so this file is never sourced there. It
+        // goes live the moment anyone moves `GitBash` to `Full`, which is
+        // exactly the kind of well-meaning change made later -- see the
+        // matching TODO(windows) on Git Bash detection in detect.rs.
         ShellFamily::Bash => Some(InitFile {
             relative_path: PathBuf::from("bombadil-bashrc"),
             // Known limitation: most distro-default ~/.bash_profile files
