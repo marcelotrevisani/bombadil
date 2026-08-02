@@ -78,6 +78,15 @@ fn windows_binary_name(kind: TerminalKind) -> &'static str {
         WindowsTerminal => "wt",
         PowerShell => "powershell",
         Cmd => "cmd",
+        // TODO(windows): this probe is likely inverted. `where bash` on a
+        // stock Windows finds WSL's C:\Windows\System32\bash.exe -- a false
+        // positive, since that is not Git Bash -- while Git for Windows'
+        // own bash.exe lives under C:\Program Files\Git\bin and is normally
+        // NOT on PATH, giving a false negative on the machines that actually
+        // have it. Neither could be verified from the machine this was
+        // written on, so the code is left alone rather than guessed at;
+        // a real fix probably probes for git.exe and derives the sibling
+        // bash.exe path from it.
         GitBash => "bash",
         Wsl => "wsl",
         _ => unreachable!("{kind:?} is not a Windows terminal"),
