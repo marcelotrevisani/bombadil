@@ -4,6 +4,7 @@ use crate::context_menu;
 use crate::deps;
 use crate::detail;
 use crate::drawer;
+use crate::env_editor;
 use crate::interpreter;
 use crate::job;
 use crate::sidebar;
@@ -11,7 +12,7 @@ use bombadil_core::envspec::{self, EnvInputs};
 use bombadil_core::model::{Config, Project, Settings, TerminalChoice};
 use bombadil_core::process::CommandRunner;
 use bombadil_core::pyproject::PyProject;
-use bombadil_core::secrets::{KeyringSecretStore, SecretStore};
+use bombadil_core::secrets::{KeyringSecretStore, SecretKey, SecretStore};
 use bombadil_core::store::Loaded;
 use bombadil_core::terminal::open::secret_values;
 use bombadil_core::terminal::{self, Os, TerminalKind};
@@ -284,6 +285,31 @@ pub enum Message {
     /// licence text. Apache-2.0 section 4 obliges the text to be reachable,
     /// and this is what reaches it.
     AboutLicenseToggled,
+    /// The Env vars tab's "Add variable" button was pressed for `scope`
+    /// (spec §5, Task 2).
+    EnvVarAdded(env_editor::EnvScope),
+    /// A row's "remove" button was pressed.
+    EnvVarRemoved(env_editor::EnvScope, usize),
+    /// A row's key textbox changed. Never secret material -- a variable's
+    /// name is never hidden from the keychain, only its value.
+    EnvVarKeyChanged(env_editor::EnvScope, usize, String),
+    /// A row's value textbox changed. Carries the typed text in plaintext,
+    /// which is sound only because `env_editor::rows` renders no value
+    /// textbox at all for a row that is already marked secret -- see
+    /// `env_editor`'s module doc for the whole argument. This can never be
+    /// produced for a secret row.
+    EnvVarValueChanged(env_editor::EnvScope, usize, String),
+    /// A row's "secret" checkbox was toggled. Carries no value at all --
+    /// marking secret moves the plaintext already sitting in `app.config`
+    /// (where `EnvVarValueChanged` put it) into a `job::run` closure by
+    /// ordinary move semantics inside `update`, never through this message.
+    /// See `env_editor`'s module doc.
+    EnvVarSecretToggled(env_editor::EnvScope, usize),
+    /// The background half of an env var edit finished: a plain edit's
+    /// persist, or a secret toggle's keychain write/delete plus persist.
+    EnvVarPersistFinished {
+        success: bool,
+    },
 }
 
 impl App {
@@ -794,7 +820,7 @@ pub fn update(app: &mut App, message: Message, runner: Arc<dyn CommandRunner>) -
 
             let config = app.config.clone();
             let persist = app.persist.clone();
-            return Task::perform(persist_removal(config, persist), |success| {
+            return Task::perform(persist_config(config, persist), |success| {
                 Message::RemoveProjectFinished { success }
             });
         }
@@ -865,6 +891,83 @@ pub fn update(app: &mut App, message: Message, runner: Arc<dyn CommandRunner>) -
         }
         Message::AboutLicenseToggled => {
             app.about_expanded = !app.about_expanded;
+        }
+        Message::EnvVarAdded(scope) => {
+            if let Some(vars) = env_editor::vars_mut(&mut app.config, scope) {
+                env_editor::add_var(vars);
+            }
+            return persist_env_edit(app);
+        }
+        Message::EnvVarRemoved(scope, index) => {
+            if let Some(vars) = env_editor::vars_mut(&mut app.config, scope) {
+                env_editor::remove_var(vars, index);
+            }
+            return persist_env_edit(app);
+        }
+        Message::EnvVarKeyChanged(scope, index, key) => {
+            if let Some(vars) = env_editor::vars_mut(&mut app.config, scope) {
+                env_editor::set_key(vars, index, key);
+            }
+            return persist_env_edit(app);
+        }
+        // Sound only because `env_editor::rows` never produces this message
+        // for a row that is already secret -- see `env_editor`'s module doc.
+        Message::EnvVarValueChanged(scope, index, value) => {
+            if let Some(vars) = env_editor::vars_mut(&mut app.config, scope) {
+                env_editor::set_value(vars, index, value);
+            }
+            return persist_env_edit(app);
+        }
+        Message::EnvVarSecretToggled(scope, index) => {
+            // Resolved before the mutable borrow of `app.config` below, and
+            // before this row's own current state (secret or not) is known
+            // -- a `Project` scope's `SecretKey` needs the project's *id*,
+            // not its index, and `App::projects` is the only place that id
+            // lives once a stale index can no longer be trusted to resolve
+            // against `app.config.projects` (a removal shifts indices).
+            let project_id = match scope {
+                env_editor::EnvScope::Global => None,
+                env_editor::EnvScope::Project(i) => match app.projects.get(i) {
+                    Some(project) => Some(project.id),
+                    // A stale index for a project that no longer exists.
+                    None => return Task::none(),
+                },
+            };
+            let Some(vars) = env_editor::vars_mut(&mut app.config, scope) else {
+                return Task::none();
+            };
+            let Some(key_name) = vars.get(index).map(|var| var.key.clone()) else {
+                return Task::none();
+            };
+            let secret_key = env_editor::secret_key(scope, project_id, &key_name);
+
+            // In-memory first, synchronously -- the same discipline every
+            // other edit in this file uses -- then the keychain call and the
+            // persist that must agree with it happen together in one
+            // background job.
+            if let Some(plain_value) = env_editor::mark_secret(vars, index) {
+                let config = app.config.clone();
+                let persist = app.persist.clone();
+                return Task::perform(
+                    mark_secret_job(secret_key, plain_value, config, persist),
+                    |success| Message::EnvVarPersistFinished { success },
+                );
+            }
+            if env_editor::unmark_secret(vars, index) {
+                let config = app.config.clone();
+                let persist = app.persist.clone();
+                return Task::perform(unmark_secret_job(secret_key, config, persist), |success| {
+                    Message::EnvVarPersistFinished { success }
+                });
+            }
+        }
+        Message::EnvVarPersistFinished { success } => {
+            if !success {
+                drawer::set_idle(
+                    &mut app.drawer,
+                    "env var change failed to persist".to_string(),
+                );
+            }
         }
     }
     Task::none()
@@ -1519,18 +1622,116 @@ async fn open_folder(
     }
 }
 
-/// The blocking half of persisting a removal: just a save. Its own function,
-/// mirroring `run_confirm_add_project`, so a test can exercise it directly
-/// with a `FakeConfigPersist` instead of through `update`'s opaque `Task`.
+/// The blocking half of persisting a config, with nothing else to do: just a
+/// save. Its own function, mirroring `run_confirm_add_project`, so a test can
+/// exercise it directly with a `FakeConfigPersist` instead of through
+/// `update`'s opaque `Task`. Shared by every caller that only needs a plain
+/// save -- a removal, and the plain (non-secret-toggling) env var edits.
 fn run_persist(config: &Config, persist: &dyn ConfigPersist) -> bool {
     persist.save(config).is_ok()
 }
 
-/// Runs off the render thread via `job::run`: persisting the config after a
-/// removal is a blocking file write, same as every other `ConfigPersist` call
-/// in this file.
-async fn persist_removal(config: Config, persist: Arc<dyn ConfigPersist>) -> bool {
+/// Dispatches a background persist of `app.config` as it stands right now
+/// (criterion 5). Shared by every plain env var edit (add, remove, rename,
+/// retype a non-secret value) -- none of them touch the keychain, so a plain
+/// `persist_config` is the whole job, unlike `EnvVarSecretToggled`, which
+/// also has a keychain call that must land in the same background step.
+fn persist_env_edit(app: &App) -> Task<Message> {
+    let config = app.config.clone();
+    let persist = app.persist.clone();
+    Task::perform(persist_config(config, persist), |success| {
+        Message::EnvVarPersistFinished { success }
+    })
+}
+
+/// Runs off the render thread via `job::run`: persisting the config is a
+/// blocking file write, same as every other `ConfigPersist` call in this
+/// file.
+async fn persist_config(config: Config, persist: Arc<dyn ConfigPersist>) -> bool {
     match job::run(move || run_persist(&config, persist.as_ref()), SYNC_TIMEOUT).await {
+        job::JobResult::Done(success) => success,
+        job::JobResult::TimedOut | job::JobResult::Failed => false,
+    }
+}
+
+/// The blocking half of marking an env var secret (criterion 2): write the
+/// plaintext to the keychain, then persist the config -- which by the time
+/// this runs already has the value blanked in memory by
+/// `env_editor::mark_secret`. Both under one `job::run` call so a keychain
+/// write can never land while the on-disk config still disagrees with it.
+///
+/// `store` is a parameter so a test can hand in an `InMemorySecretStore` and
+/// assert both halves of criterion 2 -- the store holds the value, and
+/// `persist`'s recorded config does not; the real caller (`mark_secret_job`)
+/// supplies the keychain.
+fn run_secret_write(
+    key: &SecretKey,
+    plain_value: &str,
+    config: &Config,
+    store: &dyn SecretStore,
+    persist: &dyn ConfigPersist,
+) -> bool {
+    store.set(key, plain_value).is_ok() && persist.save(config).is_ok()
+}
+
+/// The blocking half of unmarking an env var secret (criterion 3): delete the
+/// keychain entry, then persist. Same pairing discipline as
+/// `run_secret_write`, and the same reason: an orphaned keychain entry (a
+/// delete that never happened) or a config that still claims secret (a
+/// persist that never happened) are each exactly the bug the two criteria
+/// exist to catch.
+fn run_secret_delete(
+    key: &SecretKey,
+    config: &Config,
+    store: &dyn SecretStore,
+    persist: &dyn ConfigPersist,
+) -> bool {
+    store.delete(key).is_ok() && persist.save(config).is_ok()
+}
+
+/// Runs off the render thread via `job::run`. `KeyringSecretStore` is
+/// constructed here, on the job thread, never taken as a parameter of
+/// `update` -- the same discipline `sync_project` and every other keychain
+/// call in this file follow, so no test can reach the real keychain through
+/// it.
+async fn mark_secret_job(
+    key: SecretKey,
+    plain_value: String,
+    config: Config,
+    persist: Arc<dyn ConfigPersist>,
+) -> bool {
+    match job::run(
+        move || {
+            run_secret_write(
+                &key,
+                &plain_value,
+                &config,
+                &KeyringSecretStore::new(),
+                persist.as_ref(),
+            )
+        },
+        SYNC_TIMEOUT,
+    )
+    .await
+    {
+        job::JobResult::Done(success) => success,
+        job::JobResult::TimedOut | job::JobResult::Failed => false,
+    }
+}
+
+/// Runs off the render thread via `job::run`. Same discipline as
+/// `mark_secret_job`.
+async fn unmark_secret_job(
+    key: SecretKey,
+    config: Config,
+    persist: Arc<dyn ConfigPersist>,
+) -> bool {
+    match job::run(
+        move || run_secret_delete(&key, &config, &KeyringSecretStore::new(), persist.as_ref()),
+        SYNC_TIMEOUT,
+    )
+    .await
+    {
         job::JobResult::Done(success) => success,
         job::JobResult::TimedOut | job::JobResult::Failed => false,
     }
@@ -1562,8 +1763,13 @@ pub fn view(app: &App) -> iced::Element<'_, Message> {
         _ => iced::widget::text("").into(),
     };
 
+    // Global variables are always shown; the project half only once a
+    // project is selected -- the same `app.selected` `env_editor::view`
+    // needs to know which project's `env` to show alongside them.
+    let env_vars_tab = env_editor::view(&app.config, app.selected);
+
     let detail_and_drawer =
-        iced::widget::column![detail, deps_tab, drawer::view(&app.drawer)].spacing(8);
+        iced::widget::column![detail, deps_tab, env_vars_tab, drawer::view(&app.drawer)].spacing(8);
 
     let add_project_button = iced::widget::button(iced::widget::text("Add project"))
         .on_press(Message::AddProjectPickManifestRequested);
@@ -3805,6 +4011,219 @@ mod tests {
 
         let _ = update(&mut app, Message::AboutLicenseToggled, unused_runner());
         assert!(!app.about_expanded);
+    }
+
+    // --- Task 2: the Env vars tab ---
+    //
+    // Criterion 1 (a project variable overriding a global one is shown as
+    // overriding, with both values visible) is covered by
+    // `env_editor::overrides`'s own tests in `env_editor.rs`: it is a pure
+    // function, and testing it directly there is a stronger proof than
+    // re-deriving the same claim by driving `update`'s opaque `Task`.
+
+    #[test]
+    fn marking_a_variable_secret_writes_the_store_and_leaves_config_empty() {
+        // Criterion 2, both halves the brief asks for in one test: the value
+        // ends up in the store, and nothing resembling it is left in the
+        // config that gets written to config.toml.
+        let key = SecretKey::GlobalEnv {
+            key: "TOKEN".into(),
+        };
+        let mut config = Config {
+            global_env: vec![bombadil_core::model::EnvVar {
+                key: "TOKEN".into(),
+                value: "hunter2".into(),
+                secret: false,
+            }],
+            ..Config::default()
+        };
+
+        // The in-memory half `update` runs synchronously before dispatching
+        // the background job.
+        let plain_value = env_editor::mark_secret(&mut config.global_env, 0)
+            .expect("a non-secret row must yield its plaintext");
+        assert_eq!(
+            config.global_env[0].value, "",
+            "got {:?}",
+            config.global_env[0].value
+        );
+        assert!(config.global_env[0].secret);
+
+        // The background half: never touches a real keychain, per the hard
+        // security constraint -- `InMemorySecretStore` only.
+        let store = bombadil_core::secrets::InMemorySecretStore::new();
+        let persist = FakeConfigPersist::default();
+        let success = run_secret_write(&key, &plain_value, &config, &store, &persist);
+
+        assert!(success);
+        assert_eq!(
+            store.get(&key).unwrap().as_deref(),
+            Some("hunter2"),
+            "the store must hold the value the user typed"
+        );
+        let saved = persist.saved();
+        assert_eq!(
+            saved.len(),
+            1,
+            "the config must be persisted alongside the write"
+        );
+        assert_eq!(
+            saved[0].global_env[0].value, "",
+            "the persisted config must never carry the secret's value"
+        );
+    }
+
+    #[test]
+    fn unmarking_a_variable_secret_deletes_the_keychain_entry() {
+        // Criterion 3, for a project-scoped secret -- the account shape
+        // (`SecretKey::ProjectEnv`) that `GlobalEnv` alone would not catch a
+        // mix-up in.
+        let project_id = uuid::Uuid::from_u128(9);
+        let key = SecretKey::ProjectEnv {
+            project_id,
+            key: "TOKEN".into(),
+        };
+        let store = bombadil_core::secrets::InMemorySecretStore::new();
+        store.set(&key, "hunter2").unwrap();
+
+        let mut proj = project("api");
+        proj.id = project_id;
+        proj.env = vec![bombadil_core::model::EnvVar {
+            key: "TOKEN".into(),
+            value: String::new(),
+            secret: true,
+        }];
+        let mut config = Config {
+            projects: vec![proj],
+            ..Config::default()
+        };
+
+        let owed = env_editor::unmark_secret(&mut config.projects[0].env, 0);
+        assert!(owed, "a secret row must report a delete as owed");
+        assert!(!config.projects[0].env[0].secret);
+
+        let persist = FakeConfigPersist::default();
+        let success = run_secret_delete(&key, &config, &store, &persist);
+
+        assert!(success);
+        assert_eq!(
+            store.get(&key).unwrap(),
+            None,
+            "the keychain entry must be gone, not orphaned"
+        );
+        assert!(
+            !persist.saved()[0].projects[0].env[0].secret,
+            "the persisted config must record the row as no longer secret"
+        );
+    }
+
+    #[test]
+    fn the_message_that_triggers_marking_secret_never_carries_the_value() {
+        // Criterion 4, and the design question the brief asks to be
+        // answered rather than guessed at: `EnvVarSecretToggled` is what a
+        // real checkbox press sends into `update` to start the whole
+        // mark-secret flow, and it carries only `scope` and `index` -- there
+        // is no field for a value to hide in, so its derived `Debug` cannot
+        // print one no matter what the row's plaintext was.
+        let mut app = App::new(Config {
+            global_env: vec![bombadil_core::model::EnvVar {
+                key: "TOKEN".into(),
+                value: "hunter2".into(),
+                secret: false,
+            }],
+            ..Config::default()
+        });
+
+        let toggle = Message::EnvVarSecretToggled(env_editor::EnvScope::Global, 0);
+        assert!(
+            !format!("{toggle:?}").contains("hunter2"),
+            "the message that triggers the write must not carry the value"
+        );
+
+        let _ = update(&mut app, toggle, unused_runner());
+
+        // The value has now actually moved out of `Config` (see the
+        // previous test for where it went) -- so there is nothing left in
+        // `app.config` for any later `Debug` render to print either.
+        assert_eq!(app.config.global_env[0].value, "");
+        assert!(app.config.global_env[0].secret);
+
+        let finished = Message::EnvVarPersistFinished { success: true };
+        assert!(!format!("{finished:?}").contains("hunter2"));
+    }
+
+    #[test]
+    fn adding_a_global_env_var_persists_through_config_persist() {
+        // Criterion 5.
+        let mut app = App::new(Config::default());
+        let persist = Arc::new(FakeConfigPersist::default());
+        app.persist = persist.clone();
+
+        let task = update(
+            &mut app,
+            Message::EnvVarAdded(env_editor::EnvScope::Global),
+            unused_runner(),
+        );
+
+        assert_eq!(
+            app.config.global_env.len(),
+            1,
+            "in-memory must reflect the add the instant update returns"
+        );
+        assert!(
+            task.units() > 0,
+            "the add must dispatch a background persist"
+        );
+        assert!(
+            persist.saved().is_empty(),
+            "persist.save must not be called synchronously inside update"
+        );
+
+        // `Task` is opaque and never driven in a unit test in this file;
+        // every other background call is proven by running its async half
+        // directly instead, and this follows the same convention.
+        let success = block_on(persist_config(app.config.clone(), persist.clone()));
+
+        assert!(success);
+        assert_eq!(
+            persist.saved().last().unwrap().global_env.len(),
+            1,
+            "the persisted config must carry the edit, or it vanishes on restart"
+        );
+    }
+
+    #[test]
+    fn editing_a_value_persists_through_config_persist() {
+        // Criterion 5 again, for a plain (non-secret) edit rather than an
+        // add -- a different message, so it earns its own proof rather than
+        // trusting the shared `persist_env_edit` helper by association.
+        let mut app = App::new(Config {
+            global_env: vec![bombadil_core::model::EnvVar {
+                key: "HTTP_PROXY".into(),
+                value: "http://old".into(),
+                secret: false,
+            }],
+            ..Config::default()
+        });
+        let persist = Arc::new(FakeConfigPersist::default());
+        app.persist = persist.clone();
+
+        let _ = update(
+            &mut app,
+            Message::EnvVarValueChanged(env_editor::EnvScope::Global, 0, "http://new".into()),
+            unused_runner(),
+        );
+
+        assert_eq!(app.config.global_env[0].value, "http://new");
+
+        let success = block_on(persist_config(app.config.clone(), persist.clone()));
+
+        assert!(success);
+        assert_eq!(
+            persist.saved().last().unwrap().global_env[0].value,
+            "http://new",
+            "the persisted config must carry the retyped value"
+        );
     }
 
     fn project(label: &str) -> bombadil_core::model::Project {

@@ -6,6 +6,7 @@ mod context_menu;
 mod deps;
 mod detail;
 mod drawer;
+mod env_editor;
 mod interpreter;
 mod job;
 mod sidebar;
