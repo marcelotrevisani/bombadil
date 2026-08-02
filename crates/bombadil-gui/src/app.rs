@@ -5,6 +5,7 @@ use crate::deps;
 use crate::detail;
 use crate::drawer;
 use crate::env_editor;
+use crate::index_editor;
 use crate::interpreter;
 use crate::job;
 use crate::scripts_editor;
@@ -143,6 +144,19 @@ pub struct App {
     /// wrong project -- the same staleness guard `entries`/`VenvProbed` uses.
     /// `None` before the first fetch lands.
     pub deps: Option<(usize, deps::DepsTab)>,
+    /// What the user has typed so far into each `config.indexes` row's
+    /// credential textbox (spec §7, Task 4) -- always the same length as
+    /// `config.indexes`, kept in step by `IndexAdded`/`IndexRemoved`.
+    ///
+    /// Deliberately *not* a `Config` field: `IndexAuth` has no plaintext
+    /// variant for a password to sit in even transiently (unlike
+    /// `EnvVar::value`), so there is nowhere in `Config` this could go
+    /// without writing credential material to disk. See `index_editor`'s
+    /// module doc for the fuller argument. Cleared the instant its text is
+    /// handed to the keychain job (`IndexCredentialSaveRequested`) -- so
+    /// this never holds a credential any longer than the user is actively
+    /// typing it.
+    pub index_credential_drafts: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -335,6 +349,46 @@ pub enum Message {
     ScriptPersistFinished {
         success: bool,
     },
+    /// The Indexes tab's "Add index" button was pressed (spec §7, Task 4).
+    IndexAdded,
+    /// A row's "remove" button was pressed.
+    IndexRemoved(usize),
+    /// A row's name textbox changed. Plaintext, and validated for
+    /// credential-variable collisions (criterion 2) by `index_editor::view`
+    /// re-deriving `collision_message` on every render -- never secret
+    /// material, the same as an env var's key.
+    IndexNameChanged(usize, String),
+    IndexUrlChanged(usize, String),
+    /// The kind button was pressed: flips `Default`/`Extra` for this row.
+    IndexKindChanged(usize, bombadil_core::model::IndexKind),
+    /// The "default for new projects" checkbox was toggled.
+    IndexDefaultToggled(usize),
+    /// One of the three auth-kind buttons was pressed.
+    IndexAuthChoiceChanged(usize, index_editor::AuthChoice),
+    /// The username textbox changed. Plaintext -- `IndexAuth::Basic`'s
+    /// username is not secret, only the password/token paired with it is.
+    IndexUsernameChanged(usize, String),
+    /// The credential textbox changed. Carries the typed text wrapped in
+    /// `index_editor::CredentialInput`, whose hand-written `Debug` never
+    /// prints it -- see `index_editor`'s module doc for why, unlike an env
+    /// var's value, this can never be an ordinary `String` field here.
+    IndexCredentialChanged(usize, index_editor::CredentialInput),
+    /// The "save credential" button was pressed for `config.indexes[usize]`.
+    /// Only ever dispatched when `index_editor::collision_message` is `None`
+    /// for this row's current name (criterion 2) -- `view` disables the
+    /// button otherwise, so this arm never has to re-check before writing.
+    IndexCredentialSaveRequested(usize),
+    /// The background half of an index edit finished: a plain field edit's
+    /// persist, a credential save's keychain write plus persist, or a
+    /// project's selection toggle's persist.
+    IndexPersistFinished {
+        success: bool,
+    },
+    /// A project index checkbox was toggled: `usize` is the project's index
+    /// in `app.projects`/`app.config.projects`, `String` the index name
+    /// (criterion 3). Adds or removes the association only -- never reaches
+    /// `Config::indexes`, so the index itself is untouched either way.
+    ProjectIndexToggled(usize, String),
 }
 
 impl App {
@@ -345,6 +399,10 @@ impl App {
         // `boot` kicks off the real probes and `update` fills results in as
         // they land.
         let entries = sidebar::entries(&config);
+        // One blank draft per already-configured index, matching what
+        // `IndexAdded`/`IndexRemoved` keep in step with `config.indexes`
+        // from here on.
+        let index_credential_drafts = vec![String::new(); config.indexes.len()];
         Self {
             config,
             projects,
@@ -359,6 +417,7 @@ impl App {
             confirm_recreate: None,
             about_expanded: false,
             deps: None,
+            index_credential_drafts,
         }
     }
 }
@@ -1038,6 +1097,89 @@ pub fn update(app: &mut App, message: Message, runner: Arc<dyn CommandRunner>) -
                     "script change failed to persist".to_string(),
                 );
             }
+        }
+        Message::IndexAdded => {
+            index_editor::add_index(&mut app.config.indexes);
+            app.index_credential_drafts.push(String::new());
+            return persist_index_edit(app);
+        }
+        Message::IndexRemoved(i) => {
+            index_editor::remove_index(&mut app.config.indexes, i);
+            // Kept in step with `config.indexes` -- see
+            // `App::index_credential_drafts`'s own doc.
+            if i < app.index_credential_drafts.len() {
+                app.index_credential_drafts.remove(i);
+            }
+            return persist_index_edit(app);
+        }
+        Message::IndexNameChanged(i, name) => {
+            index_editor::set_name(&mut app.config.indexes, i, name);
+            return persist_index_edit(app);
+        }
+        Message::IndexUrlChanged(i, url) => {
+            index_editor::set_url(&mut app.config.indexes, i, url);
+            return persist_index_edit(app);
+        }
+        Message::IndexKindChanged(i, kind) => {
+            index_editor::set_kind(&mut app.config.indexes, i, kind);
+            return persist_index_edit(app);
+        }
+        Message::IndexDefaultToggled(i) => {
+            index_editor::toggle_default_for_new_projects(&mut app.config.indexes, i);
+            return persist_index_edit(app);
+        }
+        Message::IndexAuthChoiceChanged(i, choice) => {
+            index_editor::set_auth_choice(&mut app.config.indexes, i, choice);
+            return persist_index_edit(app);
+        }
+        Message::IndexUsernameChanged(i, username) => {
+            index_editor::set_username(&mut app.config.indexes, i, username);
+            return persist_index_edit(app);
+        }
+        // Never persisted, and no job dispatched: this is App-local scratch
+        // state, never `Config` -- see `App::index_credential_drafts`'s doc.
+        Message::IndexCredentialChanged(i, input) => {
+            if let Some(slot) = app.index_credential_drafts.get_mut(i) {
+                *slot = input.0;
+            }
+        }
+        // Criterion 1 and criterion 2 together: writes to the keychain under
+        // `SecretKey::Index`, never `Config` (`mark_secret_job` -> `run_secret_write`
+        // -> `store.set`, then `persist.save(config)`, and `config` never
+        // gained a credential field to carry one in), and only for a name
+        // that does not currently collide with another's credential
+        // variable -- `view` already disables the button that sends this for
+        // a colliding row, but the guard is repeated here so nothing else
+        // that might someday construct this message can bypass it.
+        Message::IndexCredentialSaveRequested(i) => {
+            if let Some((key, plain_value)) =
+                index_editor::credential_save(&app.config, &app.index_credential_drafts, i)
+            {
+                // Cleared the instant it is handed off -- criterion 4's other
+                // angle: this must not keep sitting in `App` state, readable
+                // by a later render, any longer than typing takes.
+                app.index_credential_drafts[i] = String::new();
+                let config = app.config.clone();
+                let persist = app.persist.clone();
+                return Task::perform(
+                    mark_secret_job(key, plain_value, config, persist),
+                    |success| Message::IndexPersistFinished { success },
+                );
+            }
+        }
+        Message::IndexPersistFinished { success } => {
+            if !success {
+                drawer::set_idle(
+                    &mut app.drawer,
+                    "index change failed to persist".to_string(),
+                );
+            }
+        }
+        Message::ProjectIndexToggled(project_index, name) => {
+            if let Some(project) = app.config.projects.get_mut(project_index) {
+                index_editor::toggle_selected(&mut project.index_names, &name);
+            }
+            return persist_index_edit(app);
         }
     }
     Task::none()
@@ -1737,6 +1879,23 @@ fn persist_script_edit(app: &App) -> Task<Message> {
     })
 }
 
+/// Dispatches a background persist of `app.config` as it stands right now,
+/// for an index edit that does not touch the keychain (add, remove, a field
+/// edit, a project's selection toggle). Mirrors `persist_env_edit` and
+/// `persist_script_edit` exactly.
+///
+/// `IndexCredentialSaveRequested` does *not* go through this: a credential
+/// save's persist has to land in the same background job as the keychain
+/// write, the same pairing `EnvVarSecretToggled` needs -- see
+/// `mark_secret_job`, which it dispatches directly instead.
+fn persist_index_edit(app: &App) -> Task<Message> {
+    let config = app.config.clone();
+    let persist = app.persist.clone();
+    Task::perform(persist_config(config, persist), |success| {
+        Message::IndexPersistFinished { success }
+    })
+}
+
 /// Runs off the render thread via `job::run`: persisting the config is a
 /// blocking file write, same as every other `ConfigPersist` call in this
 /// file.
@@ -1787,6 +1946,13 @@ fn run_secret_delete(
 /// `update` -- the same discipline `sync_project` and every other keychain
 /// call in this file follow, so no test can reach the real keychain through
 /// it.
+///
+/// Shared verbatim by `IndexCredentialSaveRequested` (Task 4): writing a
+/// plaintext value under some `SecretKey` and persisting the config that no
+/// longer carries it is exactly the same pairing an index credential save
+/// needs, and index credentials have no analogue of `mark_secret`'s
+/// in-memory half to call first -- `IndexAuth` never held the plaintext to
+/// begin with, so there is nothing to blank.
 async fn mark_secret_job(
     key: SecretKey,
     plain_value: String,
@@ -1865,11 +2031,16 @@ pub fn view(app: &App) -> iced::Element<'_, Message> {
     // project's own scripts once one is selected.
     let scripts_tab = scripts_editor::view(&app.config, app.selected);
 
+    // Every configured index, plus (once a project is selected) that
+    // project's own selection among them (spec §7, Task 4).
+    let indexes_tab = index_editor::view(&app.config, app.selected, &app.index_credential_drafts);
+
     let detail_and_drawer = iced::widget::column![
         detail,
         deps_tab,
         env_vars_tab,
         scripts_tab,
+        indexes_tab,
         drawer::view(&app.drawer)
     ]
     .spacing(8);
@@ -4525,6 +4696,264 @@ mod tests {
         assert_eq!(
             app.config.projects[0].scripts[0].path,
             PathBuf::from("/p-b.sh")
+        );
+    }
+
+    // --- Task 4: the Indexes tab ---
+    //
+    // The collision check (criterion 2) and the selection invariant
+    // (criterion 3) are proven directly against `index_editor`'s own pure
+    // functions in its own test module -- a stronger proof than re-deriving
+    // the same claim by driving `update`'s opaque `Task`. What belongs here
+    // is the wiring: that a real message reaches those functions, that a
+    // credential save actually lands in the store and nowhere in `Config`
+    // (criterion 1), and that nothing here can ever print one (criterion 4).
+
+    fn index_with_auth(
+        name: &str,
+        auth: bombadil_core::model::IndexAuth,
+    ) -> bombadil_core::model::Index {
+        bombadil_core::model::Index {
+            name: name.into(),
+            url: format!("https://{name}.example/simple"),
+            kind: bombadil_core::model::IndexKind::Extra,
+            default_for_new_projects: false,
+            auth,
+        }
+    }
+
+    #[test]
+    fn saving_an_index_credential_writes_the_store_and_leaves_config_untouched() {
+        // Criterion 1: assert both halves -- the store holds the value the
+        // user typed, and the persisted `Config` carries no trace of it
+        // anywhere. `Index` has no plaintext field a credential could land in
+        // even by accident (see `index_editor`'s module doc), so the
+        // equality check below and the `Debug`-text check are both
+        // belt-and-suspenders against a future field addition doing exactly
+        // that, not just a claim that passes by the type's current shape.
+        let idx = index_with_auth(
+            "priv",
+            bombadil_core::model::IndexAuth::Basic {
+                username: "alice".into(),
+            },
+        );
+        let mut app = App::new(Config {
+            indexes: vec![idx.clone()],
+            ..Config::default()
+        });
+        let persist = Arc::new(FakeConfigPersist::default());
+        app.persist = persist.clone();
+        app.index_credential_drafts = vec!["hunter2".to_string()];
+
+        // What `update` is actually expected to hand the keychain job --
+        // derived the same way `update` derives it (`index_editor::credential_save`),
+        // not hardcoded here, so a mutation to either the key or the value it
+        // builds is caught below rather than only by `index_editor`'s own
+        // test of that function in isolation.
+        let (key, value) =
+            index_editor::credential_save(&app.config, &app.index_credential_drafts, 0)
+                .expect("nothing here should block the save");
+        assert_eq!(
+            key,
+            SecretKey::Index {
+                name: "priv".into()
+            },
+            "a credential must be addressed by SecretKey::Index, not any other shape"
+        );
+
+        let task = update(
+            &mut app,
+            Message::IndexCredentialSaveRequested(0),
+            unused_runner(),
+        );
+
+        assert!(
+            task.units() > 0,
+            "the keychain write must be dispatched as background work, not run inline"
+        );
+        assert_eq!(
+            app.index_credential_drafts[0], "",
+            "the draft must be cleared the instant it is handed off"
+        );
+        assert!(
+            persist.saved().is_empty(),
+            "persist.save must not be called synchronously inside update"
+        );
+
+        // The background half: never touches a real keychain, per the hard
+        // security constraint -- `InMemorySecretStore` only, driven through
+        // `run_secret_write` directly rather than the real caller
+        // (`mark_secret_job`), which always constructs a `KeyringSecretStore`.
+        // Same substitution the existing env-var secret test makes for the
+        // same reason.
+        let store = bombadil_core::secrets::InMemorySecretStore::new();
+        let success = run_secret_write(&key, &value, &app.config, &store, persist.as_ref());
+
+        assert!(success);
+        assert_eq!(
+            store.get(&key).unwrap().as_deref(),
+            Some("hunter2"),
+            "the store must hold the value the user typed"
+        );
+
+        let saved = persist.saved();
+        assert_eq!(
+            saved.len(),
+            1,
+            "the config must be persisted alongside the write"
+        );
+        assert_eq!(
+            saved[0].indexes[0], idx,
+            "the persisted index must be unchanged -- no field gained the credential"
+        );
+        let rendered = format!("{:?}", saved[0]);
+        assert!(
+            !rendered.contains("hunter2"),
+            "the persisted config must never carry the credential, even in Debug; got:\n{rendered}"
+        );
+    }
+
+    #[test]
+    fn a_colliding_index_name_dispatches_no_credential_save() {
+        // Criterion 2: the message a real "save credential" press sends
+        // never reaches the keychain when the row's current name collides
+        // with another's credential variable -- caught here, before the
+        // background job (and so before `inject`'s own later refusal) rather
+        // than only at sync time.
+        let a = index_with_auth("my-index", bombadil_core::model::IndexAuth::None);
+        let b = index_with_auth(
+            "my_index",
+            bombadil_core::model::IndexAuth::Basic {
+                username: "alice".into(),
+            },
+        );
+        let mut app = App::new(Config {
+            indexes: vec![a, b],
+            ..Config::default()
+        });
+        app.index_credential_drafts = vec![String::new(), "hunter2".to_string()];
+        let persist = Arc::new(FakeConfigPersist::default());
+        app.persist = persist.clone();
+
+        let task = update(
+            &mut app,
+            Message::IndexCredentialSaveRequested(1),
+            unused_runner(),
+        );
+
+        assert_eq!(
+            task.units(),
+            0,
+            "a colliding row must dispatch nothing, not attempt the write anyway"
+        );
+        assert_eq!(
+            app.index_credential_drafts[1], "hunter2",
+            "the draft must be left untouched since nothing was saved"
+        );
+        assert!(persist.saved().is_empty());
+    }
+
+    #[test]
+    fn no_index_message_ever_prints_the_credential_in_debug() {
+        // Criterion 4, at the `Message` level: every message this tab's
+        // widgets can actually send, checked against the one string that
+        // must never appear in any of their `Debug` renderings.
+        let secret = "hunter2";
+        let messages: Vec<Message> = vec![
+            Message::IndexCredentialChanged(0, index_editor::CredentialInput(secret.to_string())),
+            Message::IndexCredentialSaveRequested(0),
+            Message::IndexPersistFinished { success: true },
+            Message::IndexPersistFinished { success: false },
+        ];
+        for msg in &messages {
+            let rendered = format!("{msg:?}");
+            assert!(
+                !rendered.contains(secret),
+                "message must never print the credential; got {rendered:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn toggling_a_project_index_updates_only_that_projects_selection() {
+        // Criterion 3, the wiring: the message a real checkbox press sends
+        // reaches `index_editor::toggle_selected` on the right project's
+        // `index_names`, and `Config::indexes` -- the shared configuration --
+        // is provably still there afterwards.
+        let idx = index_with_auth("priv", bombadil_core::model::IndexAuth::None);
+        let mut proj = project("api");
+        proj.index_names = vec!["priv".to_string()];
+        let mut app = App::new(Config {
+            indexes: vec![idx],
+            projects: vec![proj],
+            ..Config::default()
+        });
+        let persist = Arc::new(FakeConfigPersist::default());
+        app.persist = persist.clone();
+
+        let task = update(
+            &mut app,
+            Message::ProjectIndexToggled(0, "priv".to_string()),
+            unused_runner(),
+        );
+
+        assert!(
+            app.config.projects[0].index_names.is_empty(),
+            "deselecting must remove the association"
+        );
+        assert_eq!(
+            app.config.indexes.len(),
+            1,
+            "deselecting must never remove the configured index itself"
+        );
+        assert_eq!(app.config.indexes[0].name, "priv");
+        assert!(
+            task.units() > 0,
+            "the change must dispatch a background persist"
+        );
+        assert!(persist.saved().is_empty());
+
+        let success = block_on(persist_config(app.config.clone(), persist.clone()));
+        assert!(success);
+        assert!(
+            persist.saved().last().unwrap().projects[0]
+                .index_names
+                .is_empty(),
+            "the persisted config must carry the deselection"
+        );
+        assert_eq!(
+            persist.saved().last().unwrap().indexes.len(),
+            1,
+            "the persisted config must still carry the configured index"
+        );
+    }
+
+    #[test]
+    fn adding_and_removing_an_index_keeps_the_credential_drafts_in_step() {
+        let mut app = App::new(Config::default());
+
+        let _ = update(&mut app, Message::IndexAdded, unused_runner());
+        let _ = update(&mut app, Message::IndexAdded, unused_runner());
+        assert_eq!(app.config.indexes.len(), 2);
+        assert_eq!(
+            app.index_credential_drafts.len(),
+            2,
+            "one draft slot per configured index"
+        );
+
+        let _ = update(
+            &mut app,
+            Message::IndexCredentialChanged(1, index_editor::CredentialInput("typing".into())),
+            unused_runner(),
+        );
+        assert_eq!(app.index_credential_drafts[1], "typing");
+
+        let _ = update(&mut app, Message::IndexRemoved(0), unused_runner());
+        assert_eq!(app.config.indexes.len(), 1);
+        assert_eq!(
+            app.index_credential_drafts.len(),
+            1,
+            "removing a row must remove its draft slot too"
         );
     }
 

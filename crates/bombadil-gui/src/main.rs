@@ -7,6 +7,7 @@ mod deps;
 mod detail;
 mod drawer;
 mod env_editor;
+mod index_editor;
 mod interpreter;
 mod job;
 mod scripts_editor;
