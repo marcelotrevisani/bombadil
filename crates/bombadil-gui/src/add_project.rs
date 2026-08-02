@@ -134,10 +134,29 @@ fn needs_install_offer(draft: &Draft) -> bool {
 /// dialog, where the id must be real and unique -- one function rather than
 /// two, since generating a `Uuid::new_v4()` for a display-only resolve costs
 /// nothing.
+/// The label for a manifest with no `[project]` table: the project
+/// directory's own name, which is what the user picked and recognises.
+///
+/// The nameless workspace root is deliberately supported (see `draft_from`),
+/// so `unwrap_or_default()` is not a "cannot happen" fallback -- it renders
+/// as a bare sidebar marker with nothing after it and a blank detail header.
+/// Empty only for a manifest path with no directory component at all, which
+/// `venv_path::resolve` already refuses for its own reasons.
+fn fallback_label(pyproject_path: &Path) -> String {
+    pyproject_path
+        .parent()
+        .and_then(Path::file_name)
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default()
+}
+
 pub fn to_project(draft: &Draft) -> Project {
     Project {
         id: Uuid::new_v4(),
-        label: draft.name.clone().unwrap_or_default(),
+        label: draft
+            .name
+            .clone()
+            .unwrap_or_else(|| fallback_label(&draft.pyproject_path)),
         pyproject_path: draft.pyproject_path.clone(),
         index_names: Vec::new(),
         venv: match &draft.venv_choice {
@@ -467,6 +486,29 @@ requires-python = ">=3.11"
         // that is not there.
         let outcome = venv_outcome(Path::new("/whatever/.venv"), |_| None);
         assert_eq!(outcome, VenvOutcome::Create);
+    }
+
+    #[test]
+    fn a_manifest_with_no_project_table_is_labelled_by_its_directory() {
+        // The nameless workspace root is deliberately supported, so an empty
+        // label is not a "cannot happen" case: it renders as a bare sidebar
+        // marker with nothing after it and a blank detail header.
+        let draft = draft_from(
+            Path::new("/p/monorepo-root/pyproject.toml"),
+            "[tool.uv.workspace]\nmembers = []\n",
+        );
+
+        let project = to_project(&draft);
+
+        assert_eq!(project.label, "monorepo-root");
+    }
+
+    #[test]
+    fn a_declared_name_still_wins_over_the_directory() {
+        // The fallback must not start overriding what the manifest says --
+        // a project whose name differs from its folder is entirely normal.
+        let draft = draft_from(Path::new("/p/some-folder/pyproject.toml"), MANIFEST);
+        assert_eq!(to_project(&draft).label, "my-api");
     }
 
     #[test]
