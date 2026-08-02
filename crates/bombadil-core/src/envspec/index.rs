@@ -1,4 +1,4 @@
-use crate::error::SecretError;
+use crate::error::EnvError;
 use crate::model::{Index, IndexAuth, IndexKind};
 use crate::secrets::{SecretKey, SecretStore};
 use crate::validate::index_credential_var;
@@ -22,12 +22,29 @@ const TOKEN_USERNAME: &str = "__token__";
 /// one index in `indexes` is [`IndexKind::Default`], the **last** one wins
 /// silently -- this function is not the layer that should reject that;
 /// `validate` is where the user-facing check belongs.
+///
+/// If the parent shell already exports `UV_INDEX` or `UV_DEFAULT_INDEX` and
+/// `indexes` selects none of that kind, that ambient value is left untouched
+/// and survives into the composed environment -- deliberate inheritance, not
+/// a bug.
+///
+/// Two index names that normalize to the same credential variable (uv
+/// uppercases the name and maps `-` to `_`, so `my-index` and `my_index`
+/// collide) would otherwise have the second silently overwrite the first,
+/// sending one index's password to the other's server. This is rejected
+/// here, but only once credentials are actually about to be written --
+/// two colliding names that inject no credentials cannot misroute anything
+/// and must keep working.
 pub fn inject(
     indexes: &[&Index],
     store: &dyn SecretStore,
     into: &mut BTreeMap<String, String>,
-) -> Result<(), SecretError> {
+) -> Result<(), EnvError> {
     let mut extras = Vec::new();
+    // Which index last claimed a given password variable, so a second index
+    // normalizing to the same variable is caught before it overwrites the
+    // first rather than after.
+    let mut claimed_by: BTreeMap<String, String> = BTreeMap::new();
 
     for index in indexes {
         let pair = format!("{}={}", index.name, index.url);
@@ -47,15 +64,32 @@ pub fn inject(
         // No stored secret means the user has not filled it in. Injecting an
         // empty password would make uv attempt an auth that cannot succeed,
         // which reports worse than attempting none.
-        let Some(secret) = store.get(&SecretKey::Index {
-            name: index.name.clone(),
-        })?
+        let Some(secret) = store
+            .get(&SecretKey::Index {
+                name: index.name.clone(),
+            })
+            .map_err(|source| EnvError::Secret {
+                message: source.to_string(),
+            })?
         else {
             continue;
         };
 
+        let password_var = index_credential_var(&index.name, "PASSWORD");
+        if let Some(first) = claimed_by
+            .get(&password_var)
+            .filter(|first| **first != index.name)
+        {
+            return Err(EnvError::IndexCredentialCollision {
+                first: first.clone(),
+                second: index.name.clone(),
+                var: password_var,
+            });
+        }
+        claimed_by.insert(password_var.clone(), index.name.clone());
+
         into.insert(index_credential_var(&index.name, "USERNAME"), username);
-        into.insert(index_credential_var(&index.name, "PASSWORD"), secret);
+        into.insert(password_var, secret);
     }
 
     if !extras.is_empty() {
@@ -93,6 +127,27 @@ mod tests {
             env.get("UV_DEFAULT_INDEX").map(String::as_str),
             Some("priv=https://priv.example/simple")
         );
+        assert!(!env.contains_key("UV_INDEX"), "got {env:?}");
+    }
+
+    #[test]
+    fn a_default_and_an_extra_index_do_not_cross_contaminate() {
+        // Nothing else would catch a regression that mixed these two up --
+        // e.g. an Extra index's pair landing in UV_DEFAULT_INDEX, or vice
+        // versa, once both kinds are present in one call.
+        let default_idx = index("alpha", IndexKind::Default, IndexAuth::None);
+        let extra_idx = index("beta", IndexKind::Extra, IndexAuth::None);
+        let store = InMemorySecretStore::new();
+        let mut env = BTreeMap::new();
+
+        inject(&[&default_idx, &extra_idx], &store, &mut env).unwrap();
+
+        let default_val = env.get("UV_DEFAULT_INDEX").expect("UV_DEFAULT_INDEX");
+        let extra_val = env.get("UV_INDEX").expect("UV_INDEX");
+        assert!(default_val.contains("alpha"), "got {default_val}");
+        assert!(!default_val.contains("beta"), "got {default_val}");
+        assert!(extra_val.contains("beta"), "got {extra_val}");
+        assert!(!extra_val.contains("alpha"), "got {extra_val}");
     }
 
     #[test]
@@ -250,5 +305,68 @@ mod tests {
             env.get("UV_DEFAULT_INDEX").map(String::as_str),
             Some("two=https://two.example/simple")
         );
+    }
+
+    #[test]
+    fn colliding_index_names_with_credentials_are_rejected() {
+        // uv uppercases the name and maps '-' to '_', so these two both
+        // resolve to UV_INDEX_MY_INDEX_PASSWORD. Letting the second overwrite
+        // the first would send one index's password to the other's server.
+        let a = index(
+            "my-index",
+            IndexKind::Extra,
+            IndexAuth::Basic {
+                username: "alice".into(),
+            },
+        );
+        let b = index(
+            "my_index",
+            IndexKind::Extra,
+            IndexAuth::Basic {
+                username: "bob".into(),
+            },
+        );
+        let store = InMemorySecretStore::new();
+        store
+            .set(
+                &SecretKey::Index {
+                    name: "my-index".into(),
+                },
+                "alice-secret",
+            )
+            .unwrap();
+        store
+            .set(
+                &SecretKey::Index {
+                    name: "my_index".into(),
+                },
+                "bob-secret",
+            )
+            .unwrap();
+        let mut env = BTreeMap::new();
+
+        let err = inject(&[&a, &b], &store, &mut env).unwrap_err();
+
+        let rendered = err.to_string();
+        assert!(rendered.contains("my-index"), "got {rendered}");
+        assert!(rendered.contains("my_index"), "got {rendered}");
+        assert!(
+            rendered.contains("UV_INDEX_MY_INDEX_PASSWORD"),
+            "got {rendered}"
+        );
+    }
+
+    #[test]
+    fn colliding_index_names_with_no_credentials_still_succeed() {
+        // Two names that normalize the same cannot misroute anything unless
+        // credentials are actually injected -- this must keep working.
+        let a = index("my-index", IndexKind::Extra, IndexAuth::None);
+        let b = index("my_index", IndexKind::Extra, IndexAuth::None);
+        let store = InMemorySecretStore::new();
+        let mut env = BTreeMap::new();
+
+        inject(&[&a, &b], &store, &mut env).unwrap();
+
+        assert!(env.contains_key("UV_INDEX"));
     }
 }

@@ -123,9 +123,7 @@ pub fn compose(
         .iter()
         .filter(|i| inputs.project.index_names.contains(&i.name))
         .collect();
-    inject(&selected, store, &mut env).map_err(|source| EnvError::Secret {
-        message: source.to_string(),
-    })?;
+    inject(&selected, store, &mut env)?;
 
     // 6. pre-activate scripts, in order
     for script in inputs
