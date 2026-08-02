@@ -144,16 +144,27 @@ mod tests {
 
     #[test]
     fn detection_never_launches_the_terminal_itself() {
-        // A probe that opened a window on startup would be unusable.
-        let runner = FakeCommandRunner::new();
-        runner.expect("which", &["kitty"], found("kitty"));
-        let _ = available(Os::Linux, &runner);
-        for call in runner.calls() {
-            let prog = call.program.to_string_lossy().to_string();
-            assert!(
-                prog.contains("which") || prog.contains("where") || prog.contains("open"),
-                "detection must probe, not launch; got {prog}"
-            );
+        // A probe that opened a window at startup would make the app unusable.
+        // `open -Ra <app>` tests for the app; `open -a <app>` LAUNCHES it, and
+        // the program name is "open" either way -- so the -R is the only thing
+        // that distinguishes them, and it lives in the args.
+        for os in [Os::Linux, Os::MacOs, Os::Windows] {
+            let runner = FakeCommandRunner::new();
+            let _ = available(os, &runner);
+            for call in runner.calls() {
+                let prog = call.program.to_string_lossy().to_string();
+                assert!(
+                    prog.contains("which") || prog.contains("where") || prog.contains("open"),
+                    "detection must probe, not launch; got {prog}"
+                );
+                if prog.contains("open") {
+                    assert!(
+                        call.args.iter().any(|a| a == "-Ra" || a == "-R"),
+                        "an `open` probe without -R launches the app; got {:?}",
+                        call.args
+                    );
+                }
+            }
         }
     }
 }
