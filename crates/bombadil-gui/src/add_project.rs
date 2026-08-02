@@ -7,8 +7,10 @@
 //! resolved path always displayed.
 
 use crate::app::Message;
+use crate::interpreter;
 use bombadil_core::error::VenvPathError;
 use bombadil_core::model::{Project, Settings, VenvLocation};
+use bombadil_core::uv::results::Interpreter;
 use bombadil_core::{pyproject, venv_path};
 use std::path::{Path, PathBuf};
 use uuid::Uuid;
@@ -31,6 +33,12 @@ pub struct Draft {
     pub name: Option<String>,
     pub requires_python: Option<String>,
     pub venv_choice: VenvChoice,
+    /// The interpreters uv can see, fetched asynchronously by `app.rs` once
+    /// the manifest is loaded (`uv python list`). Starts empty -- before the
+    /// fetch lands, [`interpreter_status`] shows that as "checking" rather
+    /// than "none found", which would be indistinguishable from a genuinely
+    /// empty machine and would show the install offer prematurely.
+    pub interpreters: Vec<Interpreter>,
 }
 
 /// Builds a `Draft` from the chosen manifest's path and text.
@@ -51,7 +59,34 @@ pub fn draft_from(path: &Path, text: &str) -> Draft {
         name: parsed.as_ref().and_then(|p| p.name.clone()),
         requires_python: parsed.as_ref().and_then(|p| p.requires_python.clone()),
         venv_choice: VenvChoice::SettingsDefault,
+        interpreters: Vec::new(),
     }
+}
+
+/// The interpreter line for the dialog. Spec §8: pre-selected to satisfy
+/// `requires-python`, with an offer to install one when none qualifies.
+///
+/// Three states, not two: before `draft.interpreters` is populated this
+/// must read as "still looking," not "nothing found" -- the two look
+/// identical to `interpreter::preselect` (`None` either way), but only one
+/// of them should ever prompt the user to install something.
+fn interpreter_status(draft: &Draft) -> String {
+    match interpreter::preselect(&draft.interpreters, draft.requires_python.as_deref()) {
+        Some(interpreter) => format!("python: {}", interpreter.version),
+        None if draft.interpreters.is_empty() => {
+            "python: (checking available interpreters...)".to_string()
+        }
+        None => "python: no compatible interpreter found".to_string(),
+    }
+}
+
+/// Whether the dialog should offer to install a suitable interpreter: a
+/// list has actually been fetched, and nothing in it satisfies
+/// `requires_python`. Never true while `interpreters` is still empty from
+/// not having been fetched yet -- see `interpreter_status`.
+fn needs_install_offer(draft: &Draft) -> bool {
+    !draft.interpreters.is_empty()
+        && interpreter::preselect(&draft.interpreters, draft.requires_python.as_deref()).is_none()
 }
 
 /// A throwaway `Project` carrying just enough of `draft` for
@@ -120,16 +155,29 @@ pub fn view<'a>(draft: &Draft, resolved: &str) -> iced::Element<'a, Message> {
     ]
     .spacing(8);
 
-    iced::widget::column![
+    let mut column = iced::widget::column![
         iced::widget::text(draft.pyproject_path.display().to_string()),
         iced::widget::text(format!("name: {name}")),
         iced::widget::text(format!("requires-python: {requires_python}")),
-        venv_row,
-        iced::widget::text(format!("venv: {resolved}")),
-        iced::widget::button(iced::widget::text("Cancel")).on_press(Message::AddProjectCancelled),
+        iced::widget::text(interpreter_status(draft)),
     ]
-    .spacing(4)
-    .into()
+    .spacing(4);
+
+    if needs_install_offer(draft) {
+        column = column.push(
+            iced::widget::button(iced::widget::text("Install compatible interpreter"))
+                .on_press(Message::AddProjectInstallInterpreterRequested),
+        );
+    }
+
+    column
+        .push(venv_row)
+        .push(iced::widget::text(format!("venv: {resolved}")))
+        .push(
+            iced::widget::button(iced::widget::text("Cancel"))
+                .on_press(Message::AddProjectCancelled),
+        )
+        .into()
 }
 
 #[cfg(test)]
@@ -246,5 +294,50 @@ requires-python = ">=3.11"
             "changing venv_choice must change the resolved path"
         );
         assert_eq!(after, PathBuf::from("/mnt/fast/envs/api"));
+    }
+
+    fn interp(version: &str) -> Interpreter {
+        Interpreter {
+            key: format!("cpython-{version}"),
+            version: version.to_string(),
+            path: Some(PathBuf::from(format!("/usr/bin/python{version}"))),
+            implementation: "cpython".to_string(),
+        }
+    }
+
+    #[test]
+    fn the_default_interpreter_list_is_empty_until_fetched() {
+        let draft = draft_from(Path::new("/p/my-api/pyproject.toml"), MANIFEST);
+        assert!(draft.interpreters.is_empty());
+    }
+
+    #[test]
+    fn before_the_fetch_lands_the_status_reads_as_checking_not_missing() {
+        // interpreters is empty both before the fetch and when the fetch
+        // genuinely finds nothing -- interpreter_status must not conflate
+        // "still looking" with "none found," which would show the install
+        // offer prematurely.
+        let draft = draft_from(Path::new("/p/my-api/pyproject.toml"), MANIFEST);
+        assert!(interpreter_status(&draft).contains("checking"));
+        assert!(!needs_install_offer(&draft));
+    }
+
+    #[test]
+    fn a_satisfying_interpreter_is_named_in_the_status_line() {
+        let mut draft = draft_from(Path::new("/p/my-api/pyproject.toml"), MANIFEST);
+        draft.interpreters = vec![interp("3.10.13"), interp("3.11.9")];
+        assert_eq!(interpreter_status(&draft), "python: 3.11.9");
+        assert!(!needs_install_offer(&draft));
+    }
+
+    #[test]
+    fn nothing_satisfying_offers_to_install_instead_of_naming_the_wrong_one() {
+        let mut draft = draft_from(Path::new("/p/my-api/pyproject.toml"), MANIFEST);
+        draft.interpreters = vec![interp("3.9.18")];
+        assert_eq!(
+            interpreter_status(&draft),
+            "python: no compatible interpreter found"
+        );
+        assert!(needs_install_offer(&draft));
     }
 }

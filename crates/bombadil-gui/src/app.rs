@@ -2,6 +2,7 @@ use crate::add_project;
 use crate::banner;
 use crate::detail;
 use crate::drawer;
+use crate::interpreter;
 use crate::job;
 use crate::sidebar;
 use bombadil_core::envspec::{self, EnvInputs};
@@ -11,6 +12,7 @@ use bombadil_core::secrets::{KeyringSecretStore, SecretStore};
 use bombadil_core::store::Loaded;
 use bombadil_core::terminal::open::secret_values;
 use bombadil_core::uv;
+use bombadil_core::uv::results::Interpreter;
 use bombadil_core::venv_path;
 use iced::Task;
 use std::path::PathBuf;
@@ -102,6 +104,15 @@ pub enum Message {
     AddProjectManifestPicked(Option<PathBuf>),
     /// The chosen manifest has been read and parsed into a `Draft`.
     AddProjectManifestLoaded(add_project::Draft),
+    /// `uv python list` finished, on manifest load or after an install.
+    /// Spec §8: the interpreter selector is pre-selected to satisfy
+    /// `requires-python`, computed fresh from this list every render by
+    /// `interpreter::preselect` rather than stored -- the same "recompute,
+    /// don't cache" trick `resolved_venv_path_display` uses.
+    AddProjectInterpretersLoaded(Vec<Interpreter>),
+    /// The dialog's "Install compatible interpreter" button was pressed:
+    /// spec §8's offer to install one through uv when none is available.
+    AddProjectInstallInterpreterRequested,
     /// A venv option other than "chosen folder" was picked directly.
     AddProjectVenvChoiceSelected(add_project::VenvChoice),
     /// "Choose folder..." was pressed: open the async folder picker.
@@ -256,6 +267,31 @@ pub fn update(app: &mut App, message: Message, runner: Arc<dyn CommandRunner>) -
         }
         Message::AddProjectManifestLoaded(draft) => {
             app.add_project = Some(draft);
+            // Fired unconditionally, even for a manifest with no
+            // requires-python: the dialog still needs a list to preselect
+            // "newest available" from, and a fetch that only ran when a
+            // requirement was present would leave that case stuck on
+            // "checking..." forever.
+            return Task::perform(
+                list_interpreters(app.config.clone(), runner),
+                Message::AddProjectInterpretersLoaded,
+            );
+        }
+        Message::AddProjectInterpretersLoaded(interpreters) => {
+            if let Some(draft) = &mut app.add_project {
+                draft.interpreters = interpreters;
+            }
+        }
+        Message::AddProjectInstallInterpreterRequested => {
+            if let Some(draft) = &app.add_project
+                && let Some(version) =
+                    interpreter::suggested_install_version(draft.requires_python.as_deref())
+            {
+                return Task::perform(
+                    install_and_relist(version, app.config.clone(), runner),
+                    Message::AddProjectInterpretersLoaded,
+                );
+            }
         }
         Message::AddProjectVenvChoiceSelected(choice) => {
             if let Some(draft) = &mut app.add_project {
@@ -352,6 +388,104 @@ async fn sync_project(
     }
 }
 
+/// Resolves which uv binary to run, given `config.settings.uv_source`.
+/// Shared by `run_sync` and the interpreter discovery/install jobs below --
+/// all three need exactly the same Auto/FromPath/Custom/Bundled decision.
+/// The bundled closure extracts the embedded uv (see `bombadil_uv_bin`) into
+/// the platform data dir, re-using it on later calls -- `ensure_extracted`
+/// only rewrites when the file is missing or its hash no longer matches.
+/// `Auto` falls back to this when nothing usable is on PATH; `Bundled` uses
+/// it unconditionally. The error is pre-stringified because every caller
+/// does the same thing with it: surface `uv::resolve`'s own actionable text
+/// verbatim rather than a generic "could not resolve uv."
+fn resolve_uv_for(config: &Config, runner: &dyn CommandRunner) -> Result<uv::ResolvedUv, String> {
+    let bundled = || -> Result<PathBuf, String> {
+        let data_dir =
+            bombadil_core::store::paths::default_data_dir().map_err(|e| e.to_string())?;
+        bombadil_uv_bin::ensure_extracted(&data_dir).map_err(|e| e.to_string())
+    };
+    uv::resolve(
+        &config.settings.uv_source,
+        runner,
+        &uv::locate_on_path,
+        &bundled,
+    )
+    .map_err(|err| err.to_string())
+}
+
+/// The blocking half of interpreter discovery: resolve uv, run
+/// `uv python list --output-format json`, and parse it. Any failure -- no
+/// usable uv, a non-zero exit, JSON this build cannot parse -- degrades to
+/// an empty list rather than propagating an error: the dialog already has a
+/// way to show "nothing found yet" that is indistinguishable from, and no
+/// worse than, a genuine failure here.
+fn list_interpreters_blocking(config: &Config, runner: &dyn CommandRunner) -> Vec<Interpreter> {
+    let Ok(resolved) = resolve_uv_for(config, runner) else {
+        return Vec::new();
+    };
+    let spec = uv::command::python_list(&resolved);
+    match runner.run(&spec) {
+        Ok(outcome) if outcome.success() => {
+            uv::results::parse_python_list(&outcome.stdout).unwrap_or_default()
+        }
+        _ => Vec::new(),
+    }
+}
+
+/// Fetches the interpreters uv can see, off the render thread -- the same
+/// seam `probe_venv` uses. `VENV_PROBE_TIMEOUT`, not `SYNC_TIMEOUT`: `uv
+/// python list` only reads uv's own installed-interpreter cache, the same
+/// quick shape of call as a `pyvenv.cfg` read, not a `sync` that can
+/// download and build packages.
+async fn list_interpreters(config: Config, runner: Arc<dyn CommandRunner>) -> Vec<Interpreter> {
+    match job::run(
+        move || list_interpreters_blocking(&config, runner.as_ref()),
+        VENV_PROBE_TIMEOUT,
+    )
+    .await
+    {
+        job::JobResult::Done(interpreters) => interpreters,
+        job::JobResult::TimedOut | job::JobResult::Failed => Vec::new(),
+    }
+}
+
+/// The blocking half of installing an interpreter: resolve uv and run `uv
+/// python install <version>`. Failure collapses to `false` -- the caller
+/// re-lists regardless, so a failed install just means the refreshed list
+/// still has nothing satisfying, and the dialog already shows exactly that.
+fn install_interpreter_blocking(
+    version: &str,
+    config: &Config,
+    runner: &dyn CommandRunner,
+) -> bool {
+    let Ok(resolved) = resolve_uv_for(config, runner) else {
+        return false;
+    };
+    let spec = uv::command::python_install(&resolved, version);
+    runner
+        .run(&spec)
+        .map(|outcome| outcome.success())
+        .unwrap_or(false)
+}
+
+/// Installs `version` through uv, then re-fetches the interpreter list.
+/// Bounded by `SYNC_TIMEOUT`, not `VENV_PROBE_TIMEOUT`: unlike listing,
+/// `uv python install` can download a whole interpreter.
+async fn install_and_relist(
+    version: String,
+    config: Config,
+    runner: Arc<dyn CommandRunner>,
+) -> Vec<Interpreter> {
+    let install_config = config.clone();
+    let install_runner = runner.clone();
+    let _ = job::run(
+        move || install_interpreter_blocking(&version, &install_config, install_runner.as_ref()),
+        SYNC_TIMEOUT,
+    )
+    .await;
+    list_interpreters(config, runner).await
+}
+
 /// The blocking half of a sync: resolve which uv to run, compose the
 /// environment it runs in (`envspec::compose`), build the `uv sync` spec
 /// (`bombadil_core::uv::command::sync`), and run it through `runner`.
@@ -389,23 +523,9 @@ fn run_sync(
         Err(err) => return (false, vec![err.to_string()]),
     };
 
-    // Extracts the embedded uv (see `bombadil_uv_bin`) into the platform data
-    // dir, re-using it on later calls -- `ensure_extracted` only rewrites when
-    // the file is missing or its hash no longer matches. `Auto` falls back to
-    // this when nothing usable is on PATH; `Bundled` uses it unconditionally.
-    let bundled = || -> Result<PathBuf, String> {
-        let data_dir =
-            bombadil_core::store::paths::default_data_dir().map_err(|e| e.to_string())?;
-        bombadil_uv_bin::ensure_extracted(&data_dir).map_err(|e| e.to_string())
-    };
-    let resolved_uv = match uv::resolve(
-        &config.settings.uv_source,
-        runner,
-        &uv::locate_on_path,
-        &bundled,
-    ) {
+    let resolved_uv = match resolve_uv_for(config, runner) {
         Ok(resolved) => resolved,
-        Err(err) => return (false, vec![err.to_string()]),
+        Err(err) => return (false, vec![err]),
     };
 
     // Without this, `uv sync` inherits Bombadil's *ambient* environment plus
@@ -509,6 +629,7 @@ mod tests {
     use super::*;
     use bombadil_core::model::Config;
     use bombadil_core::process::FakeCommandRunner;
+    use std::path::Path;
 
     /// A runner for tests that don't care about it -- most of them, since
     /// most messages here never touch a `CommandRunner` at all.
@@ -974,6 +1095,126 @@ mod tests {
         assert!(
             joined.contains("/definitely/not/a/real/uv"),
             "the resolve error's own text must survive; got {joined}"
+        );
+    }
+
+    fn interpreter(version: &str) -> Interpreter {
+        Interpreter {
+            key: format!("cpython-{version}"),
+            version: version.to_string(),
+            path: Some(PathBuf::from(format!("/usr/bin/python{version}"))),
+            implementation: "cpython".to_string(),
+        }
+    }
+
+    fn manifest_draft(text: &str) -> add_project::Draft {
+        add_project::draft_from(Path::new("/p/my-api/pyproject.toml"), text)
+    }
+
+    #[test]
+    fn loading_a_manifest_dispatches_an_interpreter_fetch_without_blocking() {
+        // Spec §8's pre-selection needs a real interpreter list, and fetching
+        // it means running `uv python list` -- exactly the kind of blocking
+        // process spawn `job::run` exists to keep off the render thread.
+        let mut app = App::new(Config::default());
+        let fake = Arc::new(FakeCommandRunner::new());
+
+        let task = update(
+            &mut app,
+            Message::AddProjectManifestLoaded(manifest_draft("")),
+            fake.clone(),
+        );
+
+        assert!(
+            fake.calls().is_empty(),
+            "runner.run must not be called synchronously; got {:?}",
+            fake.calls()
+        );
+        assert!(
+            task.units() > 0,
+            "loading a manifest must dispatch the interpreter fetch"
+        );
+    }
+
+    #[test]
+    fn a_finished_interpreter_fetch_lands_on_the_open_draft() {
+        let mut app = App::new(Config::default());
+        app.add_project = Some(manifest_draft(""));
+        let interpreters = vec![interpreter("3.12.4")];
+
+        let _ = update(
+            &mut app,
+            Message::AddProjectInterpretersLoaded(interpreters.clone()),
+            unused_runner(),
+        );
+
+        assert_eq!(
+            app.add_project.as_ref().map(|d| d.interpreters.clone()),
+            Some(interpreters)
+        );
+    }
+
+    #[test]
+    fn a_stale_interpreter_fetch_after_cancel_is_dropped() {
+        // The dialog was cancelled before the fetch landed -- there is
+        // nothing left to attach the result to.
+        let mut app = App::new(Config::default());
+        app.add_project = None;
+
+        let _ = update(
+            &mut app,
+            Message::AddProjectInterpretersLoaded(vec![interpreter("3.12.4")]),
+            unused_runner(),
+        );
+
+        assert!(app.add_project.is_none());
+    }
+
+    #[test]
+    fn the_install_button_dispatches_without_blocking_when_a_version_can_be_suggested() {
+        let mut app = App::new(Config::default());
+        let mut draft =
+            manifest_draft("[project]\nname = \"my-api\"\nrequires-python = \">=3.11\"\n");
+        draft.interpreters = vec![interpreter("3.9.18")];
+        app.add_project = Some(draft);
+        let fake = Arc::new(FakeCommandRunner::new());
+
+        let task = update(
+            &mut app,
+            Message::AddProjectInstallInterpreterRequested,
+            fake.clone(),
+        );
+
+        assert!(
+            fake.calls().is_empty(),
+            "runner.run must not be called synchronously; got {:?}",
+            fake.calls()
+        );
+        assert!(
+            task.units() > 0,
+            "the install button must dispatch background work"
+        );
+    }
+
+    #[test]
+    fn the_install_button_dispatches_nothing_without_a_requirement_to_suggest_a_version_from() {
+        // A manifest with no requires-python (a workspace root) gives
+        // `interpreter::suggested_install_version` nothing to work with --
+        // guessing a version to install would not be "suitable" by any
+        // definition, so nothing must be dispatched.
+        let mut app = App::new(Config::default());
+        app.add_project = Some(manifest_draft("[tool.uv.workspace]\nmembers = []\n"));
+
+        let task = update(
+            &mut app,
+            Message::AddProjectInstallInterpreterRequested,
+            unused_runner(),
+        );
+
+        assert_eq!(
+            task.units(),
+            0,
+            "nothing to install for a manifest with no requires-python"
         );
     }
 

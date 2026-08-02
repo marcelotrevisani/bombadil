@@ -4,6 +4,7 @@ mod app;
 mod banner;
 mod detail;
 mod drawer;
+mod interpreter;
 mod job;
 mod sidebar;
 
