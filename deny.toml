@@ -10,7 +10,20 @@ all-features = true
 # Every RustSec advisory is a failure by default. Anything genuinely
 # unactionable gets an entry here with a comment explaining why — an empty
 # list is the goal, not a formality.
-ignore = []
+#
+# Both entries below are "unmaintained", not vulnerabilities, discovered only
+# once bombadil-gui pulled in iced 0.14 and its winit/cosmic-text font stack
+# (they postdate the licence-only spike behind the deny.toml change in plan
+# 3a task 1). Neither has a safe upgrade path today; revisit if one appears.
+ignore = [
+    # dtolnay's `paste`, archived by its author. Reached via
+    # winit -> metal -> wgpu-hal, used only on macOS's Metal backend.
+    "RUSTSEC-2024-0436",
+    # `ttf-parser`, reached via winit/cosmic-text's font stack
+    # (fontdb, owned_ttf_parser). The advisory recommends `skrifa`, which
+    # cosmic-text does not yet use.
+    "RUSTSEC-2026-0192",
+]
 
 [licenses]
 # This project is Apache-2.0, and plan 2 will redistribute the uv binary
@@ -31,11 +44,15 @@ ignore = []
 # ISC                  - ring, untrusted, rustls-webpki
 # CDLA-Permissive-2.0  - webpki-roots (Mozilla's CA certificate data)
 # BSD-3-Clause         - subtle
-allow = ["Apache-2.0", "MIT", "Unicode-3.0", "ISC", "CDLA-Permissive-2.0", "BSD-3-Clause"]
+allow = ["Apache-2.0", "MIT", "Unicode-3.0", "ISC", "CDLA-Permissive-2.0", "BSD-3-Clause", "Zlib", "BSL-1.0", "BSD-2-Clause"]
 confidence-threshold = 0.93
 
 # Crates whose license is not in the allow list, permitted deliberately.
 exceptions = [
+    # hexf-parse is CC0-1.0, reached through iced's font stack. CC0 is a
+    # public-domain dedication that explicitly grants no patent rights, which
+    # is why it is scoped to this one crate rather than allowed globally.
+    { allow = ["CC0-1.0"], crate = "hexf-parse" },
     # Reached via directories -> dirs-sys -> option-ext, so it arrives with
     # the platform config-directory lookup rather than by choice.
     #
