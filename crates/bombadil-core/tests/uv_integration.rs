@@ -3,8 +3,9 @@
 //! Run with: cargo test -p bombadil-core --features uv-integration --test uv_integration
 #![cfg(feature = "uv-integration")]
 
-use bombadil_core::model::UvSource;
+use bombadil_core::model::{Project, Script, UvSource, VenvLocation};
 use bombadil_core::process::{CommandRunner, CommandSpec, SystemCommandRunner};
+use bombadil_core::secrets::{InMemorySecretStore, KeyringSecretStore, SecretKey, SecretStore};
 use bombadil_core::uv::command::{self, DependencyGroup, ProjectContext};
 use bombadil_core::uv::results::{InstalledPackage, parse_pip_list, parse_tree};
 use bombadil_core::uv::{ResolvedUv, UvVersion, locate_on_path, resolve};
@@ -353,4 +354,151 @@ fn loose_package_editable_add_and_remove_agrees_with_a_real_uv() {
         !packages.iter().any(|p| p.name == "itest-lib"),
         "itest-lib must be gone after remove_editable; got {packages:?}"
     );
+}
+
+#[test]
+fn a_composed_environment_activates_a_real_venv() {
+    let runner = SystemCommandRunner;
+    let uv = resolve_uv(&runner);
+
+    let tmp = tempfile::tempdir().unwrap();
+    let project_dir = tmp.path().join("proj");
+    std::fs::create_dir_all(&project_dir).unwrap();
+    std::fs::write(
+        project_dir.join("pyproject.toml"),
+        "[project]\nname = \"envtest\"\nversion = \"0.1.0\"\n\
+         requires-python = \">=3.10\"\ndependencies = [\"iniconfig\"]\n",
+    )
+    .unwrap();
+
+    let venv_path = tmp.path().join("env");
+    let ctx = ProjectContext {
+        project_dir: project_dir.clone(),
+        venv_path: venv_path.clone(),
+    };
+
+    let outcome = runner.run(&command::sync(&uv, &ctx)).unwrap();
+    assert!(outcome.success(), "sync failed: {}", outcome.stderr);
+
+    let project = Project {
+        id: uuid::Uuid::from_u128(1),
+        label: "envtest".into(),
+        pyproject_path: project_dir.join("pyproject.toml"),
+        index_names: vec![],
+        venv: VenvLocation::Custom {
+            path: venv_path.clone(),
+        },
+        env: vec![],
+        scripts: vec![],
+        members: Default::default(),
+    };
+
+    let inputs = bombadil_core::envspec::EnvInputs {
+        parent: std::env::vars().collect(),
+        config: bombadil_core::model::Config::default(),
+        project,
+        venv_path: venv_path.clone(),
+    };
+
+    let store = InMemorySecretStore::new();
+    let env = bombadil_core::envspec::compose(&inputs, &store, &runner)
+        .expect("composing an environment must succeed");
+
+    // The proof: run python through the composed environment and confirm it is
+    // the venv's interpreter, importing from the venv's site-packages -- not
+    // whatever Python happens to be ambient on this machine.
+    let mut spec = CommandSpec::new("python");
+    spec.args = vec![
+        "-c".into(),
+        "import sys, iniconfig; print(sys.executable); print(iniconfig.__file__)".into(),
+    ];
+    spec.env = env.clone();
+    spec.clear_env = true;
+
+    let outcome = runner.run(&spec).unwrap();
+    assert!(outcome.success(), "python failed: {}", outcome.stderr);
+
+    // A vacuous pass lurks here: if python printed nothing, iterating stdout
+    // lines directly would run zero times and still pass. Pin the shape
+    // first.
+    let lines: Vec<&str> = outcome.stdout.lines().collect();
+    assert_eq!(
+        lines.len(),
+        2,
+        "expected sys.executable and iniconfig.__file__; got {:?}",
+        outcome.stdout
+    );
+
+    // On macOS, tempfile::tempdir() returns an unresolved /var/folders/...
+    // path while Python reports the /private/var/folders/... it resolves to,
+    // so both the raw and canonicalized venv path are accepted.
+    let venv_str = venv_path.to_string_lossy().to_string();
+    let venv_canonical = std::fs::canonicalize(&venv_path)
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_else(|_| venv_str.clone());
+
+    for line in lines {
+        assert!(
+            line.starts_with(&venv_str) || line.starts_with(&venv_canonical),
+            "the composed environment must activate the venv; got {line}"
+        );
+    }
+}
+
+#[test]
+fn a_pre_activate_script_can_export_into_the_composed_environment() {
+    // The only proof the PowerShell dump form works on Windows. A red Windows
+    // job here means that command is wrong -- which is exactly what this test
+    // is for.
+    let runner = SystemCommandRunner;
+    let tmp = tempfile::tempdir().unwrap();
+
+    let (script_path, body) = if cfg!(windows) {
+        (
+            tmp.path().join("pre.ps1"),
+            "$env:FROM_SCRIPT = 'exported'\n",
+        )
+    } else {
+        (tmp.path().join("pre.sh"), "export FROM_SCRIPT=exported\n")
+    };
+    std::fs::write(&script_path, body).unwrap();
+
+    let script = Script {
+        path: script_path,
+        args: vec![],
+        enabled: true,
+    };
+
+    let base: std::collections::BTreeMap<String, String> = std::env::vars().collect();
+    let got = bombadil_core::envspec::apply(&script, &runner, &base)
+        .expect("a pre-activate script must run and its exports be captured");
+
+    assert_eq!(
+        got.get("FROM_SCRIPT").map(String::as_str),
+        Some("exported"),
+        "the script's export was not captured"
+    );
+}
+
+#[test]
+fn the_real_keychain_round_trips_where_one_exists() {
+    let store = KeyringSecretStore::new();
+    if !store.is_available() {
+        eprintln!("no keychain on this machine; skipping");
+        return;
+    }
+
+    // Namespaced so it cannot collide with a real secret. Cleaned up before
+    // any assertion runs, so a failed assertion never leaves a live entry
+    // behind in a real OS keychain.
+    let key = SecretKey::Index {
+        name: "bombadil-integration-throwaway".into(),
+    };
+    store.set(&key, "hunter2").expect("set");
+    let round_tripped = store.get(&key);
+    store.delete(&key).expect("delete");
+    let after_delete = store.get(&key);
+
+    assert_eq!(round_tripped.unwrap().as_deref(), Some("hunter2"));
+    assert_eq!(after_delete.unwrap(), None, "the secret must be gone");
 }
