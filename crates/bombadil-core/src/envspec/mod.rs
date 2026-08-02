@@ -710,4 +710,41 @@ mod tests {
         assert!(rendered.contains("***"), "got {rendered}");
         assert!(!rendered.contains("s3cr3t-value"), "got {rendered}");
     }
+
+    #[test]
+    fn compose_and_uv_command_project_spec_agree_on_uv_project_environment() {
+        // Plan 2c hands compose's output to a uv command with clear_env =
+        // true, discarding project_spec's own UV_PROJECT_ENVIRONMENT --
+        // which is safe only because both derive it from the same venv_path
+        // the same way. Nothing else pins that the two stay in sync.
+        let venv_path = PathBuf::from("/envs/my-api");
+
+        let mut ins = inputs(Config::default(), project());
+        ins.venv_path = venv_path.clone();
+        let composed = compose_with(ins);
+
+        // Constructed directly rather than resolved, so this test touches
+        // neither a real uv binary nor the filesystem.
+        let uv = crate::uv::ResolvedUv {
+            path: PathBuf::from("/data/uv/uv"),
+            version: crate::uv::UvVersion {
+                major: 0,
+                minor: 12,
+                patch: 1,
+            },
+            origin: crate::uv::UvOrigin::Bundled,
+            newer_than_bundled: false,
+        };
+        let ctx = crate::uv::command::ProjectContext {
+            project_dir: PathBuf::from("/proj/my-api"),
+            venv_path,
+        };
+        let spec = crate::uv::command::sync(&uv, &ctx);
+
+        assert_eq!(
+            composed.get("UV_PROJECT_ENVIRONMENT"),
+            spec.env.get("UV_PROJECT_ENVIRONMENT"),
+            "compose and uv::command::project_spec must derive the same value from venv_path"
+        );
+    }
 }
