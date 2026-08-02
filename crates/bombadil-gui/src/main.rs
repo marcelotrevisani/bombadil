@@ -1,16 +1,28 @@
 mod app;
+mod detail;
 mod job;
 mod sidebar;
 
 use bombadil_core::model::Config;
+use bombadil_core::process::{CommandRunner, SystemCommandRunner};
 use bombadil_core::store::{Store, paths};
+use std::sync::Arc;
 
 fn main() -> iced::Result {
     let config = load_config();
+    // `update` takes the runner as a parameter rather than storing it on
+    // `App` so a test can substitute a `FakeCommandRunner`; here it is real.
+    let runner: Arc<dyn CommandRunner> = Arc::new(SystemCommandRunner);
 
-    iced::application(move || app::boot(config.clone()), app::update, app::view)
-        .title("Bombadil")
-        .run()
+    iced::application(
+        move || app::boot(config.clone()),
+        move |state: &mut app::App, message: app::Message| {
+            app::update(state, message, runner.clone())
+        },
+        app::view,
+    )
+    .title("Bombadil")
+    .run()
 }
 
 /// Loads the persisted config, starting from defaults rather than refusing to

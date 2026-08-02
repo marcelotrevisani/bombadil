@@ -1,9 +1,13 @@
+use crate::detail;
 use crate::job;
 use crate::sidebar;
-use bombadil_core::model::{Config, Project};
+use bombadil_core::model::{Config, Project, Settings};
+use bombadil_core::process::CommandRunner;
+use bombadil_core::uv;
 use bombadil_core::venv_path;
 use iced::Task;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 
 /// How long a venv probe (a `pyvenv.cfg` read) gets before the sidebar shows
@@ -12,6 +16,11 @@ use std::time::Duration;
 /// disk, and nothing here is worth making the user stare at a frozen sidebar
 /// for longer than that.
 const VENV_PROBE_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// How long a `uv sync` gets before it is treated as failed. Sync can
+/// download and build packages, unlike the sub-millisecond `pyvenv.cfg`
+/// read `VENV_PROBE_TIMEOUT` bounds, so this is generous rather than tight.
+const SYNC_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// Everything the window shows. Deliberately plain data: `update` is the only
 /// place it changes, which is what makes the logic testable without a display.
@@ -37,6 +46,15 @@ pub enum Message {
     /// Python version on success; `None` covers "no venv", a probe that
     /// timed out, and a probe that failed -- all three degrade to hollow.
     VenvProbed(usize, Option<String>),
+    /// The Sync action was pressed for the selected project. Never gated on
+    /// whether a venv already exists -- creating one is how the user
+    /// recovers from not having one.
+    SyncRequested,
+    /// A background sync finished. `true` on a zero exit; `false` covers a
+    /// failed resolve, a nonzero exit, a timeout and a panicking job.
+    /// Surfacing *why* it failed is the output drawer's job (a later task);
+    /// this only tracks that the run happened.
+    SyncFinished(bool),
 }
 
 impl App {
@@ -92,7 +110,12 @@ async fn probe_venv(path: PathBuf) -> Option<String> {
     }
 }
 
-pub fn update(app: &mut App, message: Message) -> Task<Message> {
+/// `runner` is a parameter rather than a field on `App` so a test can hand in
+/// a `FakeCommandRunner` and observe that `Message::SyncRequested` never
+/// calls it synchronously -- the exact freeze `job::run` exists to prevent.
+/// The real caller (`main.rs`) closes over a `SystemCommandRunner`, cloning
+/// the `Arc` for each call.
+pub fn update(app: &mut App, message: Message, runner: Arc<dyn CommandRunner>) -> Task<Message> {
     match message {
         // A stale index can arrive from a message queued before a project was
         // removed; ignoring it is better than taking the window down.
@@ -106,19 +129,97 @@ pub fn update(app: &mut App, message: Message) -> Task<Message> {
         }
         // A stale probe result for a project that no longer exists.
         Message::VenvProbed(_, _) => {}
+        Message::SyncRequested => {
+            if let Some(project) = app.selected_project().cloned() {
+                let settings = app.config.settings.clone();
+                return Task::perform(
+                    sync_project(project, settings, runner),
+                    Message::SyncFinished,
+                );
+            }
+        }
+        // Recording the outcome anywhere richer than "it happened" belongs to
+        // the output drawer (a later task).
+        Message::SyncFinished(_success) => {}
     }
     Task::none()
 }
 
+/// Runs off the render thread via `job::run` -- resolving uv and running
+/// `uv sync` both spawn a process, and `CommandRunner::run` blocks until it
+/// exits.
+async fn sync_project(
+    project: Project,
+    settings: Settings,
+    runner: Arc<dyn CommandRunner>,
+) -> bool {
+    match job::run(
+        move || run_sync(&project, &settings, runner.as_ref()),
+        SYNC_TIMEOUT,
+    )
+    .await
+    {
+        job::JobResult::Done(success) => success,
+        job::JobResult::TimedOut | job::JobResult::Failed => false,
+    }
+}
+
+/// The blocking half of a sync: resolve which uv to run, build the `uv sync`
+/// spec (`bombadil_core::uv::command::sync`), and run it through `runner`.
+/// Any resolution failure -- no project directory, no usable uv -- is
+/// reported as `false` rather than panicking, same as `venv_path::probe`'s
+/// approach to a path that turns out not to be what was expected.
+fn run_sync(project: &Project, settings: &Settings, runner: &dyn CommandRunner) -> bool {
+    let Some(project_dir) = project
+        .pyproject_path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+    else {
+        return false;
+    };
+    let Ok(venv_path) = venv_path::resolve(project, settings) else {
+        return false;
+    };
+
+    // bombadil-gui does not yet bundle uv (no dependency on
+    // bombadil-uv-bin), so `Auto`/`Bundled` sources can only ever resolve
+    // through PATH here. Documented gap, not a silent one -- filling it in
+    // is follow-up work once the GUI wires the bundled binary at all.
+    let bundled = || -> Result<PathBuf, String> {
+        Err("bombadil-gui does not bundle uv yet; install uv on PATH".to_string())
+    };
+    let Ok(resolved_uv) = uv::resolve(&settings.uv_source, runner, &uv::locate_on_path, &bundled)
+    else {
+        return false;
+    };
+
+    let ctx = uv::command::ProjectContext {
+        project_dir: project_dir.to_path_buf(),
+        venv_path,
+    };
+    let spec = uv::command::sync(&resolved_uv, &ctx);
+    runner
+        .run(&spec)
+        .map(|outcome| outcome.success())
+        .unwrap_or(false)
+}
+
 pub fn view(app: &App) -> iced::Element<'_, Message> {
+    let detail: iced::Element<'_, Message> = match app.selected_project() {
+        // The probe answers from the already-probed `entries` cache rather
+        // than touching disk again on every frame -- `boot`'s background
+        // tasks are what keep that cache current.
+        Some(project) => {
+            let entry = app.selected.and_then(|i| app.entries.get(i));
+            let header = detail::header(project, &|_| entry.and_then(|e| e.python_version.clone()));
+            detail::view(&header)
+        }
+        None => iced::widget::text("").into(),
+    };
+
     iced::widget::row![
         iced::widget::container(sidebar::view(&app.entries, app.selected)).width(240),
-        iced::widget::container(iced::widget::text(
-            app.selected_project()
-                .map(|p| p.label.clone())
-                .unwrap_or_default()
-        ))
-        .padding(12),
+        iced::widget::container(detail).padding(12),
     ]
     .into()
 }
@@ -127,6 +228,13 @@ pub fn view(app: &App) -> iced::Element<'_, Message> {
 mod tests {
     use super::*;
     use bombadil_core::model::Config;
+    use bombadil_core::process::FakeCommandRunner;
+
+    /// A runner for tests that don't care about it -- most of them, since
+    /// most messages here never touch a `CommandRunner` at all.
+    fn unused_runner() -> Arc<dyn CommandRunner> {
+        Arc::new(FakeCommandRunner::new())
+    }
 
     #[test]
     fn an_empty_config_produces_no_selection() {
@@ -157,7 +265,7 @@ mod tests {
             ..Config::default()
         };
         let mut app = App::new(config);
-        let _ = update(&mut app, Message::ProjectSelected(1));
+        let _ = update(&mut app, Message::ProjectSelected(1), unused_runner());
         assert_eq!(
             app.selected_project().map(|p| p.label.as_str()),
             Some("web")
@@ -175,11 +283,63 @@ mod tests {
             ..Config::default()
         };
         let mut app = App::new(config);
-        let _ = update(&mut app, Message::ProjectSelected(99));
+        let _ = update(&mut app, Message::ProjectSelected(99), unused_runner());
         assert_eq!(
             app.selected_project().map(|p| p.label.as_str()),
             Some("api"),
             "an out-of-range selection must be ignored, not clamped to the last project"
+        );
+    }
+
+    #[test]
+    fn a_sync_message_never_calls_the_runner_synchronously() {
+        // Task is opaque, so "it returned a Task" alone proves little -- a
+        // buggy `update` could call `runner.run` directly and still return
+        // one. The meaningful assertion is that the runner recorded nothing
+        // by the time `update` has already returned: the exact freeze
+        // `job::run` exists to prevent would show up here as a synchronous
+        // call landing in `fake.calls()` before the async task ever runs.
+        let config = Config {
+            projects: vec![project("api")],
+            ..Config::default()
+        };
+        let mut app = App::new(config);
+        let fake = Arc::new(FakeCommandRunner::new());
+        let runner: Arc<dyn CommandRunner> = fake.clone();
+
+        let task = update(&mut app, Message::SyncRequested, runner);
+
+        assert!(
+            fake.calls().is_empty(),
+            "runner.run must not be called synchronously inside update; got {:?}",
+            fake.calls()
+        );
+        assert!(
+            task.units() > 0,
+            "a Sync message must dispatch real background work, not Task::none()"
+        );
+    }
+
+    #[test]
+    fn a_project_without_a_venv_still_dispatches_sync() {
+        // Registered-without-a-venv is a normal state (see `sidebar`);
+        // gating Sync on the venv already existing would strand the exact
+        // user who needs it to create one.
+        let config = Config {
+            projects: vec![project("api")],
+            ..Config::default()
+        };
+        let mut app = App::new(config);
+        assert!(
+            !app.entries[0].venv_exists,
+            "a freshly constructed App has not been probed yet -- entries start hollow"
+        );
+
+        let task = update(&mut app, Message::SyncRequested, unused_runner());
+
+        assert!(
+            task.units() > 0,
+            "Sync must still dispatch work for a project with no venv"
         );
     }
 
