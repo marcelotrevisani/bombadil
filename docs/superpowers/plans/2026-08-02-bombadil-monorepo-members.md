@@ -467,6 +467,22 @@ taking a dependency for it."
 
 ---
 
+> **Why discovery walks the filesystem rather than asking uv.**
+>
+> `uv tree --format json` also emits a `members` array — `name`, `path`, `id`, with globs
+> already expanded by uv — and since the carried-defect fix, `DependencyGraph.members`
+> parses it. That is authoritative in a way our glob matching cannot be, so it is worth
+> saying explicitly why it is not the primary source here.
+>
+> Getting it requires a *successful* `uv tree` run, which needs a resolvable uv, a
+> lockfile, and possibly network on first use. Drawing a checklist of the packages in a
+> directory should not depend on any of that: it must work offline, before a venv exists,
+> and for loose projects that are not workspaces at all — which is most of them.
+>
+> So filesystem discovery is primary, and `DependencyGraph.members` is available to plan 3
+> as a cross-check once a tree has been fetched for other reasons. If the two ever
+> disagree for a workspace, uv is right and our glob matching has a bug.
+
 ### Task 3: Discovering the packages in a project's tree
 
 **Files:**
