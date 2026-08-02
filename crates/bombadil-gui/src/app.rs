@@ -98,7 +98,7 @@ impl App {
         // No probe yet at construction time -- every project starts hollow;
         // `boot` kicks off the real probes and `update` fills results in as
         // they land.
-        let entries = sidebar::entries(&config, &|_path| None);
+        let entries = sidebar::entries(&config);
         Self {
             config,
             projects,
@@ -297,12 +297,14 @@ fn run_sync(
         Err(err) => return (false, vec![err.to_string()]),
     };
 
-    // bombadil-gui does not bundle uv (no dependency on bombadil-uv-bin), so
-    // `Auto`/`Bundled` sources can only ever resolve through PATH here. The
-    // message below is the actionable one, and surfacing it is why the error
-    // is matched rather than discarded.
+    // Extracts the embedded uv (see `bombadil_uv_bin`) into the platform data
+    // dir, re-using it on later calls -- `ensure_extracted` only rewrites when
+    // the file is missing or its hash no longer matches. `Auto` falls back to
+    // this when nothing usable is on PATH; `Bundled` uses it unconditionally.
     let bundled = || -> Result<PathBuf, String> {
-        Err("bombadil-gui does not bundle uv yet; install uv on PATH".to_string())
+        let data_dir =
+            bombadil_core::store::paths::default_data_dir().map_err(|e| e.to_string())?;
+        bombadil_uv_bin::ensure_extracted(&data_dir).map_err(|e| e.to_string())
     };
     let resolved_uv = match uv::resolve(
         &config.settings.uv_source,
@@ -385,7 +387,8 @@ pub fn view(app: &App) -> iced::Element<'_, Message> {
     // file leaves no trace in the default `Config` it produced.
     let mut problems = app.load_problems.clone();
     problems.extend(banner::problems(&app.config));
-    iced::widget::column![banner::view(&problems), body].into()
+    let footer = iced::widget::text(crate::about::attribution()).size(11);
+    iced::widget::column![banner::view(&problems), body, footer].into()
 }
 
 #[cfg(test)]
@@ -828,14 +831,22 @@ mod tests {
 
     #[test]
     fn an_unresolvable_uv_reports_the_actionable_message() {
-        // The `bundled` closure's own message is the one the user can act on
-        // ("install uv on PATH"); a generic "could not resolve a uv binary"
-        // throws away the only sentence that helps.
+        // A `Custom` pin at a path the fake runner has no rule for fails to
+        // probe, so `resolve`'s own `ConfiguredUnavailable` message is what
+        // `run_sync` must surface -- not a generic "could not resolve a uv
+        // binary" that throws the actionable sentence away.
+        //
+        // Deliberately not `UvSource::Bundled` here: since `run_sync` now
+        // wires the real bundled fallback, exercising `Bundled` would extract
+        // the ~35 MB embedded uv to the real platform data directory, which
+        // is exactly the real-filesystem access a unit test must not do.
         let project = project("api");
         let config = Config {
             projects: vec![project.clone()],
             settings: bombadil_core::model::Settings {
-                uv_source: bombadil_core::model::UvSource::Bundled,
+                uv_source: bombadil_core::model::UvSource::Custom {
+                    path: PathBuf::from("/definitely/not/a/real/uv"),
+                },
                 ..Default::default()
             },
             ..Config::default()
@@ -848,7 +859,7 @@ mod tests {
         assert!(!success);
         let joined = lines.join("\n");
         assert!(
-            joined.contains("install uv on PATH"),
+            joined.contains("/definitely/not/a/real/uv"),
             "the resolve error's own text must survive; got {joined}"
         );
     }

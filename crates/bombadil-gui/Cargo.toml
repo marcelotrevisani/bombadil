@@ -7,7 +7,9 @@ license.workspace = true
 
 [dependencies]
 bombadil-core = { path = "../bombadil-core", version = "0.1.0" }
+bombadil-uv-bin = { path = "../bombadil-uv-bin", version = "0.1.0" }
 iced = "0.14"
+rfd = "0.17"
 
 [dev-dependencies]
 uuid.workspace = true

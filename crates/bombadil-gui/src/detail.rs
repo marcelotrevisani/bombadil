@@ -34,8 +34,7 @@ pub struct Header {
 /// Builds the header for `project`.
 ///
 /// `venv_probe` is a parameter rather than a filesystem call, so this is
-/// testable without touching disk -- the same pattern `sidebar::entries`
-/// uses. Unlike `sidebar::entries`, `header` has no `Settings` to resolve a
+/// testable without touching disk. `header` has no `Settings` to resolve a
 /// venv path with, so the probe is asked about the project directly; the
 /// real caller in `app::view` answers from `App`'s already-probed
 /// `entries` cache rather than touching disk again on every frame.

@@ -1,3 +1,4 @@
+mod about;
 mod app;
 mod banner;
 mod detail;
