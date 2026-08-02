@@ -239,6 +239,34 @@ mod tests {
     }
 
     #[test]
+    fn the_fake_tells_a_blocking_run_apart_from_a_spawn() {
+        // Callers that must not wait on their child -- a terminal emulator, a
+        // file manager -- are only provable if the fake distinguishes the two,
+        // because the default `spawn` delegates to `run`. Without this test
+        // `blocking_calls` could return a constant 0 and every assertion built
+        // on it would pass while meaning nothing.
+        let fake = FakeCommandRunner::new();
+        fake.expect(
+            "xdg-open",
+            &[],
+            CommandOutcome {
+                status: Some(0),
+                stdout: String::new(),
+                stderr: String::new(),
+            },
+        );
+        let spec = CommandSpec::new("xdg-open");
+
+        fake.spawn(&spec).unwrap();
+        assert_eq!(fake.blocking_calls(), 0, "spawn must not count as blocking");
+        assert_eq!(fake.calls().len(), 1, "a spawn is still a recorded call");
+
+        fake.run(&spec).unwrap();
+        assert_eq!(fake.blocking_calls(), 1, "run waits for the child");
+        assert_eq!(fake.calls().len(), 2);
+    }
+
+    #[test]
     fn an_unexpected_call_is_an_explicit_failure_not_a_default() {
         // A fake that silently returns success for an unprogrammed call turns
         // "we never ran this" into a passing test.

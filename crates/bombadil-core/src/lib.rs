@@ -1,5 +1,6 @@
 pub mod envspec;
 pub mod error;
+pub mod folder;
 pub mod members;
 pub mod model;
 pub mod process;

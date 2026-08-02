@@ -17,6 +17,7 @@ struct Rule {
 pub struct FakeCommandRunner {
     rules: Mutex<Vec<Rule>>,
     calls: Mutex<Vec<CommandSpec>>,
+    blocking: Mutex<usize>,
 }
 
 impl FakeCommandRunner {
@@ -34,14 +35,27 @@ impl FakeCommandRunner {
         });
     }
 
-    /// Every spec passed to `run`, in order.
+    /// Every spec passed to `run` or `spawn`, in order.
     pub fn calls(&self) -> Vec<CommandSpec> {
         self.calls.lock().unwrap().clone()
     }
-}
 
-impl CommandRunner for FakeCommandRunner {
-    fn run(&self, spec: &CommandSpec) -> Result<CommandOutcome, CommandError> {
+    /// How many calls arrived through `run` -- which waits for the child --
+    /// rather than through `spawn`, which does not.
+    ///
+    /// The default `CommandRunner::spawn` delegates to `run`, so without this
+    /// counter the two are indistinguishable to a test, and a caller that
+    /// must not block on its child (a terminal emulator, a file manager:
+    /// both live until the user closes the window) could be switched to `run`
+    /// with every assertion still passing.
+    pub fn blocking_calls(&self) -> usize {
+        *self.blocking.lock().unwrap()
+    }
+
+    /// Record the call and answer it from the programmed rules. Shared by
+    /// `run` and `spawn` so both are recorded identically; only the blocking
+    /// counter tells them apart.
+    fn record(&self, spec: &CommandSpec) -> Result<CommandOutcome, CommandError> {
         self.calls.lock().unwrap().push(spec.clone());
 
         let rules = self.rules.lock().unwrap();
@@ -59,5 +73,16 @@ impl CommandRunner for FakeCommandRunner {
                 program: spec.program.clone(),
                 args: spec.args.clone(),
             })
+    }
+}
+
+impl CommandRunner for FakeCommandRunner {
+    fn run(&self, spec: &CommandSpec) -> Result<CommandOutcome, CommandError> {
+        *self.blocking.lock().unwrap() += 1;
+        self.record(spec)
+    }
+
+    fn spawn(&self, spec: &CommandSpec) -> Result<(), CommandError> {
+        self.record(spec).map(|_| ())
     }
 }
