@@ -12,6 +12,7 @@ mod interpreter;
 mod job;
 mod members_editor;
 mod scripts_editor;
+mod settings_editor;
 mod sidebar;
 
 use bombadil_core::model::Config;

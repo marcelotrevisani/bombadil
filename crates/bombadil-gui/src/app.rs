@@ -10,9 +10,12 @@ use crate::interpreter;
 use crate::job;
 use crate::members_editor;
 use crate::scripts_editor;
+use crate::settings_editor;
 use crate::sidebar;
 use bombadil_core::envspec::{self, EnvInputs};
-use bombadil_core::model::{Config, Project, Settings, TerminalChoice};
+use bombadil_core::model::{
+    Config, DefaultVenvLocation, Project, Settings, TerminalChoice, UvSource,
+};
 use bombadil_core::process::CommandRunner;
 use bombadil_core::pyproject::PyProject;
 use bombadil_core::secrets::{KeyringSecretStore, SecretKey, SecretStore};
@@ -171,6 +174,21 @@ pub struct App {
     /// criterion 4), if any. `None` before the first press and after it
     /// resolves -- same shape as `confirm_recreate`.
     pub confirm_member_sync: Option<members_editor::ConfirmMemberSync>,
+    /// The Settings tab's (spec §5, Task 6) custom-uv-path textbox: what the
+    /// user has typed so far, kept separate from `Config` until it validates
+    /// (criterion 2) -- the same "typed text isn't committed yet" shape
+    /// `index_credential_drafts` uses. Seeded from the current
+    /// `UvSource::Custom` path, if any, so the box is not blank on reopening
+    /// a config that already names one.
+    pub uv_custom_path_draft: String,
+    /// The most recent validation of `uv_custom_path_draft` (criterion 2):
+    /// `None` before the first Validate press. `Ok` names the version that
+    /// was accepted and already written to `Settings`; `Err` is
+    /// `uv::resolve`'s own text for why it was refused -- including a
+    /// version below `MIN_UV_VERSION`, reported through
+    /// `UvResolveError::TooOld` -- and in that case `Settings::uv_source` was
+    /// never touched.
+    pub uv_custom_validation: Option<Result<String, String>>,
 }
 
 #[derive(Debug, Clone)]
@@ -430,6 +448,39 @@ pub enum Message {
     MembersSyncConfirmed,
     /// The pending member-removal confirmation was dismissed. Nothing was synced.
     MembersSyncCancelled,
+    /// One of the Settings tab's (spec §5, Task 6) three no-validation uv
+    /// source buttons was pressed: applies immediately and persists
+    /// (criterion 1) -- unlike `Custom`, none of these three names a path the
+    /// user just typed, so there is nothing to validate first.
+    SettingsUvSourceChoiceChanged(settings_editor::UvSourceChoice),
+    /// The custom-uv-path textbox changed. Plaintext, never secret material,
+    /// and never persisted on its own -- see `App::uv_custom_path_draft`.
+    SettingsUvCustomPathChanged(String),
+    /// "Validate and use" was pressed for the typed custom path (criterion
+    /// 2): dispatches `job::run`, never resolved inline -- probing a uv
+    /// binary spawns it, the same reason every other uv call in this file
+    /// goes through `job::run`.
+    SettingsUvCustomValidateRequested,
+    /// The background validation finished. Only `Ok` writes
+    /// `Settings::uv_source` and persists; `Err` -- including a version below
+    /// `MIN_UV_VERSION` -- only updates what the tab shows, so a bad path
+    /// never reaches `config.toml`.
+    SettingsUvCustomValidated(Result<uv::ResolvedUv, String>),
+    /// The background half of a Settings persist (a `uv_source` choice, or a
+    /// validated custom binary) finished.
+    SettingsPersistFinished {
+        success: bool,
+    },
+    /// "Alongside each project" was pressed for `default_venv_location`
+    /// (criterion 3): applies immediately and persists. Never touches any
+    /// project's existing venv -- see `settings_editor`'s module doc.
+    SettingsDefaultVenvLocationAlongsideSelected,
+    /// "Choose a central folder..." was pressed: open the async folder
+    /// picker, the same one `AddProjectPickVenvFolderRequested` uses.
+    SettingsDefaultVenvLocationPickFolderRequested,
+    /// The folder picker finished. `None` when the user cancelled it --
+    /// leaves the previous `default_venv_location` untouched.
+    SettingsDefaultVenvLocationFolderPicked(Option<PathBuf>),
 }
 
 /// What background loading produced for the Members tab (spec §5a): the
@@ -457,6 +508,14 @@ impl App {
         // `IndexAdded`/`IndexRemoved` keep in step with `config.indexes`
         // from here on.
         let index_credential_drafts = vec![String::new(); config.indexes.len()];
+        // Seeded from whatever `UvSource::Custom` path is already configured,
+        // if any, so the Settings tab's textbox is not blank on reopening a
+        // config that already names one -- an empty draft for every other
+        // source, since there is nothing to pre-fill.
+        let uv_custom_path_draft = match &config.settings.uv_source {
+            UvSource::Custom { path } => path.display().to_string(),
+            _ => String::new(),
+        };
         Self {
             config,
             projects,
@@ -474,6 +533,8 @@ impl App {
             index_credential_drafts,
             members: None,
             confirm_member_sync: None,
+            uv_custom_path_draft,
+            uv_custom_validation: None,
         }
     }
 }
@@ -1412,6 +1473,72 @@ pub fn update(app: &mut App, message: Message, runner: Arc<dyn CommandRunner>) -
                 return dispatch_members_sync(app, project, kind, discovered, runner);
             }
         }
+        // Criterion 1: applies immediately and persists -- the write every
+        // later `resolve_uv_for(&app.config, ..)` call reads fresh.
+        Message::SettingsUvSourceChoiceChanged(choice) => {
+            settings_editor::apply_choice(&mut app.config.settings, choice);
+            // A stale result from a previous Custom validation no longer
+            // describes the current source.
+            app.uv_custom_validation = None;
+            return persist_settings_edit(app);
+        }
+        Message::SettingsUvCustomPathChanged(text) => {
+            app.uv_custom_path_draft = text;
+        }
+        Message::SettingsUvCustomValidateRequested => {
+            let path = PathBuf::from(app.uv_custom_path_draft.trim());
+            let config = app.config.clone();
+            return Task::perform(
+                validate_uv_source(path, config, runner),
+                Message::SettingsUvCustomValidated,
+            );
+        }
+        // Criterion 2: only a passing validation ever writes `Settings` --
+        // this is the only arm that does.
+        Message::SettingsUvCustomValidated(Ok(resolved)) => {
+            app.config.settings.uv_source = UvSource::Custom {
+                path: resolved.path.clone(),
+            };
+            app.uv_custom_validation = Some(Ok(resolved.version.to_string()));
+            return persist_settings_edit(app);
+        }
+        // A refused path -- including one below `MIN_UV_VERSION`, reported
+        // through `UvResolveError::TooOld`'s own text -- only updates what
+        // the tab shows. `Settings::uv_source` is untouched, so the bad path
+        // never reaches `config.toml`.
+        Message::SettingsUvCustomValidated(Err(message)) => {
+            app.uv_custom_validation = Some(Err(message));
+        }
+        Message::SettingsPersistFinished { success } => {
+            if !success {
+                drawer::set_idle(
+                    &mut app.drawer,
+                    "settings change failed to persist".to_string(),
+                );
+            }
+        }
+        Message::SettingsDefaultVenvLocationAlongsideSelected => {
+            settings_editor::apply_default_venv_location(
+                &mut app.config.settings,
+                DefaultVenvLocation::Alongside,
+            );
+            return persist_settings_edit(app);
+        }
+        Message::SettingsDefaultVenvLocationPickFolderRequested => {
+            return Task::perform(
+                pick_folder(),
+                Message::SettingsDefaultVenvLocationFolderPicked,
+            );
+        }
+        // Cancelled -- leave the previous location untouched.
+        Message::SettingsDefaultVenvLocationFolderPicked(None) => {}
+        Message::SettingsDefaultVenvLocationFolderPicked(Some(path)) => {
+            settings_editor::apply_default_venv_location(
+                &mut app.config.settings,
+                DefaultVenvLocation::Central { path },
+            );
+            return persist_settings_edit(app);
+        }
     }
     Task::none()
 }
@@ -2244,6 +2371,58 @@ fn persist_index_edit(app: &App) -> Task<Message> {
     })
 }
 
+/// Dispatches a background persist of `app.config` as it stands right now,
+/// for a Settings edit (spec §5, Task 6) that needs no keychain call --
+/// every one of them, since neither `uv_source` nor `default_venv_location`
+/// carries a secret. Mirrors `persist_env_edit`/`persist_script_edit`/
+/// `persist_index_edit` exactly.
+fn persist_settings_edit(app: &App) -> Task<Message> {
+    let config = app.config.clone();
+    let persist = app.persist.clone();
+    Task::perform(persist_config(config, persist), |success| {
+        Message::SettingsPersistFinished { success }
+    })
+}
+
+/// The blocking half of validating a candidate `uv_source: Custom { path }`
+/// (criterion 2): resolves it through the same `resolve_uv_for` every other
+/// uv call in this file uses, against a config whose `uv_source` has been
+/// swapped for the candidate -- so a version below `MIN_UV_VERSION` comes
+/// back as `UvResolveError::TooOld`'s own text, the same as it would for a
+/// real sync, and nothing here re-derives that check.
+///
+/// Its own function, mirroring `list_interpreters_blocking`, so a test can
+/// call it directly with a `FakeCommandRunner` instead of only through the
+/// `Task` `SettingsUvCustomValidateRequested` returns.
+fn validate_uv_source_blocking(
+    path: PathBuf,
+    mut config: Config,
+    runner: &dyn CommandRunner,
+) -> Result<uv::ResolvedUv, String> {
+    config.settings.uv_source = UvSource::Custom { path };
+    resolve_uv_for(&config, runner)
+}
+
+/// Runs `validate_uv_source_blocking` off the render thread via `job::run` --
+/// criterion 2's "through `job::run`": probing a uv binary spawns it, the
+/// same reason `sync_project` and `list_interpreters` do the same.
+async fn validate_uv_source(
+    path: PathBuf,
+    config: Config,
+    runner: Arc<dyn CommandRunner>,
+) -> Result<uv::ResolvedUv, String> {
+    match job::run(
+        move || validate_uv_source_blocking(path, config, runner.as_ref()),
+        SYNC_TIMEOUT,
+    )
+    .await
+    {
+        job::JobResult::Done(result) => result,
+        job::JobResult::TimedOut => Err("validating uv timed out".to_string()),
+        job::JobResult::Failed => Err("validating uv failed unexpectedly".to_string()),
+    }
+}
+
 /// Runs off the render thread via `job::run`: persisting the config is a
 /// blocking file write, same as every other `ConfigPersist` call in this
 /// file.
@@ -2411,6 +2590,18 @@ pub fn view(app: &App) -> iced::Element<'_, Message> {
     // project's own selection among them (spec §7, Task 4).
     let indexes_tab = index_editor::view(&app.config, app.selected, &app.index_credential_drafts);
 
+    // Which uv binary to run and where new venvs go (spec §5, Task 6).
+    // `resolved_default_venv_paths` recomputes fresh from `app.config` on
+    // every render, the same "recompute, don't cache" trick `env_vars_tab`
+    // and `indexes_tab` already rely on, which is what makes criterion 3
+    // visible the instant a location change lands, with no restart.
+    let settings_tab = settings_editor::view(
+        &app.config.settings,
+        &app.config.projects,
+        &app.uv_custom_path_draft,
+        app.uv_custom_validation.as_ref(),
+    );
+
     let detail_and_drawer = iced::widget::column![
         detail,
         deps_tab,
@@ -2418,6 +2609,7 @@ pub fn view(app: &App) -> iced::Element<'_, Message> {
         env_vars_tab,
         scripts_tab,
         indexes_tab,
+        settings_tab,
         drawer::view(&app.drawer)
     ]
     .spacing(8);
@@ -5617,6 +5809,392 @@ mod tests {
         assert!(app.confirm_member_sync.is_none());
         assert_eq!(task.units(), 0);
         assert!(app.syncing.is_none());
+    }
+
+    // --- Task 6: the Settings tab ---
+
+    fn version_outcome(line: &str) -> bombadil_core::process::CommandOutcome {
+        bombadil_core::process::CommandOutcome {
+            status: Some(0),
+            stdout: line.into(),
+            stderr: String::new(),
+        }
+    }
+
+    // --- criterion 1: a `uv_source` change takes effect on the next
+    // resolve, without restarting ---
+
+    #[test]
+    fn changing_uv_source_takes_effect_on_the_next_resolve_without_restarting() {
+        // The bug this catches: a uv binary resolved once (at boot, or on
+        // first use) and cached somewhere on `App`, so the UI and the next
+        // `uv sync` disagree until the process restarts. There is no such
+        // cache to poke directly -- `resolve_uv_for` takes `&Config` fresh on
+        // every call -- so the proof is behavioural: resolve twice against
+        // the SAME running `App`, with the settings change landing via
+        // `update` in between, using two runners that each answer for only
+        // one of the two paths. If the change had not really landed in
+        // `app.config`, or `update` mutated some other copy of it, the
+        // second resolve would be asked of a runner with no rule for the old
+        // path and fail instead of succeeding against the new one.
+        let mut app = App::new(Config {
+            settings: Settings {
+                uv_source: UvSource::Custom {
+                    path: PathBuf::from("/bin/uv-old"),
+                },
+                ..Settings::default()
+            },
+            ..Config::default()
+        });
+
+        let old_runner = FakeCommandRunner::new();
+        old_runner.expect("uv-old", &["--version"], version_outcome("uv 0.12.1"));
+        let before =
+            resolve_uv_for(&app.config, &old_runner).expect("the configured old source resolves");
+        assert_eq!(before.path, PathBuf::from("/bin/uv-old"));
+
+        // Simulates a validated "use this uv" press landing -- criterion 2's
+        // own message is what a real change goes through; this test's
+        // subject is what happens to *resolution* afterward, not the
+        // validation itself.
+        let _ = update(
+            &mut app,
+            Message::SettingsUvCustomValidated(Ok(uv::ResolvedUv {
+                path: PathBuf::from("/bin/uv-new"),
+                version: uv::UvVersion {
+                    major: 0,
+                    minor: 12,
+                    patch: 1,
+                },
+                origin: uv::UvOrigin::Configured,
+                newer_than_bundled: false,
+            })),
+            unused_runner(),
+        );
+        assert_eq!(
+            app.config.settings.uv_source,
+            UvSource::Custom {
+                path: PathBuf::from("/bin/uv-new")
+            },
+            "the landed validation must write Settings::uv_source immediately"
+        );
+
+        let new_runner = FakeCommandRunner::new();
+        new_runner.expect("uv-new", &["--version"], version_outcome("uv 0.12.1"));
+        let after = resolve_uv_for(&app.config, &new_runner)
+            .expect("the new source must resolve on the very next call, with no restart");
+        assert_eq!(after.path, PathBuf::from("/bin/uv-new"));
+    }
+
+    // --- criterion 2: a custom uv binary is validated, through `job::run`,
+    // before it is ever saved ---
+
+    #[test]
+    fn requesting_custom_uv_validation_never_probes_the_runner_synchronously() {
+        let mut app = App::new(Config::default());
+        app.uv_custom_path_draft = "/opt/uv".to_string();
+        let fake = Arc::new(FakeCommandRunner::new());
+
+        let task = update(
+            &mut app,
+            Message::SettingsUvCustomValidateRequested,
+            fake.clone(),
+        );
+
+        assert!(
+            fake.calls().is_empty(),
+            "validating a uv binary must spawn it through job::run, not inline inside update; got {:?}",
+            fake.calls()
+        );
+        assert!(
+            task.units() > 0,
+            "a validate request must dispatch real background work"
+        );
+    }
+
+    #[test]
+    fn a_custom_binary_below_the_minimum_version_is_refused_and_reported_as_such() {
+        // Criterion 2's version check: `uv::resolve`'s own `TooOld` text,
+        // not a second copy of the comparison.
+        let runner = FakeCommandRunner::new();
+        runner.expect("uv", &["--version"], version_outcome("uv 0.9.0"));
+
+        let err = validate_uv_source_blocking(PathBuf::from("/opt/uv"), Config::default(), &runner)
+            .expect_err("a version below MIN_UV_VERSION must be refused");
+
+        assert!(
+            err.contains("0.9.0"),
+            "the offending version must be named; got {err}"
+        );
+        assert!(
+            err.contains("0.12.1"),
+            "the minimum it fell short of must be named too; got {err}"
+        );
+    }
+
+    #[test]
+    fn a_refused_custom_validation_never_writes_settings_or_persists() {
+        // The exact bug criterion 2 exists to catch: a bad path saved before
+        // it was ever confirmed to run, discovered later at spawn time far
+        // from this screen. `SettingsUvCustomValidated(Err(_))` -- the only
+        // message a failed validation can produce -- must leave `Settings`
+        // and the persisted config exactly as they were.
+        let original = UvSource::Bundled;
+        let mut app = App::new(Config {
+            settings: Settings {
+                uv_source: original.clone(),
+                ..Settings::default()
+            },
+            ..Config::default()
+        });
+        let persist = Arc::new(FakeConfigPersist::default());
+        app.persist = persist.clone();
+
+        let runner = FakeCommandRunner::new();
+        runner.expect("uv", &["--version"], version_outcome("uv 0.9.0"));
+        let err =
+            validate_uv_source_blocking(PathBuf::from("/opt/uv"), app.config.clone(), &runner)
+                .unwrap_err();
+
+        let task = update(
+            &mut app,
+            Message::SettingsUvCustomValidated(Err(err)),
+            unused_runner(),
+        );
+
+        assert_eq!(
+            app.config.settings.uv_source, original,
+            "a refused path must never reach Settings"
+        );
+        assert_eq!(
+            task.units(),
+            0,
+            "a refusal must not dispatch a persist -- there is nothing new to save"
+        );
+        assert!(
+            persist.saved().is_empty(),
+            "a refused validation must never be persisted"
+        );
+    }
+
+    #[test]
+    fn an_accepted_custom_validation_writes_settings_and_persists_the_probed_path() {
+        let mut app = App::new(Config::default());
+        let persist = Arc::new(FakeConfigPersist::default());
+        app.persist = persist.clone();
+
+        let runner = FakeCommandRunner::new();
+        runner.expect("uv", &["--version"], version_outcome("uv 0.12.1"));
+        let resolved =
+            validate_uv_source_blocking(PathBuf::from("/opt/uv"), app.config.clone(), &runner)
+                .expect("uv 0.12.1 meets MIN_UV_VERSION");
+
+        let _ = update(
+            &mut app,
+            Message::SettingsUvCustomValidated(Ok(resolved)),
+            unused_runner(),
+        );
+
+        assert_eq!(
+            app.config.settings.uv_source,
+            UvSource::Custom {
+                path: PathBuf::from("/opt/uv")
+            }
+        );
+
+        let success = block_on(persist_config(app.config.clone(), persist.clone()));
+        assert!(success);
+        assert_eq!(
+            persist.saved().last().unwrap().settings.uv_source,
+            UvSource::Custom {
+                path: PathBuf::from("/opt/uv")
+            },
+            "the accepted, probed path must be what is persisted"
+        );
+    }
+
+    // --- criterion 3: `default_venv_location` changes the resolved path
+    // for Default projects, and never moves or deletes an existing venv ---
+
+    #[test]
+    fn changing_the_default_venv_location_changes_the_resolved_path_for_a_default_project() {
+        let project_at = |dir: &Path| Project {
+            venv: bombadil_core::model::VenvLocation::Default,
+            pyproject_path: dir.join("pyproject.toml"),
+            ..project("api")
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = App::new(Config {
+            projects: vec![project_at(dir.path())],
+            settings: Settings {
+                default_venv_location: bombadil_core::model::DefaultVenvLocation::Alongside,
+                ..Settings::default()
+            },
+            ..Config::default()
+        });
+        let before = venv_path::resolve(&app.projects[0], &app.config.settings).unwrap();
+        assert_eq!(before, dir.path().join(".venv"));
+
+        let central = tempfile::tempdir().unwrap();
+        let _ = update(
+            &mut app,
+            Message::SettingsDefaultVenvLocationFolderPicked(Some(central.path().to_path_buf())),
+            unused_runner(),
+        );
+
+        assert_eq!(
+            app.config.settings.default_venv_location,
+            bombadil_core::model::DefaultVenvLocation::Central {
+                path: central.path().to_path_buf()
+            }
+        );
+        let after = venv_path::resolve(&app.projects[0], &app.config.settings).unwrap();
+        assert_ne!(
+            after, before,
+            "the resolved path for a Default project must change with the setting"
+        );
+        assert!(
+            after.starts_with(central.path()),
+            "got {after:?}, expected it under {central:?}",
+            central = central.path()
+        );
+    }
+
+    #[test]
+    fn changing_the_default_venv_location_never_touches_an_existing_venv_on_disk() {
+        // The half of criterion 3 that matters most: Bombadil must never
+        // move or delete a venv as a side effect of a settings change.
+        // `venv_path::resolve` performs no filesystem access at all (see its
+        // own doc), and the only call site for the crate's one destructive
+        // operation, `venv_path::delete`, is `RecreateVenvConfirmed`, gated
+        // on an explicit user confirmation -- nothing reachable from
+        // `SettingsDefaultVenvLocation*` calls it. This does not take that on
+        // faith: it puts a real venv on disk at the old location and checks
+        // it is untouched after the setting changes.
+        let dir = tempfile::tempdir().unwrap();
+        let old_venv = dir.path().join(".venv");
+        std::fs::create_dir_all(old_venv.join("lib")).unwrap();
+        std::fs::write(
+            old_venv.join("pyvenv.cfg"),
+            "home = /usr/bin\nversion_info = 3.12.1\n",
+        )
+        .unwrap();
+        std::fs::write(old_venv.join("lib").join("marker"), "still here").unwrap();
+
+        let mut app = App::new(Config {
+            projects: vec![Project {
+                venv: bombadil_core::model::VenvLocation::Default,
+                pyproject_path: dir.path().join("pyproject.toml"),
+                ..project("api")
+            }],
+            settings: Settings {
+                default_venv_location: bombadil_core::model::DefaultVenvLocation::Alongside,
+                ..Settings::default()
+            },
+            ..Config::default()
+        });
+
+        let central = tempfile::tempdir().unwrap();
+        let fake = Arc::new(FakeCommandRunner::new());
+        let _ = update(
+            &mut app,
+            Message::SettingsDefaultVenvLocationFolderPicked(Some(central.path().to_path_buf())),
+            fake.clone(),
+        );
+
+        let new_path = venv_path::resolve(&app.projects[0], &app.config.settings).unwrap();
+        assert!(
+            old_venv.exists() && old_venv.join("pyvenv.cfg").exists(),
+            "the venv at the OLD resolved location must survive the settings change untouched"
+        );
+        assert_eq!(
+            std::fs::read_to_string(old_venv.join("lib").join("marker")).unwrap(),
+            "still here",
+            "the old venv's contents must be byte-for-byte untouched, not just its directory"
+        );
+        assert!(
+            !new_path.exists(),
+            "nothing may be created at the new location either -- only the computed path changes, \
+             the venv is neither moved nor recreated"
+        );
+        assert!(
+            fake.calls().is_empty(),
+            "a settings change must spawn no process at all; got {:?}",
+            fake.calls()
+        );
+    }
+
+    #[test]
+    fn selecting_alongside_after_a_central_location_also_leaves_the_central_venv_alone() {
+        // The mirror direction of the test above -- moving back toward
+        // Alongside must be exactly as inert as moving away from it. Without
+        // this, a fix that only guarded the Alongside-to-Central direction
+        // would still pass the other test above and still be able to
+        // silently strand or delete a venv on the way back.
+        let central = tempfile::tempdir().unwrap();
+        let central_venv = central.path().join("api-000000");
+        // Not a real `central_dir_name` hash -- irrelevant here, since this
+        // test never resolves through it; it only has to be *some* existing
+        // directory under the old central root that must survive.
+        std::fs::create_dir_all(central_venv.join("lib")).unwrap();
+        std::fs::write(
+            central_venv.join("pyvenv.cfg"),
+            "home = /usr/bin\nversion_info = 3.12.1\n",
+        )
+        .unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = App::new(Config {
+            projects: vec![Project {
+                venv: bombadil_core::model::VenvLocation::Default,
+                pyproject_path: dir.path().join("pyproject.toml"),
+                ..project("api")
+            }],
+            settings: Settings {
+                default_venv_location: bombadil_core::model::DefaultVenvLocation::Central {
+                    path: central.path().to_path_buf(),
+                },
+                ..Settings::default()
+            },
+            ..Config::default()
+        });
+
+        let _ = update(
+            &mut app,
+            Message::SettingsDefaultVenvLocationAlongsideSelected,
+            unused_runner(),
+        );
+
+        assert_eq!(
+            app.config.settings.default_venv_location,
+            bombadil_core::model::DefaultVenvLocation::Alongside
+        );
+        assert!(
+            central_venv.join("pyvenv.cfg").exists(),
+            "the venv left behind under the old central location must survive"
+        );
+    }
+
+    #[test]
+    fn picking_a_default_venv_folder_dispatches_no_filesystem_or_process_work_synchronously() {
+        // "Choose a central folder..." opens the async picker; the choice
+        // itself does not run through job::run (there is nothing blocking
+        // about assigning a path), but this pins that the message that
+        // requests the picker touches neither the runner nor `Settings`
+        // until a folder actually comes back.
+        let mut app = App::new(Config::default());
+        let fake = Arc::new(FakeCommandRunner::new());
+        let before = app.config.settings.default_venv_location.clone();
+
+        let task = update(
+            &mut app,
+            Message::SettingsDefaultVenvLocationPickFolderRequested,
+            fake.clone(),
+        );
+
+        assert_eq!(app.config.settings.default_venv_location, before);
+        assert!(fake.calls().is_empty());
+        assert!(task.units() > 0, "must open the async folder picker");
     }
 
     fn project(label: &str) -> bombadil_core::model::Project {
