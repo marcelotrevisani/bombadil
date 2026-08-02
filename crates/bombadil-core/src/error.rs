@@ -142,6 +142,12 @@ pub enum EnvError {
         output: String,
     },
 
+    #[error(
+        "the pre-activate script {script} did not produce a complete environment dump; \
+         it may have called `exit`"
+    )]
+    ScriptDumpIncomplete { script: std::path::PathBuf },
+
     #[error("could not read a secret while composing the environment: {message}")]
     Secret { message: String },
 }

@@ -47,14 +47,21 @@ fn resolve_var(
         return Ok(());
     }
 
-    // A secret with nothing stored is omitted rather than set empty: an empty
-    // value looks set to the child and fails somewhere far from the cause.
+    // A secret with nothing stored is actively *removed* rather than set
+    // empty: an empty value looks set to the child and fails somewhere far
+    // from the cause. Removing rather than skipping matters because the layers
+    // accumulate into one map -- skipping would let an earlier layer's value
+    // survive, so a user who has `AWS_SECRET_ACCESS_KEY` exported in the shell
+    // that launched Bombadil and has marked it secret but not yet filled it in
+    // would silently get the ambient value while believing Bombadil supplied
+    // it.
     let stored = store.get(&key).map_err(|source| EnvError::Secret {
         message: source.to_string(),
     })?;
-    if let Some(value) = stored {
-        into.insert(var.key.clone(), value);
-    }
+    match stored {
+        Some(value) => into.insert(var.key.clone(), value),
+        None => into.remove(&var.key),
+    };
     Ok(())
 }
 
@@ -136,13 +143,23 @@ pub fn compose(
     //    while the shell showed another.
     let bin = venv_bin_dir(&inputs.venv_path);
     let bin = bin.to_string_lossy().into_owned();
-    let path = match env.get("PATH") {
+    // Windows variable names are case-insensitive and `std::env::vars()`
+    // yields the canonical spelling `Path`. Looking up "PATH" exactly would
+    // miss it, then insert a *second* key -- and since the child's environment
+    // is written in `BTreeMap` order, "PATH" sorts first and the parent's
+    // "Path" would overwrite it, leaving the venv off `PATH` entirely.
+    let path_key = env
+        .keys()
+        .find(|k| k.eq_ignore_ascii_case("PATH"))
+        .cloned()
+        .unwrap_or_else(|| "PATH".to_string());
+    let path = match env.get(&path_key) {
         Some(existing) if !existing.is_empty() => {
             format!("{bin}{}{existing}", if cfg!(windows) { ";" } else { ":" })
         }
         _ => bin.clone(),
     };
-    env.insert("PATH".to_string(), path);
+    env.insert(path_key, path);
     let venv = inputs.venv_path.to_string_lossy().into_owned();
     env.insert("UV_PROJECT_ENVIRONMENT".to_string(), venv.clone());
     env.insert("VIRTUAL_ENV".to_string(), venv);
@@ -180,6 +197,10 @@ mod tests {
                 ("PATH".to_string(), "/usr/bin".to_string()),
                 ("HOME".to_string(), "/home/t".to_string()),
                 ("PYTHONHOME".to_string(), "/stale".to_string()),
+                // Seeded so "a secret with nothing stored" is tested against a
+                // parent that actually carries the variable. Without it the
+                // test passes whether or not the layer removes anything.
+                ("TOKEN".to_string(), "ambient".to_string()),
             ]),
             config,
             project,
@@ -251,9 +272,12 @@ mod tests {
     }
 
     #[test]
-    fn a_secret_with_nothing_stored_is_omitted_rather_than_empty() {
+    fn a_secret_with_nothing_stored_is_removed_not_left_to_the_parent() {
         // An empty value looks set to the child process and fails in a way
-        // that points nowhere near the real cause.
+        // that points nowhere near the real cause -- but "omitted" is not
+        // enough either. The layers accumulate into one map, so merely
+        // skipping the insert would pass the parent's ambient TOKEN straight
+        // through while the user believes Bombadil supplied it.
         let project = Project {
             env: vec![EnvVar {
                 key: "TOKEN".into(),
@@ -266,6 +290,99 @@ mod tests {
         let got = compose_with(inputs(Config::default(), project));
 
         assert!(!got.contains_key("TOKEN"), "got {got:?}");
+    }
+
+    #[test]
+    fn a_global_secret_is_read_from_the_global_keychain_key() {
+        // Mis-keying this (e.g. reusing ProjectEnv) would leave every other
+        // compose test green while global secrets silently never resolved.
+        let config = Config {
+            global_env: vec![EnvVar {
+                key: "GLOBAL_TOKEN".into(),
+                value: String::new(),
+                secret: true,
+            }],
+            ..Config::default()
+        };
+        let store = InMemorySecretStore::new();
+        store
+            .set(
+                &SecretKey::GlobalEnv {
+                    key: "GLOBAL_TOKEN".into(),
+                },
+                "from-global-keychain",
+            )
+            .unwrap();
+        let runner = FakeCommandRunner::new();
+
+        let got = compose(&inputs(config, project()), &store, &runner).unwrap();
+
+        assert_eq!(
+            got.get("GLOBAL_TOKEN").map(String::as_str),
+            Some("from-global-keychain")
+        );
+    }
+
+    #[test]
+    fn a_global_script_runs_too_not_just_the_projects() {
+        // Dropping the `.chain()` in compose would leave every other test
+        // green while global pre-activate scripts silently never ran.
+        let config = Config {
+            global_scripts: vec![Script {
+                path: PathBuf::from("/g/global.sh"),
+                args: vec![],
+                enabled: true,
+            }],
+            ..Config::default()
+        };
+        let runner = FakeCommandRunner::new();
+        runner.expect(
+            "sh",
+            &[],
+            CommandOutcome {
+                status: Some(0),
+                stdout: "PATH=/usr/bin\0FROM_GLOBAL_SCRIPT=set\0__BOMBADIL_DUMP_OK=1\0".into(),
+                stderr: String::new(),
+            },
+        );
+        let store = InMemorySecretStore::new();
+
+        let got = compose(&inputs(config, project()), &store, &runner).unwrap();
+
+        assert_eq!(
+            got.get("FROM_GLOBAL_SCRIPT").map(String::as_str),
+            Some("set")
+        );
+        assert_eq!(
+            runner.calls().len(),
+            1,
+            "the global script must be run once"
+        );
+    }
+
+    #[test]
+    fn the_venv_is_prepended_to_a_windows_style_path_key() {
+        // Windows variable names are case-insensitive and `std::env::vars()`
+        // yields `Path`. An exact "PATH" lookup misses it and inserts a second
+        // key; the child's environment is written in BTreeMap order, so
+        // "PATH" (the venv) would be overwritten by "Path" (the parent's) and
+        // the venv would not be on PATH at all.
+        let mut ins = inputs(Config::default(), project());
+        ins.parent = BTreeMap::from([("Path".to_string(), "/usr/bin".to_string())]);
+
+        let got = compose_with(ins);
+
+        let path_keys: Vec<&String> = got
+            .keys()
+            .filter(|k| k.eq_ignore_ascii_case("PATH"))
+            .collect();
+        assert_eq!(path_keys.len(), 1, "got {path_keys:?}");
+        let path = &got[path_keys[0]];
+        assert!(path.starts_with("/envs/my-api"), "got {path}");
+        assert!(
+            path.contains("/usr/bin"),
+            "the inherited PATH must survive; got {path}"
+        );
     }
 
     #[test]
@@ -416,6 +533,7 @@ mod tests {
                     "UV_PROJECT_ENVIRONMENT=/wrong-from-script\0",
                     "FROM_SCRIPT=set\0",
                     "VIRTUAL_ENV=/wrong\0",
+                    "__BOMBADIL_DUMP_OK=1\0",
                 )
                 .to_string(),
                 stderr: String::new(),

@@ -4,11 +4,38 @@ use crate::model::Script;
 use crate::process::{CommandRunner, CommandSpec};
 use std::collections::BTreeMap;
 
+/// Written as the last record of every dump, and required by [`apply`].
+///
+/// A sourced script runs in the *same* shell, so an `exit 0` anywhere in it —
+/// `[ -f "$creds" ] || exit 0` is an everyday guard — terminates `sh -c`
+/// before `env -0` runs. Verified: `sh -c ". './exit0.sh' >/dev/null; env -0"`
+/// exits 0 with zero bytes of stdout. Without this marker that is
+/// indistinguishable from "the environment is genuinely empty", and since the
+/// dump replaces the environment wholesale it would silently discard the
+/// parent environment, every configured variable, every keychain secret and
+/// every index credential — and return `Ok`. Dot-sourcing in PowerShell
+/// behaves the same way.
+const SENTINEL_KEY: &str = "__BOMBADIL_DUMP_OK";
+
+/// Escape a string for interpolation inside a single-quoted shell literal.
+///
+/// Without this, a path or argument containing an apostrophe (`o'brien`) ends
+/// the quote early: verified to fail with `Syntax error: Unterminated quoted
+/// string`.
+fn quote(raw: &str) -> String {
+    if cfg!(windows) {
+        raw.replace('\'', "''")
+    } else {
+        raw.replace('\'', r"'\''")
+    }
+}
+
 /// Build the command that sources a script and dumps the resulting
 /// environment.
 ///
-/// POSIX uses `sh -c '. <script>; env -0'`, verified to capture values with
-/// spaces, `=` and newlines, and to surface the script's exit status.
+/// POSIX uses `sh -c "set -- <args>; . '<script>' >/dev/null; env -0;
+/// <sentinel>"`, verified to capture values with spaces, `=` and newlines, and
+/// to surface the script's exit status.
 /// stdout alone is redirected to `/dev/null` (not `2>&1`): anything the
 /// script prints there would land on the same stream as `env -0`'s
 /// NUL-separated dump and corrupt it. stderr is left alone deliberately —
@@ -17,34 +44,55 @@ use std::collections::BTreeMap;
 /// every failure report an empty message; resist "tidying" this back to
 /// `2>&1`.
 ///
+/// Arguments go through positional parameters rather than trailing operands
+/// of `.`, because dash's `.` builtin *ignores* them: verified, `sh -c
+/// ". './argp.sh' a b; env -0"` yields an empty `$1` while bash yields `a`.
+/// `/bin/sh` is dash on Debian and Ubuntu, so the trailing-operand form made
+/// [`Script::args`] silently do nothing there. `set --` is emitted even with
+/// no arguments; it simply clears the (already empty) parameters.
+///
+/// The sentinel is written with `printf '...\000'`: three-digit octal, verified
+/// to emit a real NUL under both dash and bash on this machine. A bare `\0` is
+/// not portably required to mean NUL.
+///
 /// Windows uses PowerShell writing the same NUL-separated records. That form
 /// is NOT verified on a development machine — the integration test runs on the
 /// Windows CI job, which is what proves it. `[Console]::OutputEncoding` is
 /// pinned to UTF-8 first: the dump is read back as UTF-8 (`parse_dump` drops
 /// any record that isn't), but PowerShell's default console output encoding
 /// is not guaranteed UTF-8, so without this a non-ASCII variable value would
-/// silently vanish rather than error. `$ErrorActionPreference = 'Stop'` is
+/// silently vanish rather than error. It must be the **BOM-less**
+/// `UTF8Encoding $false` — `[Text.Encoding]::UTF8` emits a BOM, which would
+/// prefix redirected stdout with `EF BB BF` and rename the dump's first key to
+/// `\u{feff}Path`. `$ErrorActionPreference = 'Stop'` is
 /// set next because `powershell -Command` otherwise exits 0 even when the
 /// sourced script writes errors; without it a broken script would silently
 /// produce a truncated environment instead of aborting.
 pub fn dump_command(script: &Script) -> CommandSpec {
-    let path = script.path.to_string_lossy();
-    let args = script.args.join(" ");
+    let path = quote(&script.path.to_string_lossy());
+    let args = script
+        .args
+        .iter()
+        .map(|a| format!("'{}'", quote(a)))
+        .collect::<Vec<_>>()
+        .join(" ");
 
     #[cfg(not(windows))]
     {
-        let program = format!(". '{path}' {args} >/dev/null; env -0");
+        let program =
+            format!("set -- {args}; . '{path}' >/dev/null; env -0; printf '{SENTINEL_KEY}=1\\000'");
         CommandSpec::new("sh").arg("-c").arg(program)
     }
 
     #[cfg(windows)]
     {
         let program = format!(
-            "[Console]::OutputEncoding = [Text.Encoding]::UTF8; \
+            "[Console]::OutputEncoding = (New-Object System.Text.UTF8Encoding $false); \
              $ErrorActionPreference = 'Stop'; \
              . '{path}' {args} | Out-Null; \
              Get-ChildItem Env: | ForEach-Object {{ \
-                 [Console]::Out.Write($_.Name + '=' + $_.Value + [char]0) }}"
+                 [Console]::Out.Write($_.Name + '=' + $_.Value + [char]0) }}; \
+             [Console]::Out.Write('{SENTINEL_KEY}=1' + [char]0)"
         );
         CommandSpec::new("powershell")
             .arg("-NoProfile")
@@ -68,7 +116,10 @@ pub fn dump_command(script: &Script) -> CommandSpec {
 /// usable `PATH` is the caller's job.
 ///
 /// A disabled script is not run. A script exiting non-zero aborts with its
-/// output attached rather than applying partially.
+/// output attached rather than applying partially, and a dump missing its
+/// trailing [`SENTINEL_KEY`] record aborts with
+/// [`EnvError::ScriptDumpIncomplete`] rather than returning the truncated
+/// environment as if it were complete.
 pub fn apply(
     script: &Script,
     runner: &dyn CommandRunner,
@@ -95,7 +146,15 @@ pub fn apply(
         });
     }
 
-    Ok(parse_dump(outcome.stdout.as_bytes()))
+    let mut env = parse_dump(outcome.stdout.as_bytes());
+    // Absent sentinel means the dump never finished -- an `exit` in the
+    // script, most likely. Returning what we got would wipe the environment.
+    if env.remove(SENTINEL_KEY).is_none() {
+        return Err(EnvError::ScriptDumpIncomplete {
+            script: script.path.clone(),
+        });
+    }
+    Ok(env)
 }
 
 #[cfg(test)]
@@ -120,7 +179,17 @@ mod tests {
         ])
     }
 
+    /// A complete dump: the records plus the trailing sentinel a real shell
+    /// writes once `env -0` has run to the end.
     fn dump(records: &[&str]) -> String {
+        let mut out = truncated_dump(records);
+        out.push_str(SENTINEL_KEY);
+        out.push_str("=1\0");
+        out
+    }
+
+    /// A dump cut short, as a script calling `exit` produces.
+    fn truncated_dump(records: &[&str]) -> String {
         let mut out = String::new();
         for r in records {
             out.push_str(r);
@@ -233,6 +302,75 @@ mod tests {
     }
 
     #[test]
+    fn an_empty_dump_is_an_error_not_an_empty_environment() {
+        // Verified against a real shell: a sourced script calling `exit 0`
+        // ends `sh -c` before `env -0` runs, so the command exits 0 with zero
+        // bytes of stdout. Trusting that would replace the whole composed
+        // environment -- parent, variables, keychain secrets, index
+        // credentials -- with nothing, and still return Ok.
+        let runner = FakeCommandRunner::new();
+        runner.expect(
+            "sh",
+            &[],
+            CommandOutcome {
+                status: Some(0),
+                stdout: String::new(),
+                stderr: String::new(),
+            },
+        );
+
+        let err = apply(&script("/p/pre.sh"), &runner, &base()).unwrap_err();
+
+        assert!(
+            matches!(err, EnvError::ScriptDumpIncomplete { .. }),
+            "got {err:?}"
+        );
+        assert!(err.to_string().contains("/p/pre.sh"), "got {err}");
+    }
+
+    #[test]
+    fn a_truncated_dump_is_an_error_not_a_partial_environment() {
+        // `exit` part-way through is the same failure with some records
+        // already written: plausible-looking output that is missing whatever
+        // came after it.
+        let runner = FakeCommandRunner::new();
+        runner.expect(
+            "sh",
+            &[],
+            CommandOutcome {
+                status: Some(0),
+                stdout: truncated_dump(&["KEEP=unchanged"]),
+                stderr: String::new(),
+            },
+        );
+
+        let err = apply(&script("/p/pre.sh"), &runner, &base()).unwrap_err();
+
+        assert!(
+            matches!(err, EnvError::ScriptDumpIncomplete { .. }),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn the_sentinel_never_reaches_the_child_process() {
+        let runner = FakeCommandRunner::new();
+        runner.expect(
+            "sh",
+            &[],
+            CommandOutcome {
+                status: Some(0),
+                stdout: dump(&["KEEP=unchanged"]),
+                stderr: String::new(),
+            },
+        );
+
+        let got = apply(&script("/p/pre.sh"), &runner, &base()).unwrap();
+
+        assert!(!got.contains_key(SENTINEL_KEY), "got {got:?}");
+    }
+
+    #[test]
     fn a_disabled_script_is_not_run_at_all() {
         let runner = FakeCommandRunner::new();
         let mut s = script("/p/pre.sh");
@@ -257,6 +395,47 @@ mod tests {
             "the dump must be NUL-separated; got {}",
             spec.args[1]
         );
+        assert!(
+            spec.args[1].contains(r"printf '__BOMBADIL_DUMP_OK=1\000'"),
+            "the dump must be self-terminating; got {}",
+            spec.args[1]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn posix_arguments_go_through_positional_parameters() {
+        // Verified against real shells: dash's `.` builtin ignores trailing
+        // operands, so `. 'x.sh' 'a b'` leaves $1 empty there while bash sets
+        // it. `set --` before the `.` works on both.
+        let mut s = script("/p/pre.sh");
+        s.args = vec!["a b".to_string(), "c".to_string()];
+
+        let spec = dump_command(&s);
+
+        assert!(
+            spec.args[1].starts_with("set -- 'a b' 'c'; . '/p/pre.sh'"),
+            "got {}",
+            spec.args[1]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_apostrophe_in_the_path_or_an_argument_is_escaped() {
+        // Verified: unescaped, `sh -c ". 'o'brien/pre.sh'; env -0"` dies with
+        // "Unterminated quoted string" and the script cannot run at all.
+        let mut s = script("/home/o'brien/pre.sh");
+        s.args = vec!["it's".to_string()];
+
+        let spec = dump_command(&s);
+
+        assert!(
+            spec.args[1].contains(r"'/home/o'\''brien/pre.sh'"),
+            "got {}",
+            spec.args[1]
+        );
+        assert!(spec.args[1].contains(r"'it'\''s'"), "got {}", spec.args[1]);
     }
 
     #[cfg(windows)]
@@ -276,6 +455,25 @@ mod tests {
         assert!(
             joined.contains("[char]0"),
             "the dump must be NUL-separated; got {joined}"
+        );
+        assert!(
+            joined.contains("__BOMBADIL_DUMP_OK=1"),
+            "the dump must be self-terminating; got {joined}"
+        );
+        assert!(
+            joined.contains("UTF8Encoding $false"),
+            "the encoding must be BOM-less, or the first key gains a \\u{{feff}}; got {joined}"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn an_apostrophe_in_the_windows_path_is_doubled() {
+        let spec = dump_command(&script(r"C:\o'brien\pre.ps1"));
+        assert!(
+            spec.args.join(" ").contains(r"C:\o''brien\pre.ps1"),
+            "got {:?}",
+            spec.args
         );
     }
 }
