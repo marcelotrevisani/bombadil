@@ -58,7 +58,12 @@ fn substitute<'a>(values: impl Iterator<Item = &'a String>, file: &str, dir: &st
 /// keychain. `compose` already resolved these once; this just tells them
 /// apart from the ordinary values sitting alongside them in `env`, mirroring
 /// how `compose` builds its own redaction set.
-fn secret_values(inputs: &EnvInputs, env: &BTreeMap<String, String>) -> Vec<String> {
+///
+/// `pub`: the GUI's Sync path has the same need -- it composes an environment
+/// and must scrub uv's transcript of anything keychain-sourced before that
+/// text reaches a `Message` (which derives `Debug`). Exporting this is better
+/// than a third copy of the rule that can drift from `compose`'s.
+pub fn secret_values(inputs: &EnvInputs, env: &BTreeMap<String, String>) -> Vec<String> {
     let mut secrets = Vec::new();
     for var in inputs.config.global_env.iter().chain(&inputs.project.env) {
         if var.secret
