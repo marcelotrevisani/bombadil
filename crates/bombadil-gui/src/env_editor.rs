@@ -32,6 +32,15 @@
 //! exactly the leak criterion 4 exists to catch. [`unmark_secret`] leaves the
 //! `Config` value empty; the user retypes if they want a new one.
 //!
+//! The *key* box is read-only for a secret row for a different reason. A
+//! secret's keychain account is named after the variable (`SecretKey::GlobalEnv`,
+//! `SecretKey::ProjectEnv`), and nothing in this module has a `SecretStore` to
+//! move an entry with -- so a rename would leave `envspec::compose` looking
+//! under a name nothing was ever stored under. An unresolvable secret is
+//! dropped, so the variable would simply vanish from the environment, with no
+//! message and no banner. Unmark secret, rename, mark secret again is the path
+//! that works. See [`set_key`].
+//!
 //! What a row displays is centralised in [`display_value`], which every
 //! rendering path here goes through (a row's own value, and a project row's
 //! overridden-global value) -- a secret is redacted there regardless of what
@@ -112,8 +121,22 @@ pub fn remove_var(vars: &mut Vec<EnvVar>, index: usize) {
     }
 }
 
+/// Only ever reached for a row that is not secret: `rows` renders the key box
+/// read-only once `var.secret` is true, so `Message::EnvVarKeyChanged` can
+/// never be produced for a secret row.
+///
+/// The guard is repeated here for the same reason `set_value`'s is. A secret's
+/// keychain account is named after the variable (`SecretKey::GlobalEnv`,
+/// `SecretKey::ProjectEnv`), and this function has no `SecretStore` to move
+/// the entry with -- so a rename that got through would leave
+/// `envspec::compose` looking under a name nothing was stored under, and an
+/// unresolvable secret is dropped: the variable would vanish from the
+/// environment entirely, with no message and no banner. Unmark secret, rename,
+/// mark secret again is the path that works.
 pub fn set_key(vars: &mut [EnvVar], index: usize, key: String) {
-    if let Some(var) = vars.get_mut(index) {
+    if let Some(var) = vars.get_mut(index)
+        && !var.secret
+    {
         var.key = key;
     }
 }
@@ -194,8 +217,11 @@ pub fn overrides(global: &[EnvVar], project_env: &[EnvVar]) -> Vec<Override> {
 fn rows<'a>(scope: EnvScope, vars: &[EnvVar]) -> iced::Element<'a, Message> {
     let mut column = iced::widget::column![].spacing(4);
     for (index, var) in vars.iter().enumerate() {
-        let key_input = iced::widget::text_input("KEY", &var.key)
-            .on_input(move |key| Message::EnvVarKeyChanged(scope, index, key));
+        // Read-only once the row is secret: the keychain account is named
+        // after the key, and nothing here can move an entry -- see `set_key`.
+        let key_input = iced::widget::text_input("KEY", &var.key).on_input_maybe(
+            (!var.secret).then_some(move |key| Message::EnvVarKeyChanged(scope, index, key)),
+        );
 
         // The one place criterion 4 is enforced at the widget level: a
         // secret row gets no textbox bound to `var.value` at all, so there
@@ -477,6 +503,26 @@ mod tests {
         let mut vars = vec![var("OLD", "1", false)];
         set_key(&mut vars, 0, "NEW".to_string());
         assert_eq!(vars[0].key, "NEW");
+    }
+
+    #[test]
+    fn set_key_never_renames_a_secret_row_out_from_under_its_keychain_entry() {
+        // `SecretKey::{GlobalEnv,ProjectEnv}` are keyed on the variable's
+        // name. Renaming the row without moving the keychain entry leaves
+        // `envspec::compose` looking under a name nothing was ever stored
+        // under -- and an unresolvable secret is dropped, so the variable
+        // disappears from the environment entirely, with no message and no
+        // banner. `rows` renders the key box read-only for a secret row for
+        // the same reason; this is the belt to that's suspenders, exactly as
+        // `set_value` already has.
+        let mut vars = vec![var("TOKEN", "", true)];
+
+        set_key(&mut vars, 0, "RENAMED".to_string());
+
+        assert_eq!(
+            vars[0].key, "TOKEN",
+            "a secret row's key must not move while its keychain entry stays put"
+        );
     }
 
     #[test]
