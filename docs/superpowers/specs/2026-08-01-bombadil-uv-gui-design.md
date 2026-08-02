@@ -267,9 +267,16 @@ Layers, in order, each overriding the previous:
 3. Project environment variables.
 4. Secret values fetched from the keychain for any variable marked secret.
 5. Index configuration and credentials (§7).
-6. `UV_PROJECT_ENVIRONMENT` set to the resolved venv path.
-7. Pre-activate scripts, run in order; their exported variables are captured and merged.
-8. `VIRTUAL_ENV` set, venv `bin`/`Scripts` prepended to `PATH`, `PYTHONHOME` removed.
+6. Pre-activate scripts, run in order; their exported variables are captured and merged.
+7. `UV_PROJECT_ENVIRONMENT` and `VIRTUAL_ENV` both set to the resolved venv path, venv
+   `bin`/`Scripts` prepended to `PATH`, `PYTHONHOME` removed.
+
+**Why the two venv variables are set together, after scripts.** They name the same
+environment: `UV_PROJECT_ENVIRONMENT` tells uv which venv to operate on, `VIRTUAL_ENV`
+tells the shell which one is active. If a pre-activate script could redirect one but not
+the other, uv would sync into one venv while the prompt showed another — a divergence
+that is silent and very hard to diagnose. Both are therefore applied last and win over
+anything a script exports.
 
 Spawning a terminal appends one final step — launching the emulator with the project
 directory as the working directory. Running a uv command does not. Otherwise the pipeline
