@@ -5004,6 +5004,40 @@ mod tests {
     }
 
     #[test]
+    fn a_recreate_confirmation_resolves_its_project_by_id_not_by_position() {
+        // Defence in depth behind the clear-on-removal proven above, and the
+        // half that makes the class unrepresentable rather than merely
+        // unreached: with `RemoveProjectRequested` clearing the confirmation,
+        // no state reachable today distinguishes an id from an index, so
+        // without this the id would go untested and the next edit that moves
+        // a project by some other route would put the defect straight back.
+        let mut app = App::new(Config {
+            projects: vec![project("a"), project("b")],
+            ..Config::default()
+        });
+        let b_id = app.config.projects[1].id.to_string();
+
+        let _ = update(&mut app, Message::RecreateVenvRequested(1), unused_runner());
+        // The list moves under the open confirmation without going through
+        // the removal path that clears it.
+        app.config.projects.swap(0, 1);
+
+        let _ = update(&mut app, Message::RecreateVenvConfirmed, unused_runner());
+
+        assert_eq!(
+            app.syncing.as_deref(),
+            Some(b_id.as_str()),
+            "the confirmation must act on the project it named, wherever that \
+             project now sits"
+        );
+        assert!(
+            app.drawer.status.contains('b'),
+            "the running status must name it too; got {:?}",
+            app.drawer.status
+        );
+    }
+
+    #[test]
     fn cancelling_a_recreate_dispatches_nothing_and_clears_the_confirmation() {
         let mut app = App::new(Config {
             projects: vec![project("api")],
