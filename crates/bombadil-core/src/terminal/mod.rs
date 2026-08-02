@@ -1,5 +1,7 @@
 use serde::{Deserialize, Serialize};
 
+pub mod activation;
+
 pub use crate::model::TerminalChoice;
 
 /// The operating system a terminal command is being built for.
