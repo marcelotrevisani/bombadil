@@ -1,5 +1,6 @@
 mod app;
 mod job;
+mod sidebar;
 
 use app::App;
 use bombadil_core::model::Config;

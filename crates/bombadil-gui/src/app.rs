@@ -1,3 +1,4 @@
+use crate::sidebar;
 use bombadil_core::model::{Config, Project};
 use iced::Task;
 
@@ -48,16 +49,13 @@ pub fn update(app: &mut App, message: Message) -> Task<Message> {
 }
 
 pub fn view(app: &App) -> iced::Element<'_, Message> {
-    let mut list = iced::widget::column![].spacing(4);
-    for (i, project) in app.projects.iter().enumerate() {
-        list = list.push(
-            iced::widget::button(iced::widget::text(project.label.clone()))
-                .on_press(Message::ProjectSelected(i))
-                .width(iced::Length::Fill),
-        );
-    }
+    // No real interpreter probe is wired yet -- every project renders hollow
+    // until a later task supplies one (job::run is the seam for it, since a
+    // real probe touches disk/spawns a process). `entries` itself stays free
+    // of I/O regardless of what the caller passes here.
+    let entries = sidebar::entries(&app.config, &|_path| None);
     iced::widget::row![
-        iced::widget::container(list).width(240),
+        iced::widget::container(sidebar::view(&entries, app.selected)).width(240),
         iced::widget::container(iced::widget::text(
             app.selected_project()
                 .map(|p| p.label.clone())
