@@ -110,17 +110,21 @@ mod tests {
     }
 
     #[test]
-    fn selecting_out_of_range_is_ignored_rather_than_panicking() {
+    fn selecting_out_of_range_is_ignored_rather_than_clamped() {
         // A stale index can arrive from a message queued before a project was
-        // removed. Panicking there would take the window down.
-        let mut app = App::new(Config {
-            projects: vec![project("api")],
+        // removed. Two projects with the FIRST selected is what separates
+        // "ignored" from "clamped to the last valid index" -- with one project
+        // both behaviours produce the same answer and the test proves nothing.
+        let config = Config {
+            projects: vec![project("api"), project("web")],
             ..Config::default()
-        });
+        };
+        let mut app = App::new(config);
         let _ = update(&mut app, Message::ProjectSelected(99));
         assert_eq!(
             app.selected_project().map(|p| p.label.as_str()),
-            Some("api")
+            Some("api"),
+            "an out-of-range selection must be ignored, not clamped to the last project"
         );
     }
 
