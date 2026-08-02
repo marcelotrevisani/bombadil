@@ -6,6 +6,7 @@
 use bombadil_core::model::{Project, Script, UvSource, VenvLocation};
 use bombadil_core::process::{CommandRunner, CommandSpec, SystemCommandRunner};
 use bombadil_core::secrets::{InMemorySecretStore, KeyringSecretStore, SecretKey, SecretStore};
+use bombadil_core::terminal::activation::{InitFile, ShellFamily, init_file};
 use bombadil_core::uv::command::{self, DependencyGroup, ProjectContext};
 use bombadil_core::uv::results::{InstalledPackage, parse_pip_list, parse_tree};
 use bombadil_core::uv::{ResolvedUv, UvVersion, locate_on_path, resolve};
@@ -501,4 +502,160 @@ fn the_real_keychain_round_trips_where_one_exists() {
 
     assert_eq!(round_tripped.unwrap().as_deref(), Some("hunter2"));
     assert_eq!(after_delete.unwrap(), None, "the secret must be gone");
+}
+
+#[test]
+#[cfg(unix)]
+fn spawn_returns_before_the_child_exits() {
+    // `open` must return as soon as the terminal is launched: `run` uses
+    // Command::output(), which waits for the child, and a terminal emulator
+    // lives until the user closes its window. gnome-terminal and konsole
+    // self-daemonize, which is why nothing caught this; kitty, alacritty,
+    // foot, xterm and every Windows console kind do not.
+    //
+    // Unix-only: `sleep` is the portable long-running child here, and this
+    // is a property of SystemCommandRunner rather than of any OS.
+    let Some(sleep) = locate_on_path("sleep") else {
+        panic!("sleep is required for this test on unix");
+    };
+
+    let spec = CommandSpec::new(&sleep).arg("30");
+
+    let started = std::time::Instant::now();
+    SystemCommandRunner
+        .spawn(&spec)
+        .expect("spawn must succeed");
+    let elapsed = started.elapsed();
+
+    assert!(
+        elapsed < std::time::Duration::from_secs(5),
+        "spawn waited for the child ({elapsed:?}); under `run` this would take 30s"
+    );
+}
+
+fn which_bash() -> Option<std::path::PathBuf> {
+    locate_on_path("bash")
+}
+
+fn which_zsh() -> Option<std::path::PathBuf> {
+    locate_on_path("zsh")
+}
+
+/// Write `file` under `tmp`, launch `shell` with the `InitFile`'s
+/// `shell_args`/`env` (substituting `{file}`/`{dir}` for the file actually
+/// written, exactly as a real caller must), and return the whole resulting
+/// `PATH`.
+///
+/// Returns `PATH` unsplit on purpose. An earlier version split on `':'` and
+/// compared the first field, which is wrong on Windows: a venv path is
+/// `C:\Users\...`, so the first field is the drive letter `C` and the test
+/// failed with `left: "C"`. `PATH`'s separator is not the same character on
+/// every platform and production code never splits it, so the parsing is
+/// removed rather than made conditional -- see `assert_venv_is_first`.
+///
+/// The child inherits the ambient environment rather than a cleared one, and
+/// `HOME` is left untouched, so the shell really does read this machine's own
+/// rc files -- that is the whole point of this test file over the hermetic
+/// unit tests in `activation.rs`.
+fn path_via_init_file(shell: &std::path::Path, tmp: &std::path::Path, file: &InitFile) -> String {
+    let path = tmp.join(&file.relative_path);
+    std::fs::write(&path, &file.contents).unwrap();
+    let dir = path.parent().unwrap().to_string_lossy().into_owned();
+    let file_str = path.to_string_lossy().into_owned();
+
+    let args: Vec<String> = file
+        .shell_args
+        .iter()
+        .map(|a| a.replace("{file}", &file_str))
+        .collect();
+
+    let mut spec = CommandSpec::new(shell);
+    spec.args = args;
+    spec.args.push("-c".into());
+    spec.args.push("printf '%s' \"$PATH\"".into());
+    for (key, value) in &file.env {
+        spec.env.insert(key.clone(), value.replace("{dir}", &dir));
+    }
+
+    let outcome = SystemCommandRunner.run(&spec).unwrap();
+    assert!(outcome.success(), "shell failed: {}", outcome.stderr);
+    outcome.stdout
+}
+
+/// Assert `venv_bin` is the first entry of `path`, separator-agnostically.
+///
+/// A prefix test alone is not enough: a venv at `/a/b` would be satisfied by
+/// a `PATH` beginning `/a/bc`, so the character immediately after the prefix
+/// must actually end the entry -- `:` on unix, `;` on Windows, or end of
+/// string when the venv is the only entry.
+fn assert_venv_is_first(path: &str, venv_bin: &std::path::Path) {
+    let venv_str = venv_bin.to_string_lossy().to_string();
+    assert!(
+        path.starts_with(&venv_str),
+        "the venv must be first after the user's rc has run; got {path}"
+    );
+    match path[venv_str.len()..].chars().next() {
+        None | Some(':') | Some(';') => {}
+        Some(other) => panic!(
+            "the venv must be a whole PATH entry, not a prefix of a longer one; \
+             {venv_str} is followed by {other:?} in {path}"
+        ),
+    }
+}
+
+#[test]
+fn the_generated_init_file_puts_the_venv_first_in_a_real_interactive_bash_shell() {
+    // Measured before this plan: without the init file an interactive bash
+    // leaves the venv at position 3, behind ~/.local/bin, because .bashrc
+    // prepends after us. This asserts the fix against a real bash.
+    // A silent skip here is absence of signal dressed up as success: cargo
+    // captures stdout on a passing test, so an eprintln'd "skipping" is
+    // invisible and the run reports a green `ok`. This file already
+    // hard-`expect`s a real uv, and the `uv-integration` feature gate already
+    // means "I have a real toolchain" -- so be loud where the shell must
+    // exist.
+    let Some(bash) = which_bash() else {
+        if cfg!(unix) {
+            panic!("bash is required for this test on unix");
+        }
+        eprintln!("no bash on this machine; skipping");
+        return;
+    };
+
+    let tmp = tempfile::tempdir().unwrap();
+    let venv_bin = tmp.path().join("envs/api/bin");
+    std::fs::create_dir_all(&venv_bin).unwrap();
+
+    let file = init_file(ShellFamily::Bash, &venv_bin).expect("bash is a known shell");
+
+    assert_venv_is_first(&path_via_init_file(&bash, tmp.path(), &file), &venv_bin);
+}
+
+#[test]
+fn the_generated_init_file_puts_the_venv_first_in_a_real_interactive_zsh_shell() {
+    // Same measurement as the bash case, but through ZDOTDIR rather than an
+    // rcfile argument -- zsh has no --rcfile equivalent.
+    // Loud only on macOS, where zsh is the default login shell and its
+    // absence really is a broken machine. `ubuntu-latest` does not ship zsh,
+    // so panicking on all of unix would turn a legitimate absence into a red
+    // CI job. `#[ignore]` is not used anywhere here: it makes CI skip by
+    // default, which is the same silence with extra steps.
+    let Some(zsh) = which_zsh() else {
+        if cfg!(target_os = "macos") {
+            panic!("zsh is required for this test on macOS");
+        }
+        eprintln!("no zsh on this machine; skipping");
+        return;
+    };
+
+    let tmp = tempfile::tempdir().unwrap();
+    let venv_bin = tmp.path().join("envs/api/bin");
+    std::fs::create_dir_all(&venv_bin).unwrap();
+
+    let file = init_file(ShellFamily::Zsh, &venv_bin).expect("zsh is a known shell");
+
+    // Same separator-agnostic assertion as the bash case: this one passes
+    // today only because macOS paths contain no colon, which is luck rather
+    // than correctness.
+    assert_venv_is_first(&path_via_init_file(&zsh, tmp.path(), &file), &venv_bin);
 }

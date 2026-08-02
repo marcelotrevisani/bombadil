@@ -292,6 +292,7 @@ mod tests {
                     ],
                 },
             }],
+            terminal_defaults: std::collections::BTreeMap::new(),
         };
 
         // Field-by-field, not just `assert_eq!(got, expected)` on the whole
@@ -303,6 +304,7 @@ mod tests {
         assert_eq!(got.global_env, expected.global_env);
         assert_eq!(got.global_scripts, expected.global_scripts);
         assert_eq!(got.projects, expected.projects);
+        assert_eq!(got.terminal_defaults, expected.terminal_defaults);
         assert_eq!(got, expected);
     }
 

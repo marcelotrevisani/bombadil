@@ -110,6 +110,16 @@ impl CommandOutcome {
 /// uv layer, the environment pipeline and the GUI be tested without processes.
 pub trait CommandRunner: Send + Sync {
     fn run(&self, spec: &CommandSpec) -> Result<CommandOutcome, CommandError>;
+
+    /// Launch and do not wait. The default delegates to `run` so fakes and
+    /// existing implementations need no change.
+    ///
+    /// Callers that need the child's output must use `run`; this exists for
+    /// the one caller that must not block -- opening a terminal emulator,
+    /// which lives for as long as the user keeps the window open.
+    fn spawn(&self, spec: &CommandSpec) -> Result<(), CommandError> {
+        self.run(spec).map(|_| ())
+    }
 }
 
 /// Shared helper so both implementations agree on what a program "is".
