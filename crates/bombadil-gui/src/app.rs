@@ -1236,8 +1236,20 @@ pub fn update(app: &mut App, message: Message, runner: Arc<dyn CommandRunner>) -
             return persist_env_edit(app);
         }
         Message::EnvVarRemoved(scope, index) => {
+            // Resolved before the row goes -- see `env_removal_secret_key`.
+            // `unmark_secret` deletes the keychain entry; removing the row
+            // entirely used not to, so the value stayed in the keychain
+            // unreachable while the row that named it was gone.
+            let owed = env_removal_secret_key(app, scope, index);
             if let Some(vars) = env_editor::vars_mut(&mut app.config, scope) {
                 env_editor::remove_var(vars, index);
+            }
+            if let Some(key) = owed {
+                let config = app.config.clone();
+                let persist = app.persist.clone();
+                return Task::perform(unmark_secret_job(key, config, persist), |success| {
+                    Message::EnvVarPersistFinished { success }
+                });
             }
             return persist_env_edit(app);
         }
@@ -1356,16 +1368,45 @@ pub fn update(app: &mut App, message: Message, runner: Arc<dyn CommandRunner>) -
             return persist_index_edit(app);
         }
         Message::IndexRemoved(i) => {
+            // Resolved before the row goes: `SecretKey::Index` is keyed on
+            // the index's name, and afterwards there is nothing left to find
+            // the entry by -- it would sit in the user's keychain forever.
+            let owed = index_credential_key(&app.config, i);
             index_editor::remove_index(&mut app.config.indexes, i);
             // Kept in step with `config.indexes` -- see
             // `App::index_credential_drafts`'s own doc.
             if i < app.index_credential_drafts.len() {
                 app.index_credential_drafts.remove(i);
             }
+            if let Some(key) = owed {
+                let config = app.config.clone();
+                let persist = app.persist.clone();
+                return Task::perform(unmark_secret_job(key, config, persist), |success| {
+                    Message::IndexPersistFinished { success }
+                });
+            }
             return persist_index_edit(app);
         }
         Message::IndexNameChanged(i, name) => {
+            // The credential follows the name: `SecretKey::Index` is keyed on
+            // it, so leaving the entry behind makes the next sync's
+            // `envspec::index::inject` look under a name nothing was stored
+            // under -- a 401 with nothing on screen explaining it -- and
+            // strands the old entry in the keychain. See
+            // `run_index_credential_rename`.
+            let from = index_credential_key(&app.config, i);
             index_editor::set_name(&mut app.config.indexes, i, name);
+            let to = index_credential_key(&app.config, i);
+            if let (Some(from), Some(to)) = (from, to)
+                && from != to
+            {
+                let config = app.config.clone();
+                let persist = app.persist.clone();
+                return Task::perform(
+                    rename_index_credential_job(from, to, config, persist),
+                    |success| Message::IndexPersistFinished { success },
+                );
+            }
             return persist_index_edit(app);
         }
         Message::IndexUrlChanged(i, url) => {
@@ -1584,6 +1625,115 @@ fn sync_target(app: &App, i: usize) -> Option<Project> {
     // editor writes, so an edit made a moment ago is in the environment the
     // sync composes. See `App::config`.
     app.config.projects.get(i).cloned()
+}
+
+/// The blocking half of renaming an index: move its credential to the account
+/// the new name addresses, then persist.
+///
+/// `SecretKey::Index` is keyed on the index's *name*, so a rename that leaves
+/// the entry where it was makes `envspec::index::inject` look under a name
+/// nothing was stored under -- a 401 at sync time with nothing on screen
+/// explaining it -- while the old entry stays in the user's keychain with
+/// nothing left in the app able to name it.
+///
+/// The set comes before the delete deliberately: the other order loses the
+/// credential outright if the second call fails. `Ok(None)` -- no credential
+/// was ever saved under the old name -- is the commonest case by far, since
+/// this runs once per keystroke while the name is being typed, and it is
+/// nothing to move rather than a failure.
+///
+/// The persist is attempted whichever way the keychain half went: a machine
+/// with no usable Secret Service must still be able to rename an index, and
+/// making the config write depend on the keychain would be a worse bug than
+/// the orphan this fixes.
+fn run_index_credential_rename(
+    from: &SecretKey,
+    to: &SecretKey,
+    config: &Config,
+    store: &dyn SecretStore,
+    persist: &dyn ConfigPersist,
+) -> bool {
+    let moved = match store.get(from) {
+        Ok(Some(value)) => store.set(to, &value).is_ok() && store.delete(from).is_ok(),
+        Ok(None) => true,
+        Err(_) => false,
+    };
+    persist.save(config).is_ok() && moved
+}
+
+/// Runs an index credential rename off the render thread via `job::run`.
+/// `KeyringSecretStore` is constructed here, on the job thread, the same
+/// discipline `mark_secret_job` and every other keychain call in this file
+/// follow.
+async fn rename_index_credential_job(
+    from: SecretKey,
+    to: SecretKey,
+    config: Config,
+    persist: Arc<dyn ConfigPersist>,
+) -> bool {
+    match job::run(
+        move || {
+            run_index_credential_rename(
+                &from,
+                &to,
+                &config,
+                &KeyringSecretStore::new(),
+                persist.as_ref(),
+            )
+        },
+        SYNC_TIMEOUT,
+    )
+    .await
+    {
+        job::JobResult::Done(success) => success,
+        job::JobResult::TimedOut | job::JobResult::Failed => false,
+    }
+}
+
+/// The keychain account `config.indexes[i]`'s credential lives under.
+///
+/// Must be resolved *before* a rename or a removal takes the name away: after
+/// that there is nothing left to find the entry by, and it sits in the user's
+/// keychain forever.
+///
+/// An empty name is deliberately not filtered out. The name box is edited one
+/// keystroke at a time, so backspacing a name to nothing and retyping it is an
+/// ordinary way to rename -- filtering the empty step would break the chain
+/// there and strand the credential under the original name. (An index left
+/// permanently unnamed is M4's problem, which this round does not touch.)
+fn index_credential_key(config: &Config, i: usize) -> Option<SecretKey> {
+    let index = config.indexes.get(i)?;
+    Some(SecretKey::Index {
+        name: index.name.clone(),
+    })
+}
+
+/// The keychain account a removed env var row owes a delete of, if any.
+///
+/// Resolved before the row is dropped, for the same reason
+/// `index_credential_key` is: `SecretKey::GlobalEnv` and
+/// `SecretKey::ProjectEnv` are keyed on the variable's name, which the removal
+/// is about to take away. `env_editor::unmark_secret` already deletes;
+/// removing the row entirely did not, so the value stayed in the keychain
+/// unreachable while the row that named it was gone.
+///
+/// `None` for a plain row: it has no entry, and issuing a delete anyway would
+/// be a keychain call per removal on a machine that may have no keychain.
+fn env_removal_secret_key(
+    app: &App,
+    scope: env_editor::EnvScope,
+    index: usize,
+) -> Option<SecretKey> {
+    let (project_id, vars) = match scope {
+        env_editor::EnvScope::Global => (None, &app.config.global_env),
+        env_editor::EnvScope::Project(i) => {
+            let project = app.config.projects.get(i)?;
+            (Some(project.id), &project.env)
+        }
+    };
+    let var = vars.get(index)?;
+    var.secret
+        .then(|| env_editor::secret_key(scope, project_id, &var.key))
 }
 
 /// The member context a Sync press for `projects[i]` must use, or `None` when
@@ -5480,6 +5630,178 @@ mod tests {
             default_for_new_projects: false,
             auth,
         }
+    }
+
+    #[test]
+    fn renaming_an_index_moves_its_credential_instead_of_orphaning_it() {
+        // `SecretKey::Index` is keyed on the index's *name*. `set_name`
+        // changed the name and touched nothing else, so the next sync's
+        // `envspec::index::inject` looked under the new name, found nothing,
+        // and failed with a 401 that nothing on screen explained -- while the
+        // old entry stayed in the user's keychain with no way for the app to
+        // name it again.
+        let config = Config {
+            indexes: vec![index_with_auth(
+                "corp",
+                bombadil_core::model::IndexAuth::Token,
+            )],
+            ..Config::default()
+        };
+        let from = SecretKey::Index {
+            name: "internal".into(),
+        };
+        let to = SecretKey::Index {
+            name: "corp".into(),
+        };
+        let store = bombadil_core::secrets::InMemorySecretStore::new();
+        store.set(&from, "hunter2").unwrap();
+        let persist = FakeConfigPersist::default();
+
+        let success = run_index_credential_rename(&from, &to, &config, &store, &persist);
+
+        assert!(success);
+        assert_eq!(
+            store.get(&to).unwrap().as_deref(),
+            Some("hunter2"),
+            "the credential must follow the rename, or the next sync is a 401"
+        );
+        assert_eq!(
+            store.get(&from).unwrap(),
+            None,
+            "the old account must not stay in the user's keychain forever"
+        );
+        assert_eq!(
+            persist.saved().len(),
+            1,
+            "the renamed config must be persisted alongside the move"
+        );
+    }
+
+    #[test]
+    fn renaming_an_index_that_never_had_a_credential_still_persists() {
+        // The commonest case by far -- an index typed for the first time,
+        // one keystroke at a time. Nothing to move must not read as a
+        // failure.
+        let config = Config::default();
+        let store = bombadil_core::secrets::InMemorySecretStore::new();
+        let persist = FakeConfigPersist::default();
+
+        let success = run_index_credential_rename(
+            &SecretKey::Index { name: "c".into() },
+            &SecretKey::Index { name: "co".into() },
+            &config,
+            &store,
+            &persist,
+        );
+
+        assert!(success);
+        assert_eq!(persist.saved().len(), 1);
+    }
+
+    #[test]
+    fn removing_an_index_deletes_the_credential_it_leaves_behind() {
+        // The other half of the same defect: `remove_index` never touched
+        // `SecretKey::Index`, so a removed index's credential stayed in the
+        // keychain forever with nothing left in the app able to name it.
+        // The account has to be resolved *before* the row goes -- afterwards
+        // there is no name to find it by.
+        let mut app = App::new(Config {
+            indexes: vec![index_with_auth(
+                "corp",
+                bombadil_core::model::IndexAuth::Token,
+            )],
+            ..Config::default()
+        });
+        let key = index_credential_key(&app.config, 0)
+            .expect("a removed index must name the credential it owes a delete of");
+        assert_eq!(
+            key,
+            SecretKey::Index {
+                name: "corp".into()
+            }
+        );
+
+        let store = bombadil_core::secrets::InMemorySecretStore::new();
+        store.set(&key, "hunter2").unwrap();
+        let persist = FakeConfigPersist::default();
+
+        let task = update(&mut app, Message::IndexRemoved(0), unused_runner());
+        assert!(task.units() > 0, "the removal must dispatch its own job");
+        assert!(app.config.indexes.is_empty());
+
+        // The background half, with the fake store the real job's
+        // `KeyringSecretStore` stands in for.
+        assert!(run_secret_delete(&key, &app.config, &store, &persist));
+        assert_eq!(
+            store.get(&key).unwrap(),
+            None,
+            "the credential must be gone, not orphaned"
+        );
+    }
+
+    #[test]
+    fn removing_a_secret_env_var_row_deletes_its_keychain_entry() {
+        // The asymmetry the review found: `env_editor::unmark_secret` deletes,
+        // but removing the row entirely did not -- so the value stayed in the
+        // keychain forever, unreachable, while the row that named it was gone.
+        let project_id = uuid::Uuid::from_u128(9);
+        let mut proj = project("api");
+        proj.id = project_id;
+        proj.env = vec![bombadil_core::model::EnvVar {
+            key: "TOKEN".into(),
+            value: String::new(),
+            secret: true,
+        }];
+        let mut app = App::new(Config {
+            projects: vec![proj],
+            ..Config::default()
+        });
+
+        // Resolved before the row goes: `SecretKey::ProjectEnv` is keyed on
+        // the variable's name, which the removal is about to take away.
+        let key = env_removal_secret_key(&app, env_editor::EnvScope::Project(0), 0)
+            .expect("removing a secret row must name the entry it owes a delete of");
+        assert_eq!(
+            key,
+            SecretKey::ProjectEnv {
+                project_id,
+                key: "TOKEN".into(),
+            }
+        );
+
+        let store = bombadil_core::secrets::InMemorySecretStore::new();
+        store.set(&key, "hunter2").unwrap();
+        let persist = FakeConfigPersist::default();
+
+        let task = update(
+            &mut app,
+            Message::EnvVarRemoved(env_editor::EnvScope::Project(0), 0),
+            unused_runner(),
+        );
+        assert!(task.units() > 0, "the removal must dispatch its own job");
+        assert!(app.config.projects[0].env.is_empty());
+
+        assert!(run_secret_delete(&key, &app.config, &store, &persist));
+        assert_eq!(store.get(&key).unwrap(), None);
+    }
+
+    #[test]
+    fn removing_a_plain_env_var_row_owes_no_keychain_delete() {
+        // The opposite mistake: an ordinary variable has no keychain entry,
+        // and issuing a delete for one would be a keychain call per removal
+        // on a machine that may have no keychain at all.
+        let mut proj = project("api");
+        proj.env = vec![bombadil_core::model::EnvVar {
+            key: "HTTP_PROXY".into(),
+            value: "http://proxy:8080".into(),
+            secret: false,
+        }];
+        let app = App::new(Config {
+            projects: vec![proj],
+            ..Config::default()
+        });
+
+        assert!(env_removal_secret_key(&app, env_editor::EnvScope::Project(0), 0).is_none());
     }
 
     #[test]

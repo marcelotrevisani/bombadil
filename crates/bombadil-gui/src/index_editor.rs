@@ -127,12 +127,20 @@ pub fn add_index(indexes: &mut Vec<Index>) {
 /// Removes `indexes[i]` only -- callers are responsible for keeping any
 /// parallel per-row state (`App::index_credential_drafts`) in step; this
 /// module never assumes such state exists.
+///
+/// That includes the keychain: this has no `SecretStore`, so `app::update`
+/// resolves the `SecretKey::Index` account *before* calling this and
+/// dispatches the delete itself. Without it the credential stayed in the
+/// user's keychain forever, with nothing left in the app able to name it.
 pub fn remove_index(indexes: &mut Vec<Index>, i: usize) {
     if i < indexes.len() {
         indexes.remove(i);
     }
 }
 
+/// Renames `indexes[i]` only. The credential keyed on the old name is moved
+/// by `app::update`, which resolves both accounts around this call -- see
+/// `remove_index` for why that split lives there rather than here.
 pub fn set_name(indexes: &mut [Index], i: usize, name: String) {
     if let Some(index) = indexes.get_mut(i) {
         index.name = name;
