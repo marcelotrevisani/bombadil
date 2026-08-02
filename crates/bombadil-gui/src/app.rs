@@ -15,7 +15,7 @@ use bombadil_core::uv;
 use bombadil_core::uv::results::Interpreter;
 use bombadil_core::venv_path;
 use iced::Task;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -31,6 +31,35 @@ const VENV_PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 /// download and build packages, unlike the sub-millisecond `pyvenv.cfg`
 /// read `VENV_PROBE_TIMEOUT` bounds, so this is generous rather than tight.
 const SYNC_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// Saves the whole config to disk. A trait rather than a bare
+/// `bombadil_core::store::Store` so a test can hand in a fake that records
+/// what would have been written instead of touching a real file -- the same
+/// shape as `CommandRunner`. Implemented for `Store` below; `main.rs` wires
+/// the real one in after `boot`.
+pub trait ConfigPersist: Send + Sync {
+    fn save(&self, config: &Config) -> Result<(), String>;
+}
+
+impl ConfigPersist for bombadil_core::store::Store {
+    fn save(&self, config: &Config) -> Result<(), String> {
+        bombadil_core::store::Store::save(self, config).map_err(|e| e.to_string())
+    }
+}
+
+/// `App::new`'s default `persist` before a real `Store` is wired in. Every
+/// save fails rather than silently succeeding -- a config that reports
+/// success while writing nothing would be a worse bug than one that never
+/// pretends to have saved at all. Exists only so tests that never confirm
+/// the add-project dialog don't need to supply a store; `main.rs` always
+/// replaces this immediately after `boot`.
+pub struct NullPersist;
+
+impl ConfigPersist for NullPersist {
+    fn save(&self, _config: &Config) -> Result<(), String> {
+        Err("no config store configured".to_string())
+    }
+}
 
 /// Everything the window shows. Deliberately plain data: `update` is the only
 /// place it changes, which is what makes the logic testable without a display.
@@ -75,6 +104,10 @@ pub struct App {
     /// `None` before a manifest is chosen and after Cancel -- there is
     /// nothing else for the dialog to show in either state.
     pub add_project: Option<add_project::Draft>,
+    /// Where confirming the add-project dialog saves the config. A trait
+    /// object, not a bare `Store`, so a test can substitute a fake -- see
+    /// `ConfigPersist`.
+    pub persist: Arc<dyn ConfigPersist>,
 }
 
 #[derive(Debug, Clone)]
@@ -121,6 +154,17 @@ pub enum Message {
     AddProjectVenvFolderPicked(Option<PathBuf>),
     /// The dialog was dismissed without adding a project.
     AddProjectCancelled,
+    /// "Add project" was pressed on an open dialog: append the draft to the
+    /// config, persist it, and adopt or create its venv.
+    AddProjectConfirmed,
+    /// The background half of `AddProjectConfirmed` finished. `index` is
+    /// where the project landed in `projects`/`entries`, so the venv status
+    /// can be refreshed the same way `boot`'s probes fill it in.
+    AddProjectConfirmFinished {
+        success: bool,
+        lines: Vec<String>,
+        index: usize,
+    },
 }
 
 impl App {
@@ -140,6 +184,7 @@ impl App {
             load_problems: Vec::new(),
             syncing: None,
             add_project: None,
+            persist: Arc::new(NullPersist),
         }
     }
 
@@ -310,6 +355,71 @@ pub fn update(app: &mut App, message: Message, runner: Arc<dyn CommandRunner>) -
         }
         Message::AddProjectCancelled => {
             app.add_project = None;
+        }
+        Message::AddProjectConfirmed => {
+            if let Some(draft) = app.add_project.take() {
+                let project = add_project::to_project(&draft);
+                let python_version =
+                    interpreter::preselect(&draft.interpreters, draft.requires_python.as_deref())
+                        .map(|i| i.version.clone());
+
+                // In-memory first, synchronously -- criterion 3's other
+                // failure mode is a dialog that looks like it worked but
+                // dispatched nothing at all. Persisting is what makes this
+                // survive a restart; that part happens off the render
+                // thread below, the same as every other blocking call in
+                // this file.
+                app.config.projects.push(project.clone());
+                app.projects.push(project.clone());
+                app.entries.push(sidebar::Entry {
+                    label: project.label.clone(),
+                    venv_exists: false,
+                    python_version: None,
+                });
+                let index = app.projects.len() - 1;
+                app.selected = Some(index);
+
+                let config = app.config.clone();
+                let persist = app.persist.clone();
+                return Task::perform(
+                    confirm_add_project(project, config, python_version, persist, runner),
+                    move |(success, lines)| Message::AddProjectConfirmFinished {
+                        success,
+                        lines,
+                        index,
+                    },
+                );
+            }
+        }
+        Message::AddProjectConfirmFinished {
+            success,
+            lines,
+            index,
+        } => {
+            // Already redacted on the job thread, same reasoning as
+            // `SyncFinished`.
+            for line in &lines {
+                drawer::push_line(&mut app.drawer, line, &[]);
+            }
+            let status = if success {
+                "project added".to_string()
+            } else {
+                "add project failed".to_string()
+            };
+            drawer::set_idle(&mut app.drawer, status);
+            if !success && !app.drawer.lines.is_empty() {
+                app.drawer.expanded = true;
+            }
+            // Refreshes the sidebar entry the same way `boot` fills in every
+            // other project's venv status, rather than trusting `success` to
+            // imply a venv now exists.
+            if let Some(project) = app.projects.get(index).cloned()
+                && let Ok(path) = venv_path::resolve(&project, &app.config.settings)
+            {
+                return Task::perform(probe_venv(path), move |version| {
+                    Message::VenvProbed(index, version)
+                });
+            }
         }
     }
     Task::none()
@@ -528,17 +638,102 @@ fn run_sync(
         Err(err) => return (false, vec![err]),
     };
 
-    // Without this, `uv sync` inherits Bombadil's *ambient* environment plus
-    // whatever one variable `uv::command::sync` sets -- so behaviour depends
-    // on whether the user launched from a shell or a desktop icon, and
-    // project/global variables, keychain secrets and private index
-    // credentials are all absent, which makes private-index authentication
-    // impossible.
+    let ctx = uv::command::ProjectContext {
+        project_dir: project_dir.to_path_buf(),
+        venv_path: venv_path.clone(),
+    };
+    let spec = uv::command::sync(&resolved_uv, &ctx);
+    compose_and_run(spec, project, config, &venv_path, store, runner)
+}
+
+/// The blocking half of confirming the add-project dialog: persist the
+/// updated config, then decide whether the chosen location already holds a
+/// venv (adopt it, run nothing) or needs one created
+/// (`uv sync -p <python>`, same composition discipline as `run_sync`).
+///
+/// `persist` and `probe` are parameters, not a concrete `Store` and
+/// `venv_path::probe` called directly, so a test can hand in fakes that
+/// never touch a real filesystem -- the real caller, `confirm_add_project`,
+/// supplies both.
+fn run_confirm_add_project(
+    project: &Project,
+    config: &Config,
+    python_version: Option<&str>,
+    persist: &dyn ConfigPersist,
+    store: &dyn SecretStore,
+    runner: &dyn CommandRunner,
+    probe: impl Fn(&Path) -> Option<String>,
+) -> (bool, Vec<String>) {
+    if let Err(err) = persist.save(config) {
+        return (false, vec![err]);
+    }
+
+    let venv_path = match venv_path::resolve(project, &config.settings) {
+        Ok(path) => path,
+        Err(err) => return (false, vec![err.to_string()]),
+    };
+
+    // Adopting: the venv already exists, so running sync anyway would
+    // silently rebuild an environment the user asked to keep (criterion 5).
+    if let add_project::VenvOutcome::Adopt { python_version } =
+        add_project::venv_outcome(&venv_path, probe)
+    {
+        return (
+            true,
+            vec![format!(
+                "existing environment adopted (python {python_version})"
+            )],
+        );
+    }
+
+    let Some(project_dir) = project
+        .pyproject_path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+    else {
+        return (false, vec!["no project directory to run uv in".to_string()]);
+    };
+    let resolved_uv = match resolve_uv_for(config, runner) {
+        Ok(resolved) => resolved,
+        Err(err) => return (false, vec![err]),
+    };
+    let ctx = uv::command::ProjectContext {
+        project_dir: project_dir.to_path_buf(),
+        venv_path: venv_path.clone(),
+    };
+    let spec = match python_version {
+        Some(python) => uv::command::sync_with_python(&resolved_uv, &ctx, python),
+        None => uv::command::sync(&resolved_uv, &ctx),
+    };
+    compose_and_run(spec, project, config, &venv_path, store, runner)
+}
+
+/// Shared by `run_sync` and `run_confirm_add_project`: compose the
+/// environment `spec` runs in, mark it authoritative with `clear_env`, run
+/// it, and redact every secret the composition resolved out of the result.
+///
+/// Without composing, `uv sync` inherits Bombadil's *ambient* environment
+/// plus whatever few variables the spec's own builder sets -- so behaviour
+/// depends on whether the user launched from a shell or a desktop icon, and
+/// project/global variables, keychain secrets and private index credentials
+/// are all absent, which makes private-index authentication impossible.
+///
+/// Redaction happens *here*, not in `update`: this is the only place the
+/// composed environment exists, and `Message` derives `Debug`, so a secrets
+/// list must never be threaded through one.
+fn compose_and_run(
+    mut spec: bombadil_core::process::CommandSpec,
+    project: &Project,
+    config: &Config,
+    venv_path: &Path,
+    store: &dyn SecretStore,
+    runner: &dyn CommandRunner,
+) -> (bool, Vec<String>) {
     let inputs = EnvInputs {
         parent: std::env::vars().collect(),
         config: config.clone(),
         project: project.clone(),
-        venv_path: venv_path.clone(),
+        venv_path: venv_path.to_path_buf(),
     };
     let env = match envspec::compose(&inputs, store, runner) {
         // `compose` already scrubs its own errors of the secrets it resolved.
@@ -547,15 +742,10 @@ fn run_sync(
     };
     let secrets = secret_values(&inputs, &env);
 
-    let ctx = uv::command::ProjectContext {
-        project_dir: project_dir.to_path_buf(),
-        venv_path,
-    };
-    let mut spec = uv::command::sync(&resolved_uv, &ctx);
-    // `clear_env`, the discipline plan 2b established and `uv::command::sync`
-    // leaves off: the composition is authoritative, not a layer on top of
-    // whatever launched Bombadil.
     spec.env = env;
+    // `clear_env`, the discipline plan 2b established and the spec builders
+    // leave off: the composition is authoritative, not a layer on top of
+    // whatever launched Bombadil.
     spec.clear_env = true;
 
     match runner.run(&spec) {
@@ -569,6 +759,42 @@ fn run_sync(
             (outcome.success(), lines)
         }
         Err(err) => (false, vec![envspec::redact(err.to_string(), &secrets)]),
+    }
+}
+
+/// Runs off the render thread via `job::run` -- persisting the config,
+/// probing the chosen venv location and possibly running `uv sync` are all
+/// blocking. Same shape as `sync_project`: `KeyringSecretStore` is
+/// constructed here, on the job thread, never taken as a parameter of
+/// `update`, and `venv_path::probe` is the real filesystem probe -- tests
+/// exercise `run_confirm_add_project` directly with a fake instead of going
+/// through this async wrapper.
+async fn confirm_add_project(
+    project: Project,
+    config: Config,
+    python_version: Option<String>,
+    persist: Arc<dyn ConfigPersist>,
+    runner: Arc<dyn CommandRunner>,
+) -> (bool, Vec<String>) {
+    match job::run(
+        move || {
+            run_confirm_add_project(
+                &project,
+                &config,
+                python_version.as_deref(),
+                persist.as_ref(),
+                &KeyringSecretStore::new(),
+                runner.as_ref(),
+                venv_path::probe,
+            )
+        },
+        SYNC_TIMEOUT,
+    )
+    .await
+    {
+        job::JobResult::Done(result) => result,
+        job::JobResult::TimedOut => (false, vec!["add project timed out".to_string()]),
+        job::JobResult::Failed => (false, vec!["add project failed unexpectedly".to_string()]),
     }
 }
 
@@ -1215,6 +1441,251 @@ mod tests {
             task.units(),
             0,
             "nothing to install for a manifest with no requires-python"
+        );
+    }
+
+    /// Records every config it was asked to save instead of touching a real
+    /// file -- the `ConfigPersist` counterpart of `FakeCommandRunner`.
+    #[derive(Default)]
+    struct FakeConfigPersist {
+        saved: std::sync::Mutex<Vec<Config>>,
+    }
+
+    impl FakeConfigPersist {
+        fn saved(&self) -> Vec<Config> {
+            self.saved.lock().unwrap().clone()
+        }
+    }
+
+    impl ConfigPersist for FakeConfigPersist {
+        fn save(&self, config: &Config) -> Result<(), String> {
+            self.saved.lock().unwrap().push(config.clone());
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn confirming_the_dialog_appends_the_project_to_the_in_memory_list_and_closes() {
+        // Criterion 3, the in-memory half: this must be true the instant
+        // `update` returns, not only once the background save lands --
+        // `Confirmed` without this would leave the dialog looking like it
+        // did nothing.
+        let mut app = App::new(Config::default());
+        app.add_project = Some(manifest_draft(
+            "[project]\nname = \"my-api\"\nrequires-python = \">=3.11\"\n",
+        ));
+
+        let _ = update(&mut app, Message::AddProjectConfirmed, unused_runner());
+
+        assert_eq!(
+            app.config.projects.len(),
+            1,
+            "got {:?}",
+            app.config.projects
+        );
+        assert_eq!(app.projects.len(), 1);
+        assert_eq!(app.projects[0].label, "my-api");
+        assert_eq!(app.entries.len(), 1);
+        assert!(
+            app.add_project.is_none(),
+            "the dialog must close once confirmed"
+        );
+    }
+
+    #[test]
+    fn confirming_a_dialog_with_nothing_chosen_does_nothing() {
+        // No manifest was ever picked -- there is no draft to confirm.
+        let mut app = App::new(Config::default());
+        app.add_project = None;
+
+        let task = update(&mut app, Message::AddProjectConfirmed, unused_runner());
+
+        assert!(app.config.projects.is_empty());
+        assert_eq!(task.units(), 0);
+    }
+
+    #[test]
+    fn confirming_the_dialog_never_persists_or_runs_uv_synchronously() {
+        // Criterion 3 and criterion 4's shared failure mode, in the shape
+        // plan 3a settled on for `SyncRequested`: the meaningful assertion
+        // is that neither `persist.save` nor `runner.run` has recorded
+        // anything by the time `update` has already returned -- the exact
+        // freeze `job::run` exists to prevent, for two different calls this
+        // time instead of one.
+        let mut app = App::new(Config::default());
+        app.add_project = Some(manifest_draft(""));
+        let persist = Arc::new(FakeConfigPersist::default());
+        app.persist = persist.clone();
+        let fake = Arc::new(FakeCommandRunner::new());
+
+        let task = update(&mut app, Message::AddProjectConfirmed, fake.clone());
+
+        assert!(
+            persist.saved().is_empty(),
+            "persist.save must not be called synchronously inside update"
+        );
+        assert!(
+            fake.calls().is_empty(),
+            "runner.run must not be called synchronously inside update; got {:?}",
+            fake.calls()
+        );
+        assert!(
+            task.units() > 0,
+            "confirming must dispatch real background work, not Task::none()"
+        );
+    }
+
+    #[test]
+    fn confirming_the_dialog_persists_the_appended_project_to_disk() {
+        // Criterion 3's other failure mode: the project reaches
+        // `app.config` in memory but never reaches the store, so it
+        // vanishes on restart. Calls the blocking half directly, the same
+        // way `sync_runs_uv_with_the_composed_environment_and_nothing_ambient`
+        // tests `run_sync` directly rather than through `update`'s opaque
+        // `Task`.
+        let project = project("api");
+        let config = Config {
+            projects: vec![project.clone()],
+            ..Config::default()
+        };
+        let persist = FakeConfigPersist::default();
+        let store = bombadil_core::secrets::InMemorySecretStore::new();
+        let runner = FakeCommandRunner::new();
+
+        let (success, _lines) = run_confirm_add_project(
+            &project,
+            &config,
+            None,
+            &persist,
+            &store,
+            &runner,
+            |_| Some("3.12.0".to_string()), // an existing venv -- adopt, not create
+        );
+
+        assert!(success);
+        let saved = persist.saved();
+        assert_eq!(saved.len(), 1, "persist.save must be called exactly once");
+        assert_eq!(
+            saved[0].projects,
+            vec![project],
+            "the project must be part of what gets persisted"
+        );
+    }
+
+    #[test]
+    fn creating_a_venv_on_confirm_runs_sync_with_python_using_the_composed_environment() {
+        // Criterion 4: the two defects plan 3a shipped and had to fix for
+        // `run_sync` -- an uncomposed environment (private-index auth
+        // silently impossible) and clear_env left unset -- must not come
+        // back for the add-project path. Tests the blocking half directly;
+        // `confirming_the_dialog_never_persists_or_runs_uv_synchronously`
+        // above covers the "never inline" half through `update`.
+        let project = bombadil_core::model::Project {
+            env: vec![bombadil_core::model::EnvVar {
+                key: "MARKER".into(),
+                value: "set".into(),
+                secret: false,
+            }],
+            ..project("api")
+        };
+        let config = Config {
+            projects: vec![project.clone()],
+            settings: fake_uv_settings(),
+            ..Config::default()
+        };
+        let persist = FakeConfigPersist::default();
+        let store = bombadil_core::secrets::InMemorySecretStore::new();
+        let runner = FakeCommandRunner::new();
+        version_probe(&runner);
+        runner.expect(
+            "uv",
+            &["sync", "-p", "3.12.1"],
+            bombadil_core::process::CommandOutcome {
+                status: Some(0),
+                stdout: String::new(),
+                stderr: String::new(),
+            },
+        );
+
+        let (success, _lines) = run_confirm_add_project(
+            &project,
+            &config,
+            Some("3.12.1"),
+            &persist,
+            &store,
+            &runner,
+            |_| None, // no venv present yet -- must create
+        );
+
+        assert!(success);
+        let calls = runner.calls();
+        let sync = calls
+            .iter()
+            .find(|c| c.args.iter().any(|a| a == "sync"))
+            .expect("uv sync -p must have been run");
+        assert_eq!(
+            sync.args,
+            vec!["sync", "-p", "3.12.1"],
+            "the preselected interpreter must be pinned; got {:?}",
+            sync.args
+        );
+        assert!(
+            sync.clear_env,
+            "the composition must be authoritative, not layered on the ambient environment"
+        );
+        assert_eq!(
+            sync.env.get("MARKER").map(String::as_str),
+            Some("set"),
+            "a project env var must reach uv; got {:?}",
+            sync.env.keys().collect::<Vec<_>>()
+        );
+        assert!(
+            sync.env.contains_key("VIRTUAL_ENV"),
+            "the composed activation layer must be present"
+        );
+    }
+
+    #[test]
+    fn adopting_an_existing_venv_on_confirm_does_not_run_sync() {
+        // Criterion 5: adoption must not silently rebuild an environment the
+        // user asked to keep. No rule is programmed on `runner` for `uv
+        // sync` at all -- if `run_confirm_add_project` ran it anyway,
+        // `FakeCommandRunner` would return `CommandError::Unexpected`
+        // instead of quietly succeeding.
+        let project = project("api");
+        let config = Config {
+            projects: vec![project.clone()],
+            settings: fake_uv_settings(),
+            ..Config::default()
+        };
+        let persist = FakeConfigPersist::default();
+        let store = bombadil_core::secrets::InMemorySecretStore::new();
+        let runner = FakeCommandRunner::new();
+
+        let (success, lines) = run_confirm_add_project(
+            &project,
+            &config,
+            Some("3.12.1"),
+            &persist,
+            &store,
+            &runner,
+            |_| Some("3.11.9".to_string()), // an existing venv
+        );
+
+        assert!(success);
+        assert!(
+            runner.calls().is_empty(),
+            "adoption must not run uv at all; got {:?}",
+            runner.calls()
+        );
+        assert!(
+            lines.iter().any(|l| l.contains("3.11.9")),
+            "the adopted version should be reported; got {lines:?}"
+        );
+        assert_eq!(
+            persist.saved().len(),
+            1,
+            "the config must still be persisted on adoption"
         );
     }
 

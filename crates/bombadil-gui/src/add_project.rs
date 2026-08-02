@@ -89,12 +89,14 @@ fn needs_install_offer(draft: &Draft) -> bool {
         && interpreter::preselect(&draft.interpreters, draft.requires_python.as_deref()).is_none()
 }
 
-/// A throwaway `Project` carrying just enough of `draft` for
-/// `venv_path::resolve` -- id and label are display-only for that call, so a
-/// nil id and the (possibly absent) name are fine here.
-fn to_project(draft: &Draft) -> Project {
+/// Builds the `Project` a draft describes. Used both for resolving its venv
+/// path for display (id is irrelevant to that call) and for confirming the
+/// dialog, where the id must be real and unique -- one function rather than
+/// two, since generating a `Uuid::new_v4()` for a display-only resolve costs
+/// nothing.
+pub fn to_project(draft: &Draft) -> Project {
     Project {
-        id: Uuid::nil(),
+        id: Uuid::new_v4(),
         label: draft.name.clone().unwrap_or_default(),
         pyproject_path: draft.pyproject_path.clone(),
         index_names: Vec::new(),
@@ -126,6 +128,28 @@ pub fn resolved_venv_path_display(draft: &Draft, settings: &Settings) -> String 
     match resolved_venv_path(draft, settings) {
         Ok(path) => path.display().to_string(),
         Err(err) => err.to_string(),
+    }
+}
+
+/// What confirming the dialog will do to the chosen venv location.
+/// Spec §8: when the folder already holds a virtual environment the dialog
+/// states it will be adopted, and shows its Python version; otherwise a
+/// fresh one is created.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum VenvOutcome {
+    Adopt { python_version: String },
+    Create,
+}
+
+/// Decides `VenvOutcome` for `venv_path`. `probe` is a parameter rather than
+/// `venv_path::probe` called directly here, so this stays pure and testable
+/// without a real filesystem -- `venv_path` may not exist at all on the
+/// machine running a test. The real caller (`app::run_confirm_add_project`)
+/// passes `venv_path::probe` itself.
+pub fn venv_outcome(venv_path: &Path, probe: impl Fn(&Path) -> Option<String>) -> VenvOutcome {
+    match probe(venv_path) {
+        Some(python_version) => VenvOutcome::Adopt { python_version },
+        None => VenvOutcome::Create,
     }
 }
 
@@ -170,13 +194,17 @@ pub fn view<'a>(draft: &Draft, resolved: &str) -> iced::Element<'a, Message> {
         );
     }
 
+    let actions = iced::widget::row![
+        iced::widget::button(iced::widget::text("Add project"))
+            .on_press(Message::AddProjectConfirmed),
+        iced::widget::button(iced::widget::text("Cancel")).on_press(Message::AddProjectCancelled),
+    ]
+    .spacing(8);
+
     column
         .push(venv_row)
         .push(iced::widget::text(format!("venv: {resolved}")))
-        .push(
-            iced::widget::button(iced::widget::text("Cancel"))
-                .on_press(Message::AddProjectCancelled),
-        )
+        .push(actions)
         .into()
 }
 
@@ -339,5 +367,45 @@ requires-python = ">=3.11"
             "python: no compatible interpreter found"
         );
         assert!(needs_install_offer(&draft));
+    }
+
+    #[test]
+    fn a_folder_holding_a_venv_is_reported_as_adoptable_with_its_version() {
+        // Criterion 1. The mutation this earns its place against: treating an
+        // existing venv as empty and silently recreating it, which destroys
+        // the user's environment. `probe` never touches a real path -- it is
+        // a fake closure, so this proves the *wiring*, not the filesystem
+        // read `venv_path::probe` itself already covers.
+        let outcome = venv_outcome(Path::new("/whatever/.venv"), |_| Some("3.12.4".to_string()));
+        assert_eq!(
+            outcome,
+            VenvOutcome::Adopt {
+                python_version: "3.12.4".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn an_empty_folder_is_reported_as_a_creation_not_an_adoption() {
+        // Criterion 2: the opposite mistake -- claiming to adopt something
+        // that is not there.
+        let outcome = venv_outcome(Path::new("/whatever/.venv"), |_| None);
+        assert_eq!(outcome, VenvOutcome::Create);
+    }
+
+    #[test]
+    fn to_project_gives_every_draft_a_real_unique_id() {
+        // Confirming the dialog needs a real id -- `venv_path::resolve`
+        // itself never reads it, so a nil id would pass every existing
+        // `resolved_venv_path` test and still be wrong for the config the
+        // project is about to be appended to.
+        let draft = draft_from(Path::new("/p/my-api/pyproject.toml"), MANIFEST);
+        let a = to_project(&draft);
+        let b = to_project(&draft);
+        assert_ne!(a.id, Uuid::nil());
+        assert_ne!(
+            a.id, b.id,
+            "two confirmations of the same draft must not collide"
+        );
     }
 }
