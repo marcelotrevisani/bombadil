@@ -19,8 +19,12 @@ use std::collections::BTreeMap;
 ///
 /// Windows uses PowerShell writing the same NUL-separated records. That form
 /// is NOT verified on a development machine — the integration test runs on the
-/// Windows CI job, which is what proves it. `$ErrorActionPreference = 'Stop'`
-/// is set first because `powershell -Command` otherwise exits 0 even when the
+/// Windows CI job, which is what proves it. `[Console]::OutputEncoding` is
+/// pinned to UTF-8 first: the dump is read back as UTF-8 (`parse_dump` drops
+/// any record that isn't), but PowerShell's default console output encoding
+/// is not guaranteed UTF-8, so without this a non-ASCII variable value would
+/// silently vanish rather than error. `$ErrorActionPreference = 'Stop'` is
+/// set next because `powershell -Command` otherwise exits 0 even when the
 /// sourced script writes errors; without it a broken script would silently
 /// produce a truncated environment instead of aborting.
 pub fn dump_command(script: &Script) -> CommandSpec {
@@ -36,7 +40,8 @@ pub fn dump_command(script: &Script) -> CommandSpec {
     #[cfg(windows)]
     {
         let program = format!(
-            "$ErrorActionPreference = 'Stop'; \
+            "[Console]::OutputEncoding = [Text.Encoding]::UTF8; \
+             $ErrorActionPreference = 'Stop'; \
              . '{path}' {args} | Out-Null; \
              Get-ChildItem Env: | ForEach-Object {{ \
                  [Console]::Out.Write($_.Name + '=' + $_.Value + [char]0) }}"
@@ -146,6 +151,25 @@ mod tests {
 
         assert_eq!(got.get("NEW").map(String::as_str), Some("added"));
         assert_eq!(got.get("KEEP").map(String::as_str), Some("unchanged"));
+
+        // Pin the glue: dump_command and the CommandSpec fields are each
+        // tested on their own, but nothing else confirms apply actually
+        // wires them together instead of e.g. running a bare `sh`.
+        let calls = runner.calls();
+        assert_eq!(calls.len(), 1);
+        let spec = &calls[0];
+        assert!(
+            spec.clear_env,
+            "the script must see exactly `base`, or the dump diff is meaningless"
+        );
+        assert_eq!(spec.env, base());
+        assert!(
+            spec.args
+                .iter()
+                .any(|a| a.contains("env -0") || a.contains("[char]0")),
+            "apply must go through dump_command; got {:?}",
+            spec.args
+        );
     }
 
     #[test]
