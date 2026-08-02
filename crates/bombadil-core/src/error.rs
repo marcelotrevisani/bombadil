@@ -141,4 +141,7 @@ pub enum EnvError {
         status: Option<i32>,
         output: String,
     },
+
+    #[error("could not read a secret while composing the environment: {message}")]
+    Secret { message: String },
 }
