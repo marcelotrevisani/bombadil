@@ -124,13 +124,21 @@ pub fn open(
 
     let (shell_args, extra_env) = match &init {
         Some(f) => {
-            let file_path = scratch_dir.join(&f.relative_path);
-            if let Some(parent) = file_path.parent() {
-                std::fs::create_dir_all(parent).map_err(|source| EnvError::TerminalInitFile {
-                    path: file_path.clone(),
-                    message: source.to_string(),
-                })?;
-            }
+            // Every shell family's relative_path is a fixed name
+            // (bombadil-bashrc, .zshrc, ...), so joining it straight under
+            // scratch_dir would let a second `open` for a DIFFERENT project
+            // overwrite the first project's init file before its shell has
+            // read it -- the first terminal then activates the wrong
+            // project's environment. Namespacing by project id keeps
+            // concurrent opens for different projects from colliding; a
+            // second open for the *same* project id still overwrites, which
+            // is fine, since it is the same venv path either way.
+            let dir = scratch_dir.join(inputs.project.id.to_string());
+            std::fs::create_dir_all(&dir).map_err(|source| EnvError::TerminalInitFile {
+                path: dir.clone(),
+                message: source.to_string(),
+            })?;
+            let file_path = dir.join(&f.relative_path);
             std::fs::write(&file_path, &f.contents).map_err(|source| {
                 EnvError::TerminalInitFile {
                     path: file_path.clone(),
@@ -139,11 +147,7 @@ pub fn open(
             })?;
 
             let file_str = file_path.to_string_lossy().into_owned();
-            let dir_str = file_path
-                .parent()
-                .unwrap_or(scratch_dir)
-                .to_string_lossy()
-                .into_owned();
+            let dir_str = dir.to_string_lossy().into_owned();
 
             let shell_args = substitute(f.shell_args.iter(), &file_str, &dir_str);
             let extra_env: BTreeMap<String, String> = f
@@ -172,11 +176,16 @@ pub fn open(
         spec.args.join(" ")
     );
 
+    // No live path puts a secret into `spec.args` today, but a custom
+    // terminal template is exactly the kind of thing that could later
+    // interpolate an environment value into argv -- redact both fields with
+    // the same set, not just `message`.
+    let secrets = secret_values(inputs, &env);
     runner
         .run(&spec)
         .map_err(|source| EnvError::TerminalSpawn {
-            argv: argv_line,
-            message: redact(source.to_string(), &secret_values(inputs, &env)),
+            argv: redact(argv_line, &secrets),
+            message: redact(source.to_string(), &secrets),
         })?;
 
     Ok(())
@@ -387,5 +396,178 @@ mod tests {
         let rendered = err.to_string();
         assert!(!rendered.contains("s3cr3t-open-value"), "got {rendered}");
         assert!(rendered.contains("***"), "got {rendered}");
+    }
+
+    fn success_outcome() -> crate::process::CommandOutcome {
+        crate::process::CommandOutcome {
+            status: Some(0),
+            stdout: String::new(),
+            stderr: String::new(),
+        }
+    }
+
+    fn extract_flag_value(spec: &crate::process::CommandSpec, flag: &str) -> String {
+        let idx = spec
+            .args
+            .iter()
+            .position(|a| a == flag)
+            .unwrap_or_else(|| panic!("{flag} not found in {:?}", spec.args));
+        spec.args[idx + 1].clone()
+    }
+
+    #[test]
+    fn two_projects_do_not_share_an_init_file_even_under_the_same_scratch_dir() {
+        // A fixed filename per shell family (bombadil-bashrc, .zshrc, ...)
+        // joined straight under scratch_dir would let a second `open` for a
+        // DIFFERENT project overwrite the first project's init file before
+        // its shell has read it -- the first terminal would then activate
+        // the wrong project's environment. Same class of silent
+        // wrong-environment bug this whole plan exists to prevent.
+        let store = InMemorySecretStore::new();
+        let runner = FakeCommandRunner::new();
+        runner.expect("gnome-terminal", &[], success_outcome());
+        let tmp = tempfile::tempdir().unwrap();
+
+        let ins_a = EnvInputs {
+            parent: BTreeMap::from([("PATH".to_string(), "/usr/bin".to_string())]),
+            config: Config::default(),
+            project: Project {
+                id: Uuid::from_u128(1),
+                ..project()
+            },
+            venv_path: PathBuf::from("/envs/project-a"),
+        };
+        let ins_b = EnvInputs {
+            parent: BTreeMap::from([("PATH".to_string(), "/usr/bin".to_string())]),
+            config: Config::default(),
+            project: Project {
+                id: Uuid::from_u128(2),
+                ..project()
+            },
+            venv_path: PathBuf::from("/envs/project-b"),
+        };
+
+        for ins in [&ins_a, &ins_b] {
+            open(
+                &TerminalChoice::Detected(TerminalKind::GnomeTerminal),
+                Os::Linux,
+                ins,
+                "/bin/bash",
+                &store,
+                &runner,
+                tmp.path(),
+            )
+            .expect("opening must succeed");
+        }
+
+        let calls = runner.calls();
+        assert_eq!(calls.len(), 2);
+        let path_a = extract_flag_value(&calls[0], "--rcfile");
+        let path_b = extract_flag_value(&calls[1], "--rcfile");
+        assert_ne!(
+            path_a, path_b,
+            "two different projects must not share an init file path"
+        );
+
+        let contents_a = std::fs::read_to_string(&path_a).unwrap();
+        let contents_b = std::fs::read_to_string(&path_b).unwrap();
+        assert!(contents_a.contains("/envs/project-a"), "got {contents_a}");
+        assert!(!contents_a.contains("/envs/project-b"), "got {contents_a}");
+        assert!(contents_b.contains("/envs/project-b"), "got {contents_b}");
+        assert!(!contents_b.contains("/envs/project-a"), "got {contents_b}");
+    }
+
+    #[test]
+    fn zsh_gets_zdotdir_pointing_at_a_real_directory_not_the_placeholder() {
+        // {dir} is never exercised by the bash-only tests above; a
+        // regression isolated to the {dir} substitution would leave zsh
+        // users with a literal "{dir}" ZDOTDIR, which sources nothing --
+        // silently losing activation rather than failing loudly.
+        let store = InMemorySecretStore::new();
+        let runner = FakeCommandRunner::new();
+        runner.expect("gnome-terminal", &[], success_outcome());
+        let tmp = tempfile::tempdir().unwrap();
+        let ins = inputs(project());
+
+        open(
+            &TerminalChoice::Detected(TerminalKind::GnomeTerminal),
+            Os::Linux,
+            &ins,
+            "/bin/zsh",
+            &store,
+            &runner,
+            tmp.path(),
+        )
+        .expect("opening must succeed");
+
+        let calls = runner.calls();
+        let zdotdir = calls[0].env.get("ZDOTDIR").expect("ZDOTDIR must be set");
+        assert!(!zdotdir.contains("{dir}"), "got {zdotdir}");
+        let expected = tmp.path().join(ins.project.id.to_string());
+        assert_eq!(PathBuf::from(zdotdir), expected);
+    }
+
+    #[test]
+    fn posix_sh_gets_env_pointing_at_a_real_file_not_the_placeholder() {
+        let store = InMemorySecretStore::new();
+        let runner = FakeCommandRunner::new();
+        runner.expect("gnome-terminal", &[], success_outcome());
+        let tmp = tempfile::tempdir().unwrap();
+        let ins = inputs(project());
+
+        open(
+            &TerminalChoice::Detected(TerminalKind::GnomeTerminal),
+            Os::Linux,
+            &ins,
+            "/bin/sh",
+            &store,
+            &runner,
+            tmp.path(),
+        )
+        .expect("opening must succeed");
+
+        let calls = runner.calls();
+        let env_var = calls[0].env.get("ENV").expect("ENV must be set");
+        assert!(!env_var.contains("{file}"), "got {env_var}");
+        let expected = tmp
+            .path()
+            .join(ins.project.id.to_string())
+            .join("bombadil-env.sh");
+        assert_eq!(PathBuf::from(env_var), expected);
+    }
+
+    #[test]
+    fn fish_substitutes_file_in_the_middle_of_an_argument() {
+        // fish's shell_args carries "{file}" embedded inside "source {file}",
+        // not as a standalone argument -- an equality-based substitution
+        // would silently leave it untouched.
+        let store = InMemorySecretStore::new();
+        let runner = FakeCommandRunner::new();
+        runner.expect("gnome-terminal", &[], success_outcome());
+        let tmp = tempfile::tempdir().unwrap();
+        let ins = inputs(project());
+
+        open(
+            &TerminalChoice::Detected(TerminalKind::GnomeTerminal),
+            Os::Linux,
+            &ins,
+            "/usr/local/bin/fish",
+            &store,
+            &runner,
+            tmp.path(),
+        )
+        .expect("opening must succeed");
+
+        let calls = runner.calls();
+        let args = calls[0].args.join(" ");
+        assert!(!args.contains("{file}"), "got {args}");
+        let expected_file = tmp
+            .path()
+            .join(ins.project.id.to_string())
+            .join("bombadil.fish");
+        assert!(
+            args.contains(&format!("source {}", expected_file.display())),
+            "got {args}"
+        );
     }
 }
