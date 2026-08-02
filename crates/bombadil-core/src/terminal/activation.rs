@@ -95,7 +95,13 @@ pub fn init_file(family: ShellFamily, venv_bin: &Path) -> Option<InitFile> {
         }),
         ShellFamily::Fish => Some(InitFile {
             relative_path: PathBuf::from("bombadil.fish"),
-            contents: format!("fish_add_path --prepend --path '{bin}'\n"),
+            // --move is load-bearing, not decoration: `compose` has already
+            // put the venv on PATH by the time this runs, and fish_add_path
+            // is idempotent -- without --move it sees the component already
+            // present and does nothing at all, leaving it wherever
+            // config.fish demoted it. Exactly the silent no-op this file
+            // exists to prevent.
+            contents: format!("fish_add_path --move --prepend --path '{bin}'\n"),
             // `-C` (run a command before reading config) requires fish >= 3.4
             // (released 2022). No version guard exists here and none is
             // planned; noted so the next person does not think it was
@@ -177,6 +183,24 @@ mod tests {
             file.contents
         );
         assert!(file.contents.contains("--prepend"), "got {}", file.contents);
+    }
+
+    #[test]
+    fn fish_moves_the_venv_rather_than_relying_on_it_being_absent() {
+        // fish_add_path is idempotent: it will NOT move a component that is
+        // already in $PATH unless --move is given. `compose` has already put
+        // the venv on PATH before this file runs, so without --move the
+        // command is a complete no-op and the venv stays wherever
+        // config.fish demoted it -- activation silently fails while `open`
+        // still returns Ok. fish is not installed here and is not on CI
+        // runners, so this unit test is the only place the requirement can
+        // be held.
+        let file = init_file(ShellFamily::Fish, Path::new("/envs/api/bin")).unwrap();
+        assert!(
+            file.contents.contains("--move"),
+            "without --move fish_add_path does nothing; got {}",
+            file.contents
+        );
     }
 
     #[test]
