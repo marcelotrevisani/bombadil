@@ -81,6 +81,14 @@ fn resolve_var(
 /// writes its commands to stderr with variables already expanded, so a
 /// failing script's stderr can otherwise carry a secret straight into
 /// [`EnvError::ScriptFailed`] verbatim.
+///
+/// No minimum length is enforced on a secret before it is treated as a
+/// redaction needle (empty strings are the only exception, skipped below).
+/// A short secret risks over-redacting unrelated stderr that happens to
+/// contain the same short string, but a length floor would risk leaving a
+/// short secret unredacted outright -- a guaranteed leak traded for
+/// readability. Over-redaction fails safe; that is the trade this function
+/// deliberately takes.
 fn redact(mut text: String, secrets: &[String]) -> String {
     for secret in secrets {
         // An empty needle would match (and get replaced) everywhere.
@@ -132,6 +140,13 @@ fn redact_env_error(err: EnvError, secrets: &[String]) -> EnvError {
 /// parent process had. This is deliberate -- they are *pre*-activate
 /// scripts, and a non-activated environment is exactly what that name
 /// promises -- but a script that shells out to `python` will still hit it.
+///
+/// Secret redaction is applied only around the `apply` call for each
+/// pre-activate script -- a future text-carrying `EnvError` raised elsewhere
+/// in this function would bypass it. It also only covers secrets resolved
+/// *before* the failing script ran: a value a pre-activate script introduces
+/// itself (e.g. one it exports for a later script) is not in the redaction
+/// set, so a later script's traced stderr could still expose it.
 pub fn compose(
     inputs: &EnvInputs,
     store: &dyn SecretStore,
@@ -712,6 +727,111 @@ mod tests {
     }
 
     #[test]
+    fn a_failing_pre_activate_script_never_leaks_an_index_password_in_its_error() {
+        // The redaction set is built from project/global env secrets AND from
+        // the index passwords compose reads back after inject -- deleting
+        // just that read-back would leave the project-secret leak test above
+        // green while a private index's password still leaked.
+        use crate::model::{Index, IndexAuth, IndexKind};
+
+        let idx = Index {
+            name: "priv".into(),
+            url: "https://priv.example/simple".into(),
+            kind: IndexKind::Extra,
+            default_for_new_projects: false,
+            auth: IndexAuth::Basic {
+                username: "alice".into(),
+            },
+        };
+        let config = Config {
+            indexes: vec![idx],
+            ..Config::default()
+        };
+        let project = Project {
+            index_names: vec!["priv".into()],
+            scripts: vec![Script {
+                path: PathBuf::from("/p/pre.sh"),
+                args: vec![],
+                enabled: true,
+            }],
+            ..project()
+        };
+        let store = InMemorySecretStore::new();
+        store
+            .set(
+                &SecretKey::Index {
+                    name: "priv".into(),
+                },
+                "index-password-value",
+            )
+            .unwrap();
+        let runner = FakeCommandRunner::new();
+        runner.expect(
+            shell(),
+            &[],
+            CommandOutcome {
+                status: Some(1),
+                stdout: String::new(),
+                stderr: "+ curl -u alice:index-password-value https://priv.example/simple".into(),
+            },
+        );
+
+        let err = compose(&inputs(config, project), &store, &runner).unwrap_err();
+
+        let rendered = err.to_string();
+        assert!(rendered.contains("***"), "got {rendered}");
+        assert!(!rendered.contains("index-password-value"), "got {rendered}");
+    }
+
+    #[test]
+    fn a_spawn_failure_never_leaks_a_secret_in_its_error() {
+        // Covers the ScriptSpawn arm of redact_env_error -- the tests above
+        // only exercise ScriptFailed. An unprogrammed FakeCommandRunner call
+        // reports the exact command line it could not match, and a script
+        // argument is interpolated straight into that command line, so this
+        // reaches ScriptSpawn with the secret in its `message` without a real
+        // spawn failure. The secret goes in `args`, not `path`: `path` also
+        // becomes EnvError::ScriptSpawn's `script` field, which redaction
+        // does not touch, and putting it there would leak through that field
+        // instead of testing the one this test targets.
+        let project = Project {
+            env: vec![EnvVar {
+                key: "TOKEN".into(),
+                value: String::new(),
+                secret: true,
+            }],
+            scripts: vec![Script {
+                path: PathBuf::from("/p/pre.sh"),
+                args: vec!["s3cr3t-spawn-value".to_string()],
+                enabled: true,
+            }],
+            ..project()
+        };
+        let store = InMemorySecretStore::new();
+        store
+            .set(
+                &SecretKey::ProjectEnv {
+                    project_id: Uuid::from_u128(7),
+                    key: "TOKEN".into(),
+                },
+                "s3cr3t-spawn-value",
+            )
+            .unwrap();
+        // No outcome programmed: the runner fails every call, and its
+        // CommandError::Unexpected message embeds the whole command line --
+        // including the secret-bearing script path -- so this reaches
+        // ScriptSpawn with the secret in its message without spawning
+        // anything real.
+        let runner = FakeCommandRunner::new();
+
+        let err = compose(&inputs(Config::default(), project), &store, &runner).unwrap_err();
+
+        let rendered = err.to_string();
+        assert!(rendered.contains("***"), "got {rendered}");
+        assert!(!rendered.contains("s3cr3t-spawn-value"), "got {rendered}");
+    }
+
+    #[test]
     fn compose_and_uv_command_project_spec_agree_on_uv_project_environment() {
         // Plan 2c hands compose's output to a uv command with clear_env =
         // true, discarding project_spec's own UV_PROJECT_ENVIRONMENT --
@@ -741,6 +861,10 @@ mod tests {
         };
         let spec = crate::uv::command::sync(&uv, &ctx);
 
+        assert!(
+            composed.contains_key("UV_PROJECT_ENVIRONMENT"),
+            "got {composed:?}"
+        );
         assert_eq!(
             composed.get("UV_PROJECT_ENVIRONMENT"),
             spec.env.get("UV_PROJECT_ENVIRONMENT"),
