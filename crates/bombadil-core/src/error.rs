@@ -72,6 +72,48 @@ pub enum VenvPathError {
     NoProjectDirectory { pyproject_path: PathBuf },
 }
 
+/// Why [`crate::venv_path::delete`] refused to remove something.
+///
+/// One variant per refusal rather than a single "could not delete": this is
+/// the only destructive filesystem operation in the crate, and a user who is
+/// told *why* it was refused can act on it, while "could not delete" invites
+/// them to go and `rm -rf` it by hand.
+#[derive(Debug, thiserror::Error)]
+pub enum VenvDeleteError {
+    #[error("the project's virtual environment path could not be resolved: {0}")]
+    Resolve(#[from] VenvPathError),
+
+    /// The caller asked to delete something that is not where this project's
+    /// virtual environment lives. Nothing is touched.
+    #[error(
+        "{path} is not the virtual environment of this project (that is {expected}), \
+         so it will not be deleted"
+    )]
+    OutsideProject { path: PathBuf, expected: PathBuf },
+
+    /// No `pyvenv.cfg`, so whatever is there was not created by uv or the
+    /// stdlib `venv` module. A plausible name is not evidence.
+    #[error(
+        "{path} holds no pyvenv.cfg, so it is not a virtual environment and will not be deleted"
+    )]
+    NotAVenv { path: PathBuf },
+
+    /// A symlink or a plain file at the venv path. Deleting a symlink would
+    /// either be a no-op on the environment or, if it were followed, remove
+    /// whatever it points at -- neither is what "delete this venv" means.
+    #[error(
+        "{path} is not a real directory (it is a file or a symlink), so it will not be deleted"
+    )]
+    NotADirectory { path: PathBuf },
+
+    #[error("could not delete {path}: {source}")]
+    Io {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum UvResolveError {
     #[error("the bundled uv could not be made available: {message}")]
