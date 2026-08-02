@@ -9,7 +9,7 @@ use uuid::Uuid;
 pub const SERVICE: &str = "bombadil";
 
 /// Which secret, addressed the way spec section 5 names them.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SecretKey {
     /// Credentials for a named package index.
     Index { name: String },
