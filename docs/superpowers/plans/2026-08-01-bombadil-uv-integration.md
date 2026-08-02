@@ -1600,6 +1600,22 @@ UV_PROJECT_ENVIRONMENT; that pairing is what lets a venv live anywhere."
 
 ### Task 6: Parsing uv's JSON output
 
+> **PLAN DEFECT, found by the whole-branch review — read before building the Dependencies tab.**
+>
+> `TreeRoot { id: String }` and `RawTree` below read only `schema` and `roots`, so
+> `TreeOutcome::Parsed` carries **no edges and no children** — nothing from which spec §8's
+> *"Direct dependencies expand to reveal their transitive tree"* can be rendered. The
+> implementation matches this plan's Interfaces block verbatim; the gap is in the plan.
+>
+> Two consequences worth knowing. The committed fixture was trimmed to exactly the fields the
+> type reads, so it no longer proves the parser survives real uv output shape. And the
+> integration test asserts only `parse_tree(..).is_ok()`, which is close to unfalsifiable given
+> every field is `#[serde(default)]`.
+>
+> Not a merge blocker: §8 does not bind this branch and `RawTree` extends additively. **Plan 3
+> must** add the `packages` array with each package's `dependencies`, and restore the fixture to
+> real captured `uv tree --format json` output, before the dependency tree can be drawn.
+
 **Files:**
 - Create: `crates/bombadil-core/src/uv/results.rs`
 - Create: `crates/bombadil-core/tests/fixtures/uv-pip-list.json`
