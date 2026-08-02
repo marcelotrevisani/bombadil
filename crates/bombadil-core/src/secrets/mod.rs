@@ -1,5 +1,7 @@
+mod keyring_store;
 mod memory;
 
+pub use keyring_store::KeyringSecretStore;
 pub use memory::InMemorySecretStore;
 
 use crate::error::SecretError;
@@ -7,6 +9,10 @@ use uuid::Uuid;
 
 /// The keychain service every Bombadil secret is stored under.
 pub const SERVICE: &str = "bombadil";
+
+/// An account name never written to, used only to probe whether the keychain
+/// answers at all.
+pub const SECRET_PROBE_ACCOUNT: &str = "availability-probe";
 
 /// Which secret, addressed the way spec section 5 names them.
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -19,3 +19,4 @@ sha2.workspace = true
 directories.workspace = true
 thiserror.workspace = true
 tempfile.workspace = true
+keyring.workspace = true
