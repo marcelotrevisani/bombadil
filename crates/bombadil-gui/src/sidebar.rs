@@ -6,8 +6,6 @@
 //! project without a venv is still listed, just marked hollow.
 
 use bombadil_core::model::Config;
-use bombadil_core::venv_path;
-use std::path::Path;
 
 use crate::app::Message;
 
@@ -20,34 +18,18 @@ pub struct Entry {
 
 /// Builds one `Entry` per project, in config order.
 ///
-/// `venv_probe` is a parameter rather than a filesystem call so this runs
-/// without touching disk in tests; the caller supplies a real probe.
-///
-/// **It is production-dead.** The only real caller (`app::App::new`) passes
-/// `|_| None`, so every entry starts hollow and the real versions arrive
-/// asynchronously through `Message::VenvProbed` -- probing inline here would
-/// block the render thread on a `pyvenv.cfg` read, which is exactly what
-/// `app::boot`'s background probes exist to avoid. Left in place because the
-/// tests below exercise the filled/hollow branches through it; do not mistake
-/// it for live wiring.
-///
-/// A project whose venv path cannot be resolved (`venv_path::resolve` fails
-/// on a `pyproject.toml` with no parent) is listed hollow rather than
-/// dropped -- dropping it would make it unrecoverable through the UI, since
-/// the user could never select it again to fix or remove it.
-pub fn entries(config: &Config, venv_probe: &dyn Fn(&Path) -> Option<String>) -> Vec<Entry> {
+/// Every entry starts hollow: `app::boot`'s background probes fill in real
+/// venv status asynchronously through `Message::VenvProbed`. Probing here
+/// inline would block the render thread on a `pyvenv.cfg` read, which is
+/// exactly what those background probes exist to avoid.
+pub fn entries(config: &Config) -> Vec<Entry> {
     config
         .projects
         .iter()
-        .map(|project| {
-            let python_version = venv_path::resolve(project, &config.settings)
-                .ok()
-                .and_then(|path| venv_probe(&path));
-            Entry {
-                label: project.label.clone(),
-                venv_exists: python_version.is_some(),
-                python_version,
-            }
+        .map(|project| Entry {
+            label: project.label.clone(),
+            venv_exists: false,
+            python_version: None,
         })
         .collect()
 }
@@ -56,6 +38,10 @@ pub fn entries(config: &Config, venv_probe: &dyn Fn(&Path) -> Option<String>) ->
 /// lives in `entries`. `selected` is accepted for parity with the other
 /// `view` functions in this crate; highlighting the selected row is left to
 /// styling, not covered by a test.
+///
+/// Each row is wrapped in a `mouse_area` so a right-click opens the project's
+/// context menu (spec §8) without disturbing the left-click select behaviour
+/// the button already provides.
 pub fn view<'a>(entries: &[Entry], _selected: Option<usize>) -> iced::Element<'a, Message> {
     let mut list = iced::widget::column![].spacing(4);
     for (i, entry) in entries.iter().enumerate() {
@@ -68,11 +54,11 @@ pub fn view<'a>(entries: &[Entry], _selected: Option<usize>) -> iced::Element<'a
             Some(version) => format!("{marker} {} ({version})", entry.label),
             None => format!("{marker} {}", entry.label),
         };
-        list = list.push(
-            iced::widget::button(iced::widget::text(label))
-                .on_press(Message::ProjectSelected(i))
-                .width(iced::Length::Fill),
-        );
+        let row = iced::widget::button(iced::widget::text(label))
+            .on_press(Message::ProjectSelected(i))
+            .width(iced::Length::Fill);
+        list =
+            list.push(iced::widget::mouse_area(row).on_right_press(Message::ContextMenuOpened(i)));
     }
     list.into()
 }
@@ -82,18 +68,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_project_with_a_venv_is_marked_filled() {
-        let entries = entries(&config_with(&["api"]), &|_| Some("3.12.1".into()));
-        assert_eq!(entries.len(), 1);
-        assert!(entries[0].venv_exists);
-        assert_eq!(entries[0].python_version.as_deref(), Some("3.12.1"));
-    }
-
-    #[test]
-    fn a_project_without_a_venv_is_marked_hollow_and_still_listed() {
+    fn every_entry_starts_hollow_and_still_lists_the_project() {
         // Registered-without-a-venv is a normal state, not an error: the user
         // adds the project first and creates the environment afterwards.
-        let entries = entries(&config_with(&["api"]), &|_| None);
+        // Real versions arrive later through `Message::VenvProbed`, not from
+        // `entries` itself.
+        let entries = entries(&config_with(&["api"]));
         assert_eq!(entries.len(), 1);
         assert!(!entries[0].venv_exists);
         assert_eq!(entries[0].python_version, None);
@@ -101,20 +81,9 @@ mod tests {
 
     #[test]
     fn entries_follow_config_order_so_the_list_does_not_reshuffle() {
-        let entries = entries(&config_with(&["web", "api"]), &|_| None);
+        let entries = entries(&config_with(&["web", "api"]));
         let labels: Vec<&str> = entries.iter().map(|e| e.label.as_str()).collect();
         assert_eq!(labels, vec!["web", "api"]);
-    }
-
-    #[test]
-    fn a_project_whose_venv_path_cannot_be_resolved_is_listed_as_hollow() {
-        // venv_path::resolve fails on a pyproject path with no parent. Dropping
-        // the project from the list would make it unrecoverable through the UI.
-        let mut config = config_with(&["api"]);
-        config.projects[0].pyproject_path = std::path::PathBuf::from("pyproject.toml");
-        let entries = entries(&config, &|_| Some("3.12.1".into()));
-        assert_eq!(entries.len(), 1, "the project must still be listed");
-        assert!(!entries[0].venv_exists);
     }
 
     fn config_with(labels: &[&str]) -> bombadil_core::model::Config {

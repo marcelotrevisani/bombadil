@@ -1,18 +1,23 @@
+use crate::add_project;
 use crate::banner;
+use crate::context_menu;
 use crate::detail;
 use crate::drawer;
+use crate::interpreter;
 use crate::job;
 use crate::sidebar;
 use bombadil_core::envspec::{self, EnvInputs};
-use bombadil_core::model::{Config, Project};
+use bombadil_core::model::{Config, Project, Settings, TerminalChoice};
 use bombadil_core::process::CommandRunner;
 use bombadil_core::secrets::{KeyringSecretStore, SecretStore};
 use bombadil_core::store::Loaded;
 use bombadil_core::terminal::open::secret_values;
+use bombadil_core::terminal::{self, Os, TerminalKind};
 use bombadil_core::uv;
+use bombadil_core::uv::results::Interpreter;
 use bombadil_core::venv_path;
 use iced::Task;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -20,13 +25,43 @@ use std::time::Duration;
 /// that project as hollow instead of waiting on it. Reading a small local
 /// file is normally sub-millisecond; a few seconds already covers a slow
 /// disk, and nothing here is worth making the user stare at a frozen sidebar
-/// for longer than that.
+/// for longer than that. Reused by `load_manifest_draft` for the same reason:
+/// a `pyproject.toml` read is the same shape of small local file read.
 const VENV_PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// How long a `uv sync` gets before it is treated as failed. Sync can
 /// download and build packages, unlike the sub-millisecond `pyvenv.cfg`
 /// read `VENV_PROBE_TIMEOUT` bounds, so this is generous rather than tight.
 const SYNC_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// Saves the whole config to disk. A trait rather than a bare
+/// `bombadil_core::store::Store` so a test can hand in a fake that records
+/// what would have been written instead of touching a real file -- the same
+/// shape as `CommandRunner`. Implemented for `Store` below; `main.rs` wires
+/// the real one in after `boot`.
+pub trait ConfigPersist: Send + Sync {
+    fn save(&self, config: &Config) -> Result<(), String>;
+}
+
+impl ConfigPersist for bombadil_core::store::Store {
+    fn save(&self, config: &Config) -> Result<(), String> {
+        bombadil_core::store::Store::save(self, config).map_err(|e| e.to_string())
+    }
+}
+
+/// `App::new`'s default `persist` before a real `Store` is wired in. Every
+/// save fails rather than silently succeeding -- a config that reports
+/// success while writing nothing would be a worse bug than one that never
+/// pretends to have saved at all. Exists only so tests that never confirm
+/// the add-project dialog don't need to supply a store; `main.rs` always
+/// replaces this immediately after `boot`.
+pub struct NullPersist;
+
+impl ConfigPersist for NullPersist {
+    fn save(&self, _config: &Config) -> Result<(), String> {
+        Err("no config store configured".to_string())
+    }
+}
 
 /// Everything the window shows. Deliberately plain data: `update` is the only
 /// place it changes, which is what makes the logic testable without a display.
@@ -63,10 +98,29 @@ pub struct App {
     /// interleave its transcript into the first one's. One at a time is what
     /// the UI can actually represent.
     ///
-    /// A `String` rather than a `Uuid` because `uuid` is a dev-dependency of
-    /// this crate, not a dependency, and adding one for an equality check is
-    /// not worth it.
+    /// A `String` rather than a `Uuid`: this predates `uuid` becoming a real
+    /// dependency of this crate (added for `add_project::to_project`), and an
+    /// equality check has no need for the typed form.
     pub syncing: Option<String>,
+    /// The in-progress add-project dialog, if the user has picked a manifest.
+    /// `None` before a manifest is chosen and after Cancel -- there is
+    /// nothing else for the dialog to show in either state.
+    pub add_project: Option<add_project::Draft>,
+    /// Where confirming the add-project dialog saves the config. A trait
+    /// object, not a bare `Store`, so a test can substitute a fake -- see
+    /// `ConfigPersist`.
+    pub persist: Arc<dyn ConfigPersist>,
+    /// The open context menu (spec §8: right-click a project), if any.
+    /// `None` before the first right-click and after it closes -- there is
+    /// nothing else for the menu to show in either state, the same shape
+    /// `add_project` uses for its own dialog.
+    pub context_menu: Option<context_menu::ContextMenu>,
+    /// Whether the footer is showing the bundled uv licence in full.
+    /// Apache-2.0 section 4 obliges the text to be reachable, and
+    /// `bombadil_uv_bin::UV_LICENSE` is compiled in -- this is what reaches
+    /// it. Collapsed by default: it is thousands of words of boilerplate,
+    /// and the obligation is that the user *can* read it.
+    pub about_expanded: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -76,10 +130,17 @@ pub enum Message {
     /// Python version on success; `None` covers "no venv", a probe that
     /// timed out, and a probe that failed -- all three degrade to hollow.
     VenvProbed(usize, Option<String>),
-    /// The Sync action was pressed for the selected project. Never gated on
+    /// The Sync action was pressed for `projects[usize]`. Never gated on
     /// whether a venv already exists -- creating one is how the user
     /// recovers from not having one.
-    SyncRequested,
+    ///
+    /// Carries the index rather than resolving against `app.selected`, the
+    /// same shape `OpenTerminalRequested` and `RemoveProjectRequested` use:
+    /// the context menu is opened by a right-press that deliberately does
+    /// *not* move the selection, so a selection-resolved Sync would run
+    /// `uv sync` -- which prunes packages absent from the target's lockfile
+    /// -- against an environment the user never named.
+    SyncRequested(usize),
     /// A background sync finished. `success` is true only on a zero exit;
     /// `lines` is the transcript to hand to the output drawer -- uv's stdout
     /// and stderr on a real run, or a single line describing a failed
@@ -89,6 +150,92 @@ pub enum Message {
         success: bool,
         lines: Vec<String>,
     },
+    /// The "Add project" button was pressed: open the async file picker for
+    /// a `pyproject.toml`.
+    AddProjectPickManifestRequested,
+    /// The manifest picker finished. `None` when the user cancelled it.
+    AddProjectManifestPicked(Option<PathBuf>),
+    /// The chosen manifest has been read and parsed into a `Draft`.
+    AddProjectManifestLoaded(add_project::Draft),
+    /// `uv python list` finished, on manifest load or after an install.
+    /// Spec §8: the interpreter selector is pre-selected to satisfy
+    /// `requires-python`, computed fresh from this list every render by
+    /// `interpreter::preselect` rather than stored -- the same "recompute,
+    /// don't cache" trick `resolved_venv_path_display` uses.
+    ///
+    /// A `Result`, not a bare `Vec`: an empty list and a failed fetch are
+    /// different things to show. Collapsing both to `vec![]` left the dialog
+    /// reading "(checking available interpreters...)" forever with the
+    /// install button suppressed -- no error, no retry.
+    AddProjectInterpretersLoaded(Result<Vec<Interpreter>, String>),
+    /// The dialog's "Install compatible interpreter" button was pressed:
+    /// spec §8's offer to install one through uv when none is available.
+    AddProjectInstallInterpreterRequested,
+    /// A venv option other than "chosen folder" was picked directly.
+    AddProjectVenvChoiceSelected(add_project::VenvChoice),
+    /// The adopt-or-create probe for the dialog's chosen venv location
+    /// finished (spec §8: the dialog states that an existing environment
+    /// will be adopted, and shows its Python version).
+    ///
+    /// Carries the path it probed, not just the answer: the user can change
+    /// the choice again while a probe is in flight, and an older result
+    /// landing last would describe a folder that is no longer chosen. Same
+    /// "drop the stale result" discipline as `VenvProbed` and
+    /// `ContextMenuTerminalsDetected`.
+    AddProjectVenvOutcomeProbed(PathBuf, add_project::VenvOutcome),
+    /// "Choose folder..." was pressed: open the async folder picker.
+    AddProjectPickVenvFolderRequested,
+    /// The folder picker finished. `None` when the user cancelled it.
+    AddProjectVenvFolderPicked(Option<PathBuf>),
+    /// The dialog was dismissed without adding a project.
+    AddProjectCancelled,
+    /// "Add project" was pressed on an open dialog: append the draft to the
+    /// config, persist it, and adopt or create its venv.
+    AddProjectConfirmed,
+    /// The background half of `AddProjectConfirmed` finished. `index` is
+    /// where the project landed in `projects`/`entries`, so the venv status
+    /// can be refreshed the same way `boot`'s probes fill it in.
+    AddProjectConfirmFinished {
+        success: bool,
+        lines: Vec<String>,
+        index: usize,
+    },
+    /// A project was right-clicked: open the context menu for `projects[usize]`
+    /// and kick off terminal detection. Spec §8.
+    ContextMenuOpened(usize),
+    /// The context menu was dismissed without an action -- Close was pressed,
+    /// or an action that closes it as a side effect (Open terminal, Remove).
+    ContextMenuClosed,
+    /// Terminal detection finished for the open context menu. Criterion 1:
+    /// `terminal::detect::available` fires up to seven probes, run through
+    /// `job::run` (see `detect_terminals`) so none of them can hang the
+    /// window on a stale mount or a slow `open -Ra`.
+    ContextMenuTerminalsDetected(Vec<TerminalKind>),
+    /// "Open terminal" (or its Custom entry) was picked for `projects[usize]`.
+    /// Criterion 5: dispatched as background work, never run inline --
+    /// `open_terminal` wraps the call in `job::run`, and `terminal::open::open`
+    /// itself spawns the emulator via `CommandRunner::spawn`, not `run`, so
+    /// the window is never held hostage for the terminal's lifetime.
+    OpenTerminalRequested(usize, TerminalChoice),
+    /// The background open finished. `Ok(())` on a successful spawn; `Err`
+    /// carries text `terminal::open::open` has already redacted of any
+    /// secret the composed environment resolved.
+    OpenTerminalFinished(Result<(), String>),
+    /// "Remove from list" was picked for `projects[usize]`. Criterion 4:
+    /// removes the project from `config`/`projects`/`entries` in memory,
+    /// synchronously, and dispatches a background persist -- the same
+    /// in-memory-first shape `AddProjectConfirmed` uses. Never touches the
+    /// venv on disk: nothing in this path calls a `CommandRunner`, and
+    /// `bombadil-core` has no function that could delete one anyway.
+    RemoveProjectRequested(usize),
+    /// The background persist for a removal finished.
+    RemoveProjectFinished {
+        success: bool,
+    },
+    /// The footer's licence control was pressed: show or hide the bundled uv
+    /// licence text. Apache-2.0 section 4 obliges the text to be reachable,
+    /// and this is what reaches it.
+    AboutLicenseToggled,
 }
 
 impl App {
@@ -98,7 +245,7 @@ impl App {
         // No probe yet at construction time -- every project starts hollow;
         // `boot` kicks off the real probes and `update` fills results in as
         // they land.
-        let entries = sidebar::entries(&config, &|_path| None);
+        let entries = sidebar::entries(&config);
         Self {
             config,
             projects,
@@ -107,11 +254,11 @@ impl App {
             drawer: drawer::Drawer::default(),
             load_problems: Vec::new(),
             syncing: None,
+            add_project: None,
+            persist: Arc::new(NullPersist),
+            context_menu: None,
+            about_expanded: false,
         }
-    }
-
-    pub fn selected_project(&self) -> Option<&Project> {
-        self.selected.and_then(|i| self.projects.get(i))
     }
 }
 
@@ -176,9 +323,15 @@ pub fn update(app: &mut App, message: Message, runner: Arc<dyn CommandRunner>) -
         // two concurrent `uv sync` processes on the same project easy to
         // reach: the job times out, the user presses Sync again, and the
         // abandoned child is still running.
-        Message::SyncRequested if app.syncing.is_some() => {}
-        Message::SyncRequested => {
-            if let Some(project) = app.selected_project().cloned() {
+        //
+        // The menu closes either way, the same as `OpenTerminalRequested`
+        // and `RemoveProjectRequested`: an action taken from the menu
+        // dismisses it, whether or not the press was swallowed.
+        Message::SyncRequested(i) => {
+            app.context_menu = None;
+            if app.syncing.is_none()
+                && let Some(project) = app.projects.get(i).cloned()
+            {
                 let config = app.config.clone();
                 app.syncing = Some(project.id.to_string());
                 // Fresh drawer per run, but showing a *running* status rather
@@ -224,8 +377,317 @@ pub fn update(app: &mut App, message: Message, runner: Arc<dyn CommandRunner>) -
                 app.drawer.expanded = true;
             }
         }
+        Message::AddProjectPickManifestRequested => {
+            return Task::perform(pick_pyproject(), Message::AddProjectManifestPicked);
+        }
+        // The dialog was cancelled -- nothing chosen, nothing to do.
+        Message::AddProjectManifestPicked(None) => {}
+        Message::AddProjectManifestPicked(Some(path)) => {
+            return Task::perform(load_manifest_draft(path), Message::AddProjectManifestLoaded);
+        }
+        Message::AddProjectManifestLoaded(draft) => {
+            // The default venv choice already resolves to a real path, so
+            // the adopt-or-create question has an answer from the moment the
+            // dialog opens -- waiting for the user to touch the venv control
+            // would leave the commonest case (accept the default) unanswered.
+            let outcome_probe = probe_draft_venv(&draft, &app.config.settings);
+            app.add_project = Some(draft);
+            // Fired unconditionally, even for a manifest with no
+            // requires-python: the dialog still needs a list to preselect
+            // "newest available" from, and a fetch that only ran when a
+            // requirement was present would leave that case stuck on
+            // "checking..." forever.
+            return Task::batch([
+                Task::perform(
+                    list_interpreters(app.config.clone(), runner),
+                    Message::AddProjectInterpretersLoaded,
+                ),
+                outcome_probe,
+            ]);
+        }
+        Message::AddProjectInterpretersLoaded(result) => {
+            if let Some(draft) = &mut app.add_project {
+                draft.interpreters = match result {
+                    Ok(interpreters) => add_project::Interpreters::Loaded(interpreters),
+                    Err(why) => add_project::Interpreters::Failed(why),
+                };
+            }
+        }
+        Message::AddProjectInstallInterpreterRequested => {
+            if let Some(draft) = &app.add_project
+                && let Some(version) =
+                    interpreter::suggested_install_version(draft.requires_python.as_deref())
+            {
+                return Task::perform(
+                    install_and_relist(version, app.config.clone(), runner),
+                    Message::AddProjectInterpretersLoaded,
+                );
+            }
+        }
+        Message::AddProjectVenvChoiceSelected(choice) => {
+            if let Some(draft) = &mut app.add_project {
+                draft.venv_choice = choice;
+                // Clearing first: the statement on screen describes the
+                // folder the user just moved away from.
+                draft.venv_outcome = None;
+                return probe_draft_venv(draft, &app.config.settings);
+            }
+        }
+        Message::AddProjectVenvOutcomeProbed(path, outcome) => {
+            // Dropped unless it still describes the currently chosen
+            // location -- `resolved_venv_path` performs no filesystem
+            // access, so re-resolving here is free.
+            if let Some(draft) = &mut app.add_project
+                && add_project::resolved_venv_path(draft, &app.config.settings)
+                    .is_ok_and(|current| current == path)
+            {
+                draft.venv_outcome = Some(outcome);
+            }
+        }
+        Message::AddProjectPickVenvFolderRequested => {
+            return Task::perform(pick_folder(), Message::AddProjectVenvFolderPicked);
+        }
+        // Folder picker cancelled -- leave the previous choice untouched.
+        Message::AddProjectVenvFolderPicked(None) => {}
+        Message::AddProjectVenvFolderPicked(Some(path)) => {
+            if let Some(draft) = &mut app.add_project {
+                draft.venv_choice = add_project::VenvChoice::Chosen(path);
+                draft.venv_outcome = None;
+                return probe_draft_venv(draft, &app.config.settings);
+            }
+        }
+        Message::AddProjectCancelled => {
+            app.add_project = None;
+        }
+        Message::AddProjectConfirmed => {
+            if let Some(draft) = app.add_project.take() {
+                let project = add_project::to_project(&draft);
+                let python_version = interpreter::preselect(
+                    draft.interpreters.available(),
+                    draft.requires_python.as_deref(),
+                )
+                .map(|i| i.version.clone());
+
+                // In-memory first, synchronously -- criterion 3's other
+                // failure mode is a dialog that looks like it worked but
+                // dispatched nothing at all. Persisting is what makes this
+                // survive a restart; that part happens off the render
+                // thread below, the same as every other blocking call in
+                // this file.
+                app.config.projects.push(project.clone());
+                app.projects.push(project.clone());
+                app.entries.push(sidebar::Entry {
+                    label: project.label.clone(),
+                    venv_exists: false,
+                    python_version: None,
+                });
+                let index = app.projects.len() - 1;
+                app.selected = Some(index);
+                // This path runs `uv sync -p <version>` too, so it claims the
+                // same single in-flight slot `SyncRequested` does. Without
+                // it, confirming the dialog -- which also selects the new
+                // project, and the detail header always renders Sync --
+                // leaves the user one press away from two concurrent
+                // `uv sync` on the same venv, interleaving into the one
+                // shared drawer. See `App::syncing`'s own doc.
+                app.syncing = Some(project.id.to_string());
+
+                let config = app.config.clone();
+                let persist = app.persist.clone();
+                return Task::perform(
+                    confirm_add_project(project, config, python_version, persist, runner),
+                    move |(success, lines)| Message::AddProjectConfirmFinished {
+                        success,
+                        lines,
+                        index,
+                    },
+                );
+            }
+        }
+        Message::AddProjectConfirmFinished {
+            success,
+            lines,
+            index,
+        } => {
+            // Releases the slot `AddProjectConfirmed` claimed. Never
+            // clearing it would make the guard a deadlock: Sync would work
+            // exactly zero times after adding a project.
+            app.syncing = None;
+            // Already redacted on the job thread, same reasoning as
+            // `SyncFinished`.
+            for line in &lines {
+                drawer::push_line(&mut app.drawer, line, &[]);
+            }
+            let status = if success {
+                "project added".to_string()
+            } else {
+                "add project failed".to_string()
+            };
+            drawer::set_idle(&mut app.drawer, status);
+            if !success && !app.drawer.lines.is_empty() {
+                app.drawer.expanded = true;
+            }
+            // Refreshes the sidebar entry the same way `boot` fills in every
+            // other project's venv status, rather than trusting `success` to
+            // imply a venv now exists.
+            if let Some(project) = app.projects.get(index).cloned()
+                && let Ok(path) = venv_path::resolve(&project, &app.config.settings)
+            {
+                return Task::perform(probe_venv(path), move |version| {
+                    Message::VenvProbed(index, version)
+                });
+            }
+        }
+        // A stale index can arrive the same way `ProjectSelected`'s can.
+        Message::ContextMenuOpened(i) if i < app.projects.len() => {
+            app.context_menu = Some(context_menu::ContextMenu {
+                project_index: i,
+                terminals: Vec::new(),
+            });
+            return Task::perform(
+                detect_terminals(Os::host(), runner),
+                Message::ContextMenuTerminalsDetected,
+            );
+        }
+        Message::ContextMenuOpened(_) => {}
+        Message::ContextMenuClosed => {
+            app.context_menu = None;
+        }
+        // A stale detection result for a menu the user already closed.
+        Message::ContextMenuTerminalsDetected(terminals) => {
+            if let Some(menu) = &mut app.context_menu {
+                menu.terminals = terminals;
+            }
+        }
+        Message::OpenTerminalRequested(i, choice) if i < app.projects.len() => {
+            app.context_menu = None;
+            if let Some(project) = app.projects.get(i).cloned() {
+                let config = app.config.clone();
+                return Task::perform(
+                    open_terminal(choice, project, config, runner),
+                    Message::OpenTerminalFinished,
+                );
+            }
+        }
+        Message::OpenTerminalRequested(_, _) => {}
+        Message::OpenTerminalFinished(Ok(())) => {}
+        Message::OpenTerminalFinished(Err(message)) => {
+            // Redacted already, on the job thread inside `terminal::open::open`
+            // -- the composed environment never reaches this `Message`, the
+            // same discipline `SyncFinished` follows for `run_sync`.
+            drawer::push_line(&mut app.drawer, &message, &[]);
+            drawer::set_idle(&mut app.drawer, "open terminal failed".to_string());
+            if !app.drawer.lines.is_empty() {
+                app.drawer.expanded = true;
+            }
+        }
+        Message::RemoveProjectRequested(i) if i < app.projects.len() => {
+            // In-memory first, synchronously -- the same discipline
+            // `AddProjectConfirmed` uses, so the sidebar reflects the removal
+            // the instant `update` returns rather than only once the
+            // background persist lands.
+            app.config.projects.remove(i);
+            app.projects.remove(i);
+            app.entries.remove(i);
+            app.selected = match app.selected {
+                Some(s) if s == i => (!app.projects.is_empty())
+                    .then_some(i.min(app.projects.len().saturating_sub(1))),
+                Some(s) if s > i => Some(s - 1),
+                other => other,
+            };
+            app.context_menu = None;
+
+            let config = app.config.clone();
+            let persist = app.persist.clone();
+            return Task::perform(persist_removal(config, persist), |success| {
+                Message::RemoveProjectFinished { success }
+            });
+        }
+        Message::RemoveProjectRequested(_) => {}
+        Message::RemoveProjectFinished { success } => {
+            if !success {
+                drawer::set_idle(&mut app.drawer, "remove failed to persist".to_string());
+            }
+        }
+        Message::AboutLicenseToggled => {
+            app.about_expanded = !app.about_expanded;
+        }
     }
     Task::none()
+}
+
+/// Dispatches the adopt-or-create probe for wherever the draft's venv choice
+/// resolves to right now (spec §8).
+///
+/// Through `job::run`, like every other filesystem read in this file, and
+/// never from `view`: the answer comes from reading a `pyvenv.cfg`, which
+/// can hang on a stale network mount, and `view` runs on the render thread.
+///
+/// `Task::none()` when the path cannot be resolved at all -- only possible
+/// for a manifest with no directory component, which the dialog already
+/// reports in place of the resolved path.
+fn probe_draft_venv(draft: &add_project::Draft, settings: &Settings) -> Task<Message> {
+    match add_project::resolved_venv_path(draft, settings) {
+        Ok(path) => Task::perform(probe_venv_outcome(path), |(path, outcome)| {
+            Message::AddProjectVenvOutcomeProbed(path, outcome)
+        }),
+        Err(_) => Task::none(),
+    }
+}
+
+/// Decides adopt-or-create for `path` off the render thread, reusing
+/// `probe_venv` (and so `VENV_PROBE_TIMEOUT`, and its degrade-to-hollow
+/// behaviour) rather than a second copy of the same job wiring. A probe that
+/// times out reports `Create`, which is the honest answer: nothing has been
+/// found there.
+///
+/// Returns the path alongside the outcome so `update` can drop a result the
+/// user's later choice has already superseded.
+async fn probe_venv_outcome(path: PathBuf) -> (PathBuf, add_project::VenvOutcome) {
+    let version = probe_venv(path.clone()).await;
+    let outcome = add_project::venv_outcome(&path, |_| version.clone());
+    (path, outcome)
+}
+
+/// Opens the async manifest picker. Never the blocking `rfd::FileDialog`: a
+/// modal dialog on the render thread would freeze the window exactly like a
+/// synchronous `CommandRunner::run` call would.
+async fn pick_pyproject() -> Option<PathBuf> {
+    rfd::AsyncFileDialog::new()
+        .add_filter("pyproject.toml", &["toml"])
+        .pick_file()
+        .await
+        .map(|handle| handle.path().to_path_buf())
+}
+
+/// Opens the async folder picker for a chosen venv location. Same reasoning
+/// as `pick_pyproject`: async only.
+async fn pick_folder() -> Option<PathBuf> {
+    rfd::AsyncFileDialog::new()
+        .pick_folder()
+        .await
+        .map(|handle| handle.path().to_path_buf())
+}
+
+/// Reads the chosen manifest off the render thread via `job::run` -- the
+/// same seam `probe_venv` uses for `pyvenv.cfg` -- then hands the text to
+/// `add_project::draft_from`, which is pure. A read failure (permissions, the
+/// file vanishing between pick and read) degrades to empty text rather than
+/// losing the chosen path: `draft_from` already treats unparseable text as
+/// "no fields parsed, path kept", so an empty string lands in exactly that
+/// path with no separate error case to wire up.
+async fn load_manifest_draft(path: PathBuf) -> add_project::Draft {
+    let read_path = path.clone();
+    let text = match job::run(
+        move || std::fs::read_to_string(&read_path).unwrap_or_default(),
+        VENV_PROBE_TIMEOUT,
+    )
+    .await
+    {
+        job::JobResult::Done(text) => text,
+        job::JobResult::TimedOut | job::JobResult::Failed => String::new(),
+    };
+    add_project::draft_from(&path, &text)
 }
 
 /// Runs off the render thread via `job::run` -- resolving uv and running
@@ -258,6 +720,124 @@ async fn sync_project(
         job::JobResult::TimedOut => (false, vec!["sync timed out".to_string()]),
         job::JobResult::Failed => (false, vec!["sync failed unexpectedly".to_string()]),
     }
+}
+
+/// Resolves which uv binary to run, given `config.settings.uv_source`.
+/// Shared by `run_sync` and the interpreter discovery/install jobs below --
+/// all three need exactly the same Auto/FromPath/Custom/Bundled decision.
+/// The bundled closure extracts the embedded uv (see `bombadil_uv_bin`) into
+/// the platform data dir, re-using it on later calls -- `ensure_extracted`
+/// only rewrites when the file is missing or its hash no longer matches.
+/// `Auto` falls back to this when nothing usable is on PATH; `Bundled` uses
+/// it unconditionally. The error is pre-stringified because every caller
+/// does the same thing with it: surface `uv::resolve`'s own actionable text
+/// verbatim rather than a generic "could not resolve uv."
+fn resolve_uv_for(config: &Config, runner: &dyn CommandRunner) -> Result<uv::ResolvedUv, String> {
+    let bundled = || -> Result<PathBuf, String> {
+        let data_dir =
+            bombadil_core::store::paths::default_data_dir().map_err(|e| e.to_string())?;
+        bombadil_uv_bin::ensure_extracted(&data_dir).map_err(|e| e.to_string())
+    };
+    uv::resolve(
+        &config.settings.uv_source,
+        runner,
+        &uv::locate_on_path,
+        &bundled,
+    )
+    .map_err(|err| err.to_string())
+}
+
+/// The blocking half of interpreter discovery: resolve uv, run
+/// `uv python list --output-format json`, and parse it.
+///
+/// Every failure -- no usable uv, a non-zero exit, output this build cannot
+/// parse -- comes back as `Err` carrying uv's own text where there is any.
+/// Degrading to an empty list instead is what left the dialog stuck on
+/// "(checking available interpreters...)" forever: the empty list is
+/// indistinguishable from a fetch that has not landed yet, so the dialog
+/// showed neither an error nor the install offer, and there was nothing the
+/// user could do but cancel.
+fn list_interpreters_blocking(
+    config: &Config,
+    runner: &dyn CommandRunner,
+) -> Result<Vec<Interpreter>, String> {
+    let resolved = resolve_uv_for(config, runner)?;
+    let spec = uv::command::python_list(&resolved);
+    match runner.run(&spec) {
+        Ok(outcome) if outcome.success() => uv::results::parse_python_list(&outcome.stdout)
+            .map_err(|err| format!("could not read uv's interpreter list: {err}")),
+        // uv ran and refused. Its stderr is the actionable part; the exit
+        // code alone tells the user nothing.
+        Ok(outcome) => Err(match outcome.stderr.trim() {
+            "" => "uv python list failed".to_string(),
+            stderr => stderr.to_string(),
+        }),
+        Err(err) => Err(err.to_string()),
+    }
+}
+
+/// Fetches the interpreters uv can see, off the render thread -- the same
+/// seam `probe_venv` uses.
+///
+/// `SYNC_TIMEOUT`, not `VENV_PROBE_TIMEOUT`: `uv python list` itself only
+/// reads uv's own interpreter cache, but this is also the first call that
+/// resolves uv at all, and on a machine with nothing usable on PATH --
+/// exactly the case the bundled uv exists for -- resolving means extracting
+/// and hashing a ~35 MB binary and then executing a freshly written
+/// executable, which on Windows means waiting for Defender to scan it. Three
+/// seconds does not cover that, and a timeout here is not a hollow sidebar
+/// row: it is a dialog with no interpreter to offer.
+async fn list_interpreters(
+    config: Config,
+    runner: Arc<dyn CommandRunner>,
+) -> Result<Vec<Interpreter>, String> {
+    match job::run(
+        move || list_interpreters_blocking(&config, runner.as_ref()),
+        SYNC_TIMEOUT,
+    )
+    .await
+    {
+        job::JobResult::Done(result) => result,
+        job::JobResult::TimedOut => Err("listing interpreters timed out".to_string()),
+        job::JobResult::Failed => Err("listing interpreters failed unexpectedly".to_string()),
+    }
+}
+
+/// The blocking half of installing an interpreter: resolve uv and run `uv
+/// python install <version>`. Failure collapses to `false` -- the caller
+/// re-lists regardless, so a failed install just means the refreshed list
+/// still has nothing satisfying, and the dialog already shows exactly that.
+fn install_interpreter_blocking(
+    version: &str,
+    config: &Config,
+    runner: &dyn CommandRunner,
+) -> bool {
+    let Ok(resolved) = resolve_uv_for(config, runner) else {
+        return false;
+    };
+    let spec = uv::command::python_install(&resolved, version);
+    runner
+        .run(&spec)
+        .map(|outcome| outcome.success())
+        .unwrap_or(false)
+}
+
+/// Installs `version` through uv, then re-fetches the interpreter list.
+/// Bounded by `SYNC_TIMEOUT`, not `VENV_PROBE_TIMEOUT`: unlike listing,
+/// `uv python install` can download a whole interpreter.
+async fn install_and_relist(
+    version: String,
+    config: Config,
+    runner: Arc<dyn CommandRunner>,
+) -> Result<Vec<Interpreter>, String> {
+    let install_config = config.clone();
+    let install_runner = runner.clone();
+    let _ = job::run(
+        move || install_interpreter_blocking(&version, &install_config, install_runner.as_ref()),
+        SYNC_TIMEOUT,
+    )
+    .await;
+    list_interpreters(config, runner).await
 }
 
 /// The blocking half of a sync: resolve which uv to run, compose the
@@ -297,34 +877,107 @@ fn run_sync(
         Err(err) => return (false, vec![err.to_string()]),
     };
 
-    // bombadil-gui does not bundle uv (no dependency on bombadil-uv-bin), so
-    // `Auto`/`Bundled` sources can only ever resolve through PATH here. The
-    // message below is the actionable one, and surfacing it is why the error
-    // is matched rather than discarded.
-    let bundled = || -> Result<PathBuf, String> {
-        Err("bombadil-gui does not bundle uv yet; install uv on PATH".to_string())
-    };
-    let resolved_uv = match uv::resolve(
-        &config.settings.uv_source,
-        runner,
-        &uv::locate_on_path,
-        &bundled,
-    ) {
+    let resolved_uv = match resolve_uv_for(config, runner) {
         Ok(resolved) => resolved,
+        Err(err) => return (false, vec![err]),
+    };
+
+    let ctx = uv::command::ProjectContext {
+        project_dir: project_dir.to_path_buf(),
+        venv_path: venv_path.clone(),
+    };
+    let spec = uv::command::sync(&resolved_uv, &ctx);
+    compose_and_run(spec, project, config, &venv_path, store, runner)
+}
+
+/// The blocking half of confirming the add-project dialog: persist the
+/// updated config, then decide whether the chosen location already holds a
+/// venv (adopt it, run nothing) or needs one created
+/// (`uv sync -p <python>`, same composition discipline as `run_sync`).
+///
+/// `persist` and `probe` are parameters, not a concrete `Store` and
+/// `venv_path::probe` called directly, so a test can hand in fakes that
+/// never touch a real filesystem -- the real caller, `confirm_add_project`,
+/// supplies both.
+fn run_confirm_add_project(
+    project: &Project,
+    config: &Config,
+    python_version: Option<&str>,
+    persist: &dyn ConfigPersist,
+    store: &dyn SecretStore,
+    runner: &dyn CommandRunner,
+    probe: impl Fn(&Path) -> Option<String>,
+) -> (bool, Vec<String>) {
+    if let Err(err) = persist.save(config) {
+        return (false, vec![err]);
+    }
+
+    let venv_path = match venv_path::resolve(project, &config.settings) {
+        Ok(path) => path,
         Err(err) => return (false, vec![err.to_string()]),
     };
 
-    // Without this, `uv sync` inherits Bombadil's *ambient* environment plus
-    // whatever one variable `uv::command::sync` sets -- so behaviour depends
-    // on whether the user launched from a shell or a desktop icon, and
-    // project/global variables, keychain secrets and private index
-    // credentials are all absent, which makes private-index authentication
-    // impossible.
+    // Adopting: the venv already exists, so running sync anyway would
+    // silently rebuild an environment the user asked to keep (criterion 5).
+    if let add_project::VenvOutcome::Adopt { python_version } =
+        add_project::venv_outcome(&venv_path, probe)
+    {
+        return (
+            true,
+            vec![format!(
+                "existing environment adopted (python {python_version})"
+            )],
+        );
+    }
+
+    let Some(project_dir) = project
+        .pyproject_path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+    else {
+        return (false, vec!["no project directory to run uv in".to_string()]);
+    };
+    let resolved_uv = match resolve_uv_for(config, runner) {
+        Ok(resolved) => resolved,
+        Err(err) => return (false, vec![err]),
+    };
+    let ctx = uv::command::ProjectContext {
+        project_dir: project_dir.to_path_buf(),
+        venv_path: venv_path.clone(),
+    };
+    let spec = match python_version {
+        Some(python) => uv::command::sync_with_python(&resolved_uv, &ctx, python),
+        None => uv::command::sync(&resolved_uv, &ctx),
+    };
+    compose_and_run(spec, project, config, &venv_path, store, runner)
+}
+
+/// Shared by `run_sync` and `run_confirm_add_project`: compose the
+/// environment `spec` runs in, mark it authoritative with `clear_env`, run
+/// it, and redact every secret the composition resolved out of the result.
+///
+/// Without composing, `uv sync` inherits Bombadil's *ambient* environment
+/// plus whatever few variables the spec's own builder sets -- so behaviour
+/// depends on whether the user launched from a shell or a desktop icon, and
+/// project/global variables, keychain secrets and private index credentials
+/// are all absent, which makes private-index authentication impossible.
+///
+/// Redaction happens *here*, not in `update`: this is the only place the
+/// composed environment exists, and `Message` derives `Debug`, so a secrets
+/// list must never be threaded through one.
+fn compose_and_run(
+    mut spec: bombadil_core::process::CommandSpec,
+    project: &Project,
+    config: &Config,
+    venv_path: &Path,
+    store: &dyn SecretStore,
+    runner: &dyn CommandRunner,
+) -> (bool, Vec<String>) {
     let inputs = EnvInputs {
         parent: std::env::vars().collect(),
         config: config.clone(),
         project: project.clone(),
-        venv_path: venv_path.clone(),
+        venv_path: venv_path.to_path_buf(),
     };
     let env = match envspec::compose(&inputs, store, runner) {
         // `compose` already scrubs its own errors of the secrets it resolved.
@@ -333,15 +986,10 @@ fn run_sync(
     };
     let secrets = secret_values(&inputs, &env);
 
-    let ctx = uv::command::ProjectContext {
-        project_dir: project_dir.to_path_buf(),
-        venv_path,
-    };
-    let mut spec = uv::command::sync(&resolved_uv, &ctx);
-    // `clear_env`, the discipline plan 2b established and `uv::command::sync`
-    // leaves off: the composition is authoritative, not a layer on top of
-    // whatever launched Bombadil.
     spec.env = env;
+    // `clear_env`, the discipline plan 2b established and the spec builders
+    // leave off: the composition is authoritative, not a layer on top of
+    // whatever launched Bombadil.
     spec.clear_env = true;
 
     match runner.run(&spec) {
@@ -358,34 +1006,224 @@ fn run_sync(
     }
 }
 
+/// Runs off the render thread via `job::run` -- persisting the config,
+/// probing the chosen venv location and possibly running `uv sync` are all
+/// blocking. Same shape as `sync_project`: `KeyringSecretStore` is
+/// constructed here, on the job thread, never taken as a parameter of
+/// `update`, and `venv_path::probe` is the real filesystem probe -- tests
+/// exercise `run_confirm_add_project` directly with a fake instead of going
+/// through this async wrapper.
+async fn confirm_add_project(
+    project: Project,
+    config: Config,
+    python_version: Option<String>,
+    persist: Arc<dyn ConfigPersist>,
+    runner: Arc<dyn CommandRunner>,
+) -> (bool, Vec<String>) {
+    match job::run(
+        move || {
+            run_confirm_add_project(
+                &project,
+                &config,
+                python_version.as_deref(),
+                persist.as_ref(),
+                &KeyringSecretStore::new(),
+                runner.as_ref(),
+                venv_path::probe,
+            )
+        },
+        SYNC_TIMEOUT,
+    )
+    .await
+    {
+        job::JobResult::Done(result) => result,
+        job::JobResult::TimedOut => (false, vec!["add project timed out".to_string()]),
+        job::JobResult::Failed => (false, vec!["add project failed unexpectedly".to_string()]),
+    }
+}
+
+/// Detects installed terminals off the render thread. Criterion 1:
+/// `terminal::detect::available` fires up to seven probes (`which`, `where`,
+/// `open -Ra`), any one of which can hang -- a `which` walking a stale
+/// network mount, a slow `open -Ra` waiting on LaunchServices -- exactly what
+/// `job::run`'s timeout exists for. Degrades to an empty list on a timeout or
+/// a panic, the same as every other probe in this file: offering nothing is
+/// safer than offering a terminal that turns out not to be there (spec §9).
+async fn detect_terminals(os: Os, runner: Arc<dyn CommandRunner>) -> Vec<TerminalKind> {
+    match job::run(
+        move || terminal::detect::available(os, runner.as_ref()),
+        VENV_PROBE_TIMEOUT,
+    )
+    .await
+    {
+        job::JobResult::Done(kinds) => kinds,
+        job::JobResult::TimedOut | job::JobResult::Failed => Vec::new(),
+    }
+}
+
+/// The blocking half of opening a terminal: resolves the venv path and hands
+/// off to `terminal::open::open`, which composes the environment and spawns
+/// the emulator via `CommandRunner::spawn` -- never `run`, which would hold
+/// the window hostage for the terminal's whole lifetime (criterion 5).
+///
+/// `KeyringSecretStore` is constructed by the caller, on the job thread, the
+/// same discipline `sync_project` uses -- it is the one piece of this path a
+/// test must never reach.
+///
+/// `shell` comes from `$SHELL` rather than being hardcoded: unset (as it
+/// commonly is on Windows) degrades to an unrecognised shell family, which
+/// `terminal::open::open` already handles by opening without the
+/// re-assertion rather than refusing to open at all.
+fn run_open_terminal(
+    choice: &TerminalChoice,
+    project: &Project,
+    config: &Config,
+    store: &dyn SecretStore,
+    runner: &dyn CommandRunner,
+) -> Result<(), String> {
+    let venv_path = venv_path::resolve(project, &config.settings).map_err(|e| e.to_string())?;
+    let inputs = EnvInputs {
+        parent: std::env::vars().collect(),
+        config: config.clone(),
+        project: project.clone(),
+        venv_path,
+    };
+    let shell = std::env::var("SHELL").unwrap_or_default();
+    // A Bombadil-owned scratch directory for the re-assertion init file
+    // `terminal::open::open` writes -- namespaced per-project underneath by
+    // `open` itself, so two concurrent opens for different projects cannot
+    // collide (see its own doc comment).
+    let scratch_dir = std::env::temp_dir().join("bombadil-terminal-init");
+    terminal::open::open(
+        choice,
+        Os::host(),
+        &inputs,
+        &shell,
+        store,
+        runner,
+        &scratch_dir,
+    )
+    .map_err(|err| err.to_string())
+}
+
+/// Runs off the render thread via `job::run` -- same shape as `sync_project`.
+async fn open_terminal(
+    choice: TerminalChoice,
+    project: Project,
+    config: Config,
+    runner: Arc<dyn CommandRunner>,
+) -> Result<(), String> {
+    match job::run(
+        move || {
+            run_open_terminal(
+                &choice,
+                &project,
+                &config,
+                &KeyringSecretStore::new(),
+                runner.as_ref(),
+            )
+        },
+        VENV_PROBE_TIMEOUT,
+    )
+    .await
+    {
+        job::JobResult::Done(result) => result,
+        job::JobResult::TimedOut => Err("opening the terminal timed out".to_string()),
+        job::JobResult::Failed => Err("opening the terminal failed unexpectedly".to_string()),
+    }
+}
+
+/// The blocking half of persisting a removal: just a save. Its own function,
+/// mirroring `run_confirm_add_project`, so a test can exercise it directly
+/// with a `FakeConfigPersist` instead of through `update`'s opaque `Task`.
+fn run_persist(config: &Config, persist: &dyn ConfigPersist) -> bool {
+    persist.save(config).is_ok()
+}
+
+/// Runs off the render thread via `job::run`: persisting the config after a
+/// removal is a blocking file write, same as every other `ConfigPersist` call
+/// in this file.
+async fn persist_removal(config: Config, persist: Arc<dyn ConfigPersist>) -> bool {
+    match job::run(move || run_persist(&config, persist.as_ref()), SYNC_TIMEOUT).await {
+        job::JobResult::Done(success) => success,
+        job::JobResult::TimedOut | job::JobResult::Failed => false,
+    }
+}
+
 pub fn view(app: &App) -> iced::Element<'_, Message> {
-    let detail: iced::Element<'_, Message> = match app.selected_project() {
+    // The index is carried through rather than dropped: the header's Sync
+    // button names the project it acts on (`Message::SyncRequested`), so the
+    // selected index has to survive as far as the button.
+    let selected = app
+        .selected
+        .and_then(|i| app.projects.get(i).map(|project| (i, project)));
+    let detail: iced::Element<'_, Message> = match selected {
         // The probe answers from the already-probed `entries` cache rather
         // than touching disk again on every frame -- `boot`'s background
         // tasks are what keep that cache current.
-        Some(project) => {
-            let entry = app.selected.and_then(|i| app.entries.get(i));
+        Some((i, project)) => {
+            let entry = app.entries.get(i);
             let header = detail::header(project, &|_| entry.and_then(|e| e.python_version.clone()));
-            detail::view(&header)
+            detail::view(&header, i)
         }
         None => iced::widget::text("").into(),
     };
 
     let detail_and_drawer = iced::widget::column![detail, drawer::view(&app.drawer)].spacing(8);
 
+    let add_project_button = iced::widget::button(iced::widget::text("Add project"))
+        .on_press(Message::AddProjectPickManifestRequested);
+    let sidebar_and_controls = iced::widget::column![
+        add_project_button,
+        sidebar::view(&app.entries, app.selected)
+    ]
+    .spacing(8);
+
     let body = iced::widget::row![
-        iced::widget::container(sidebar::view(&app.entries, app.selected)).width(240),
+        iced::widget::container(sidebar_and_controls).width(240),
         iced::widget::container(detail_and_drawer).padding(12),
     ];
+
+    // Recomputed fresh on every render from `app.add_project`'s current
+    // `venv_choice`, the same trick `banner::problems` uses to stay live --
+    // this is what makes the resolved path track a venv choice the user just
+    // changed, per spec §8, rather than a value cached from when the
+    // manifest was first picked.
+    let add_project_dialog: iced::Element<'_, Message> = match &app.add_project {
+        Some(draft) => {
+            let resolved = add_project::resolved_venv_path_display(draft, &app.config.settings);
+            add_project::view(draft, &resolved)
+        }
+        None => iced::widget::text("").into(),
+    };
 
     // The config problems are recomputed from `app.config` on every call,
     // not cached anywhere on `App` -- see `banner`'s module doc for why that
     // is what makes this never go stale after a config change. The load
     // problems are the exception: the load happened once, and an unreadable
     // file leaves no trace in the default `Config` it produced.
+    // Same freshness reasoning as `add_project_dialog`: the default terminal
+    // is read straight from `app.config` on every render rather than cached,
+    // so a settings change (plan 3c) would not need this to be re-derived.
+    let context_menu_view: iced::Element<'_, Message> = match &app.context_menu {
+        Some(menu) => {
+            let default = app.config.terminal_defaults.get(&Os::host());
+            context_menu::view(menu, default)
+        }
+        None => iced::widget::text("").into(),
+    };
+
     let mut problems = app.load_problems.clone();
     problems.extend(banner::problems(&app.config));
-    iced::widget::column![banner::view(&problems), body].into()
+    let footer = crate::about::view(app.about_expanded);
+    iced::widget::column![
+        banner::view(&problems),
+        body,
+        add_project_dialog,
+        context_menu_view,
+        footer
+    ]
+    .into()
 }
 
 #[cfg(test)]
@@ -393,6 +1231,32 @@ mod tests {
     use super::*;
     use bombadil_core::model::Config;
     use bombadil_core::process::FakeCommandRunner;
+    use std::path::Path;
+
+    /// The selected project's label. A test helper rather than a method on
+    /// `App`: nothing in the real code path resolves a project from the
+    /// selection alone any more -- `view` carries the index alongside the
+    /// project, because the header's Sync button has to name what it acts on.
+    fn selected_label(app: &App) -> Option<&str> {
+        app.selected
+            .and_then(|i| app.projects.get(i))
+            .map(|p| p.label.as_str())
+    }
+
+    /// The first terminal kind the *host* OS supports.
+    ///
+    /// `run_open_terminal` builds argv for `Os::host()`, and `argv::build`
+    /// correctly refuses a kind belonging to another OS -- so a test pairing
+    /// a hardcoded Linux kind with the host either fails outright on macOS
+    /// and Windows or, worse, passes off the wrong-OS guard instead of the
+    /// behaviour it claims to cover. `Os` is a parameter everywhere in
+    /// `terminal`, never a `cfg!`, precisely so this is derivable rather
+    /// than something to compile the test away over.
+    fn host_terminal_kind() -> TerminalKind {
+        *TerminalKind::for_os(Os::host())
+            .first()
+            .expect("every supported OS has at least one terminal kind")
+    }
 
     /// A runner for tests that don't care about it -- most of them, since
     /// most messages here never touch a `CommandRunner` at all.
@@ -416,10 +1280,7 @@ mod tests {
             ..Config::default()
         };
         let app = App::new(config);
-        assert_eq!(
-            app.selected_project().map(|p| p.label.as_str()),
-            Some("api")
-        );
+        assert_eq!(selected_label(&app), Some("api"));
     }
 
     #[test]
@@ -430,10 +1291,7 @@ mod tests {
         };
         let mut app = App::new(config);
         let _ = update(&mut app, Message::ProjectSelected(1), unused_runner());
-        assert_eq!(
-            app.selected_project().map(|p| p.label.as_str()),
-            Some("web")
-        );
+        assert_eq!(selected_label(&app), Some("web"));
     }
 
     #[test]
@@ -449,7 +1307,7 @@ mod tests {
         let mut app = App::new(config);
         let _ = update(&mut app, Message::ProjectSelected(99), unused_runner());
         assert_eq!(
-            app.selected_project().map(|p| p.label.as_str()),
+            selected_label(&app),
             Some("api"),
             "an out-of-range selection must be ignored, not clamped to the last project"
         );
@@ -471,7 +1329,7 @@ mod tests {
         let fake = Arc::new(FakeCommandRunner::new());
         let runner: Arc<dyn CommandRunner> = fake.clone();
 
-        let task = update(&mut app, Message::SyncRequested, runner);
+        let task = update(&mut app, Message::SyncRequested(0), runner);
 
         assert!(
             fake.calls().is_empty(),
@@ -499,7 +1357,7 @@ mod tests {
             "a freshly constructed App has not been probed yet -- entries start hollow"
         );
 
-        let task = update(&mut app, Message::SyncRequested, unused_runner());
+        let task = update(&mut app, Message::SyncRequested(0), unused_runner());
 
         assert!(
             task.units() > 0,
@@ -604,7 +1462,7 @@ mod tests {
             ..Config::default()
         });
 
-        let _ = update(&mut app, Message::SyncRequested, unused_runner());
+        let _ = update(&mut app, Message::SyncRequested(0), unused_runner());
 
         assert!(
             app.drawer.status.contains("syncing"),
@@ -633,10 +1491,10 @@ mod tests {
         });
         let fake = Arc::new(FakeCommandRunner::new());
 
-        let first = update(&mut app, Message::SyncRequested, fake.clone());
+        let first = update(&mut app, Message::SyncRequested(0), fake.clone());
         assert!(first.units() > 0, "the first Sync must dispatch work");
 
-        let second = update(&mut app, Message::SyncRequested, fake.clone());
+        let second = update(&mut app, Message::SyncRequested(0), fake.clone());
 
         assert_eq!(
             second.units(),
@@ -651,6 +1509,83 @@ mod tests {
     }
 
     #[test]
+    fn syncing_from_the_context_menu_targets_the_right_clicked_project_not_the_selected_one() {
+        // The whole reason `SyncRequested` carries an index. A right-press
+        // opens the menu for a project without moving `app.selected` (see
+        // `sidebar::view`), so a Sync resolved against the selection runs
+        // `uv sync` -- which prunes packages absent from the target's
+        // lockfile -- against an environment the user never named.
+        //
+        // Two projects with the FIRST selected and the SECOND right-clicked
+        // is what separates the two behaviours: every other `SyncRequested`
+        // test uses a single-project config, where right and wrong are the
+        // same value, which is exactly why this was invisible.
+        let mut app = App::new(Config {
+            projects: vec![project("api"), project("web")],
+            ..Config::default()
+        });
+        assert_eq!(app.selected, Some(0), "api must be the selected project");
+        let web_id = app.projects[1].id.to_string();
+
+        let _ = update(&mut app, Message::ContextMenuOpened(1), unused_runner());
+        assert_eq!(
+            app.selected,
+            Some(0),
+            "right-pressing must NOT move the selection -- that would silently \
+             change what the detail pane shows"
+        );
+
+        let _ = update(&mut app, Message::SyncRequested(1), unused_runner());
+
+        // `syncing` holds the id of the project the dispatched job was built
+        // for, and the drawer names it: both are the observable end of the
+        // same resolution, and the spec handed to `run_sync` is built from
+        // that very `Project`.
+        assert_eq!(
+            app.syncing.as_deref(),
+            Some(web_id.as_str()),
+            "the sync must target the right-clicked project (web), not the selected one (api)"
+        );
+        assert!(
+            app.drawer.status.contains("web"),
+            "the running status must name the project actually being synced; got {:?}",
+            app.drawer.status
+        );
+    }
+
+    #[test]
+    fn syncing_from_the_context_menu_closes_it() {
+        // `OpenTerminalRequested` and `RemoveProjectRequested` both clear the
+        // menu; leaving it open for Sync alone is an inconsistency the user
+        // has to clean up by hand.
+        let mut app = App::new(Config {
+            projects: vec![project("api")],
+            ..Config::default()
+        });
+        let _ = update(&mut app, Message::ContextMenuOpened(0), unused_runner());
+        assert!(app.context_menu.is_some());
+
+        let _ = update(&mut app, Message::SyncRequested(0), unused_runner());
+
+        assert!(app.context_menu.is_none());
+    }
+
+    #[test]
+    fn syncing_an_out_of_range_project_dispatches_nothing() {
+        // A stale index can arrive from a message queued before a project was
+        // removed, the same way `ProjectSelected`'s can.
+        let mut app = App::new(Config {
+            projects: vec![project("api")],
+            ..Config::default()
+        });
+
+        let task = update(&mut app, Message::SyncRequested(99), unused_runner());
+
+        assert_eq!(task.units(), 0);
+        assert!(app.syncing.is_none());
+    }
+
+    #[test]
     fn a_sync_that_finishes_releases_the_in_flight_slot() {
         // The guard above is a deadlock if it is never cleared: Sync would
         // work exactly once per launch.
@@ -658,7 +1593,7 @@ mod tests {
             projects: vec![project("api")],
             ..Config::default()
         });
-        let _ = update(&mut app, Message::SyncRequested, unused_runner());
+        let _ = update(&mut app, Message::SyncRequested(0), unused_runner());
         let _ = update(
             &mut app,
             Message::SyncFinished {
@@ -668,7 +1603,7 @@ mod tests {
             unused_runner(),
         );
 
-        let again = update(&mut app, Message::SyncRequested, unused_runner());
+        let again = update(&mut app, Message::SyncRequested(0), unused_runner());
         assert!(
             again.units() > 0,
             "Sync must dispatch again once the previous run has finished"
@@ -828,14 +1763,22 @@ mod tests {
 
     #[test]
     fn an_unresolvable_uv_reports_the_actionable_message() {
-        // The `bundled` closure's own message is the one the user can act on
-        // ("install uv on PATH"); a generic "could not resolve a uv binary"
-        // throws away the only sentence that helps.
+        // A `Custom` pin at a path the fake runner has no rule for fails to
+        // probe, so `resolve`'s own `ConfiguredUnavailable` message is what
+        // `run_sync` must surface -- not a generic "could not resolve a uv
+        // binary" that throws the actionable sentence away.
+        //
+        // Deliberately not `UvSource::Bundled` here: since `run_sync` now
+        // wires the real bundled fallback, exercising `Bundled` would extract
+        // the ~35 MB embedded uv to the real platform data directory, which
+        // is exactly the real-filesystem access a unit test must not do.
         let project = project("api");
         let config = Config {
             projects: vec![project.clone()],
             settings: bombadil_core::model::Settings {
-                uv_source: bombadil_core::model::UvSource::Bundled,
+                uv_source: bombadil_core::model::UvSource::Custom {
+                    path: PathBuf::from("/definitely/not/a/real/uv"),
+                },
                 ..Default::default()
             },
             ..Config::default()
@@ -848,9 +1791,1061 @@ mod tests {
         assert!(!success);
         let joined = lines.join("\n");
         assert!(
-            joined.contains("install uv on PATH"),
+            joined.contains("/definitely/not/a/real/uv"),
             "the resolve error's own text must survive; got {joined}"
         );
+    }
+
+    fn interpreter(version: &str) -> Interpreter {
+        Interpreter {
+            key: format!("cpython-{version}"),
+            version: version.to_string(),
+            path: Some(PathBuf::from(format!("/usr/bin/python{version}"))),
+            implementation: "cpython".to_string(),
+        }
+    }
+
+    fn manifest_draft(text: &str) -> add_project::Draft {
+        add_project::draft_from(Path::new("/p/my-api/pyproject.toml"), text)
+    }
+
+    #[test]
+    fn loading_a_manifest_dispatches_an_interpreter_fetch_without_blocking() {
+        // Spec §8's pre-selection needs a real interpreter list, and fetching
+        // it means running `uv python list` -- exactly the kind of blocking
+        // process spawn `job::run` exists to keep off the render thread.
+        let mut app = App::new(Config::default());
+        let fake = Arc::new(FakeCommandRunner::new());
+
+        let task = update(
+            &mut app,
+            Message::AddProjectManifestLoaded(manifest_draft("")),
+            fake.clone(),
+        );
+
+        assert!(
+            fake.calls().is_empty(),
+            "runner.run must not be called synchronously; got {:?}",
+            fake.calls()
+        );
+        assert!(
+            task.units() > 0,
+            "loading a manifest must dispatch the interpreter fetch"
+        );
+    }
+
+    #[test]
+    fn a_finished_interpreter_fetch_lands_on_the_open_draft() {
+        let mut app = App::new(Config::default());
+        app.add_project = Some(manifest_draft(""));
+        let interpreters = vec![interpreter("3.12.4")];
+
+        let _ = update(
+            &mut app,
+            Message::AddProjectInterpretersLoaded(Ok(interpreters.clone())),
+            unused_runner(),
+        );
+
+        assert_eq!(
+            app.add_project.as_ref().map(|d| d.interpreters.clone()),
+            Some(add_project::Interpreters::Loaded(interpreters))
+        );
+    }
+
+    #[test]
+    fn a_failed_interpreter_fetch_reaches_the_draft_as_a_failure_not_an_empty_list() {
+        // The dead end this fix exists for: every failure used to arrive as
+        // `vec![]`, which the dialog cannot tell apart from a fetch that has
+        // not landed yet -- so it showed "(checking available
+        // interpreters...)" forever, with no error and no way forward.
+        let mut app = App::new(Config::default());
+        app.add_project = Some(manifest_draft(""));
+
+        let _ = update(
+            &mut app,
+            Message::AddProjectInterpretersLoaded(Err("no uv binary is available".to_string())),
+            unused_runner(),
+        );
+
+        assert_eq!(
+            app.add_project.as_ref().map(|d| d.interpreters.clone()),
+            Some(add_project::Interpreters::Failed(
+                "no uv binary is available".to_string()
+            )),
+            "a failed fetch must be representable on the draft, not collapse into Pending"
+        );
+    }
+
+    #[test]
+    fn an_unresolvable_uv_fails_the_interpreter_fetch_with_its_own_message() {
+        // The producer half: `list_interpreters_blocking` is what could not
+        // express failure before. A `Custom` pin the fake runner has no rule
+        // for fails to probe -- `uv::resolve`'s actionable text is what has
+        // to survive, the same discipline `run_sync` follows.
+        let config = Config {
+            settings: bombadil_core::model::Settings {
+                uv_source: bombadil_core::model::UvSource::Custom {
+                    path: PathBuf::from("/definitely/not/a/real/uv"),
+                },
+                ..Default::default()
+            },
+            ..Config::default()
+        };
+
+        let got = list_interpreters_blocking(&config, &FakeCommandRunner::new());
+
+        let err = got.expect_err("an unresolvable uv must not look like an empty machine");
+        assert!(
+            err.contains("/definitely/not/a/real/uv"),
+            "the resolve error's own text must survive; got {err}"
+        );
+    }
+
+    #[test]
+    fn unparseable_interpreter_output_fails_rather_than_reading_as_no_interpreters() {
+        // uv ran and exited zero but this build cannot read what it printed
+        // -- a version skew, not an empty machine, and the two must not look
+        // the same to the user.
+        let config = Config {
+            settings: fake_uv_settings(),
+            ..Config::default()
+        };
+        let runner = FakeCommandRunner::new();
+        version_probe(&runner);
+        runner.expect(
+            "uv",
+            &["python", "list", "--output-format", "json"],
+            bombadil_core::process::CommandOutcome {
+                status: Some(0),
+                stdout: "not json at all".into(),
+                stderr: String::new(),
+            },
+        );
+
+        let got = list_interpreters_blocking(&config, &runner);
+
+        assert!(
+            got.is_err(),
+            "unparseable output must be reported, not silently emptied; got {got:?}"
+        );
+    }
+
+    #[test]
+    fn changing_the_venv_choice_dispatches_an_adoption_probe_without_touching_disk_inline() {
+        // Spec §8's "the dialog states that it will be adopted" needs the
+        // probe to run *before* the user confirms, and it reads a
+        // `pyvenv.cfg` -- so it goes through `job::run` like every other
+        // filesystem read here, never inline in `update` and never in `view`.
+        let mut app = App::new(Config::default());
+        let mut draft = manifest_draft("");
+        draft.venv_outcome = Some(add_project::VenvOutcome::Adopt {
+            python_version: "3.9.18".to_string(),
+        });
+        app.add_project = Some(draft);
+
+        let task = update(
+            &mut app,
+            Message::AddProjectVenvChoiceSelected(add_project::VenvChoice::Chosen(PathBuf::from(
+                "/mnt/fast/envs/api",
+            ))),
+            unused_runner(),
+        );
+
+        assert!(
+            task.units() > 0,
+            "changing the venv choice must dispatch a fresh adopt-or-create probe"
+        );
+        assert_eq!(
+            app.add_project
+                .as_ref()
+                .and_then(|d| d.venv_outcome.clone()),
+            None,
+            "the previous folder's statement must be cleared, not left on screen"
+        );
+    }
+
+    #[test]
+    fn opening_the_dialog_probes_the_default_venv_location_too() {
+        // Accepting the default without touching the venv control is the
+        // commonest path; leaving it unprobed would leave exactly that user
+        // with no adoption statement.
+        let mut app = App::new(Config::default());
+
+        let task = update(
+            &mut app,
+            Message::AddProjectManifestLoaded(manifest_draft("")),
+            unused_runner(),
+        );
+
+        assert!(
+            task.units() > 1,
+            "loading a manifest must dispatch both the interpreter fetch and the venv probe; \
+             got {} unit(s)",
+            task.units()
+        );
+    }
+
+    #[test]
+    fn a_landed_adoption_probe_reaches_the_open_draft() {
+        let mut app = App::new(Config::default());
+        app.add_project = Some(manifest_draft(""));
+        // What `VenvChoice::SettingsDefault` resolves to for this manifest.
+        let probed = PathBuf::from("/p/my-api/.venv");
+
+        let _ = update(
+            &mut app,
+            Message::AddProjectVenvOutcomeProbed(
+                probed,
+                add_project::VenvOutcome::Adopt {
+                    python_version: "3.9.18".to_string(),
+                },
+            ),
+            unused_runner(),
+        );
+
+        assert_eq!(
+            app.add_project
+                .as_ref()
+                .and_then(|d| d.venv_outcome.clone()),
+            Some(add_project::VenvOutcome::Adopt {
+                python_version: "3.9.18".to_string()
+            })
+        );
+    }
+
+    #[test]
+    fn an_adoption_probe_for_a_folder_no_longer_chosen_is_dropped() {
+        // The user changed their mind while the probe was in flight: an
+        // older result landing last would describe a folder that is not the
+        // one on screen.
+        let mut app = App::new(Config::default());
+        app.add_project = Some(manifest_draft(""));
+
+        let _ = update(
+            &mut app,
+            Message::AddProjectVenvOutcomeProbed(
+                PathBuf::from("/somewhere/else/.venv"),
+                add_project::VenvOutcome::Adopt {
+                    python_version: "3.9.18".to_string(),
+                },
+            ),
+            unused_runner(),
+        );
+
+        assert_eq!(
+            app.add_project
+                .as_ref()
+                .and_then(|d| d.venv_outcome.clone()),
+            None,
+            "a probe of a path the draft no longer resolves to must be dropped"
+        );
+    }
+
+    #[test]
+    fn a_stale_interpreter_fetch_after_cancel_is_dropped() {
+        // The dialog was cancelled before the fetch landed -- there is
+        // nothing left to attach the result to.
+        let mut app = App::new(Config::default());
+        app.add_project = None;
+
+        let _ = update(
+            &mut app,
+            Message::AddProjectInterpretersLoaded(Ok(vec![interpreter("3.12.4")])),
+            unused_runner(),
+        );
+
+        assert!(app.add_project.is_none());
+    }
+
+    #[test]
+    fn the_install_button_dispatches_without_blocking_when_a_version_can_be_suggested() {
+        let mut app = App::new(Config::default());
+        let mut draft =
+            manifest_draft("[project]\nname = \"my-api\"\nrequires-python = \">=3.11\"\n");
+        draft.interpreters = add_project::Interpreters::Loaded(vec![interpreter("3.9.18")]);
+        app.add_project = Some(draft);
+        let fake = Arc::new(FakeCommandRunner::new());
+
+        let task = update(
+            &mut app,
+            Message::AddProjectInstallInterpreterRequested,
+            fake.clone(),
+        );
+
+        assert!(
+            fake.calls().is_empty(),
+            "runner.run must not be called synchronously; got {:?}",
+            fake.calls()
+        );
+        assert!(
+            task.units() > 0,
+            "the install button must dispatch background work"
+        );
+    }
+
+    #[test]
+    fn the_install_button_dispatches_nothing_without_a_requirement_to_suggest_a_version_from() {
+        // A manifest with no requires-python (a workspace root) gives
+        // `interpreter::suggested_install_version` nothing to work with --
+        // guessing a version to install would not be "suitable" by any
+        // definition, so nothing must be dispatched.
+        let mut app = App::new(Config::default());
+        app.add_project = Some(manifest_draft("[tool.uv.workspace]\nmembers = []\n"));
+
+        let task = update(
+            &mut app,
+            Message::AddProjectInstallInterpreterRequested,
+            unused_runner(),
+        );
+
+        assert_eq!(
+            task.units(),
+            0,
+            "nothing to install for a manifest with no requires-python"
+        );
+    }
+
+    /// Records every config it was asked to save instead of touching a real
+    /// file -- the `ConfigPersist` counterpart of `FakeCommandRunner`.
+    #[derive(Default)]
+    struct FakeConfigPersist {
+        saved: std::sync::Mutex<Vec<Config>>,
+    }
+
+    impl FakeConfigPersist {
+        fn saved(&self) -> Vec<Config> {
+            self.saved.lock().unwrap().clone()
+        }
+    }
+
+    impl ConfigPersist for FakeConfigPersist {
+        fn save(&self, config: &Config) -> Result<(), String> {
+            self.saved.lock().unwrap().push(config.clone());
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn confirming_the_dialog_appends_the_project_to_the_in_memory_list_and_closes() {
+        // Criterion 3, the in-memory half: this must be true the instant
+        // `update` returns, not only once the background save lands --
+        // `Confirmed` without this would leave the dialog looking like it
+        // did nothing.
+        let mut app = App::new(Config::default());
+        app.add_project = Some(manifest_draft(
+            "[project]\nname = \"my-api\"\nrequires-python = \">=3.11\"\n",
+        ));
+
+        let _ = update(&mut app, Message::AddProjectConfirmed, unused_runner());
+
+        assert_eq!(
+            app.config.projects.len(),
+            1,
+            "got {:?}",
+            app.config.projects
+        );
+        assert_eq!(app.projects.len(), 1);
+        assert_eq!(app.projects[0].label, "my-api");
+        assert_eq!(app.entries.len(), 1);
+        assert!(
+            app.add_project.is_none(),
+            "the dialog must close once confirmed"
+        );
+    }
+
+    #[test]
+    fn a_sync_pressed_right_after_confirming_the_dialog_dispatches_nothing() {
+        // Confirming runs `uv sync -p <version>` and also selects the new
+        // project, and the detail header always renders Sync -- so without
+        // claiming the in-flight slot the user is one press away from two
+        // concurrent `uv sync` on the same venv, interleaving into the one
+        // shared drawer. `App::syncing`'s own doc names both consequences as
+        // the reason the slot exists.
+        let mut app = App::new(Config::default());
+        app.add_project = Some(manifest_draft(
+            "[project]\nname = \"my-api\"\nrequires-python = \">=3.11\"\n",
+        ));
+        let fake = Arc::new(FakeCommandRunner::new());
+
+        let confirm = update(&mut app, Message::AddProjectConfirmed, fake.clone());
+        assert!(confirm.units() > 0, "confirming must dispatch work");
+
+        let sync = update(&mut app, Message::SyncRequested(0), fake.clone());
+
+        assert_eq!(
+            sync.units(),
+            0,
+            "a Sync pressed while the confirm's own uv sync is in flight must dispatch nothing"
+        );
+        assert!(
+            fake.calls().is_empty(),
+            "no uv command may be issued by the ignored press; got {:?}",
+            fake.calls()
+        );
+    }
+
+    #[test]
+    fn a_finished_confirm_releases_the_in_flight_slot() {
+        // The other half: a guard that is never cleared is a deadlock, and
+        // Sync would work exactly zero times after adding a project.
+        let mut app = App::new(Config::default());
+        app.add_project = Some(manifest_draft("[project]\nname = \"my-api\"\n"));
+
+        let _ = update(&mut app, Message::AddProjectConfirmed, unused_runner());
+        let _ = update(
+            &mut app,
+            Message::AddProjectConfirmFinished {
+                success: true,
+                lines: vec![],
+                index: 0,
+            },
+            unused_runner(),
+        );
+
+        assert!(app.syncing.is_none());
+        let again = update(&mut app, Message::SyncRequested(0), unused_runner());
+        assert!(
+            again.units() > 0,
+            "Sync must dispatch again once the confirm has finished"
+        );
+    }
+
+    #[test]
+    fn confirming_a_dialog_with_nothing_chosen_does_nothing() {
+        // No manifest was ever picked -- there is no draft to confirm.
+        let mut app = App::new(Config::default());
+        app.add_project = None;
+
+        let task = update(&mut app, Message::AddProjectConfirmed, unused_runner());
+
+        assert!(app.config.projects.is_empty());
+        assert_eq!(task.units(), 0);
+    }
+
+    #[test]
+    fn confirming_the_dialog_never_persists_or_runs_uv_synchronously() {
+        // Criterion 3 and criterion 4's shared failure mode, in the shape
+        // plan 3a settled on for `SyncRequested`: the meaningful assertion
+        // is that neither `persist.save` nor `runner.run` has recorded
+        // anything by the time `update` has already returned -- the exact
+        // freeze `job::run` exists to prevent, for two different calls this
+        // time instead of one.
+        let mut app = App::new(Config::default());
+        app.add_project = Some(manifest_draft(""));
+        let persist = Arc::new(FakeConfigPersist::default());
+        app.persist = persist.clone();
+        let fake = Arc::new(FakeCommandRunner::new());
+
+        let task = update(&mut app, Message::AddProjectConfirmed, fake.clone());
+
+        assert!(
+            persist.saved().is_empty(),
+            "persist.save must not be called synchronously inside update"
+        );
+        assert!(
+            fake.calls().is_empty(),
+            "runner.run must not be called synchronously inside update; got {:?}",
+            fake.calls()
+        );
+        assert!(
+            task.units() > 0,
+            "confirming must dispatch real background work, not Task::none()"
+        );
+    }
+
+    #[test]
+    fn confirming_the_dialog_persists_the_appended_project_to_disk() {
+        // Criterion 3's other failure mode: the project reaches
+        // `app.config` in memory but never reaches the store, so it
+        // vanishes on restart. Calls the blocking half directly, the same
+        // way `sync_runs_uv_with_the_composed_environment_and_nothing_ambient`
+        // tests `run_sync` directly rather than through `update`'s opaque
+        // `Task`.
+        let project = project("api");
+        let config = Config {
+            projects: vec![project.clone()],
+            ..Config::default()
+        };
+        let persist = FakeConfigPersist::default();
+        let store = bombadil_core::secrets::InMemorySecretStore::new();
+        let runner = FakeCommandRunner::new();
+
+        let (success, _lines) = run_confirm_add_project(
+            &project,
+            &config,
+            None,
+            &persist,
+            &store,
+            &runner,
+            |_| Some("3.12.0".to_string()), // an existing venv -- adopt, not create
+        );
+
+        assert!(success);
+        let saved = persist.saved();
+        assert_eq!(saved.len(), 1, "persist.save must be called exactly once");
+        assert_eq!(
+            saved[0].projects,
+            vec![project],
+            "the project must be part of what gets persisted"
+        );
+    }
+
+    #[test]
+    fn creating_a_venv_on_confirm_runs_sync_with_python_using_the_composed_environment() {
+        // Criterion 4: the two defects plan 3a shipped and had to fix for
+        // `run_sync` -- an uncomposed environment (private-index auth
+        // silently impossible) and clear_env left unset -- must not come
+        // back for the add-project path. Tests the blocking half directly;
+        // `confirming_the_dialog_never_persists_or_runs_uv_synchronously`
+        // above covers the "never inline" half through `update`.
+        let project = bombadil_core::model::Project {
+            env: vec![bombadil_core::model::EnvVar {
+                key: "MARKER".into(),
+                value: "set".into(),
+                secret: false,
+            }],
+            ..project("api")
+        };
+        let config = Config {
+            projects: vec![project.clone()],
+            settings: fake_uv_settings(),
+            ..Config::default()
+        };
+        let persist = FakeConfigPersist::default();
+        let store = bombadil_core::secrets::InMemorySecretStore::new();
+        let runner = FakeCommandRunner::new();
+        version_probe(&runner);
+        runner.expect(
+            "uv",
+            &["sync", "-p", "3.12.1"],
+            bombadil_core::process::CommandOutcome {
+                status: Some(0),
+                stdout: String::new(),
+                stderr: String::new(),
+            },
+        );
+
+        let (success, _lines) = run_confirm_add_project(
+            &project,
+            &config,
+            Some("3.12.1"),
+            &persist,
+            &store,
+            &runner,
+            |_| None, // no venv present yet -- must create
+        );
+
+        assert!(success);
+        let calls = runner.calls();
+        let sync = calls
+            .iter()
+            .find(|c| c.args.iter().any(|a| a == "sync"))
+            .expect("uv sync -p must have been run");
+        assert_eq!(
+            sync.args,
+            vec!["sync", "-p", "3.12.1"],
+            "the preselected interpreter must be pinned; got {:?}",
+            sync.args
+        );
+        assert!(
+            sync.clear_env,
+            "the composition must be authoritative, not layered on the ambient environment"
+        );
+        assert_eq!(
+            sync.env.get("MARKER").map(String::as_str),
+            Some("set"),
+            "a project env var must reach uv; got {:?}",
+            sync.env.keys().collect::<Vec<_>>()
+        );
+        assert!(
+            sync.env.contains_key("VIRTUAL_ENV"),
+            "the composed activation layer must be present"
+        );
+    }
+
+    #[test]
+    fn adopting_an_existing_venv_on_confirm_does_not_run_sync() {
+        // Criterion 5: adoption must not silently rebuild an environment the
+        // user asked to keep. No rule is programmed on `runner` for `uv
+        // sync` at all -- if `run_confirm_add_project` ran it anyway,
+        // `FakeCommandRunner` would return `CommandError::Unexpected`
+        // instead of quietly succeeding.
+        let project = project("api");
+        let config = Config {
+            projects: vec![project.clone()],
+            settings: fake_uv_settings(),
+            ..Config::default()
+        };
+        let persist = FakeConfigPersist::default();
+        let store = bombadil_core::secrets::InMemorySecretStore::new();
+        let runner = FakeCommandRunner::new();
+
+        let (success, lines) = run_confirm_add_project(
+            &project,
+            &config,
+            Some("3.12.1"),
+            &persist,
+            &store,
+            &runner,
+            |_| Some("3.11.9".to_string()), // an existing venv
+        );
+
+        assert!(success);
+        assert!(
+            runner.calls().is_empty(),
+            "adoption must not run uv at all; got {:?}",
+            runner.calls()
+        );
+        assert!(
+            lines.iter().any(|l| l.contains("3.11.9")),
+            "the adopted version should be reported; got {lines:?}"
+        );
+        assert_eq!(
+            persist.saved().len(),
+            1,
+            "the config must still be persisted on adoption"
+        );
+    }
+
+    /// Drive a future to completion on this thread, for tests that need the
+    /// result of one of this file's `async fn`s (`detect_terminals`,
+    /// `open_terminal`) without going through iced's opaque `Task`. Same
+    /// trick `job::run`'s own tests use: its future does its waiting on an
+    /// `mpsc` channel via `recv_timeout`, which blocks the polling thread
+    /// itself, so a trivial spin-poll executor is enough and avoids pulling
+    /// in a runtime.
+    fn block_on<F: std::future::Future>(mut f: F) -> F::Output {
+        use std::task::{Context, Poll, Waker};
+        let mut f = unsafe { std::pin::Pin::new_unchecked(&mut f) };
+        let waker = Waker::noop();
+        let mut cx = Context::from_waker(waker);
+        loop {
+            if let Poll::Ready(v) = f.as_mut().poll(&mut cx) {
+                return v;
+            }
+            std::thread::yield_now();
+        }
+    }
+
+    // --- Criterion 1: only detected terminals are offered ---
+
+    #[test]
+    fn opening_the_context_menu_dispatches_terminal_detection_without_blocking() {
+        // The dispatch-shape half of criterion 1: `available` fires up to
+        // seven probes, any of which can hang, so detection must never run
+        // synchronously inside `update` -- exactly the freeze `job::run`
+        // exists to prevent.
+        let mut app = App::new(Config {
+            projects: vec![project("api")],
+            ..Config::default()
+        });
+        let fake = Arc::new(FakeCommandRunner::new());
+
+        let task = update(&mut app, Message::ContextMenuOpened(0), fake.clone());
+
+        assert!(
+            fake.calls().is_empty(),
+            "runner.run must not be called synchronously inside update; got {:?}",
+            fake.calls()
+        );
+        assert!(
+            task.units() > 0,
+            "opening the context menu must dispatch the terminal probe"
+        );
+        assert_eq!(
+            app.context_menu.as_ref().map(|m| m.project_index),
+            Some(0),
+            "the menu must open for the right-clicked project immediately"
+        );
+    }
+
+    #[test]
+    fn context_menu_terminal_detection_only_offers_what_the_probe_finds() {
+        // The content half of criterion 1: exercises `detect_terminals`
+        // directly, the async function `job::run` wraps -- the same pattern
+        // `run_sync`'s own tests use for its blocking counterpart. Proves the
+        // GUI's wiring actually reaches `terminal::detect::available` rather
+        // than a hardcoded list of every kind for the OS.
+        let runner = FakeCommandRunner::new();
+        runner.expect(
+            "which",
+            &["kitty"],
+            bombadil_core::process::CommandOutcome {
+                status: Some(0),
+                stdout: "/usr/bin/kitty".into(),
+                stderr: String::new(),
+            },
+        );
+
+        let got = block_on(detect_terminals(
+            bombadil_core::terminal::Os::Linux,
+            Arc::new(runner),
+        ));
+
+        assert_eq!(
+            got,
+            vec![bombadil_core::terminal::TerminalKind::Kitty],
+            "only the terminal the probe actually found must be offered"
+        );
+    }
+
+    #[test]
+    fn a_stale_detection_result_after_the_menu_closed_is_dropped() {
+        let mut app = App::new(Config {
+            projects: vec![project("api")],
+            ..Config::default()
+        });
+        app.context_menu = None;
+
+        let _ = update(
+            &mut app,
+            Message::ContextMenuTerminalsDetected(vec![
+                bombadil_core::terminal::TerminalKind::Kitty,
+            ]),
+            unused_runner(),
+        );
+
+        assert!(app.context_menu.is_none());
+    }
+
+    // --- Criterion 2: the configured default appears first ---
+    // Pure ordering logic (`context_menu::ordered`) is covered in
+    // `context_menu.rs`'s own tests, the same file it lives in; this test
+    // covers the GUI wiring that carries `terminal_defaults` from `Config`
+    // into `view` -- see `context_menu_view` in `view`, which reads
+    // `app.config.terminal_defaults` fresh on every render.
+
+    #[test]
+    fn the_configured_default_is_read_from_config_for_the_hosts_os() {
+        // The kind is derived from the host rather than hardcoded: a default
+        // keyed to this OS but naming a terminal that cannot exist on it is
+        // not a configuration the app could ever have written. This one never
+        // reaches `argv::build`, so it passed everywhere either way -- but
+        // leaving the pattern here is how it gets copied into a test that
+        // does.
+        let kind = host_terminal_kind();
+        let config = Config {
+            projects: vec![project("api")],
+            terminal_defaults: std::collections::BTreeMap::from([(
+                Os::host(),
+                TerminalChoice::Detected(kind),
+            )]),
+            ..Config::default()
+        };
+        let app = App::new(config);
+        assert_eq!(
+            app.config.terminal_defaults.get(&Os::host()),
+            Some(&TerminalChoice::Detected(kind)),
+            "the configured default for this OS must be reachable for view to order by"
+        );
+    }
+
+    // --- Criterion 4: Remove from list ---
+
+    #[test]
+    fn removing_a_project_deletes_it_from_the_in_memory_config_immediately() {
+        let config = Config {
+            projects: vec![project("api"), project("web")],
+            ..Config::default()
+        };
+        let mut app = App::new(config);
+
+        let task = update(
+            &mut app,
+            Message::RemoveProjectRequested(0),
+            unused_runner(),
+        );
+
+        assert_eq!(
+            app.config.projects.len(),
+            1,
+            "got {:?}",
+            app.config.projects
+        );
+        assert_eq!(app.config.projects[0].label, "web");
+        assert_eq!(app.projects.len(), 1);
+        assert_eq!(app.projects[0].label, "web");
+        assert_eq!(app.entries.len(), 1);
+        assert!(
+            task.units() > 0,
+            "removal must still dispatch a background persist"
+        );
+    }
+
+    #[test]
+    fn removing_a_project_persists_the_config_without_it() {
+        // Exercises `run_persist` directly, the same pattern
+        // `confirming_the_dialog_persists_the_appended_project_to_disk` uses
+        // for the add-project path.
+        let project_a = project("api");
+        let project_b = project("web");
+        let config = Config {
+            projects: vec![project_b.clone()],
+            ..Config::default()
+        };
+        let persist = FakeConfigPersist::default();
+
+        let success = run_persist(&config, &persist);
+
+        assert!(success);
+        let saved = persist.saved();
+        assert_eq!(saved.len(), 1, "persist.save must be called exactly once");
+        assert_eq!(
+            saved[0].projects,
+            vec![project_b],
+            "the removed project must be absent from what gets persisted"
+        );
+        assert!(!saved[0].projects.contains(&project_a));
+    }
+
+    #[test]
+    fn removing_the_last_remaining_project_leaves_nothing_selected() {
+        // The subtraction `projects.len() - 1` underflows once the removed
+        // project was the only one -- must clear the selection instead of
+        // panicking.
+        let mut app = App::new(Config {
+            projects: vec![project("api")],
+            ..Config::default()
+        });
+        app.selected = Some(0);
+
+        let _ = update(
+            &mut app,
+            Message::RemoveProjectRequested(0),
+            unused_runner(),
+        );
+
+        assert!(app.projects.is_empty());
+        assert!(app.selected.is_none());
+    }
+
+    #[test]
+    fn removing_a_project_never_touches_the_venv_on_disk() {
+        // bombadil-core has no function capable of deleting a venv at all --
+        // confirmed by inspection: the only `fs::remove_*` call in the whole
+        // crate lives inside `venv_path`'s own test fixture teardown, not in
+        // any code `update` can reach. So this proves the removal path we
+        // built calls no `CommandRunner` at all, which is everything there
+        // is to guard against today; there is no delete-venv primitive for a
+        // future regression to accidentally wire up removal into yet.
+        let mut app = App::new(Config {
+            projects: vec![project("api")],
+            ..Config::default()
+        });
+        let fake = Arc::new(FakeCommandRunner::new());
+
+        let _ = update(&mut app, Message::RemoveProjectRequested(0), fake.clone());
+
+        assert!(
+            fake.calls().is_empty(),
+            "removing a project must not run or spawn any process; got {:?}",
+            fake.calls()
+        );
+    }
+
+    #[test]
+    fn removing_an_out_of_range_project_is_ignored() {
+        let mut app = App::new(Config {
+            projects: vec![project("api")],
+            ..Config::default()
+        });
+
+        let task = update(
+            &mut app,
+            Message::RemoveProjectRequested(99),
+            unused_runner(),
+        );
+
+        assert_eq!(
+            app.projects.len(),
+            1,
+            "an invalid index must change nothing"
+        );
+        assert_eq!(task.units(), 0);
+    }
+
+    #[test]
+    fn removing_the_selected_project_clears_or_shifts_the_selection() {
+        let mut app = App::new(Config {
+            projects: vec![project("api"), project("web")],
+            ..Config::default()
+        });
+        app.selected = Some(0);
+
+        let _ = update(
+            &mut app,
+            Message::RemoveProjectRequested(0),
+            unused_runner(),
+        );
+
+        assert_eq!(
+            selected_label(&app),
+            Some("web"),
+            "removing the selected project must not leave a dangling index"
+        );
+    }
+
+    // --- Criterion 5: opening a terminal dispatches through job::run ---
+
+    #[test]
+    fn opening_a_terminal_never_calls_the_runner_synchronously() {
+        let mut app = App::new(Config {
+            projects: vec![project("api")],
+            ..Config::default()
+        });
+        let fake = Arc::new(FakeCommandRunner::new());
+
+        let task = update(
+            &mut app,
+            Message::OpenTerminalRequested(
+                0,
+                TerminalChoice::Detected(bombadil_core::terminal::TerminalKind::Kitty),
+            ),
+            fake.clone(),
+        );
+
+        assert!(
+            fake.calls().is_empty(),
+            "runner.run/spawn must not be called synchronously inside update; got {:?}",
+            fake.calls()
+        );
+        assert!(
+            task.units() > 0,
+            "opening a terminal must dispatch real background work, not Task::none()"
+        );
+        assert!(
+            app.context_menu.is_none(),
+            "the menu should close once an action is taken from it"
+        );
+    }
+
+    #[test]
+    fn opening_a_terminal_for_an_out_of_range_project_dispatches_nothing() {
+        let mut app = App::new(Config {
+            projects: vec![project("api")],
+            ..Config::default()
+        });
+
+        let task = update(
+            &mut app,
+            Message::OpenTerminalRequested(
+                99,
+                TerminalChoice::Detected(bombadil_core::terminal::TerminalKind::Kitty),
+            ),
+            unused_runner(),
+        );
+
+        assert_eq!(task.units(), 0);
+    }
+
+    #[test]
+    fn opening_a_terminal_spawns_the_chosen_kind_with_the_composed_environment() {
+        // Exercises `run_open_terminal` directly, the blocking half
+        // `open_terminal` wraps in `job::run` -- the same pattern
+        // `run_sync`'s own tests use. Proves the GUI wiring reaches
+        // `terminal::open::open` with the right project/config, not just
+        // that *some* process gets run.
+        let project = bombadil_core::model::Project {
+            env: vec![bombadil_core::model::EnvVar {
+                key: "MARKER".into(),
+                value: "set".into(),
+                secret: false,
+            }],
+            ..project("api")
+        };
+        let config = Config {
+            projects: vec![project.clone()],
+            ..Config::default()
+        };
+        let store = bombadil_core::secrets::InMemorySecretStore::new();
+        let runner = FakeCommandRunner::new();
+        // One rule per host's first kind: `expect` matches on the program's
+        // file stem, so exactly one of these can ever fire -- `gnome-terminal`
+        // on Linux, `open -a Terminal` on macOS, `wt.exe` on Windows. Naming
+        // all three keeps this test running the real path on every platform
+        // instead of only the one CI happens to be generous with.
+        for program in ["gnome-terminal", "open", "wt"] {
+            runner.expect(
+                program,
+                &[],
+                bombadil_core::process::CommandOutcome {
+                    status: Some(0),
+                    stdout: String::new(),
+                    stderr: String::new(),
+                },
+            );
+        }
+
+        let result = run_open_terminal(
+            &TerminalChoice::Detected(host_terminal_kind()),
+            &project,
+            &config,
+            &store,
+            &runner,
+        );
+
+        assert!(result.is_ok(), "got {result:?}");
+        let calls = runner.calls();
+        assert_eq!(calls.len(), 1, "the terminal must actually be spawned");
+        assert!(
+            calls[0].clear_env,
+            "the composition must be authoritative, not layered on the ambient environment"
+        );
+        assert_eq!(
+            calls[0].env.get("MARKER").map(String::as_str),
+            Some("set"),
+            "a project env var must reach the terminal; got {:?}",
+            calls[0].env.keys().collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn a_terminal_that_has_disappeared_reports_a_failure_not_a_panic() {
+        // No rule programmed -- the spawn itself fails, the "terminal has
+        // disappeared" case spec §9 names. `run_open_terminal` must surface
+        // it as an `Err`, not unwrap and take the window down.
+        let config = Config {
+            projects: vec![project("api")],
+            ..Config::default()
+        };
+        let store = bombadil_core::secrets::InMemorySecretStore::new();
+        let runner = FakeCommandRunner::new();
+
+        let result = run_open_terminal(
+            &TerminalChoice::Detected(host_terminal_kind()),
+            &project("api"),
+            &config,
+            &store,
+            &runner,
+        );
+
+        let err =
+            result.expect_err("a terminal that will not spawn must not be reported as opened");
+        // With a hardcoded Linux kind this assertion passed on macOS and
+        // Windows for the wrong reason: `argv::build` refused the kind before
+        // anything was ever spawned, so spec §9's "the terminal has
+        // disappeared" case went unexercised on exactly the two platforms
+        // where it is least verified.
+        assert!(
+            !err.contains("not a terminal available"),
+            "the failure must come from the spawn, not the wrong-OS guard; got {err}"
+        );
+    }
+
+    #[test]
+    fn the_bundled_licence_can_be_shown_and_hidden_again() {
+        // Apache-2.0 section 4 obliges the text to be reachable. It is
+        // compiled into the executable (`bombadil_uv_bin::UV_LICENSE`) and
+        // had no consumer at all; this flag is what `view` renders it from,
+        // so a toggle that never flips leaves the obligation unmet.
+        let mut app = App::new(Config::default());
+        assert!(!app.about_expanded, "the licence starts collapsed");
+
+        let _ = update(&mut app, Message::AboutLicenseToggled, unused_runner());
+        assert!(app.about_expanded);
+
+        let _ = update(&mut app, Message::AboutLicenseToggled, unused_runner());
+        assert!(!app.about_expanded);
     }
 
     fn project(label: &str) -> bombadil_core::model::Project {
