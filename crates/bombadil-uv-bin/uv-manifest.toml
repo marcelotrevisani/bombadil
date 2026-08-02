@@ -22,3 +22,15 @@ sha256 = "769d373e146692c639b5fbaae33b331c297a32e03d30448772051902df52bbf4"
 [targets.x86_64-pc-windows-msvc]
 asset = "uv-x86_64-pc-windows-msvc.zip"
 sha256 = "8fcb0cb46e1229065e344758980924e569bef5882ef45f46fada8fb24e06b74a"
+
+[targets.aarch64-pc-windows-msvc]
+asset = "uv-aarch64-pc-windows-msvc.zip"
+sha256 = "9bc7c18e616230fa2dc6fb24bc3afde18a95c2b5c9433de747e9502c66041568"
+
+[targets.x86_64-unknown-linux-musl]
+asset = "uv-x86_64-unknown-linux-musl.tar.gz"
+sha256 = "47823f814693bab8623308341369190de30b5c621eec5b1ee20352eae8c7982c"
+
+[targets.aarch64-unknown-linux-musl]
+asset = "uv-aarch64-unknown-linux-musl.tar.gz"
+sha256 = "ce218dad9eb48a39dd86160bec6291fac7275f20a9cabcc4bc10dd2c757208f8"
