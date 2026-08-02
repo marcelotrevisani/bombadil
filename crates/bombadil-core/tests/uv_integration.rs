@@ -584,7 +584,16 @@ fn the_generated_init_file_puts_the_venv_first_in_a_real_interactive_bash_shell(
     // Measured before this plan: without the init file an interactive bash
     // leaves the venv at position 3, behind ~/.local/bin, because .bashrc
     // prepends after us. This asserts the fix against a real bash.
+    // A silent skip here is absence of signal dressed up as success: cargo
+    // captures stdout on a passing test, so an eprintln'd "skipping" is
+    // invisible and the run reports a green `ok`. This file already
+    // hard-`expect`s a real uv, and the `uv-integration` feature gate already
+    // means "I have a real toolchain" -- so be loud where the shell must
+    // exist.
     let Some(bash) = which_bash() else {
+        if cfg!(unix) {
+            panic!("bash is required for this test on unix");
+        }
         eprintln!("no bash on this machine; skipping");
         return;
     };
@@ -607,7 +616,15 @@ fn the_generated_init_file_puts_the_venv_first_in_a_real_interactive_bash_shell(
 fn the_generated_init_file_puts_the_venv_first_in_a_real_interactive_zsh_shell() {
     // Same measurement as the bash case, but through ZDOTDIR rather than an
     // rcfile argument -- zsh has no --rcfile equivalent.
+    // Loud only on macOS, where zsh is the default login shell and its
+    // absence really is a broken machine. `ubuntu-latest` does not ship zsh,
+    // so panicking on all of unix would turn a legitimate absence into a red
+    // CI job. `#[ignore]` is not used anywhere here: it makes CI skip by
+    // default, which is the same silence with extra steps.
     let Some(zsh) = which_zsh() else {
+        if cfg!(target_os = "macos") {
+            panic!("zsh is required for this test on macOS");
+        }
         eprintln!("no zsh on this machine; skipping");
         return;
     };
