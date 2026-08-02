@@ -128,6 +128,18 @@ pub enum SecretError {
 }
 
 #[derive(Debug, thiserror::Error)]
+pub enum TerminalError {
+    #[error("{kind:?} is not a terminal available on {os:?}")]
+    WrongOs {
+        kind: crate::terminal::TerminalKind,
+        os: crate::terminal::Os,
+    },
+
+    #[error("the custom terminal command is empty")]
+    EmptyTemplate,
+}
+
+#[derive(Debug, thiserror::Error)]
 pub enum EnvError {
     #[error("could not run the pre-activate script {script}: {message}")]
     ScriptSpawn {

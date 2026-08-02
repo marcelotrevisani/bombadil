@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 
 pub mod activation;
+pub mod argv;
 
 pub use crate::model::TerminalChoice;
 
