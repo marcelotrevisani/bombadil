@@ -1138,9 +1138,14 @@ bash with a real user configuration and asserts the venv is first."
 
 ## What the remaining plan picks up
 
-**Plan 3 (the GUI)** consumes `detect::available` for the context submenu, `TerminalChoice` for the default-per-OS setting, and `open::open` for the action. It must also surface two things this plan records but cannot fix:
+**Plan 3 (the GUI)** consumes `detect::available` for the context submenu, `TerminalChoice` for the default-per-OS setting, and `open::open` for the action. It must also surface things this plan records but cannot fix.
 
-- macOS `Terminal.app`/`iTerm2` and Windows `cmd` cannot carry a shell argument, so the re-assertion does not reach them; the venv is still on `PATH` but may not be first.
+**Six of the fourteen kinds are degraded, in two materially different ways.** Drive the warning off `TerminalKind::activation_support()`, which is the machine-readable form of this and is pinned for all fourteen kinds by a test — not off a hardcoded list in the GUI.
+
+- **`ActivationSupport::Full`** — activation genuinely works: all seven Linux kinds (`GnomeTerminal`, `Konsole`, `Kitty`, `Alacritty`, `WezTerm`, `Foot`, `Xterm`) plus `WindowsTerminal`. No warning needed.
+- **`ActivationSupport::PathOnly`** — `PowerShell`, `Cmd`, `GitBash`. The composed environment does arrive (they are spawned as ordinary child processes), but none has a flag to hand it a specific shell binary plus arguments, so the generated init file never runs and nothing re-asserts the venv after the user's rc. `Cmd` and `PowerShell` are near-fine in practice — the composed `PATH` already leads with the venv and neither has an rc that re-prepends — while `GitBash` runs `bash --login -i` and reproduces the measured demotion. Warn: "on `PATH`, but your shell configuration may push it back."
+- **`ActivationSupport::None`** — `TerminalApp`, `ITerm2`, `Wsl`. **The venv is not on `PATH` at all.** `open -a Terminal <cwd>` / `open -a iTerm <cwd>` hand the request to LaunchServices, which does not propagate the calling process's environment (that is why `launchctl setenv` exists); `spec.env` and `clear_env` are delivered to the `open` binary and discarded, and only `cwd` survives because it is an argument. `wsl.exe` is the same across the WSL boundary — nothing crosses except via `WSLENV`, and a `C:\...\Scripts` path would be meaningless inside the distro anyway. Warn: "not activated." Windows users should be steered to `WindowsTerminal`.
+
 - An unrecognised shell gets no re-assertion. The user should be told plainly rather than left with a terminal that looks activated and is not.
 
 It must also wire `validate()`, which still has no caller — see the note carried from plan 2b.

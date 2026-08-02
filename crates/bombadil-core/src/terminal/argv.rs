@@ -10,22 +10,39 @@
 //! nothing about whether the terminal actually opened -- that is handled
 //! later, at spawn time, not here.
 //!
-//! ## Known limitation: six terminals cannot carry the shell
+//! ## Known limitation: six terminals are degraded, in two different ways
 //!
-//! `TerminalApp` and `ITerm2` (`open -a Terminal <cwd>` / `open -a iTerm
-//! <cwd>`, both macOS kinds) launch the user's own default shell. So do four
-//! of Windows' five kinds: `Cmd` (`cmd.exe /K cd /d <cwd>`), `PowerShell`
-//! (`powershell.exe -NoExit -Command Set-Location ...`), `GitBash`
-//! (`bash.exe --login -i`), and `Wsl` (`wsl.exe --cd <cwd>`). None of these
-//! six has a flag to hand the emulator a specific shell binary or arguments,
-//! so Task 2's activation re-assertion (the generated init file, passed in
-//! here as `shell`/`shell_args`) never reaches them.
+//! Six kinds do not get full activation, and they do not all fail the same
+//! way. [`TerminalKind::activation_support`] is the machine-readable form of
+//! what follows, and the GUI should drive its warning off that rather than
+//! off this comment.
 //!
-//! `WindowsTerminal` is the *only* Windows kind where activation works,
-//! alongside all seven Linux kinds. The GUI should steer Windows users
-//! toward `WindowsTerminal` and surface the other four Windows kinds and
-//! both macOS kinds as a known limitation, rather than let Bombadil report
-//! the venv as active when the spawned shell never saw the re-assertion.
+//! **`ActivationSupport::PathOnly` -- `PowerShell`, `Cmd`, `GitBash`.** These
+//! are spawned as ordinary child processes, so the composed environment (and
+//! `clear_env`) does reach them. What does not reach them is the re-assertion:
+//! none of `cmd.exe /K cd /d <cwd>`, `powershell.exe -NoExit -Command
+//! Set-Location ...` or `bash.exe --login -i` has a flag to hand the emulator
+//! a specific shell binary plus arguments, so the generated init file passed
+//! in here as `shell`/`shell_args` is dropped. `Cmd` and `PowerShell` are
+//! near-fine in practice -- the composed `PATH` already leads with the venv
+//! and neither has an rc that re-prepends -- while `GitBash` runs an
+//! interactive login bash, whose rc reproduces the measured demotion.
+//!
+//! **`ActivationSupport::None` -- `TerminalApp`, `ITerm2`, `Wsl`.** These get
+//! no composed environment at all, so the venv is not merely demoted on
+//! `PATH`, it is absent from it. `open -a Terminal <cwd>` and `open -a iTerm
+//! <cwd>` hand the request to LaunchServices, which does not propagate the
+//! calling process's environment -- that is precisely why `launchctl setenv`
+//! exists. `spec.env` and `spec.clear_env` are delivered to the `open` binary
+//! and discarded; `cwd` survives only because it is an argument. `wsl.exe`
+//! fails the same way across the WSL boundary: nothing crosses it except via
+//! `WSLENV`, and a `C:\...\Scripts` path would be meaningless inside the
+//! distro regardless.
+//!
+//! **`ActivationSupport::Full`** is all seven Linux kinds plus
+//! `WindowsTerminal` -- the *only* Windows kind where activation works. The
+//! GUI should steer Windows users toward it, and must not report the venv as
+//! active for any of the six above.
 
 use super::{Os, TerminalChoice, TerminalKind};
 use crate::error::TerminalError;
