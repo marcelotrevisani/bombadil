@@ -1,4 +1,5 @@
 pub mod error;
+pub mod members;
 pub mod model;
 pub mod process;
 pub mod pyproject;
