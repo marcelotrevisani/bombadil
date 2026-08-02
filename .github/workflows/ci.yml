@@ -42,8 +42,13 @@ jobs:
 
   uv-integration:
     # Proves the argv builders and JSON parsers agree with a real uv, which
-    # the hermetic unit tests deliberately cannot.
-    runs-on: ubuntu-latest
+    # the hermetic unit tests deliberately cannot. Spec §10 requires this on
+    # all three platforms, not just Linux.
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable

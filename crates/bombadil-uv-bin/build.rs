@@ -67,9 +67,16 @@ fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
+/// ureq 3's default has no global timeout, so a stalled body read would
+/// otherwise hang the build (and CI) indefinitely.
+const DOWNLOAD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
 fn download(url: &str) -> Vec<u8> {
     let mut body = Vec::new();
     ureq::get(url)
+        .config()
+        .timeout_global(Some(DOWNLOAD_TIMEOUT))
+        .build()
         .call()
         .unwrap_or_else(|e| panic!("could not download {url}: {e}"))
         .into_body()

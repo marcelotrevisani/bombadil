@@ -70,9 +70,10 @@ pub fn ensure_extracted(data_dir: &Path) -> Result<PathBuf, ExtractError> {
         path: parent.to_path_buf(),
         source,
     })?;
+    let tmp_path = tmp.path().to_path_buf();
 
     tmp.write_all(UV_BYTES).map_err(|source| ExtractError::Io {
-        path: path.clone(),
+        path: tmp_path.clone(),
         source,
     })?;
 
@@ -82,13 +83,13 @@ pub fn ensure_extracted(data_dir: &Path) -> Result<PathBuf, ExtractError> {
         tmp.as_file()
             .set_permissions(std::fs::Permissions::from_mode(0o755))
             .map_err(|source| ExtractError::Io {
-                path: path.clone(),
+                path: tmp_path.clone(),
                 source,
             })?;
     }
 
     tmp.persist(&path).map_err(|e| ExtractError::Io {
-        path: path.clone(),
+        path: tmp_path,
         source: e.error,
     })?;
 

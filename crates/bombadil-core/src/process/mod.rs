@@ -60,6 +60,15 @@ impl CommandSpec {
         self.env.insert(key.into(), value.into());
         self
     }
+
+    /// Start the child from an empty environment; only `env` entries are
+    /// visible to it. Plan 2b uses this to compose a full environment
+    /// without inheriting the caller's ambient one.
+    #[must_use]
+    pub fn clear_env(mut self) -> Self {
+        self.clear_env = true;
+        self
+    }
 }
 
 /// What a finished process left behind.
@@ -86,6 +95,10 @@ pub enum CommandError {
         source: std::io::Error,
     },
 
+    /// Only `FakeCommandRunner` constructs this; gated the same way so it
+    /// does not appear in production docs or need handling by every
+    /// production `match` over `CommandError`.
+    #[cfg(any(test, feature = "test-support"))]
     #[error("no fake outcome was programmed for {program} {args:?}")]
     Unexpected { program: PathBuf, args: Vec<String> },
 }
