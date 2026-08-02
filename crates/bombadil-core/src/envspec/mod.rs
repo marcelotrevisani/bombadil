@@ -146,8 +146,9 @@ pub fn compose(
     // Windows variable names are case-insensitive and `std::env::vars()`
     // yields the canonical spelling `Path`. Looking up "PATH" exactly would
     // miss it, then insert a *second* key -- and since the child's environment
-    // is written in `BTreeMap` order, "PATH" sorts first and the parent's
-    // "Path" would overwrite it, leaving the venv off `PATH` entirely.
+    // is written in `BTreeMap` order and `Command` keys its env table
+    // case-insensitively on Windows, whichever spelling is written last wins,
+    // leaving the venv off `PATH` entirely.
     let path_key = env
         .keys()
         .find(|k| k.eq_ignore_ascii_case("PATH"))
@@ -159,6 +160,12 @@ pub fn compose(
         }
         _ => bin.clone(),
     };
+    // Picking one spelling is not enough when the map holds several -- a
+    // config naming a variable `PATH` alongside the Windows parent's `Path`
+    // gives two, and `find` takes the `BTreeMap`-sorted first ("PATH" <
+    // "Path"), leaving the other behind to be written afterwards with its
+    // stale value. Exactly one PATH-ish key may survive.
+    env.retain(|k, _| k == &path_key || !k.eq_ignore_ascii_case("PATH"));
     env.insert(path_key, path);
     let venv = inputs.venv_path.to_string_lossy().into_owned();
     env.insert("UV_PROJECT_ENVIRONMENT".to_string(), venv.clone());
@@ -383,6 +390,29 @@ mod tests {
             path.contains("/usr/bin"),
             "the inherited PATH must survive; got {path}"
         );
+    }
+
+    #[test]
+    fn only_one_path_key_survives_when_the_parent_holds_two_spellings() {
+        // A config naming a variable `PATH` alongside the Windows parent's
+        // `Path` puts both in the map. `find` walks BTreeMap order and "PATH"
+        // sorts before "Path", so the stale `Path` would survive untouched --
+        // and `Command` keys its env table case-insensitively on Windows, so
+        // whichever is written last wins. Written last is "Path".
+        let mut ins = inputs(Config::default(), project());
+        ins.parent = BTreeMap::from([
+            ("PATH".to_string(), "/from/upper".to_string()),
+            ("Path".to_string(), "/from/mixed".to_string()),
+        ]);
+
+        let got = compose_with(ins);
+
+        let path_keys: Vec<&String> = got
+            .keys()
+            .filter(|k| k.eq_ignore_ascii_case("PATH"))
+            .collect();
+        assert_eq!(path_keys.len(), 1, "got {path_keys:?}");
+        assert!(got[path_keys[0]].starts_with("/envs/my-api"), "got {got:?}");
     }
 
     #[test]

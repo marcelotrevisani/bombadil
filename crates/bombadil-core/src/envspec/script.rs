@@ -15,6 +15,14 @@ use std::collections::BTreeMap;
 /// parent environment, every configured variable, every keychain secret and
 /// every index credential — and return `Ok`. Dot-sourcing in PowerShell
 /// behaves the same way.
+///
+/// It is written *conditionally on the dump succeeding* (`env -0 && printf`),
+/// not merely after it. `printf` is a shell builtin while `env` is an external
+/// binary needing a `PATH` lookup, so an unusable `PATH` makes `env -0` write
+/// nothing while the unconditional `printf` still runs and still exits 0 —
+/// verified, `env -i PATH=/nonexistent sh -c "...; env -0; printf ..."` emits
+/// the sentinel alone. Ungated, the sentinel would prove only that the shell
+/// reached the end of the command, which is not the claim it is here to make.
 const SENTINEL_KEY: &str = "__BOMBADIL_DUMP_OK";
 
 /// Escape a string for interpolation inside a single-quoted shell literal.
@@ -33,7 +41,7 @@ fn quote(raw: &str) -> String {
 /// Build the command that sources a script and dumps the resulting
 /// environment.
 ///
-/// POSIX uses `sh -c "set -- <args>; . '<script>' >/dev/null; env -0;
+/// POSIX uses `sh -c "set -- <args>; . '<script>' >/dev/null; env -0 &&
 /// <sentinel>"`, verified to capture values with spaces, `=` and newlines, and
 /// to surface the script's exit status.
 /// stdout alone is redirected to `/dev/null` (not `2>&1`): anything the
@@ -68,6 +76,15 @@ fn quote(raw: &str) -> String {
 /// set next because `powershell -Command` otherwise exits 0 even when the
 /// sourced script writes errors; without it a broken script would silently
 /// produce a truncated environment instead of aborting.
+///
+/// The PowerShell sentinel is deliberately *not* gated the way the POSIX one
+/// is. The hazard the gate closes is an external binary that cannot be found;
+/// `Get-ChildItem Env:` is an in-process cmdlet over the built-in Environment
+/// provider, so there is no lookup to fail, and `$ErrorActionPreference =
+/// 'Stop'` already makes any error it does raise terminating — which aborts
+/// the whole `-Command` before the sentinel line is reached. `&&` would also
+/// be a parse error: it is a PowerShell 7 pipeline-chain operator and
+/// `powershell.exe` is Windows PowerShell 5.1.
 pub fn dump_command(script: &Script) -> CommandSpec {
     let path = quote(&script.path.to_string_lossy());
     let args = script
@@ -79,8 +96,9 @@ pub fn dump_command(script: &Script) -> CommandSpec {
 
     #[cfg(not(windows))]
     {
-        let program =
-            format!("set -- {args}; . '{path}' >/dev/null; env -0; printf '{SENTINEL_KEY}=1\\000'");
+        let program = format!(
+            "set -- {args}; . '{path}' >/dev/null; env -0 && printf '{SENTINEL_KEY}=1\\000'"
+        );
         CommandSpec::new("sh").arg("-c").arg(program)
     }
 
@@ -396,8 +414,10 @@ mod tests {
             spec.args[1]
         );
         assert!(
-            spec.args[1].contains(r"printf '__BOMBADIL_DUMP_OK=1\000'"),
-            "the dump must be self-terminating; got {}",
+            spec.args[1].contains(r"env -0 && printf '__BOMBADIL_DUMP_OK=1\000'"),
+            "the sentinel must be conditional on the dump succeeding, not merely \
+             follow it -- `printf` is a builtin and `env` is not, so an unusable \
+             PATH otherwise yields the sentinel with an empty dump; got {}",
             spec.args[1]
         );
     }
