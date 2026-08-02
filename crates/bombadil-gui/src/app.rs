@@ -152,8 +152,10 @@ pub struct App {
     /// fetched for, paired with that project's index so a result that
     /// arrives after the selection has moved on is never shown against the
     /// wrong project -- the same staleness guard `entries`/`VenvProbed` uses.
-    /// `None` before the first fetch lands.
-    pub deps: Option<(usize, deps::DepsTab)>,
+    /// `None` before the first fetch lands; `Err` once one has landed that
+    /// could not read the environment -- which the tab reports, rather than
+    /// showing rows that would claim nothing is installed.
+    pub deps: Option<(usize, Result<deps::DepsTab, String>)>,
     /// What the user has typed so far into each `config.indexes` row's
     /// credential textbox (spec §7, Task 4) -- always the same length as
     /// `config.indexes`, kept in step by `IndexAdded`/`IndexRemoved`.
@@ -278,7 +280,11 @@ pub enum Message {
     /// never run inline, because `uv tree` on a large project is slow.
     /// Carries the index for the same staleness reason `VenvProbed` does:
     /// the user can select a different project before this lands.
-    DepsLoaded(usize, DepsFetch),
+    ///
+    /// `Err` carries why the environment could not be read at all, so the tab
+    /// can say so instead of rendering every declared package as
+    /// `"(not installed)"` -- see `fetch_deps_blocking`.
+    DepsLoaded(usize, Result<DepsFetch, String>),
     /// The Sync action was pressed for `projects[usize]`. Never gated on
     /// whether a venv already exists -- creating one is how the user
     /// recovers from not having one.
@@ -715,11 +721,13 @@ async fn probe_venv(path: PathBuf) -> Option<String> {
 pub struct DepsFetch {
     pyproject: PyProject,
     installed: Vec<InstalledPackage>,
-    /// `None` covers both "no venv to ask yet" and "the command failed to
-    /// run" -- neither is uv answering with a schema this build does not
-    /// understand, which is the one case `deps::build` explains to the user.
-    /// See its own doc for why the two must stay distinguishable.
-    tree: Option<TreeOutcome>,
+    /// `Err` carries uv's own text for a tree that could not be read at all --
+    /// a non-zero exit, or output this build cannot parse. Kept apart from
+    /// `Ok(TreeOutcome::UnsupportedSchema)`, which is uv answering with a
+    /// schema this build does not understand; see `deps::build`'s own doc for
+    /// why the two must stay distinguishable. Not fatal to the whole fetch:
+    /// the rows above are still true without a tree.
+    tree: Result<TreeOutcome, String>,
 }
 
 /// Resolves what a Dependencies fetch needs to run project-scoped uv
@@ -740,55 +748,69 @@ fn deps_command_context(project: &Project, config: &Config) -> Option<uv::comman
     })
 }
 
-/// The blocking half of a Dependencies fetch: read the manifest, then (if a
-/// uv can be resolved and the project has a venv to ask about) run `uv pip
-/// list` and `uv tree`. Every failure along the way -- an unreadable
-/// manifest, no resolvable uv, a command that exits non-zero, output this
-/// build cannot parse -- degrades to an empty/absent result rather than
-/// erroring: a project that has never been synced has no installed packages
-/// and no tree yet, which is a normal state (the same "registered without a
-/// venv" state `sidebar` already treats as ordinary), not a failure to
-/// report.
+/// What a uv command that ran and refused has to say for itself: its own
+/// stderr where there is any, `fallback` where there is none. The exit code
+/// alone tells the user nothing, which is the whole reason this is carried
+/// rather than collapsed into a bare failure.
+fn uv_refusal(outcome: &bombadil_core::process::CommandOutcome, fallback: &str) -> String {
+    match outcome.stderr.trim() {
+        "" => fallback.to_string(),
+        stderr => stderr.to_string(),
+    }
+}
+
+/// The blocking half of a Dependencies fetch: resolve uv, read the manifest,
+/// then run `uv pip list` and `uv tree`.
+///
+/// Every failure -- no resolvable uv, an unresolvable venv location, an
+/// unreadable manifest, a command that exits non-zero, output this build
+/// cannot parse -- comes back as `Err` carrying uv's own text where there is
+/// any, the same shape `list_interpreters_blocking` uses.
+///
+/// Degrading to an empty result instead is what made a failed fetch
+/// indistinguishable from an environment with nothing in it: `installed` came
+/// back empty, so every declared package rendered as `"(not installed)"` -- a
+/// positive claim about the environment when the truth was that we could not
+/// ask it. A project with no venv is not exempt from that: `uv pip list`
+/// refuses, and saying so beats claiming that nothing is installed.
+///
+/// The tree is the one part that does not fail the whole fetch: its `Err`
+/// travels as far as `deps::build`, which explains it in the tab while still
+/// showing every row `uv pip list` did answer for.
 fn fetch_deps_blocking(
     project: &Project,
     config: &Config,
     runner: &dyn CommandRunner,
-) -> DepsFetch {
-    let pyproject = bombadil_core::pyproject::load(&project.pyproject_path).unwrap_or_default();
+) -> Result<DepsFetch, String> {
+    let resolved_uv = resolve_uv_for(config, runner)?;
+    let ctx = deps_command_context(project, config)
+        .ok_or_else(|| "this project has no directory or no resolvable venv path".to_string())?;
 
-    let Some(resolved_uv) = resolve_uv_for(config, runner).ok() else {
-        return DepsFetch {
-            pyproject,
-            installed: Vec::new(),
-            tree: None,
-        };
-    };
-    let Some(ctx) = deps_command_context(project, config) else {
-        return DepsFetch {
-            pyproject,
-            installed: Vec::new(),
-            tree: None,
-        };
+    let installed = match runner.run(&uv::command::pip_list(&resolved_uv, &ctx)) {
+        Ok(outcome) if outcome.success() => uv::results::parse_pip_list(&outcome.stdout)
+            .map_err(|err| format!("could not read uv's installed package list: {err}"))?,
+        Ok(outcome) => return Err(uv_refusal(&outcome, "uv pip list failed")),
+        Err(err) => return Err(err.to_string()),
     };
 
-    let installed = runner
-        .run(&uv::command::pip_list(&resolved_uv, &ctx))
-        .ok()
-        .filter(|outcome| outcome.success())
-        .and_then(|outcome| uv::results::parse_pip_list(&outcome.stdout).ok())
-        .unwrap_or_default();
+    let tree = match runner.run(&uv::command::tree(&resolved_uv, &ctx, DEPS_TREE_DEPTH)) {
+        Ok(outcome) if outcome.success() => uv::results::parse_tree(&outcome.stdout)
+            .map_err(|err| format!("could not read uv's dependency tree: {err}")),
+        Ok(outcome) => Err(uv_refusal(&outcome, "uv tree failed")),
+        Err(err) => Err(err.to_string()),
+    };
 
-    let tree = runner
-        .run(&uv::command::tree(&resolved_uv, &ctx, DEPS_TREE_DEPTH))
-        .ok()
-        .filter(|outcome| outcome.success())
-        .and_then(|outcome| uv::results::parse_tree(&outcome.stdout).ok());
+    // Read last, and its own failure reported like any other: there is nothing
+    // to render a manifest against once the environment could not be described,
+    // and doing it in this order keeps every failure above a pure uv question.
+    let pyproject = bombadil_core::pyproject::load(&project.pyproject_path)
+        .map_err(|err| format!("could not read this project's manifest: {err}"))?;
 
-    DepsFetch {
+    Ok(DepsFetch {
         pyproject,
         installed,
         tree,
-    }
+    })
 }
 
 /// Runs a Dependencies fetch off the render thread via `job::run` --
@@ -797,7 +819,11 @@ fn fetch_deps_blocking(
 /// `update` would freeze the window exactly like `sync_project` would.
 /// `SYNC_TIMEOUT`, not `VENV_PROBE_TIMEOUT`, for the same reason `sync_project`
 /// uses it: this can run a full uv resolve, not a sub-millisecond file read.
-async fn load_deps(project: Project, config: Config, runner: Arc<dyn CommandRunner>) -> DepsFetch {
+async fn load_deps(
+    project: Project,
+    config: Config,
+    runner: Arc<dyn CommandRunner>,
+) -> Result<DepsFetch, String> {
     match job::run(
         move || fetch_deps_blocking(&project, &config, runner.as_ref()),
         SYNC_TIMEOUT,
@@ -805,11 +831,11 @@ async fn load_deps(project: Project, config: Config, runner: Arc<dyn CommandRunn
     .await
     {
         job::JobResult::Done(fetch) => fetch,
-        job::JobResult::TimedOut | job::JobResult::Failed => DepsFetch {
-            pyproject: PyProject::default(),
-            installed: Vec::new(),
-            tree: None,
-        },
+        // Reported rather than degraded to an empty tab, for the reason
+        // `fetch_deps_blocking`'s own doc gives: an empty tab is a claim about
+        // the environment, and a timeout is not in a position to make one.
+        job::JobResult::TimedOut => Err("reading dependencies timed out".to_string()),
+        job::JobResult::Failed => Err("reading dependencies failed unexpectedly".to_string()),
     }
 }
 
@@ -950,8 +976,13 @@ pub fn update(app: &mut App, message: Message, runner: Arc<dyn CommandRunner>) -
         // A stale probe result for a project that no longer exists.
         Message::VenvProbed(_, _) => {}
         Message::DepsLoaded(i, fetch) if i < app.config.projects.len() => {
-            let tab = deps::build(&fetch.pyproject, &fetch.installed, fetch.tree);
-            app.deps = Some((i, tab));
+            // The failure is kept, not flattened into an empty tab: `deps::view`
+            // renders it as the reason it is, which is the one thing an empty
+            // tab could never say.
+            app.deps = Some((
+                i,
+                fetch.map(|fetch| deps::build(&fetch.pyproject, &fetch.installed, fetch.tree)),
+            ));
         }
         // A stale fetch for a project that no longer exists, or that the
         // user has since moved away from -- `view` only ever reads
@@ -2157,10 +2188,7 @@ fn list_interpreters_blocking(
             .map_err(|err| format!("could not read uv's interpreter list: {err}")),
         // uv ran and refused. Its stderr is the actionable part; the exit
         // code alone tells the user nothing.
-        Ok(outcome) => Err(match outcome.stderr.trim() {
-            "" => "uv python list failed".to_string(),
-            stderr => stderr.to_string(),
-        }),
+        Ok(outcome) => Err(uv_refusal(&outcome, "uv python list failed")),
         Err(err) => Err(err.to_string()),
     }
 }
@@ -3224,7 +3252,7 @@ mod tests {
             )],
             ..Config::default()
         });
-        app.deps = Some((0, deps::build(&PyProject::default(), &[], None)));
+        app.deps = Some((0, Ok(deps::build(&PyProject::default(), &[], no_tree()))));
         app.members = Some((
             0,
             MembersFetch {
@@ -3297,6 +3325,100 @@ mod tests {
         );
     }
 
+    /// A tree result for a test that is not about the tree. `Err` rather than
+    /// a hand-built graph: what it holds does not matter here, and building a
+    /// `DependencyGraph` by hand would only obscure what does.
+    fn no_tree() -> Result<TreeOutcome, String> {
+        Err("this test is not about the tree".to_string())
+    }
+
+    #[test]
+    fn a_failed_deps_fetch_is_kept_as_the_failure_it_is() {
+        // The defect: a fetch that could not ask the environment anything
+        // landed as an empty `installed` list, so every declared package
+        // rendered `"(not installed)"` -- a positive claim about the venv, and
+        // indistinguishable from one that really is empty. The failure has to
+        // survive as far as the tab.
+        let mut app = App::new(Config {
+            projects: vec![project("api")],
+            ..Config::default()
+        });
+
+        let _ = update(
+            &mut app,
+            Message::DepsLoaded(0, Err("No virtual environment found".to_string())),
+            unused_runner(),
+        );
+
+        let (index, fetched) = app
+            .deps
+            .as_ref()
+            .expect("a failed fetch must still land, or the tab stays blank forever");
+        assert_eq!(*index, 0);
+        let cause = fetched
+            .as_ref()
+            .expect_err("the failure must not have been flattened into a tab");
+        assert_eq!(cause, "No virtual environment found");
+        assert!(
+            deps::unavailable_message(cause).contains("No virtual environment found"),
+            "what the tab renders must name the cause"
+        );
+    }
+
+    #[test]
+    fn an_unresolvable_uv_fails_the_deps_fetch_with_its_own_message() {
+        // The producer half. A `Custom` pin the fake runner has no rule for
+        // fails to probe -- `uv::resolve`'s actionable text is what has to
+        // survive, the same discipline `list_interpreters_blocking` follows.
+        let config = Config {
+            settings: bombadil_core::model::Settings {
+                uv_source: bombadil_core::model::UvSource::Custom {
+                    path: PathBuf::from("/definitely/not/a/real/uv"),
+                },
+                ..Default::default()
+            },
+            ..Config::default()
+        };
+
+        let got = fetch_deps_blocking(&project("api"), &config, &FakeCommandRunner::new());
+
+        let err = got.expect_err("an unresolvable uv must not look like an empty environment");
+        assert!(
+            err.contains("/definitely/not/a/real/uv"),
+            "the resolve error's own text must survive; got {err}"
+        );
+    }
+
+    #[test]
+    fn a_uv_pip_list_that_refuses_fails_the_fetch_carrying_uvs_stderr() {
+        // uv ran and refused -- no venv, a broken one, a permissions problem.
+        // Its stderr is the actionable part; the exit code alone tells the
+        // user nothing, and an empty tab tells them something false.
+        let config = Config {
+            settings: fake_uv_settings(),
+            ..Config::default()
+        };
+        let runner = FakeCommandRunner::new();
+        version_probe(&runner);
+        runner.expect(
+            "uv",
+            &["pip", "list"],
+            bombadil_core::process::CommandOutcome {
+                status: Some(2),
+                stdout: String::new(),
+                stderr: "error: No virtual environment found at /p/api/.venv".into(),
+            },
+        );
+
+        let got = fetch_deps_blocking(&project("api"), &config, &runner);
+
+        let err = got.expect_err("a non-zero exit must not read as nothing installed");
+        assert!(
+            err.contains("No virtual environment found"),
+            "uv's own stderr must survive; got {err}"
+        );
+    }
+
     #[test]
     fn a_deps_fetch_result_is_built_and_stored_against_its_project_index() {
         let mut app = App::new(Config {
@@ -3309,16 +3431,17 @@ mod tests {
                 ..Default::default()
             },
             installed: vec![],
-            tree: None,
+            tree: no_tree(),
         };
 
-        let _ = update(&mut app, Message::DepsLoaded(0, fetch), unused_runner());
+        let _ = update(&mut app, Message::DepsLoaded(0, Ok(fetch)), unused_runner());
 
-        let (index, tab) = app
+        let (index, fetched) = app
             .deps
             .as_ref()
             .expect("a landed fetch must populate app.deps");
         assert_eq!(*index, 0);
+        let tab = fetched.as_ref().expect("this fetch succeeded");
         assert!(
             tab.groups[0].rows.iter().any(|r| r.name == "httpx"),
             "the tab must be built from the fetched manifest; got {:?}",
@@ -3332,10 +3455,10 @@ mod tests {
         let fetch = DepsFetch {
             pyproject: PyProject::default(),
             installed: vec![],
-            tree: None,
+            tree: no_tree(),
         };
 
-        let _ = update(&mut app, Message::DepsLoaded(0, fetch), unused_runner());
+        let _ = update(&mut app, Message::DepsLoaded(0, Ok(fetch)), unused_runner());
 
         assert!(
             app.deps.is_none(),
@@ -3352,7 +3475,7 @@ mod tests {
             projects: vec![project("api"), project("web")],
             ..Config::default()
         });
-        app.deps = Some((0, deps::build(&PyProject::default(), &[], None)));
+        app.deps = Some((0, Ok(deps::build(&PyProject::default(), &[], no_tree()))));
 
         let _ = update(
             &mut app,
