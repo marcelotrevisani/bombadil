@@ -10,6 +10,10 @@ use std::path::{Path, PathBuf};
 /// The uv release embedded in this build.
 pub const BUNDLED_VERSION: &str = "0.12.1";
 
+/// uv's license text, redistributed with the embedded binary as Apache-2.0
+/// section 4 requires. Surface this in an About dialog.
+pub const UV_LICENSE: &str = include_str!("../UV-LICENSE-APACHE");
+
 const EXE_NAME: &str = env!("BOMBADIL_UV_EXE_NAME");
 const UV_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/", env!("BOMBADIL_UV_EXE_NAME")));
 
@@ -98,6 +102,12 @@ mod tests {
     #[test]
     fn the_embedded_binary_is_not_empty() {
         assert!(UV_BYTES.len() > 1_000_000, "got {} bytes", UV_BYTES.len());
+    }
+
+    #[test]
+    fn the_uv_license_is_present_and_looks_like_apache_2() {
+        assert!(!UV_LICENSE.is_empty());
+        assert!(UV_LICENSE.contains("Apache License"), "got:\n{UV_LICENSE}");
     }
 
     #[test]
