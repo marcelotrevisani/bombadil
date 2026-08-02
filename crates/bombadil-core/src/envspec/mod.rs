@@ -89,7 +89,13 @@ fn resolve_var(
 /// short secret unredacted outright -- a guaranteed leak traded for
 /// readability. Over-redaction fails safe; that is the trade this function
 /// deliberately takes.
-fn redact(mut text: String, secrets: &[String]) -> String {
+///
+/// `pub`: `terminal::open` already duplicates this rather than sharing it
+/// (a known drift risk, see that module's doc comment), and the GUI's output
+/// drawer (Task 5) is a second consumer with the same need -- redact a
+/// transcript of secret-bearing text before it is shown to a user. Exporting
+/// this one is better than a third copy that can drift from the other two.
+pub fn redact(mut text: String, secrets: &[String]) -> String {
     for secret in secrets {
         // An empty needle would match (and get replaced) everywhere.
         if secret.is_empty() {

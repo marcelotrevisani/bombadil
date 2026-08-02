@@ -1,4 +1,5 @@
 use crate::detail;
+use crate::drawer;
 use crate::job;
 use crate::sidebar;
 use bombadil_core::model::{Config, Project, Settings};
@@ -37,6 +38,10 @@ pub struct App {
     /// One row per project, in `sidebar::entries` order. Starts all-hollow;
     /// `boot`'s probe tasks fill in real venv status as they complete.
     pub entries: Vec<sidebar::Entry>,
+    /// The output drawer for the most recent (or in-flight) Sync. Spec §8/§9:
+    /// streams a running sync's output and collapses to a status line once
+    /// it finishes.
+    pub drawer: drawer::Drawer,
 }
 
 #[derive(Debug, Clone)]
@@ -50,11 +55,15 @@ pub enum Message {
     /// whether a venv already exists -- creating one is how the user
     /// recovers from not having one.
     SyncRequested,
-    /// A background sync finished. `true` on a zero exit; `false` covers a
-    /// failed resolve, a nonzero exit, a timeout and a panicking job.
-    /// Surfacing *why* it failed is the output drawer's job (a later task);
-    /// this only tracks that the run happened.
-    SyncFinished(bool),
+    /// A background sync finished. `success` is true only on a zero exit;
+    /// `lines` is the transcript to hand to the output drawer -- uv's stdout
+    /// and stderr on a real run, or a single line describing a failed
+    /// resolve, a timeout, or a panicking job when there is no process
+    /// output to show instead.
+    SyncFinished {
+        success: bool,
+        lines: Vec<String>,
+    },
 }
 
 impl App {
@@ -70,6 +79,7 @@ impl App {
             projects,
             selected,
             entries,
+            drawer: drawer::Drawer::default(),
         }
     }
 
@@ -132,15 +142,31 @@ pub fn update(app: &mut App, message: Message, runner: Arc<dyn CommandRunner>) -
         Message::SyncRequested => {
             if let Some(project) = app.selected_project().cloned() {
                 let settings = app.config.settings.clone();
+                // Fresh drawer per run: `push_line` will re-expand it as
+                // soon as the first line of the new run's output lands.
+                app.drawer = drawer::Drawer::default();
                 return Task::perform(
                     sync_project(project, settings, runner),
-                    Message::SyncFinished,
+                    |(success, lines)| Message::SyncFinished { success, lines },
                 );
             }
         }
-        // Recording the outcome anywhere richer than "it happened" belongs to
-        // the output drawer (a later task).
-        Message::SyncFinished(_success) => {}
+        Message::SyncFinished { success, lines } => {
+            // No secrets to redact yet: `run_sync` builds its spec with
+            // `uv::command::sync` directly rather than through
+            // `envspec::compose`, so nothing keychain-sourced flows through
+            // this path today. `push_line` still redacts on the way in, so a
+            // future caller that does compose one cannot forget to.
+            for line in &lines {
+                drawer::push_line(&mut app.drawer, line, &[]);
+            }
+            let status = if success {
+                "sync succeeded".to_string()
+            } else {
+                "sync failed".to_string()
+            };
+            drawer::set_idle(&mut app.drawer, status);
+        }
     }
     Task::none()
 }
@@ -152,33 +178,43 @@ async fn sync_project(
     project: Project,
     settings: Settings,
     runner: Arc<dyn CommandRunner>,
-) -> bool {
+) -> (bool, Vec<String>) {
     match job::run(
         move || run_sync(&project, &settings, runner.as_ref()),
         SYNC_TIMEOUT,
     )
     .await
     {
-        job::JobResult::Done(success) => success,
-        job::JobResult::TimedOut | job::JobResult::Failed => false,
+        job::JobResult::Done(result) => result,
+        job::JobResult::TimedOut => (false, vec!["sync timed out".to_string()]),
+        job::JobResult::Failed => (false, vec!["sync failed unexpectedly".to_string()]),
     }
 }
 
 /// The blocking half of a sync: resolve which uv to run, build the `uv sync`
 /// spec (`bombadil_core::uv::command::sync`), and run it through `runner`.
 /// Any resolution failure -- no project directory, no usable uv -- is
-/// reported as `false` rather than panicking, same as `venv_path::probe`'s
-/// approach to a path that turns out not to be what was expected.
-fn run_sync(project: &Project, settings: &Settings, runner: &dyn CommandRunner) -> bool {
+/// reported as `false` plus a one-line explanation rather than panicking,
+/// same as `venv_path::probe`'s approach to a path that turns out not to be
+/// what was expected. A real run's `lines` is uv's stdout followed by its
+/// stderr, in the order `CommandOutcome` carries them.
+fn run_sync(
+    project: &Project,
+    settings: &Settings,
+    runner: &dyn CommandRunner,
+) -> (bool, Vec<String>) {
     let Some(project_dir) = project
         .pyproject_path
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
     else {
-        return false;
+        return (false, vec!["no project directory to run uv in".to_string()]);
     };
     let Ok(venv_path) = venv_path::resolve(project, settings) else {
-        return false;
+        return (
+            false,
+            vec!["could not resolve a virtual environment path".to_string()],
+        );
     };
 
     // bombadil-gui does not yet bundle uv (no dependency on
@@ -190,7 +226,7 @@ fn run_sync(project: &Project, settings: &Settings, runner: &dyn CommandRunner) 
     };
     let Ok(resolved_uv) = uv::resolve(&settings.uv_source, runner, &uv::locate_on_path, &bundled)
     else {
-        return false;
+        return (false, vec!["could not resolve a uv binary".to_string()]);
     };
 
     let ctx = uv::command::ProjectContext {
@@ -198,10 +234,14 @@ fn run_sync(project: &Project, settings: &Settings, runner: &dyn CommandRunner) 
         venv_path,
     };
     let spec = uv::command::sync(&resolved_uv, &ctx);
-    runner
-        .run(&spec)
-        .map(|outcome| outcome.success())
-        .unwrap_or(false)
+    match runner.run(&spec) {
+        Ok(outcome) => {
+            let mut lines: Vec<String> = outcome.stdout.lines().map(str::to_string).collect();
+            lines.extend(outcome.stderr.lines().map(str::to_string));
+            (outcome.success(), lines)
+        }
+        Err(err) => (false, vec![err.to_string()]),
+    }
 }
 
 pub fn view(app: &App) -> iced::Element<'_, Message> {
@@ -217,9 +257,11 @@ pub fn view(app: &App) -> iced::Element<'_, Message> {
         None => iced::widget::text("").into(),
     };
 
+    let detail_and_drawer = iced::widget::column![detail, drawer::view(&app.drawer)].spacing(8);
+
     iced::widget::row![
         iced::widget::container(sidebar::view(&app.entries, app.selected)).width(240),
-        iced::widget::container(detail).padding(12),
+        iced::widget::container(detail_and_drawer).padding(12),
     ]
     .into()
 }
