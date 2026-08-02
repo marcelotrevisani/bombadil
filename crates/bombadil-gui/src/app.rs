@@ -152,8 +152,10 @@ pub struct App {
     /// fetched for, paired with that project's index so a result that
     /// arrives after the selection has moved on is never shown against the
     /// wrong project -- the same staleness guard `entries`/`VenvProbed` uses.
-    /// `None` before the first fetch lands.
-    pub deps: Option<(usize, deps::DepsTab)>,
+    /// `None` before the first fetch lands; `Err` once one has landed that
+    /// could not read the environment -- which the tab reports, rather than
+    /// showing rows that would claim nothing is installed.
+    pub deps: Option<(usize, Result<deps::DepsTab, String>)>,
     /// What the user has typed so far into each `config.indexes` row's
     /// credential textbox (spec §7, Task 4) -- always the same length as
     /// `config.indexes`, kept in step by `IndexAdded`/`IndexRemoved`.
@@ -167,6 +169,28 @@ pub struct App {
     /// this never holds a credential any longer than the user is actively
     /// typing it.
     pub index_credential_drafts: Vec<String>,
+    /// The name each `config.indexes` row's keychain credential is actually
+    /// stored under -- always the same length as `config.indexes`, kept in
+    /// step by `IndexAdded`/`IndexRemoved` exactly as
+    /// `index_credential_drafts` is.
+    ///
+    /// `SecretKey::Index` is keyed on the index's *name*, so renaming a row
+    /// has to move the entry. That used to happen inside `IndexNameChanged`,
+    /// which meant a keychain `get` per character typed; the rename now
+    /// happens once, at `IndexEditCommitted`, and this is what still knows
+    /// where the entry was left in the meantime. Seeded from the loaded
+    /// config, whose names are by definition the ones the entries were last
+    /// written under.
+    pub index_credential_names: Vec<String>,
+    /// What the user has typed into each Env vars row's value textbox but has
+    /// not committed -- see `env_editor::ValueDrafts`.
+    ///
+    /// Deliberately *not* in `Config`, for the reason `index_credential_drafts`
+    /// is not: an env var's value becomes a secret the moment the user ticks
+    /// "secret", and every keystroke before that used to be written to
+    /// `config.toml` and then released to free blocks by the store's atomic
+    /// rename. Nothing here is ever handed to a `ConfigPersist`.
+    pub env_value_drafts: env_editor::ValueDrafts,
     /// The Members tab (spec §5a, Task 5) raw fetch for whichever project it
     /// was last fetched for, paired with that project's index -- same
     /// staleness guard `deps` uses. Deliberately the *raw* fetch, not a
@@ -256,7 +280,11 @@ pub enum Message {
     /// never run inline, because `uv tree` on a large project is slow.
     /// Carries the index for the same staleness reason `VenvProbed` does:
     /// the user can select a different project before this lands.
-    DepsLoaded(usize, DepsFetch),
+    ///
+    /// `Err` carries why the environment could not be read at all, so the tab
+    /// can say so instead of rendering every declared package as
+    /// `"(not installed)"` -- see `fetch_deps_blocking`.
+    DepsLoaded(usize, Result<DepsFetch, String>),
     /// The Sync action was pressed for `projects[usize]`. Never gated on
     /// whether a venv already exists -- creating one is how the user
     /// recovers from not having one.
@@ -398,12 +426,22 @@ pub enum Message {
     /// textbox at all for a row that is already marked secret -- see
     /// `env_editor`'s module doc for the whole argument. This can never be
     /// produced for a secret row.
+    ///
+    /// Lands in `App::env_value_drafts` and nowhere else: it dispatches no
+    /// persist and never touches `Config`, so a value the user is still
+    /// deciding whether to mark secret cannot reach `config.toml` on the way.
     EnvVarValueChanged(env_editor::EnvScope, usize, String),
+    /// The user committed a row's typed value -- Enter in the textbox, or the
+    /// row's "save value" button. Carries no text: the value is already in
+    /// `App::env_value_drafts`, and `env_editor::commit_value` is what moves
+    /// it into `Config`. This is the only path by which a plaintext value
+    /// reaches disk.
+    EnvVarValueCommitted(env_editor::EnvScope, usize),
     /// A row's "secret" checkbox was toggled. Carries no value at all --
-    /// marking secret moves the plaintext already sitting in `app.config`
-    /// (where `EnvVarValueChanged` put it) into a `job::run` closure by
-    /// ordinary move semantics inside `update`, never through this message.
-    /// See `env_editor`'s module doc.
+    /// marking secret moves the plaintext sitting in this row's draft (or in
+    /// `app.config`, if the user had already committed it) into a `job::run`
+    /// closure by ordinary move semantics inside `update`, never through this
+    /// message. See `env_editor`'s module doc.
     EnvVarSecretToggled(env_editor::EnvScope, usize),
     /// The background half of an env var edit finished: a plain edit's
     /// persist, or a secret toggle's keychain write/delete plus persist.
@@ -442,8 +480,20 @@ pub enum Message {
     /// credential-variable collisions (criterion 2) by `index_editor::view`
     /// re-deriving `collision_message` on every render -- never secret
     /// material, the same as an env var's key.
+    ///
+    /// In-memory only: no persist, and no keychain call. Renaming an index
+    /// has to move its credential, and doing that from here meant a keychain
+    /// `get` per character typed. `IndexEditCommitted` is where both happen,
+    /// once.
     IndexNameChanged(usize, String),
+    /// A row's URL textbox changed. In-memory only, same as
+    /// `IndexNameChanged`: `IndexEditCommitted` is what persists it.
     IndexUrlChanged(usize, String),
+    /// The user committed a row's typed fields -- Enter in one of its
+    /// textboxes, or the row's "save" button. Persists the config, and moves
+    /// the row's keychain credential if its name has changed since the last
+    /// commit (`App::index_credential_names`).
+    IndexEditCommitted(usize),
     /// The kind button was pressed: flips `Default`/`Extra` for this row.
     IndexKindChanged(usize, bombadil_core::model::IndexKind),
     /// The "default for new projects" checkbox was toggled.
@@ -452,6 +502,7 @@ pub enum Message {
     IndexAuthChoiceChanged(usize, index_editor::AuthChoice),
     /// The username textbox changed. Plaintext -- `IndexAuth::Basic`'s
     /// username is not secret, only the password/token paired with it is.
+    /// In-memory only, same as `IndexUrlChanged`.
     IndexUsernameChanged(usize, String),
     /// The credential textbox changed. Carries the typed text wrapped in
     /// `index_editor::CredentialInput`, whose hand-written `Debug` never
@@ -560,6 +611,13 @@ impl App {
         // `IndexAdded`/`IndexRemoved` keep in step with `config.indexes`
         // from here on.
         let index_credential_drafts = vec![String::new(); config.indexes.len()];
+        // Where each row's credential currently lives -- the loaded config's
+        // own names, since that is what any stored entry was written under.
+        let index_credential_names = config
+            .indexes
+            .iter()
+            .map(|index| index.name.clone())
+            .collect();
         // Seeded from whatever `UvSource::Custom` path is already configured,
         // if any, so the Settings tab's textbox is not blank on reopening a
         // config that already names one -- an empty draft for every other
@@ -582,6 +640,8 @@ impl App {
             about_expanded: false,
             deps: None,
             index_credential_drafts,
+            index_credential_names,
+            env_value_drafts: env_editor::ValueDrafts::new(),
             members: None,
             confirm_member_sync: None,
             uv_custom_path_draft,
@@ -661,11 +721,13 @@ async fn probe_venv(path: PathBuf) -> Option<String> {
 pub struct DepsFetch {
     pyproject: PyProject,
     installed: Vec<InstalledPackage>,
-    /// `None` covers both "no venv to ask yet" and "the command failed to
-    /// run" -- neither is uv answering with a schema this build does not
-    /// understand, which is the one case `deps::build` explains to the user.
-    /// See its own doc for why the two must stay distinguishable.
-    tree: Option<TreeOutcome>,
+    /// `Err` carries uv's own text for a tree that could not be read at all --
+    /// a non-zero exit, or output this build cannot parse. Kept apart from
+    /// `Ok(TreeOutcome::UnsupportedSchema)`, which is uv answering with a
+    /// schema this build does not understand; see `deps::build`'s own doc for
+    /// why the two must stay distinguishable. Not fatal to the whole fetch:
+    /// the rows above are still true without a tree.
+    tree: Result<TreeOutcome, String>,
 }
 
 /// Resolves what a Dependencies fetch needs to run project-scoped uv
@@ -686,55 +748,69 @@ fn deps_command_context(project: &Project, config: &Config) -> Option<uv::comman
     })
 }
 
-/// The blocking half of a Dependencies fetch: read the manifest, then (if a
-/// uv can be resolved and the project has a venv to ask about) run `uv pip
-/// list` and `uv tree`. Every failure along the way -- an unreadable
-/// manifest, no resolvable uv, a command that exits non-zero, output this
-/// build cannot parse -- degrades to an empty/absent result rather than
-/// erroring: a project that has never been synced has no installed packages
-/// and no tree yet, which is a normal state (the same "registered without a
-/// venv" state `sidebar` already treats as ordinary), not a failure to
-/// report.
+/// What a uv command that ran and refused has to say for itself: its own
+/// stderr where there is any, `fallback` where there is none. The exit code
+/// alone tells the user nothing, which is the whole reason this is carried
+/// rather than collapsed into a bare failure.
+fn uv_refusal(outcome: &bombadil_core::process::CommandOutcome, fallback: &str) -> String {
+    match outcome.stderr.trim() {
+        "" => fallback.to_string(),
+        stderr => stderr.to_string(),
+    }
+}
+
+/// The blocking half of a Dependencies fetch: resolve uv, read the manifest,
+/// then run `uv pip list` and `uv tree`.
+///
+/// Every failure -- no resolvable uv, an unresolvable venv location, an
+/// unreadable manifest, a command that exits non-zero, output this build
+/// cannot parse -- comes back as `Err` carrying uv's own text where there is
+/// any, the same shape `list_interpreters_blocking` uses.
+///
+/// Degrading to an empty result instead is what made a failed fetch
+/// indistinguishable from an environment with nothing in it: `installed` came
+/// back empty, so every declared package rendered as `"(not installed)"` -- a
+/// positive claim about the environment when the truth was that we could not
+/// ask it. A project with no venv is not exempt from that: `uv pip list`
+/// refuses, and saying so beats claiming that nothing is installed.
+///
+/// The tree is the one part that does not fail the whole fetch: its `Err`
+/// travels as far as `deps::build`, which explains it in the tab while still
+/// showing every row `uv pip list` did answer for.
 fn fetch_deps_blocking(
     project: &Project,
     config: &Config,
     runner: &dyn CommandRunner,
-) -> DepsFetch {
-    let pyproject = bombadil_core::pyproject::load(&project.pyproject_path).unwrap_or_default();
+) -> Result<DepsFetch, String> {
+    let resolved_uv = resolve_uv_for(config, runner)?;
+    let ctx = deps_command_context(project, config)
+        .ok_or_else(|| "this project has no directory or no resolvable venv path".to_string())?;
 
-    let Some(resolved_uv) = resolve_uv_for(config, runner).ok() else {
-        return DepsFetch {
-            pyproject,
-            installed: Vec::new(),
-            tree: None,
-        };
-    };
-    let Some(ctx) = deps_command_context(project, config) else {
-        return DepsFetch {
-            pyproject,
-            installed: Vec::new(),
-            tree: None,
-        };
+    let installed = match runner.run(&uv::command::pip_list(&resolved_uv, &ctx)) {
+        Ok(outcome) if outcome.success() => uv::results::parse_pip_list(&outcome.stdout)
+            .map_err(|err| format!("could not read uv's installed package list: {err}"))?,
+        Ok(outcome) => return Err(uv_refusal(&outcome, "uv pip list failed")),
+        Err(err) => return Err(err.to_string()),
     };
 
-    let installed = runner
-        .run(&uv::command::pip_list(&resolved_uv, &ctx))
-        .ok()
-        .filter(|outcome| outcome.success())
-        .and_then(|outcome| uv::results::parse_pip_list(&outcome.stdout).ok())
-        .unwrap_or_default();
+    let tree = match runner.run(&uv::command::tree(&resolved_uv, &ctx, DEPS_TREE_DEPTH)) {
+        Ok(outcome) if outcome.success() => uv::results::parse_tree(&outcome.stdout)
+            .map_err(|err| format!("could not read uv's dependency tree: {err}")),
+        Ok(outcome) => Err(uv_refusal(&outcome, "uv tree failed")),
+        Err(err) => Err(err.to_string()),
+    };
 
-    let tree = runner
-        .run(&uv::command::tree(&resolved_uv, &ctx, DEPS_TREE_DEPTH))
-        .ok()
-        .filter(|outcome| outcome.success())
-        .and_then(|outcome| uv::results::parse_tree(&outcome.stdout).ok());
+    // Read last, and its own failure reported like any other: there is nothing
+    // to render a manifest against once the environment could not be described,
+    // and doing it in this order keeps every failure above a pure uv question.
+    let pyproject = bombadil_core::pyproject::load(&project.pyproject_path)
+        .map_err(|err| format!("could not read this project's manifest: {err}"))?;
 
-    DepsFetch {
+    Ok(DepsFetch {
         pyproject,
         installed,
         tree,
-    }
+    })
 }
 
 /// Runs a Dependencies fetch off the render thread via `job::run` --
@@ -743,7 +819,11 @@ fn fetch_deps_blocking(
 /// `update` would freeze the window exactly like `sync_project` would.
 /// `SYNC_TIMEOUT`, not `VENV_PROBE_TIMEOUT`, for the same reason `sync_project`
 /// uses it: this can run a full uv resolve, not a sub-millisecond file read.
-async fn load_deps(project: Project, config: Config, runner: Arc<dyn CommandRunner>) -> DepsFetch {
+async fn load_deps(
+    project: Project,
+    config: Config,
+    runner: Arc<dyn CommandRunner>,
+) -> Result<DepsFetch, String> {
     match job::run(
         move || fetch_deps_blocking(&project, &config, runner.as_ref()),
         SYNC_TIMEOUT,
@@ -751,11 +831,11 @@ async fn load_deps(project: Project, config: Config, runner: Arc<dyn CommandRunn
     .await
     {
         job::JobResult::Done(fetch) => fetch,
-        job::JobResult::TimedOut | job::JobResult::Failed => DepsFetch {
-            pyproject: PyProject::default(),
-            installed: Vec::new(),
-            tree: None,
-        },
+        // Reported rather than degraded to an empty tab, for the reason
+        // `fetch_deps_blocking`'s own doc gives: an empty tab is a claim about
+        // the environment, and a timeout is not in a position to make one.
+        job::JobResult::TimedOut => Err("reading dependencies timed out".to_string()),
+        job::JobResult::Failed => Err("reading dependencies failed unexpectedly".to_string()),
     }
 }
 
@@ -896,8 +976,13 @@ pub fn update(app: &mut App, message: Message, runner: Arc<dyn CommandRunner>) -
         // A stale probe result for a project that no longer exists.
         Message::VenvProbed(_, _) => {}
         Message::DepsLoaded(i, fetch) if i < app.config.projects.len() => {
-            let tab = deps::build(&fetch.pyproject, &fetch.installed, fetch.tree);
-            app.deps = Some((i, tab));
+            // The failure is kept, not flattened into an empty tab: `deps::view`
+            // renders it as the reason it is, which is the one thing an empty
+            // tab could never say.
+            app.deps = Some((
+                i,
+                fetch.map(|fetch| deps::build(&fetch.pyproject, &fetch.installed, fetch.tree)),
+            ));
         }
         // A stale fetch for a project that no longer exists, or that the
         // user has since moved away from -- `view` only ever reads
@@ -1309,6 +1394,9 @@ pub fn update(app: &mut App, message: Message, runner: Arc<dyn CommandRunner>) -
             if let Some(vars) = env_editor::vars_mut(&mut app.config, scope) {
                 env_editor::remove_var(vars, index);
             }
+            // Every later row in this scope has just shifted down one; its
+            // draft has to shift with it or it commits into its neighbour.
+            env_editor::drop_draft_row(&mut app.env_value_drafts, scope, index);
             if let Some(key) = owed {
                 let config = app.config.clone();
                 let persist = app.persist.clone();
@@ -1324,13 +1412,26 @@ pub fn update(app: &mut App, message: Message, runner: Arc<dyn CommandRunner>) -
             }
             return persist_env_edit(app);
         }
+        // Draft only: no `Config` write and no persist, so a value the user is
+        // still deciding whether to mark secret never transits `config.toml`.
         // Sound only because `env_editor::rows` never produces this message
         // for a row that is already secret -- see `env_editor`'s module doc.
         Message::EnvVarValueChanged(scope, index, value) => {
-            if let Some(vars) = env_editor::vars_mut(&mut app.config, scope) {
-                env_editor::set_value(vars, index, value);
+            app.env_value_drafts.insert((scope, index), value);
+        }
+        // The one path a plaintext value reaches disk by. Nothing to persist
+        // when the row had no draft (a stray Enter), which is what keeps this
+        // from being a save per press.
+        Message::EnvVarValueCommitted(scope, index) => {
+            let committed = match env_editor::vars_mut(&mut app.config, scope) {
+                Some(vars) => {
+                    env_editor::commit_value(vars, &mut app.env_value_drafts, scope, index)
+                }
+                None => false,
+            };
+            if committed {
+                return persist_env_edit(app);
             }
-            return persist_env_edit(app);
         }
         Message::EnvVarSecretToggled(scope, index) => {
             // Resolved before the mutable borrow of `app.config` below, and
@@ -1358,7 +1459,12 @@ pub fn update(app: &mut App, message: Message, runner: Arc<dyn CommandRunner>) -
             // other edit in this file uses -- then the keychain call and the
             // persist that must agree with it happen together in one
             // background job.
-            if let Some(plain_value) = env_editor::mark_secret(vars, index) {
+            // Takes the plaintext from the row's draft -- where, on this tab's
+            // own workflow, it is the only copy, `Config` never having seen it
+            // -- or from `Config` for a value committed earlier.
+            if let Some(plain_value) =
+                env_editor::take_secret_value(vars, &mut app.env_value_drafts, scope, index)
+            {
                 let config = app.config.clone();
                 let persist = app.persist.clone();
                 return Task::perform(
@@ -1430,18 +1536,22 @@ pub fn update(app: &mut App, message: Message, runner: Arc<dyn CommandRunner>) -
         Message::IndexAdded => {
             index_editor::add_index(&mut app.config.indexes);
             app.index_credential_drafts.push(String::new());
+            app.index_credential_names.push(String::new());
             return persist_index_edit(app);
         }
         Message::IndexRemoved(i) => {
             // Resolved before the row goes: `SecretKey::Index` is keyed on
             // the index's name, and afterwards there is nothing left to find
             // the entry by -- it would sit in the user's keychain forever.
-            let owed = index_credential_key(&app.config, i);
+            let owed = index_credential_key(app, i);
             index_editor::remove_index(&mut app.config.indexes, i);
             // Kept in step with `config.indexes` -- see
             // `App::index_credential_drafts`'s own doc.
             if i < app.index_credential_drafts.len() {
                 app.index_credential_drafts.remove(i);
+            }
+            if i < app.index_credential_names.len() {
+                app.index_credential_names.remove(i);
             }
             if let Some(key) = owed {
                 let config = app.config.clone();
@@ -1452,47 +1562,33 @@ pub fn update(app: &mut App, message: Message, runner: Arc<dyn CommandRunner>) -
             }
             return persist_index_edit(app);
         }
+        // The three typed fields write in-memory only: no persist, and -- for
+        // the name -- no keychain call. `IndexEditCommitted` is where both
+        // happen, once per edit instead of once per character.
         Message::IndexNameChanged(i, name) => {
-            // The credential follows the name: `SecretKey::Index` is keyed on
-            // it, so leaving the entry behind makes the next sync's
-            // `envspec::index::inject` look under a name nothing was stored
-            // under -- a 401 with nothing on screen explaining it -- and
-            // strands the old entry in the keychain. See
-            // `run_index_credential_rename`.
-            let from = index_credential_key(&app.config, i);
             index_editor::set_name(&mut app.config.indexes, i, name);
-            let to = index_credential_key(&app.config, i);
-            if let (Some(from), Some(to)) = (from, to)
-                && from != to
-            {
-                let config = app.config.clone();
-                let persist = app.persist.clone();
-                return Task::perform(
-                    rename_index_credential_job(from, to, config, persist),
-                    |success| Message::IndexPersistFinished { success },
-                );
-            }
-            return persist_index_edit(app);
         }
         Message::IndexUrlChanged(i, url) => {
             index_editor::set_url(&mut app.config.indexes, i, url);
-            return persist_index_edit(app);
-        }
-        Message::IndexKindChanged(i, kind) => {
-            index_editor::set_kind(&mut app.config.indexes, i, kind);
-            return persist_index_edit(app);
-        }
-        Message::IndexDefaultToggled(i) => {
-            index_editor::toggle_default_for_new_projects(&mut app.config.indexes, i);
-            return persist_index_edit(app);
-        }
-        Message::IndexAuthChoiceChanged(i, choice) => {
-            index_editor::set_auth_choice(&mut app.config.indexes, i, choice);
-            return persist_index_edit(app);
         }
         Message::IndexUsernameChanged(i, username) => {
             index_editor::set_username(&mut app.config.indexes, i, username);
-            return persist_index_edit(app);
+        }
+        Message::IndexEditCommitted(i) => return commit_index_edit(app, i),
+        // A discrete press rather than typing, so it commits the row as it
+        // stands -- which is also what keeps a rename typed just before it
+        // from being persisted while the credential stays under the old name.
+        Message::IndexKindChanged(i, kind) => {
+            index_editor::set_kind(&mut app.config.indexes, i, kind);
+            return commit_index_edit(app, i);
+        }
+        Message::IndexDefaultToggled(i) => {
+            index_editor::toggle_default_for_new_projects(&mut app.config.indexes, i);
+            return commit_index_edit(app, i);
+        }
+        Message::IndexAuthChoiceChanged(i, choice) => {
+            index_editor::set_auth_choice(&mut app.config.indexes, i, choice);
+            return commit_index_edit(app, i);
         }
         // Never persisted, and no job dispatched: this is App-local scratch
         // state, never `Config` -- see `App::index_credential_drafts`'s doc.
@@ -1517,6 +1613,17 @@ pub fn update(app: &mut App, message: Message, runner: Arc<dyn CommandRunner>) -
                 // angle: this must not keep sitting in `App` state, readable
                 // by a later render, any longer than typing takes.
                 app.index_credential_drafts[i] = String::new();
+                // `credential_save` resolved the account from the row's
+                // *current* name, and the job below persists that same config,
+                // so this is now where the credential lives -- recorded, or a
+                // later commit would try to rename an entry that has already
+                // moved and overwrite it with the old one.
+                if let (Some(index), Some(slot)) = (
+                    app.config.indexes.get(i),
+                    app.index_credential_names.get_mut(i),
+                ) {
+                    *slot = index.name.clone();
+                }
                 let config = app.config.clone();
                 let persist = app.persist.clone();
                 return Task::perform(
@@ -1707,8 +1814,8 @@ fn sync_target(app: &App, i: usize) -> Option<Project> {
 /// The set comes before the delete deliberately: the other order loses the
 /// credential outright if the second call fails. `Ok(None)` -- no credential
 /// was ever saved under the old name -- is the commonest case by far, since
-/// this runs once per keystroke while the name is being typed, and it is
-/// nothing to move rather than a failure.
+/// most indexes never get one, and it is nothing to move rather than a
+/// failure.
 ///
 /// The persist is attempted whichever way the keychain half went: a machine
 /// with no usable Secret Service must still be able to rename an index, and
@@ -1758,22 +1865,64 @@ async fn rename_index_credential_job(
     }
 }
 
-/// The keychain account `config.indexes[i]`'s credential lives under.
+/// The keychain account `config.indexes[i]`'s credential actually lives
+/// under -- `App::index_credential_names[i]`, not whatever is currently in the
+/// name textbox, which the user may be part-way through retyping.
 ///
-/// Must be resolved *before* a rename or a removal takes the name away: after
+/// Must be resolved *before* a rename or a removal updates that record: after
 /// that there is nothing left to find the entry by, and it sits in the user's
 /// keychain forever.
 ///
-/// An empty name is deliberately not filtered out. The name box is edited one
-/// keystroke at a time, so backspacing a name to nothing and retyping it is an
-/// ordinary way to rename -- filtering the empty step would break the chain
-/// there and strand the credential under the original name. (An index left
-/// permanently unnamed is M4's problem, which this round does not touch.)
-fn index_credential_key(config: &Config, i: usize) -> Option<SecretKey> {
-    let index = config.indexes.get(i)?;
-    Some(SecretKey::Index {
-        name: index.name.clone(),
-    })
+/// An empty name is deliberately not filtered out: a row added this session
+/// starts with one, and a `get` against it simply finds nothing. (An index
+/// left permanently unnamed is M4's problem, which this round does not touch.)
+fn index_credential_key(app: &App, i: usize) -> Option<SecretKey> {
+    let name = app.index_credential_names.get(i)?;
+    Some(SecretKey::Index { name: name.clone() })
+}
+
+/// The credential move committing `config.indexes[i]` owes: from the account
+/// the entry is actually under (`App::index_credential_names`) to the one the
+/// row's current name resolves to. `None` when they already agree -- the row
+/// was not renamed since the last commit -- or when there is no such row.
+///
+/// Its own function so the exact pair of accounts a real commit would move
+/// between is directly testable, the same reason `index_editor::credential_save`
+/// is not inlined in `update`.
+fn index_rename_on_commit(app: &App, i: usize) -> Option<(SecretKey, SecretKey)> {
+    let name = app.config.indexes.get(i)?.name.clone();
+    let from = index_credential_key(app, i)?;
+    let to = SecretKey::Index { name };
+    (from != to).then_some((from, to))
+}
+
+/// Persists `config.indexes[i]` as it now stands, moving its keychain
+/// credential first if the row has been renamed since the last commit.
+///
+/// This is the whole reason the rename is no longer done from
+/// `IndexNameChanged`: that ran `SecretStore::get` once per character typed
+/// into the name box -- on a machine whose keychain prompts, once per
+/// character. The move itself is unchanged (`run_index_credential_rename`);
+/// only how often it happens is.
+/// Where the record of the account is updated matters: only the branch that
+/// actually dispatches the move touches it, so the two can never disagree
+/// about whether the entry has been moved.
+fn commit_index_edit(app: &mut App, i: usize) -> Task<Message> {
+    if let Some((from, to)) = index_rename_on_commit(app, i) {
+        if let (Some(index), Some(slot)) = (
+            app.config.indexes.get(i),
+            app.index_credential_names.get_mut(i),
+        ) {
+            *slot = index.name.clone();
+        }
+        let config = app.config.clone();
+        let persist = app.persist.clone();
+        return Task::perform(
+            rename_index_credential_job(from, to, config, persist),
+            |success| Message::IndexPersistFinished { success },
+        );
+    }
+    persist_index_edit(app)
 }
 
 /// The keychain account a removed env var row owes a delete of, if any.
@@ -2039,10 +2188,7 @@ fn list_interpreters_blocking(
             .map_err(|err| format!("could not read uv's interpreter list: {err}")),
         // uv ran and refused. Its stderr is the actionable part; the exit
         // code alone tells the user nothing.
-        Ok(outcome) => Err(match outcome.stderr.trim() {
-            "" => "uv python list failed".to_string(),
-            stderr => stderr.to_string(),
-        }),
+        Ok(outcome) => Err(uv_refusal(&outcome, "uv python list failed")),
         Err(err) => Err(err.to_string()),
     }
 }
@@ -2876,7 +3022,7 @@ pub fn view(app: &App) -> iced::Element<'_, Message> {
         // Global variables are always shown; the project half only once a
         // project is selected -- the same `app.selected` `env_editor::view`
         // needs to know which project's `env` to show alongside them.
-        Tab::EnvVars => env_editor::view(&app.config, app.selected),
+        Tab::EnvVars => env_editor::view(&app.config, app.selected, &app.env_value_drafts),
         // Same shape as the Env vars tab: global scripts always shown, the
         // project's own scripts once one is selected.
         Tab::Scripts => scripts_editor::view(&app.config, app.selected),
@@ -3106,7 +3252,7 @@ mod tests {
             )],
             ..Config::default()
         });
-        app.deps = Some((0, deps::build(&PyProject::default(), &[], None)));
+        app.deps = Some((0, Ok(deps::build(&PyProject::default(), &[], no_tree()))));
         app.members = Some((
             0,
             MembersFetch {
@@ -3179,6 +3325,100 @@ mod tests {
         );
     }
 
+    /// A tree result for a test that is not about the tree. `Err` rather than
+    /// a hand-built graph: what it holds does not matter here, and building a
+    /// `DependencyGraph` by hand would only obscure what does.
+    fn no_tree() -> Result<TreeOutcome, String> {
+        Err("this test is not about the tree".to_string())
+    }
+
+    #[test]
+    fn a_failed_deps_fetch_is_kept_as_the_failure_it_is() {
+        // The defect: a fetch that could not ask the environment anything
+        // landed as an empty `installed` list, so every declared package
+        // rendered `"(not installed)"` -- a positive claim about the venv, and
+        // indistinguishable from one that really is empty. The failure has to
+        // survive as far as the tab.
+        let mut app = App::new(Config {
+            projects: vec![project("api")],
+            ..Config::default()
+        });
+
+        let _ = update(
+            &mut app,
+            Message::DepsLoaded(0, Err("No virtual environment found".to_string())),
+            unused_runner(),
+        );
+
+        let (index, fetched) = app
+            .deps
+            .as_ref()
+            .expect("a failed fetch must still land, or the tab stays blank forever");
+        assert_eq!(*index, 0);
+        let cause = fetched
+            .as_ref()
+            .expect_err("the failure must not have been flattened into a tab");
+        assert_eq!(cause, "No virtual environment found");
+        assert!(
+            deps::unavailable_message(cause).contains("No virtual environment found"),
+            "what the tab renders must name the cause"
+        );
+    }
+
+    #[test]
+    fn an_unresolvable_uv_fails_the_deps_fetch_with_its_own_message() {
+        // The producer half. A `Custom` pin the fake runner has no rule for
+        // fails to probe -- `uv::resolve`'s actionable text is what has to
+        // survive, the same discipline `list_interpreters_blocking` follows.
+        let config = Config {
+            settings: bombadil_core::model::Settings {
+                uv_source: bombadil_core::model::UvSource::Custom {
+                    path: PathBuf::from("/definitely/not/a/real/uv"),
+                },
+                ..Default::default()
+            },
+            ..Config::default()
+        };
+
+        let got = fetch_deps_blocking(&project("api"), &config, &FakeCommandRunner::new());
+
+        let err = got.expect_err("an unresolvable uv must not look like an empty environment");
+        assert!(
+            err.contains("/definitely/not/a/real/uv"),
+            "the resolve error's own text must survive; got {err}"
+        );
+    }
+
+    #[test]
+    fn a_uv_pip_list_that_refuses_fails_the_fetch_carrying_uvs_stderr() {
+        // uv ran and refused -- no venv, a broken one, a permissions problem.
+        // Its stderr is the actionable part; the exit code alone tells the
+        // user nothing, and an empty tab tells them something false.
+        let config = Config {
+            settings: fake_uv_settings(),
+            ..Config::default()
+        };
+        let runner = FakeCommandRunner::new();
+        version_probe(&runner);
+        runner.expect(
+            "uv",
+            &["pip", "list"],
+            bombadil_core::process::CommandOutcome {
+                status: Some(2),
+                stdout: String::new(),
+                stderr: "error: No virtual environment found at /p/api/.venv".into(),
+            },
+        );
+
+        let got = fetch_deps_blocking(&project("api"), &config, &runner);
+
+        let err = got.expect_err("a non-zero exit must not read as nothing installed");
+        assert!(
+            err.contains("No virtual environment found"),
+            "uv's own stderr must survive; got {err}"
+        );
+    }
+
     #[test]
     fn a_deps_fetch_result_is_built_and_stored_against_its_project_index() {
         let mut app = App::new(Config {
@@ -3191,16 +3431,17 @@ mod tests {
                 ..Default::default()
             },
             installed: vec![],
-            tree: None,
+            tree: no_tree(),
         };
 
-        let _ = update(&mut app, Message::DepsLoaded(0, fetch), unused_runner());
+        let _ = update(&mut app, Message::DepsLoaded(0, Ok(fetch)), unused_runner());
 
-        let (index, tab) = app
+        let (index, fetched) = app
             .deps
             .as_ref()
             .expect("a landed fetch must populate app.deps");
         assert_eq!(*index, 0);
+        let tab = fetched.as_ref().expect("this fetch succeeded");
         assert!(
             tab.groups[0].rows.iter().any(|r| r.name == "httpx"),
             "the tab must be built from the fetched manifest; got {:?}",
@@ -3214,10 +3455,10 @@ mod tests {
         let fetch = DepsFetch {
             pyproject: PyProject::default(),
             installed: vec![],
-            tree: None,
+            tree: no_tree(),
         };
 
-        let _ = update(&mut app, Message::DepsLoaded(0, fetch), unused_runner());
+        let _ = update(&mut app, Message::DepsLoaded(0, Ok(fetch)), unused_runner());
 
         assert!(
             app.deps.is_none(),
@@ -3234,7 +3475,7 @@ mod tests {
             projects: vec![project("api"), project("web")],
             ..Config::default()
         });
-        app.deps = Some((0, deps::build(&PyProject::default(), &[], None)));
+        app.deps = Some((0, Ok(deps::build(&PyProject::default(), &[], no_tree()))));
 
         let _ = update(
             &mut app,
@@ -3741,6 +3982,10 @@ mod tests {
             Message::EnvVarAdded(env_editor::EnvScope::Project(0)),
             Message::EnvVarKeyChanged(env_editor::EnvScope::Project(0), 0, "MARKER".into()),
             Message::EnvVarValueChanged(env_editor::EnvScope::Project(0), 0, "set".into()),
+            // Typing alone leaves the value in `App::env_value_drafts`; this
+            // is the press that puts it in `Config`, where `envspec::compose`
+            // reads it from.
+            Message::EnvVarValueCommitted(env_editor::EnvScope::Project(0), 0),
         ] {
             let _ = update(&mut app, message, unused_runner());
         }
@@ -5579,17 +5824,65 @@ mod tests {
         );
     }
 
+    fn plain_var(key: &str, value: &str) -> bombadil_core::model::EnvVar {
+        bombadil_core::model::EnvVar {
+            key: key.into(),
+            value: value.into(),
+            secret: false,
+        }
+    }
+
     #[test]
-    fn editing_a_value_persists_through_config_persist() {
-        // Criterion 5 again, for a plain (non-secret) edit rather than an
-        // add -- a different message, so it earns its own proof rather than
-        // trusting the shared `persist_env_edit` helper by association.
+    fn typing_a_value_reaches_neither_config_nor_config_persist() {
+        // The defect this exists to catch: `EnvVarValueChanged` used to write
+        // `Config` *and* dispatch a persist, so a PyPI token typed into that
+        // box was written to `config.toml` once per character -- and the
+        // store's atomic rename released every intermediate copy to free
+        // blocks rather than overwriting it. The typing itself must reach
+        // neither.
         let mut app = App::new(Config {
-            global_env: vec![bombadil_core::model::EnvVar {
-                key: "HTTP_PROXY".into(),
-                value: "http://old".into(),
-                secret: false,
-            }],
+            global_env: vec![plain_var("TOKEN", "")],
+            ..Config::default()
+        });
+        let persist = Arc::new(FakeConfigPersist::default());
+        app.persist = persist.clone();
+
+        // One message per character, exactly as iced sends them.
+        let mut task_units = 0;
+        for prefix in ["h", "hu", "hun", "hunt", "hunte", "hunter", "hunter2"] {
+            let task = update(
+                &mut app,
+                Message::EnvVarValueChanged(env_editor::EnvScope::Global, 0, prefix.into()),
+                unused_runner(),
+            );
+            task_units += task.units();
+        }
+
+        assert_eq!(
+            task_units, 0,
+            "typing must dispatch no work at all -- a dispatched persist is a write to config.toml"
+        );
+        assert_eq!(
+            app.config.global_env[0].value, "",
+            "the typed text must not be in Config, which is what any persist would write out"
+        );
+        assert!(
+            !format!("{:?}", app.config).contains("hunter2"),
+            "nothing a Debug render of Config could print may carry the typed text"
+        );
+        assert!(
+            persist.saved().is_empty(),
+            "no save may have happened, synchronously or otherwise"
+        );
+    }
+
+    #[test]
+    fn committing_a_typed_value_puts_it_in_config_and_persists_it() {
+        // The other half: not persisting per keystroke must not mean the
+        // value is quietly lost. Enter, or the row's save button, is what
+        // commits it -- and then it does reach `config.toml`.
+        let mut app = App::new(Config {
+            global_env: vec![plain_var("HTTP_PROXY", "http://old")],
             ..Config::default()
         });
         let persist = Arc::new(FakeConfigPersist::default());
@@ -5600,16 +5893,91 @@ mod tests {
             Message::EnvVarValueChanged(env_editor::EnvScope::Global, 0, "http://new".into()),
             unused_runner(),
         );
+        let task = update(
+            &mut app,
+            Message::EnvVarValueCommitted(env_editor::EnvScope::Global, 0),
+            unused_runner(),
+        );
 
+        assert!(task.units() > 0, "the commit must dispatch a persist");
         assert_eq!(app.config.global_env[0].value, "http://new");
+        assert!(
+            persist.saved().is_empty(),
+            "persist.save must not be called synchronously inside update"
+        );
 
+        // `Task` is opaque and never driven in a unit test in this file;
+        // every other background call is proven by running its async half
+        // directly instead, and this follows the same convention.
         let success = block_on(persist_config(app.config.clone(), persist.clone()));
 
         assert!(success);
         assert_eq!(
             persist.saved().last().unwrap().global_env[0].value,
             "http://new",
-            "the persisted config must carry the retyped value"
+            "the persisted config must carry the committed value"
+        );
+    }
+
+    #[test]
+    fn a_typed_value_marked_secret_reaches_the_keychain_having_never_been_in_config() {
+        // The workflow the whole editor is built around: type the value, then
+        // tick "secret". The plaintext has to arrive in the `SecretStore` --
+        // and the config that is saved alongside it must never have held it,
+        // at any point in the sequence.
+        let mut app = App::new(Config {
+            global_env: vec![plain_var("TOKEN", "")],
+            ..Config::default()
+        });
+        let persist = FakeConfigPersist::default();
+
+        let _ = update(
+            &mut app,
+            Message::EnvVarValueChanged(env_editor::EnvScope::Global, 0, "hunter2".into()),
+            unused_runner(),
+        );
+        let task = update(
+            &mut app,
+            Message::EnvVarSecretToggled(env_editor::EnvScope::Global, 0),
+            unused_runner(),
+        );
+        assert!(task.units() > 0, "marking secret must dispatch its own job");
+        assert!(
+            app.env_value_drafts.is_empty(),
+            "the toggle must have taken the draft -- if it is still here, the value \
+             `update` handed the keychain job did not come from what the user typed"
+        );
+
+        // The keychain half runs against the in-memory store the real job's
+        // `KeyringSecretStore` stands in for. Which plaintext
+        // `env_editor::take_secret_value` yields for this state is proven
+        // directly in `env_editor`'s own tests; what is proven here is that
+        // `update` reaches it and leaves nothing behind.
+        let key = SecretKey::GlobalEnv {
+            key: "TOKEN".to_string(),
+        };
+        let store = bombadil_core::secrets::InMemorySecretStore::new();
+        assert!(run_secret_write(
+            &key,
+            "hunter2",
+            &app.config,
+            &store,
+            &persist
+        ));
+
+        assert_eq!(
+            store.get(&key).unwrap().as_deref(),
+            Some("hunter2"),
+            "the value the user typed must be what the keychain ends up holding"
+        );
+        assert!(app.config.global_env[0].secret);
+        assert_eq!(app.config.global_env[0].value, "");
+        assert!(
+            persist
+                .saved()
+                .iter()
+                .all(|c| !format!("{c:?}").contains("hunter2")),
+            "no config that was ever handed to a persister may contain the plaintext"
         );
     }
 
@@ -5902,6 +6270,145 @@ mod tests {
     }
 
     #[test]
+    fn typing_an_index_name_neither_saves_the_config_nor_touches_the_keychain() {
+        // `IndexNameChanged` used to persist *and* dispatch a credential
+        // rename -- a `SecretStore::get` per character typed, on a machine
+        // whose keychain may prompt. The typing itself must dispatch nothing.
+        let mut app = App::new(Config {
+            indexes: vec![index_with_auth(
+                "corp",
+                bombadil_core::model::IndexAuth::Token,
+            )],
+            ..Config::default()
+        });
+        let persist = Arc::new(FakeConfigPersist::default());
+        app.persist = persist.clone();
+
+        let mut task_units = 0;
+        for prefix in ["c", "co", "cor", "corp", "corp-", "corp-e", "corp-eu"] {
+            let task = update(
+                &mut app,
+                Message::IndexNameChanged(0, prefix.to_string()),
+                unused_runner(),
+            );
+            task_units += task.units();
+        }
+
+        assert_eq!(
+            task_units, 0,
+            "typing a name must dispatch neither a persist nor a keychain job"
+        );
+        assert!(persist.saved().is_empty());
+        assert_eq!(
+            app.config.indexes[0].name, "corp-eu",
+            "the box must still be responsive -- the edit is in memory"
+        );
+        assert_eq!(
+            index_credential_key(&app, 0),
+            Some(SecretKey::Index {
+                name: "corp".into()
+            }),
+            "the credential has not moved yet, so the account it lives under must not have either"
+        );
+    }
+
+    #[test]
+    fn committing_a_renamed_index_moves_its_credential_once() {
+        // The other half: one rename per edit instead of one per character,
+        // and the entry still ends up under the new name.
+        let mut app = App::new(Config {
+            indexes: vec![index_with_auth(
+                "internal",
+                bombadil_core::model::IndexAuth::Token,
+            )],
+            ..Config::default()
+        });
+        for prefix in ["c", "co", "cor", "corp"] {
+            let _ = update(
+                &mut app,
+                Message::IndexNameChanged(0, prefix.to_string()),
+                unused_runner(),
+            );
+        }
+
+        // The exact pair of accounts the commit will move between -- one move,
+        // for the whole edit, not one per character.
+        let (from, to) = index_rename_on_commit(&app, 0).expect("a renamed row owes a move");
+        assert_eq!(
+            from,
+            SecretKey::Index {
+                name: "internal".into()
+            }
+        );
+        assert_eq!(
+            to,
+            SecretKey::Index {
+                name: "corp".into()
+            }
+        );
+
+        let task = update(&mut app, Message::IndexEditCommitted(0), unused_runner());
+
+        assert!(task.units() > 0, "the commit must dispatch the rename job");
+        assert_eq!(
+            index_rename_on_commit(&app, 0),
+            None,
+            "the commit must record where the credential now lives, or the next one moves it again"
+        );
+
+        // The background half, against the in-memory store the real job's
+        // `KeyringSecretStore` stands in for.
+        let store = bombadil_core::secrets::InMemorySecretStore::new();
+        store.set(&from, "hunter2").unwrap();
+        let persist = FakeConfigPersist::default();
+        assert!(run_index_credential_rename(
+            &from,
+            &to,
+            &app.config,
+            &store,
+            &persist
+        ));
+        assert_eq!(store.get(&to).unwrap().as_deref(), Some("hunter2"));
+        assert_eq!(store.get(&from).unwrap(), None);
+    }
+
+    #[test]
+    fn typing_an_index_url_does_not_save_but_committing_it_does() {
+        // The write amplification half, on a field that carries no secret:
+        // still one save per edit, not one per character -- and the edit is
+        // not lost, because the commit is what saves it.
+        let mut app = App::new(Config {
+            indexes: vec![index_with_auth(
+                "corp",
+                bombadil_core::model::IndexAuth::None,
+            )],
+            ..Config::default()
+        });
+        let persist = Arc::new(FakeConfigPersist::default());
+        app.persist = persist.clone();
+
+        let typing = update(
+            &mut app,
+            Message::IndexUrlChanged(0, "https://corp.example/simple".to_string()),
+            unused_runner(),
+        );
+        assert_eq!(typing.units(), 0, "typing a URL must dispatch no save");
+
+        let task = update(&mut app, Message::IndexEditCommitted(0), unused_runner());
+        assert!(task.units() > 0, "the commit must dispatch one");
+
+        assert!(block_on(persist_config(
+            app.config.clone(),
+            persist.clone()
+        )));
+        assert_eq!(
+            persist.saved().last().unwrap().indexes[0].url,
+            "https://corp.example/simple",
+            "the committed URL must reach the persisted config"
+        );
+    }
+
+    #[test]
     fn removing_an_index_deletes_the_credential_it_leaves_behind() {
         // The other half of the same defect: `remove_index` never touched
         // `SecretKey::Index`, so a removed index's credential stayed in the
@@ -5915,7 +6422,7 @@ mod tests {
             )],
             ..Config::default()
         });
-        let key = index_credential_key(&app.config, 0)
+        let key = index_credential_key(&app, 0)
             .expect("a removed index must name the credential it owes a delete of");
         assert_eq!(
             key,

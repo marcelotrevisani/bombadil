@@ -9,19 +9,34 @@
 //! typing.
 //!
 //! # How a secret's value reaches the keychain without ever entering a
-//! `Debug`-deriving `Message`
+//! `Debug`-deriving `Message` -- or `config.toml`
 //!
 //! The value textbox for a row is only ever shown -- and only ever produces
 //! `Message::EnvVarValueChanged` -- while that row is *not* marked secret
 //! (see `rows` below, which renders a fixed placeholder instead of a textbox
 //! once `var.secret` is true). So every value that message ever carries is,
-//! by construction, not a secret: it is ordinary plaintext the user is still
-//! deciding whether to protect, the same as typing `HTTP_PROXY`.
+//! by construction, not a secret *yet*: it is ordinary plaintext the user is
+//! still deciding whether to protect, the same as typing `HTTP_PROXY`.
+//!
+//! "Not a secret yet" is not the same as "safe to write to disk", which is
+//! what this editor used to do. `EnvVarValueChanged` wrote straight into
+//! `Config` and dispatched a persist, so a PyPI token typed into that box
+//! reached `config.toml` once per character, and only the later
+//! `EnvVarSecretToggled` blanked it -- by which time the store's atomic
+//! rename had already released every intermediate copy to free blocks.
+//!
+//! So the in-progress value lives in [`ValueDrafts`] -- `App`-level scratch
+//! state that no `ConfigPersist` can see -- exactly as `index_editor`'s
+//! credential does, and reaches `Config` only when the user commits the row
+//! (`Message::EnvVarValueCommitted`, from Enter or the row's save button).
+//! Ticking "secret" first is what the workflow is *for*, and on that path the
+//! plaintext goes from the draft to the keychain having never been in
+//! `Config` at all.
 //!
 //! Checking "secret" does not carry the typed text in its own message at
 //! all: `Message::EnvVarSecretToggled` names only the row (`scope`, `index`).
-//! `app::update` reads the plaintext straight out of `app.config` -- where
-//! the user's typing already landed via `EnvVarValueChanged` -- through
+//! `app::update` takes the plaintext from this row's draft, or -- for a value
+//! the user had already committed -- straight out of `app.config` through
 //! [`mark_secret`], which returns it by ordinary function return, and moves
 //! it into a `job::run` closure by ordinary Rust move semantics: the same
 //! seam every other keychain call in this crate uses (`sync_project`,
@@ -50,6 +65,7 @@
 use crate::app::Message;
 use bombadil_core::model::{Config, EnvVar};
 use bombadil_core::secrets::SecretKey;
+use std::collections::HashMap;
 use uuid::Uuid;
 
 /// The text shown in place of a secret's real value -- never rendered,
@@ -59,11 +75,22 @@ const REDACTED: &str = "(secret -- stored in the keychain)";
 /// Which list of variables a row edits: `Config::global_env`, or one
 /// project's `Project::env` addressed by its position in
 /// `App::config.projects`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum EnvScope {
     Global,
     Project(usize),
 }
+
+/// What the user has typed into each value textbox but not yet committed --
+/// keyed by the row it belongs to, and held by `App`, never by `Config`. See
+/// the module doc for why it cannot live in `EnvVar::value` while it is being
+/// typed.
+///
+/// An absent entry means "this row has nothing uncommitted", which is the
+/// state every row is in when the tab opens and the state a row returns to the
+/// moment it is committed ([`commit_value`]) or moved to the keychain
+/// (`app::update`'s `EnvVarSecretToggled` arm takes the draft out).
+pub type ValueDrafts = HashMap<(EnvScope, usize), String>;
 
 /// The `&mut Vec<EnvVar>` a scope addresses. `None` only for a `Project`
 /// scope whose index no longer exists -- the same stale-index tolerance
@@ -153,6 +180,73 @@ pub fn set_value(vars: &mut [EnvVar], index: usize, value: String) {
     }
 }
 
+/// What a row's value textbox shows: the uncommitted draft when the user has
+/// typed one, otherwise what `Config` currently holds. Never called for a
+/// secret row -- `rows` renders no textbox at all for one -- so this cannot
+/// become a path back to a secret's real text; [`display_value`] stays the
+/// only thing a secret row renders through.
+pub fn value_box_text<'a>(
+    drafts: &'a ValueDrafts,
+    scope: EnvScope,
+    index: usize,
+    var: &'a EnvVar,
+) -> &'a str {
+    drafts
+        .get(&(scope, index))
+        .map(String::as_str)
+        .unwrap_or(&var.value)
+}
+
+/// Whether this row has typing that has not reached `Config` yet -- what the
+/// row's save button is enabled by, so an uncommitted value is visible as
+/// uncommitted rather than silently waiting to be lost.
+pub fn is_uncommitted(drafts: &ValueDrafts, scope: EnvScope, index: usize, var: &EnvVar) -> bool {
+    matches!(drafts.get(&(scope, index)), Some(draft) if *draft != var.value)
+}
+
+/// Moves this row's draft into `Config` (plaintext, deliberately: the user
+/// committed a value they did not mark secret). Returns whether anything was
+/// committed, so `app::update` can skip the persist when there was nothing to
+/// save.
+///
+/// The draft is taken either way -- a draft for a secret row cannot be
+/// committed (see [`set_value`]) and must not be left sitting in `App` state
+/// afterwards either.
+pub fn commit_value(
+    vars: &mut [EnvVar],
+    drafts: &mut ValueDrafts,
+    scope: EnvScope,
+    index: usize,
+) -> bool {
+    let Some(value) = drafts.remove(&(scope, index)) else {
+        return false;
+    };
+    let committed = matches!(vars.get(index), Some(var) if !var.secret);
+    set_value(vars, index, value);
+    committed
+}
+
+/// Keeps `drafts` addressing the same rows after `removed` is deleted from
+/// `scope`: that row's own draft goes with it, and every later row in the same
+/// scope shifts down one.
+///
+/// Without this a removal silently moves every later draft onto its
+/// neighbour's row -- the value the user is part-way through typing would
+/// commit into a different variable.
+pub fn drop_draft_row(drafts: &mut ValueDrafts, scope: EnvScope, removed: usize) {
+    let mut shifted = ValueDrafts::new();
+    drafts.retain(|(s, i), value| {
+        if *s != scope || *i < removed {
+            return true;
+        }
+        if *i > removed {
+            shifted.insert((*s, *i - 1), std::mem::take(value));
+        }
+        false
+    });
+    drafts.extend(shifted);
+}
+
 /// The in-memory half of marking `index` secret (criterion 2): blanks the
 /// `Config`-facing value and flips the flag, returning the plaintext that was
 /// there so the caller can move it -- by ordinary return, never through a
@@ -167,6 +261,39 @@ pub fn mark_secret(vars: &mut [EnvVar], index: usize) -> Option<String> {
     }
     var.secret = true;
     Some(std::mem::take(&mut var.value))
+}
+
+/// Everything ticking "secret" has to decide in memory: which plaintext the
+/// keychain job must write, with `Config` left blank either way.
+///
+/// The row's uncommitted draft wins over what `Config` holds -- it is what the
+/// textbox was showing, and on the workflow this tab is built around (type the
+/// value, then tick secret) it is the *only* copy, since typing never reaches
+/// `Config`. An empty draft falls back to a value the user committed earlier;
+/// a row with neither yields an empty string, which is what marking an empty
+/// row secret has always stored.
+///
+/// `None` for an out-of-range index or a row already secret -- [`mark_secret`]'s
+/// own two nothing-to-do cases. The draft is dropped regardless: a row that
+/// just became secret must not leave the plaintext sitting in `App` state.
+///
+/// A function here rather than inlined in `app::update` for the reason
+/// `index_editor::credential_save` gives: the exact plaintext a real press
+/// sends to the keychain is then directly testable, without driving an opaque
+/// `Task`.
+pub fn take_secret_value(
+    vars: &mut [EnvVar],
+    drafts: &mut ValueDrafts,
+    scope: EnvScope,
+    index: usize,
+) -> Option<String> {
+    let drafted = drafts.remove(&(scope, index));
+    let committed = mark_secret(vars, index)?;
+    Some(
+        drafted
+            .filter(|value| !value.is_empty())
+            .unwrap_or(committed),
+    )
 }
 
 /// The in-memory half of unmarking `index` secret (criterion 3): just the
@@ -214,7 +341,7 @@ pub fn overrides(global: &[EnvVar], project_env: &[EnvVar]) -> Vec<Override> {
 
 /// Renders one scope's rows. Deliberately dumb, like every other `view` in
 /// this crate: all the logic worth testing lives in the functions above.
-fn rows<'a>(scope: EnvScope, vars: &[EnvVar]) -> iced::Element<'a, Message> {
+fn rows<'a>(scope: EnvScope, vars: &[EnvVar], drafts: &ValueDrafts) -> iced::Element<'a, Message> {
     let mut column = iced::widget::column![].spacing(4);
     for (index, var) in vars.iter().enumerate() {
         // Read-only once the row is secret: the keychain account is named
@@ -230,10 +357,21 @@ fn rows<'a>(scope: EnvScope, vars: &[EnvVar]) -> iced::Element<'a, Message> {
         let value_widget: iced::Element<'_, Message> = if var.secret {
             iced::widget::text(display_value(var)).into()
         } else {
-            iced::widget::text_input("value", &var.value)
+            // Bound to the draft, never straight to `Config` -- see the module
+            // doc. Enter commits, the same as the save button below.
+            iced::widget::text_input("value", value_box_text(drafts, scope, index, var))
                 .on_input(move |value| Message::EnvVarValueChanged(scope, index, value))
+                .on_submit(Message::EnvVarValueCommitted(scope, index))
                 .into()
         };
+
+        // Enabled only while this row has typing `Config` has not seen, the
+        // same "no press needed, no press possible" treatment `index_editor`'s
+        // auth buttons give a control whose action is already the state.
+        let save_value = iced::widget::button(iced::widget::text("save value")).on_press_maybe(
+            (!var.secret && is_uncommitted(drafts, scope, index, var))
+                .then_some(Message::EnvVarValueCommitted(scope, index)),
+        );
 
         let secret_toggle = iced::widget::checkbox(var.secret)
             .label("secret")
@@ -242,18 +380,24 @@ fn rows<'a>(scope: EnvScope, vars: &[EnvVar]) -> iced::Element<'a, Message> {
         let remove = iced::widget::button(iced::widget::text("remove"))
             .on_press(Message::EnvVarRemoved(scope, index));
 
-        column = column
-            .push(iced::widget::row![key_input, value_widget, secret_toggle, remove].spacing(6));
+        column = column.push(
+            iced::widget::row![key_input, value_widget, save_value, secret_toggle, remove]
+                .spacing(6),
+        );
     }
     column.into()
 }
 
 /// Renders the whole tab: global variables, then (if a project is selected)
 /// that project's own variables plus the overrides among them (criterion 1).
-pub fn view<'a>(config: &Config, selected_project: Option<usize>) -> iced::Element<'a, Message> {
+pub fn view<'a>(
+    config: &Config,
+    selected_project: Option<usize>,
+    drafts: &ValueDrafts,
+) -> iced::Element<'a, Message> {
     let mut column = iced::widget::column![
         iced::widget::text("Global variables").size(16),
-        rows(EnvScope::Global, &config.global_env),
+        rows(EnvScope::Global, &config.global_env, drafts),
         iced::widget::button(iced::widget::text("Add global variable"))
             .on_press(Message::EnvVarAdded(EnvScope::Global)),
     ]
@@ -263,7 +407,7 @@ pub fn view<'a>(config: &Config, selected_project: Option<usize>) -> iced::Eleme
         && let Some(project) = config.projects.get(i)
     {
         column = column.push(iced::widget::text("Project variables").size(16));
-        column = column.push(rows(EnvScope::Project(i), &project.env));
+        column = column.push(rows(EnvScope::Project(i), &project.env, drafts));
         column = column.push(
             iced::widget::button(iced::widget::text("Add project variable"))
                 .on_press(Message::EnvVarAdded(EnvScope::Project(i))),
@@ -362,6 +506,64 @@ mod tests {
         assert_eq!(taken.as_deref(), Some("hunter2"));
         assert_eq!(vars[0].value, "", "got {:?}", vars[0].value);
         assert!(vars[0].secret);
+    }
+
+    #[test]
+    fn marking_secret_takes_the_typed_draft_the_user_never_committed() {
+        // The whole point of the draft: on this tab's own workflow -- type the
+        // value, then tick "secret" -- `Config` never held the plaintext at
+        // all, so this is the only copy there is to give the keychain.
+        let mut vars = vec![var("TOKEN", "", false)];
+        let mut drafts = ValueDrafts::new();
+        drafts.insert((EnvScope::Global, 0), "hunter2".to_string());
+
+        let taken = take_secret_value(&mut vars, &mut drafts, EnvScope::Global, 0);
+
+        assert_eq!(taken.as_deref(), Some("hunter2"));
+        assert!(vars[0].secret);
+        assert_eq!(vars[0].value, "");
+        assert!(
+            drafts.is_empty(),
+            "the plaintext must not be left in App state either; got {drafts:?}"
+        );
+    }
+
+    #[test]
+    fn marking_secret_falls_back_to_a_value_the_user_had_already_committed() {
+        let mut vars = vec![var("TOKEN", "committed-earlier", false)];
+        let mut drafts = ValueDrafts::new();
+
+        let taken = take_secret_value(&mut vars, &mut drafts, EnvScope::Global, 0);
+
+        assert_eq!(taken.as_deref(), Some("committed-earlier"));
+        assert_eq!(vars[0].value, "");
+    }
+
+    #[test]
+    fn a_draft_beats_a_stale_committed_value_when_marking_secret() {
+        // Retyping over a committed value and ticking secret must protect what
+        // the box is showing, not what it used to show.
+        let mut vars = vec![var("TOKEN", "old", false)];
+        let mut drafts = ValueDrafts::new();
+        drafts.insert((EnvScope::Global, 0), "new".to_string());
+
+        assert_eq!(
+            take_secret_value(&mut vars, &mut drafts, EnvScope::Global, 0).as_deref(),
+            Some("new")
+        );
+    }
+
+    #[test]
+    fn marking_an_already_secret_row_takes_nothing_and_leaves_no_draft() {
+        let mut vars = vec![var("TOKEN", "", true)];
+        let mut drafts = ValueDrafts::new();
+        drafts.insert((EnvScope::Global, 0), "stray".to_string());
+
+        assert_eq!(
+            take_secret_value(&mut vars, &mut drafts, EnvScope::Global, 0),
+            None
+        );
+        assert!(drafts.is_empty());
     }
 
     #[test]
@@ -530,6 +732,121 @@ mod tests {
         let mut vars = vec![var("A", "old", false)];
         set_value(&mut vars, 0, "new".to_string());
         assert_eq!(vars[0].value, "new");
+    }
+
+    // --- the value draft: typed text that has not reached `Config` ---
+
+    #[test]
+    fn a_row_with_a_draft_shows_the_draft_and_one_without_shows_config() {
+        let vars = [var("A", "committed", false)];
+        let mut drafts = ValueDrafts::new();
+        assert_eq!(
+            value_box_text(&drafts, EnvScope::Global, 0, &vars[0]),
+            "committed"
+        );
+
+        drafts.insert((EnvScope::Global, 0), "typing".to_string());
+        assert_eq!(
+            value_box_text(&drafts, EnvScope::Global, 0, &vars[0]),
+            "typing",
+            "the box must show what the user typed, not what Config still holds"
+        );
+    }
+
+    #[test]
+    fn a_draft_for_one_scope_never_shows_in_the_other() {
+        // Global row 0 and project 0's row 0 are different variables that
+        // share an index -- keying drafts on the index alone would cross them.
+        let vars = [var("A", "project-value", false)];
+        let mut drafts = ValueDrafts::new();
+        drafts.insert((EnvScope::Global, 0), "global-typing".to_string());
+        assert_eq!(
+            value_box_text(&drafts, EnvScope::Project(0), 0, &vars[0]),
+            "project-value"
+        );
+    }
+
+    #[test]
+    fn committing_a_draft_moves_it_into_config_and_clears_it() {
+        let mut vars = vec![var("A", "old", false)];
+        let mut drafts = ValueDrafts::new();
+        drafts.insert((EnvScope::Global, 0), "new".to_string());
+
+        let committed = commit_value(&mut vars, &mut drafts, EnvScope::Global, 0);
+
+        assert!(committed, "a real commit must report that there is work");
+        assert_eq!(vars[0].value, "new");
+        assert!(
+            drafts.is_empty(),
+            "the draft must not linger once committed; got {drafts:?}"
+        );
+    }
+
+    #[test]
+    fn committing_a_row_with_no_draft_reports_nothing_to_do() {
+        // What keeps a stray Enter from dispatching a persist per press.
+        let mut vars = vec![var("A", "old", false)];
+        let mut drafts = ValueDrafts::new();
+        assert!(!commit_value(&mut vars, &mut drafts, EnvScope::Global, 0));
+        assert_eq!(vars[0].value, "old");
+    }
+
+    #[test]
+    fn committing_never_writes_a_draft_into_a_secret_row() {
+        let mut vars = vec![var("TOKEN", "", true)];
+        let mut drafts = ValueDrafts::new();
+        drafts.insert((EnvScope::Global, 0), "smuggled".to_string());
+
+        let committed = commit_value(&mut vars, &mut drafts, EnvScope::Global, 0);
+
+        assert!(!committed);
+        assert_eq!(vars[0].value, "", "got {:?}", vars[0].value);
+        assert!(
+            drafts.is_empty(),
+            "the draft must not be left sitting in App state either"
+        );
+    }
+
+    #[test]
+    fn a_row_is_uncommitted_only_while_its_draft_differs_from_config() {
+        let vars = [var("A", "same", false)];
+        let mut drafts = ValueDrafts::new();
+        assert!(!is_uncommitted(&drafts, EnvScope::Global, 0, &vars[0]));
+
+        drafts.insert((EnvScope::Global, 0), "same".to_string());
+        assert!(!is_uncommitted(&drafts, EnvScope::Global, 0, &vars[0]));
+
+        drafts.insert((EnvScope::Global, 0), "different".to_string());
+        assert!(is_uncommitted(&drafts, EnvScope::Global, 0, &vars[0]));
+    }
+
+    #[test]
+    fn removing_a_row_drops_its_draft_and_shifts_the_later_ones_down() {
+        // The bug this exists to catch: without the shift, row 2's in-progress
+        // text commits into row 1's variable after row 1 is removed.
+        let mut drafts = ValueDrafts::new();
+        drafts.insert((EnvScope::Global, 0), "zero".to_string());
+        drafts.insert((EnvScope::Global, 1), "one".to_string());
+        drafts.insert((EnvScope::Global, 2), "two".to_string());
+        drafts.insert((EnvScope::Project(0), 1), "other-scope".to_string());
+
+        drop_draft_row(&mut drafts, EnvScope::Global, 1);
+
+        assert_eq!(
+            drafts.get(&(EnvScope::Global, 0)).map(String::as_str),
+            Some("zero")
+        );
+        assert_eq!(
+            drafts.get(&(EnvScope::Global, 1)).map(String::as_str),
+            Some("two"),
+            "row 2's draft must follow it down to row 1; got {drafts:?}"
+        );
+        assert_eq!(drafts.get(&(EnvScope::Global, 2)), None);
+        assert_eq!(
+            drafts.get(&(EnvScope::Project(0), 1)).map(String::as_str),
+            Some("other-scope"),
+            "another scope's rows did not move"
+        );
     }
 
     #[test]

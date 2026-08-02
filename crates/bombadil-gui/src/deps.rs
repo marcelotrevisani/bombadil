@@ -59,15 +59,16 @@ pub struct DepsTab {
     pub groups: Vec<DepGroup>,
     /// The resolved graph, when `uv tree` produced one this build understands
     /// -- `transitive_dependencies` below walks it to expand a direct
-    /// dependency's row. `None` both when there is no tree data at all (no
-    /// venv yet, the command failed) and when uv emitted a schema this build
-    /// was not tested against; either way the tab still shows every row
-    /// above, direct dependencies only (criterion 4).
+    /// dependency's row. `None` both when uv emitted a schema this build was
+    /// not tested against and when the tree could not be read at all; either
+    /// way the tab still shows every row above, direct dependencies only
+    /// (criterion 4).
     pub graph: Option<DependencyGraph>,
-    /// Set only for `TreeOutcome::UnsupportedSchema`, so the tab can say why
-    /// the transitive tree is unavailable rather than rendering an
-    /// unexplained empty expand affordance (criterion 4). `None` for the
-    /// ordinary "no tree fetched yet" case, which needs no explanation.
+    /// Why the transitive tree is unavailable, when it is: an unrecognised
+    /// schema (`TreeOutcome::UnsupportedSchema`), or uv's own text for a tree
+    /// that could not be read. Either way the tab says so rather than
+    /// rendering an unexplained empty expand affordance (criterion 4).
+    /// `None` only when there is a graph, which needs no explanation.
     pub tree_note: Option<String>,
 }
 
@@ -153,18 +154,23 @@ fn resolve_group<'a>(
 }
 
 /// Builds the Dependencies tab from a parsed manifest, what is installed, and
-/// (if fetched) the resolved tree.
+/// the resolved tree.
 ///
-/// `tree` is `None` when no tree data has been fetched at all -- no venv yet,
-/// or the `uv tree` process itself failed to run -- as opposed to
-/// `Some(TreeOutcome::UnsupportedSchema { .. })`, which means uv ran and
-/// answered with a schema this build does not understand (criterion 4). Both
-/// leave `graph` empty, but only the second sets `tree_note`: an absent venv
-/// needs no explanation, an unrecognised schema does.
+/// The three things `tree` can say must stay distinguishable, and each gets
+/// its own note (criterion 4): a graph this build understands, uv answering
+/// with a schema it does not (`TreeOutcome::UnsupportedSchema`), and the tree
+/// not being readable at all -- `Err`, carrying uv's own text. The last one
+/// used to arrive as the same `None` as "nothing fetched yet", so a real JSON
+/// parse error rendered as an ordinary tab with no tree and nothing said.
+///
+/// There is no "not fetched" case here on purpose: this is only ever built
+/// from a fetch that got far enough to run `uv tree`, and one that did not
+/// never reaches a `DepsTab` at all -- `app::update` keeps the whole fetch's
+/// `Err` instead.
 pub fn build(
     pyproject: &PyProject,
     installed: &[InstalledPackage],
-    tree: Option<TreeOutcome>,
+    tree: Result<TreeOutcome, String>,
 ) -> DepsTab {
     let mut declared_anywhere: BTreeSet<String> = BTreeSet::new();
     let mut groups = Vec::new();
@@ -225,12 +231,17 @@ pub fn build(
     );
 
     let (graph, tree_note) = match tree {
-        None => (None, None),
-        Some(TreeOutcome::Parsed(graph)) => (Some(graph), None),
-        Some(TreeOutcome::UnsupportedSchema { found }) => (
+        Ok(TreeOutcome::Parsed(graph)) => (Some(graph), None),
+        Ok(TreeOutcome::UnsupportedSchema { found }) => (
             None,
             Some(format!(
                 "uv returned a dependency tree in an unrecognised format ({found}); showing direct dependencies only."
+            )),
+        ),
+        Err(cause) => (
+            None,
+            Some(format!(
+                "could not read the dependency tree ({cause}); showing direct dependencies only."
             )),
         ),
     };
@@ -279,13 +290,36 @@ pub fn find_id_by_name<'a>(graph: &'a DependencyGraph, name: &str) -> Option<&'a
         .map(|pkg| pkg.id.as_str())
 }
 
-/// Renders the tab. Deliberately dumb, like every other `view` in this crate
-/// -- all the logic worth testing lives in `build`, `transitive_dependencies`
-/// and `find_id_by_name` above. A direct dependency's transitive tree, when
-/// `tab.graph` has one, is shown beneath it unconditionally rather than
-/// behind a click -- `App` carries no per-row expand state, so "expand" here
-/// means "the tree is rendered," not an interaction to wire up later.
-pub fn view<'a>(tab: &DepsTab) -> iced::Element<'a, crate::app::Message> {
+/// What the tab shows instead of rows when the fetch itself failed: no venv
+/// to ask, no resolvable uv, a `uv pip list` that exited non-zero, output this
+/// build cannot parse.
+///
+/// The alternative is what this used to do -- degrade to an empty `installed`
+/// list, so every declared package rendered as `"(not installed)"`. That is a
+/// positive claim about the environment when the truth is that we could not
+/// ask it anything, and it is indistinguishable from a genuinely empty venv.
+/// `cause` is uv's own text wherever there is any, the same discipline
+/// `app::list_interpreters_blocking` follows.
+pub fn unavailable_message(cause: &str) -> String {
+    format!("could not read this project's environment: {cause}")
+}
+
+/// Renders the tab, or -- for a fetch that failed -- [`unavailable_message`]
+/// alone, with no rows at all: a row claiming a version, or the absence of
+/// one, would be a claim this fetch is in no position to make.
+///
+/// Deliberately dumb, like every other `view` in this crate: all the logic
+/// worth testing lives in `build`, `unavailable_message`,
+/// `transitive_dependencies` and `find_id_by_name`. A direct dependency's
+/// transitive tree, when `tab.graph` has one, is shown beneath it
+/// unconditionally rather than behind a click -- `App` carries no per-row
+/// expand state, so "expand" here means "the tree is rendered," not an
+/// interaction to wire up later.
+pub fn view<'a>(fetched: &Result<DepsTab, String>) -> iced::Element<'a, crate::app::Message> {
+    let tab = match fetched {
+        Ok(tab) => tab,
+        Err(cause) => return iced::widget::text(unavailable_message(cause)).into(),
+    };
     let mut column = iced::widget::column![].spacing(12);
 
     if let Some(note) = &tab.tree_note {
@@ -329,6 +363,13 @@ pub fn view<'a>(tab: &DepsTab) -> iced::Element<'a, crate::app::Message> {
 mod tests {
     use super::*;
     use std::collections::BTreeMap;
+
+    /// A tree result for a test that is not about the tree: `Err`, since
+    /// every fetch that reaches `build` at all has run `uv tree` and got
+    /// either an answer or a reason.
+    fn no_tree() -> Result<TreeOutcome, String> {
+        Err("this test is not about the tree".to_string())
+    }
 
     fn pkg(name: &str, version: &str) -> InstalledPackage {
         InstalledPackage {
@@ -397,7 +438,7 @@ mod tests {
     #[test]
     fn a_declared_and_installed_package_shows_both() {
         let installed = vec![pkg("fastapi", "0.115.2")];
-        let tab = build(&pyproject(), &installed, None);
+        let tab = build(&pyproject(), &installed, no_tree());
         let main = &tab.groups[0];
         let row = main.rows.iter().find(|r| r.name == "fastapi").unwrap();
         assert_eq!(row.constraint.as_deref(), Some(">=0.115"));
@@ -409,7 +450,7 @@ mod tests {
         // The exact bug criterion 1 exists to catch: dropping this row hides
         // precisely the packages a user needs to `uv sync`.
         let installed: Vec<InstalledPackage> = vec![];
-        let tab = build(&pyproject(), &installed, None);
+        let tab = build(&pyproject(), &installed, no_tree());
         let main = &tab.groups[0];
         let row = main
             .rows
@@ -426,7 +467,7 @@ mod tests {
     #[test]
     fn an_installed_but_undeclared_package_is_shown_marked_as_such() {
         let installed = vec![pkg("fastapi", "0.115.2"), pkg("anyio", "4.14.2")];
-        let tab = build(&pyproject(), &installed, None);
+        let tab = build(&pyproject(), &installed, no_tree());
         let main = &tab.groups[0];
         let row = main
             .rows
@@ -447,7 +488,7 @@ mod tests {
         // just `main` -- otherwise every extra's own packages would double
         // up as fake "leftovers".
         let installed = vec![pkg("typer", "0.12.0")];
-        let tab = build(&pyproject(), &installed, None);
+        let tab = build(&pyproject(), &installed, no_tree());
         let main = &tab.groups[0];
         assert!(
             !main.rows.iter().any(|r| r.name == "typer"),
@@ -460,7 +501,7 @@ mod tests {
 
     #[test]
     fn main_groups_and_extras_are_separate_and_a_shared_package_appears_in_both() {
-        let tab = build(&pyproject(), &[], None);
+        let tab = build(&pyproject(), &[], no_tree());
 
         let kinds: Vec<&GroupKind> = tab.groups.iter().map(|g| &g.kind).collect();
         assert!(kinds.contains(&&GroupKind::Main));
@@ -508,7 +549,7 @@ mod tests {
             ]),
             ..Default::default()
         };
-        let tab = build(&pyproject, &[], None);
+        let tab = build(&pyproject, &[], no_tree());
         // Must simply finish -- an infinite loop here would hang the test
         // (and, in the real app, the render thread once this feeds `view`).
         assert_eq!(tab.groups.len(), 3); // main + a + b
@@ -522,7 +563,7 @@ mod tests {
         let tab = build(
             &pyproject(),
             &installed,
-            Some(TreeOutcome::UnsupportedSchema {
+            Ok(TreeOutcome::UnsupportedSchema {
                 found: "v2".to_string(),
             }),
         );
@@ -542,7 +583,7 @@ mod tests {
         let tab = build(
             &pyproject(),
             &[],
-            Some(TreeOutcome::UnsupportedSchema {
+            Ok(TreeOutcome::UnsupportedSchema {
                 found: "v2".to_string(),
             }),
         );
@@ -559,14 +600,68 @@ mod tests {
         );
     }
 
+    // --- a fetch that failed outright: named, never rendered as rows ---
+
     #[test]
-    fn no_tree_fetched_yet_carries_no_note() {
-        // Distinct from UnsupportedSchema: no venv yet (or the command
-        // hasn't run) needs no explanation, unlike an uv that answered with a
-        // schema this build does not understand.
-        let tab = build(&pyproject(), &[], None);
+    fn an_unavailable_environment_is_reported_by_its_cause() {
+        let message = unavailable_message("error: No virtual environment found at /p/api/.venv");
+
+        assert!(
+            message.contains("No virtual environment found at /p/api/.venv"),
+            "the cause uv gave must survive into what the user reads; got {message:?}"
+        );
+        assert!(
+            !message.contains("not installed"),
+            "a fetch that could not ask must not claim anything about what is installed; \
+             got {message:?}"
+        );
+    }
+
+    #[test]
+    fn an_unreadable_tree_says_so_rather_than_looking_like_no_tree_at_all() {
+        // The literal repeat of the defect one line up in `fetch_deps_blocking`:
+        // `parse_tree(..).ok()` threw a real JSON parse error into the same
+        // `None` as "nothing fetched yet", so a tree uv answered with and this
+        // build could not read rendered as an ordinary tab with no tree and
+        // nothing said about it.
+        let tab = build(
+            &pyproject(),
+            &[],
+            Err("could not read uv's dependency tree: expected value at line 1".to_string()),
+        );
+
         assert!(tab.graph.is_none());
-        assert!(tab.tree_note.is_none());
+        let note = tab
+            .tree_note
+            .expect("a tree that could not be read must be explained, not silently absent");
+        assert!(
+            note.contains("expected value at line 1"),
+            "the note must carry the actual reason; got {note:?}"
+        );
+    }
+
+    #[test]
+    fn an_unreadable_tree_is_not_confused_with_an_unrecognised_schema() {
+        // Both leave `graph` empty and both say something, but they say
+        // different things: `deps::build`'s own doc requires the two to stay
+        // distinguishable.
+        let unreadable = build(&pyproject(), &[], Err("uv tree failed".to_string()));
+        let unsupported = build(
+            &pyproject(),
+            &[],
+            Ok(TreeOutcome::UnsupportedSchema {
+                found: "v2".to_string(),
+            }),
+        );
+
+        assert_ne!(unreadable.tree_note, unsupported.tree_note);
+        assert!(
+            !unreadable
+                .tree_note
+                .unwrap()
+                .contains("unrecognised format"),
+            "a tree that never parsed must not be reported as a schema this build has not seen"
+        );
     }
 
     #[test]
@@ -576,7 +671,7 @@ mod tests {
             members: vec![],
             packages: BTreeMap::new(),
         };
-        let tab = build(&pyproject(), &[], Some(TreeOutcome::Parsed(graph.clone())));
+        let tab = build(&pyproject(), &[], Ok(TreeOutcome::Parsed(graph.clone())));
         assert_eq!(tab.graph, Some(graph));
         assert!(tab.tree_note.is_none());
     }
