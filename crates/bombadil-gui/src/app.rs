@@ -7,7 +7,7 @@ use crate::interpreter;
 use crate::job;
 use crate::sidebar;
 use bombadil_core::envspec::{self, EnvInputs};
-use bombadil_core::model::{Config, Project, TerminalChoice};
+use bombadil_core::model::{Config, Project, Settings, TerminalChoice};
 use bombadil_core::process::CommandRunner;
 use bombadil_core::secrets::{KeyringSecretStore, SecretStore};
 use bombadil_core::store::Loaded;
@@ -173,6 +173,16 @@ pub enum Message {
     AddProjectInstallInterpreterRequested,
     /// A venv option other than "chosen folder" was picked directly.
     AddProjectVenvChoiceSelected(add_project::VenvChoice),
+    /// The adopt-or-create probe for the dialog's chosen venv location
+    /// finished (spec §8: the dialog states that an existing environment
+    /// will be adopted, and shows its Python version).
+    ///
+    /// Carries the path it probed, not just the answer: the user can change
+    /// the choice again while a probe is in flight, and an older result
+    /// landing last would describe a folder that is no longer chosen. Same
+    /// "drop the stale result" discipline as `VenvProbed` and
+    /// `ContextMenuTerminalsDetected`.
+    AddProjectVenvOutcomeProbed(PathBuf, add_project::VenvOutcome),
     /// "Choose folder..." was pressed: open the async folder picker.
     AddProjectPickVenvFolderRequested,
     /// The folder picker finished. `None` when the user cancelled it.
@@ -376,16 +386,24 @@ pub fn update(app: &mut App, message: Message, runner: Arc<dyn CommandRunner>) -
             return Task::perform(load_manifest_draft(path), Message::AddProjectManifestLoaded);
         }
         Message::AddProjectManifestLoaded(draft) => {
+            // The default venv choice already resolves to a real path, so
+            // the adopt-or-create question has an answer from the moment the
+            // dialog opens -- waiting for the user to touch the venv control
+            // would leave the commonest case (accept the default) unanswered.
+            let outcome_probe = probe_draft_venv(&draft, &app.config.settings);
             app.add_project = Some(draft);
             // Fired unconditionally, even for a manifest with no
             // requires-python: the dialog still needs a list to preselect
             // "newest available" from, and a fetch that only ran when a
             // requirement was present would leave that case stuck on
             // "checking..." forever.
-            return Task::perform(
-                list_interpreters(app.config.clone(), runner),
-                Message::AddProjectInterpretersLoaded,
-            );
+            return Task::batch([
+                Task::perform(
+                    list_interpreters(app.config.clone(), runner),
+                    Message::AddProjectInterpretersLoaded,
+                ),
+                outcome_probe,
+            ]);
         }
         Message::AddProjectInterpretersLoaded(result) => {
             if let Some(draft) = &mut app.add_project {
@@ -409,6 +427,21 @@ pub fn update(app: &mut App, message: Message, runner: Arc<dyn CommandRunner>) -
         Message::AddProjectVenvChoiceSelected(choice) => {
             if let Some(draft) = &mut app.add_project {
                 draft.venv_choice = choice;
+                // Clearing first: the statement on screen describes the
+                // folder the user just moved away from.
+                draft.venv_outcome = None;
+                return probe_draft_venv(draft, &app.config.settings);
+            }
+        }
+        Message::AddProjectVenvOutcomeProbed(path, outcome) => {
+            // Dropped unless it still describes the currently chosen
+            // location -- `resolved_venv_path` performs no filesystem
+            // access, so re-resolving here is free.
+            if let Some(draft) = &mut app.add_project
+                && add_project::resolved_venv_path(draft, &app.config.settings)
+                    .is_ok_and(|current| current == path)
+            {
+                draft.venv_outcome = Some(outcome);
             }
         }
         Message::AddProjectPickVenvFolderRequested => {
@@ -419,6 +452,8 @@ pub fn update(app: &mut App, message: Message, runner: Arc<dyn CommandRunner>) -
         Message::AddProjectVenvFolderPicked(Some(path)) => {
             if let Some(draft) = &mut app.add_project {
                 draft.venv_choice = add_project::VenvChoice::Chosen(path);
+                draft.venv_outcome = None;
+                return probe_draft_venv(draft, &app.config.settings);
             }
         }
         Message::AddProjectCancelled => {
@@ -579,6 +614,39 @@ pub fn update(app: &mut App, message: Message, runner: Arc<dyn CommandRunner>) -
         }
     }
     Task::none()
+}
+
+/// Dispatches the adopt-or-create probe for wherever the draft's venv choice
+/// resolves to right now (spec §8).
+///
+/// Through `job::run`, like every other filesystem read in this file, and
+/// never from `view`: the answer comes from reading a `pyvenv.cfg`, which
+/// can hang on a stale network mount, and `view` runs on the render thread.
+///
+/// `Task::none()` when the path cannot be resolved at all -- only possible
+/// for a manifest with no directory component, which the dialog already
+/// reports in place of the resolved path.
+fn probe_draft_venv(draft: &add_project::Draft, settings: &Settings) -> Task<Message> {
+    match add_project::resolved_venv_path(draft, settings) {
+        Ok(path) => Task::perform(probe_venv_outcome(path), |(path, outcome)| {
+            Message::AddProjectVenvOutcomeProbed(path, outcome)
+        }),
+        Err(_) => Task::none(),
+    }
+}
+
+/// Decides adopt-or-create for `path` off the render thread, reusing
+/// `probe_venv` (and so `VENV_PROBE_TIMEOUT`, and its degrade-to-hollow
+/// behaviour) rather than a second copy of the same job wiring. A probe that
+/// times out reports `Create`, which is the honest answer: nothing has been
+/// found there.
+///
+/// Returns the path alongside the outcome so `update` can drop a result the
+/// user's later choice has already superseded.
+async fn probe_venv_outcome(path: PathBuf) -> (PathBuf, add_project::VenvOutcome) {
+    let version = probe_venv(path.clone()).await;
+    let outcome = add_project::venv_outcome(&path, |_| version.clone());
+    (path, outcome)
 }
 
 /// Opens the async manifest picker. Never the blocking `rfd::FileDialog`: a
@@ -1844,6 +1912,117 @@ mod tests {
         assert!(
             got.is_err(),
             "unparseable output must be reported, not silently emptied; got {got:?}"
+        );
+    }
+
+    #[test]
+    fn changing_the_venv_choice_dispatches_an_adoption_probe_without_touching_disk_inline() {
+        // Spec §8's "the dialog states that it will be adopted" needs the
+        // probe to run *before* the user confirms, and it reads a
+        // `pyvenv.cfg` -- so it goes through `job::run` like every other
+        // filesystem read here, never inline in `update` and never in `view`.
+        let mut app = App::new(Config::default());
+        let mut draft = manifest_draft("");
+        draft.venv_outcome = Some(add_project::VenvOutcome::Adopt {
+            python_version: "3.9.18".to_string(),
+        });
+        app.add_project = Some(draft);
+
+        let task = update(
+            &mut app,
+            Message::AddProjectVenvChoiceSelected(add_project::VenvChoice::Chosen(PathBuf::from(
+                "/mnt/fast/envs/api",
+            ))),
+            unused_runner(),
+        );
+
+        assert!(
+            task.units() > 0,
+            "changing the venv choice must dispatch a fresh adopt-or-create probe"
+        );
+        assert_eq!(
+            app.add_project
+                .as_ref()
+                .and_then(|d| d.venv_outcome.clone()),
+            None,
+            "the previous folder's statement must be cleared, not left on screen"
+        );
+    }
+
+    #[test]
+    fn opening_the_dialog_probes_the_default_venv_location_too() {
+        // Accepting the default without touching the venv control is the
+        // commonest path; leaving it unprobed would leave exactly that user
+        // with no adoption statement.
+        let mut app = App::new(Config::default());
+
+        let task = update(
+            &mut app,
+            Message::AddProjectManifestLoaded(manifest_draft("")),
+            unused_runner(),
+        );
+
+        assert!(
+            task.units() > 1,
+            "loading a manifest must dispatch both the interpreter fetch and the venv probe; \
+             got {} unit(s)",
+            task.units()
+        );
+    }
+
+    #[test]
+    fn a_landed_adoption_probe_reaches_the_open_draft() {
+        let mut app = App::new(Config::default());
+        app.add_project = Some(manifest_draft(""));
+        // What `VenvChoice::SettingsDefault` resolves to for this manifest.
+        let probed = PathBuf::from("/p/my-api/.venv");
+
+        let _ = update(
+            &mut app,
+            Message::AddProjectVenvOutcomeProbed(
+                probed,
+                add_project::VenvOutcome::Adopt {
+                    python_version: "3.9.18".to_string(),
+                },
+            ),
+            unused_runner(),
+        );
+
+        assert_eq!(
+            app.add_project
+                .as_ref()
+                .and_then(|d| d.venv_outcome.clone()),
+            Some(add_project::VenvOutcome::Adopt {
+                python_version: "3.9.18".to_string()
+            })
+        );
+    }
+
+    #[test]
+    fn an_adoption_probe_for_a_folder_no_longer_chosen_is_dropped() {
+        // The user changed their mind while the probe was in flight: an
+        // older result landing last would describe a folder that is not the
+        // one on screen.
+        let mut app = App::new(Config::default());
+        app.add_project = Some(manifest_draft(""));
+
+        let _ = update(
+            &mut app,
+            Message::AddProjectVenvOutcomeProbed(
+                PathBuf::from("/somewhere/else/.venv"),
+                add_project::VenvOutcome::Adopt {
+                    python_version: "3.9.18".to_string(),
+                },
+            ),
+            unused_runner(),
+        );
+
+        assert_eq!(
+            app.add_project
+                .as_ref()
+                .and_then(|d| d.venv_outcome.clone()),
+            None,
+            "a probe of a path the draft no longer resolves to must be dropped"
         );
     }
 

@@ -70,6 +70,16 @@ pub struct Draft {
     /// `app.rs` once the manifest is loaded. See [`Interpreters`] for why
     /// this is not a plain `Vec`.
     pub interpreters: Interpreters,
+    /// Whether confirming would adopt an environment already sitting at the
+    /// chosen location or create a fresh one (spec §8). `None` until the
+    /// probe for the current `venv_choice` lands, and reset to `None` every
+    /// time that choice changes -- a statement about the previous folder is
+    /// worse than no statement at all.
+    ///
+    /// Filled in asynchronously by `app.rs` through `job::run`, the same
+    /// seam `interpreters` uses: deciding this means reading `pyvenv.cfg`,
+    /// which the render thread must never do.
+    pub venv_outcome: Option<VenvOutcome>,
 }
 
 /// Builds a `Draft` from the chosen manifest's path and text.
@@ -91,6 +101,7 @@ pub fn draft_from(path: &Path, text: &str) -> Draft {
         requires_python: parsed.as_ref().and_then(|p| p.requires_python.clone()),
         venv_choice: VenvChoice::SettingsDefault,
         interpreters: Interpreters::Pending,
+        venv_outcome: None,
     }
 }
 
@@ -129,11 +140,6 @@ fn needs_install_offer(draft: &Draft) -> bool {
     }
 }
 
-/// Builds the `Project` a draft describes. Used both for resolving its venv
-/// path for display (id is irrelevant to that call) and for confirming the
-/// dialog, where the id must be real and unique -- one function rather than
-/// two, since generating a `Uuid::new_v4()` for a display-only resolve costs
-/// nothing.
 /// The label for a manifest with no `[project]` table: the project
 /// directory's own name, which is what the user picked and recognises.
 ///
@@ -150,6 +156,11 @@ fn fallback_label(pyproject_path: &Path) -> String {
         .unwrap_or_default()
 }
 
+/// Builds the `Project` a draft describes. Used both for resolving its venv
+/// path for display (id is irrelevant to that call) and for confirming the
+/// dialog, where the id must be real and unique -- one function rather than
+/// two, since generating a `Uuid::new_v4()` for a display-only resolve costs
+/// nothing.
 pub fn to_project(draft: &Draft) -> Project {
     Project {
         id: Uuid::new_v4(),
@@ -212,6 +223,26 @@ pub fn venv_outcome(venv_path: &Path, probe: impl Fn(&Path) -> Option<String>) -
     }
 }
 
+/// The adopt-or-create sentence the dialog shows under the resolved path.
+/// `None` while the probe for the current choice has not landed -- saying
+/// nothing yet beats saying something about the previous folder.
+///
+/// The adoption line names the version *and* the consequence: an adopted
+/// venv keeps whatever Python it already has, so the interpreter selected
+/// above it is not used. Without that, pointing the dialog at a stale 3.9
+/// venv under `requires-python = ">=3.12"` adopts it silently, and the
+/// detail header afterwards just reads "Python 3.9" with nothing to explain
+/// why the chosen interpreter was ignored.
+fn venv_outcome_status(draft: &Draft) -> Option<String> {
+    Some(match draft.venv_outcome.as_ref()? {
+        VenvOutcome::Adopt { python_version } => format!(
+            "this folder already holds a virtual environment (python {python_version}) -- \
+             it will be adopted as it is, and the interpreter selected above will not be used"
+        ),
+        VenvOutcome::Create => "a new virtual environment will be created here".to_string(),
+    })
+}
+
 /// Renders the dialog for an already-chosen manifest. Deliberately dumb: all
 /// the logic worth testing lives in `draft_from` and `resolved_venv_path`.
 /// `resolved` is computed by the caller (`app::view`) so it is recomputed
@@ -260,11 +291,15 @@ pub fn view<'a>(draft: &Draft, resolved: &str) -> iced::Element<'a, Message> {
     ]
     .spacing(8);
 
-    column
+    column = column
         .push(venv_row)
-        .push(iced::widget::text(format!("venv: {resolved}")))
-        .push(actions)
-        .into()
+        .push(iced::widget::text(format!("venv: {resolved}")));
+
+    if let Some(outcome) = venv_outcome_status(draft) {
+        column = column.push(iced::widget::text(outcome));
+    }
+
+    column.push(actions).into()
 }
 
 #[cfg(test)]
@@ -509,6 +544,58 @@ requires-python = ">=3.11"
         // a project whose name differs from its folder is entirely normal.
         let draft = draft_from(Path::new("/p/some-folder/pyproject.toml"), MANIFEST);
         assert_eq!(to_project(&draft).label, "my-api");
+    }
+
+    #[test]
+    fn a_chosen_folder_holding_a_venv_states_the_adoption_and_its_version() {
+        // Spec §8, and the whole point of probing before the user confirms:
+        // `venv_outcome` existed and was tested, but its only caller ran on
+        // the job thread *after* confirmation, so the dialog never said a
+        // word. Pointing it at a stale 3.9 venv under
+        // `requires-python = ">=3.12"` adopted that 3.9 silently, and the
+        // header afterwards just read "Python 3.9".
+        let mut draft = draft_from(Path::new("/p/my-api/pyproject.toml"), MANIFEST);
+        draft.venv_outcome = Some(VenvOutcome::Adopt {
+            python_version: "3.9.18".to_string(),
+        });
+
+        let status = venv_outcome_status(&draft).expect("a probed draft must say what will happen");
+
+        assert!(
+            status.contains("adopted"),
+            "the adoption must be stated outright; got {status}"
+        );
+        assert!(
+            status.contains("3.9.18"),
+            "the version of what is being adopted must be named; got {status}"
+        );
+        assert!(
+            status.contains("interpreter selected above will not be used"),
+            "the consequence of adopting is that the chosen interpreter is ignored; got {status}"
+        );
+    }
+
+    #[test]
+    fn an_empty_chosen_folder_does_not_claim_an_adoption() {
+        let mut draft = draft_from(Path::new("/p/my-api/pyproject.toml"), MANIFEST);
+        draft.venv_outcome = Some(VenvOutcome::Create);
+
+        let status = venv_outcome_status(&draft).expect("a probed draft must say what will happen");
+
+        assert!(
+            !status.contains("adopt"),
+            "claiming to adopt something that is not there is the opposite mistake; got {status}"
+        );
+        assert!(status.contains("created"), "got {status}");
+    }
+
+    #[test]
+    fn nothing_is_stated_until_the_probe_for_the_current_choice_lands() {
+        // A statement about the folder the user just moved away from is
+        // worse than no statement at all.
+        let draft = draft_from(Path::new("/p/my-api/pyproject.toml"), MANIFEST);
+        assert_eq!(draft.venv_outcome, None);
+        assert_eq!(venv_outcome_status(&draft), None);
     }
 
     #[test]
