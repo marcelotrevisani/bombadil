@@ -5,8 +5,14 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
+[features]
+default = []
+test-support = []
+uv-integration = []
+
 [dependencies]
 serde.workspace = true
+serde_json.workspace = true
 toml.workspace = true
 uuid.workspace = true
 sha2.workspace = true

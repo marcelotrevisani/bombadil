@@ -14,7 +14,7 @@ This is **plan 1 of 3** derived from `docs/superpowers/specs/2026-08-01-bombadil
 
 Every task's requirements implicitly include this section.
 
-- **Rust edition 2024**, `rust-version = "1.85"`. Verified against rustc 1.97.1.
+- **Rust edition 2024**, `rust-version = "1.85"`. Verified against rustc 1.97.1. (Raised to 1.88 in plan 2's task 3, once `zip` 8.6.0's own MSRV required it — this plan's own code needed no more than 1.85.)
 - **Dependency versions are pinned to those verified against crates.io on 2026-08-01:** `serde` 1.0.229 (feature `derive`), `toml` 1.1.4, `uuid` 1.24.0 (features `v4`, `serde`), `sha2` 0.11.0, `directories` 6.0.0, `thiserror` 2.0.19, `tempfile` 3.27.0. Note `toml` is 1.x and `sha2` is 0.11 — both moved APIs from the versions you may remember. The code in this plan compiles against these exact versions.
 - **`bombadil-core` must not depend on `iced`.** Not now, not in later plans.
 - **Never write `pyproject.toml` or `uv.lock`.** uv owns both. This crate only reads `pyproject.toml`.

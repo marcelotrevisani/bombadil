@@ -71,3 +71,32 @@ pub enum VenvPathError {
     #[error("{pyproject_path} has no parent directory, so the project directory is unknown")]
     NoProjectDirectory { pyproject_path: PathBuf },
 }
+
+#[derive(Debug, thiserror::Error)]
+pub enum UvResolveError {
+    #[error("the bundled uv could not be made available: {message}")]
+    BundledUnavailable { message: String },
+
+    #[error("settings require uv from PATH, but no runnable uv was found there")]
+    PathUvUnavailable,
+
+    #[error("settings point at {path}, which could not be run")]
+    ConfiguredUnavailable { path: PathBuf },
+
+    #[error("{path} is uv {found}, older than the minimum supported {minimum}")]
+    TooOld {
+        path: PathBuf,
+        found: String,
+        minimum: String,
+    },
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum ResultsError {
+    #[error("could not parse the JSON output of `{command}`: {source}")]
+    Json {
+        command: &'static str,
+        #[source]
+        source: serde_json::Error,
+    },
+}

@@ -40,6 +40,25 @@ jobs:
         env:
           SKIP: cargo-fmt,cargo-clippy
 
+  uv-integration:
+    # Proves the argv builders and JSON parsers agree with a real uv, which
+    # the hermetic unit tests deliberately cannot. Spec §10 requires this on
+    # all three platforms, not just Linux.
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: astral-sh/setup-uv@v5
+        with:
+          version: "0.12.1"
+      - name: Integration test
+        run: cargo test -p bombadil-core --locked --features uv-integration --test uv_integration
+
   deny:
     # Security advisories, license compatibility, banned/duplicate crates and
     # crate sources. Policy lives in deny.toml; run it locally with
@@ -53,13 +72,13 @@ jobs:
 
   msrv:
     # Pins to the workspace's declared rust-version so a dependency bump that
-    # needs a newer compiler than 1.85 fails here instead of surfacing only
+    # needs a newer compiler than 1.88 fails here instead of surfacing only
     # for a user on an older toolchain. One OS is enough: this job checks the
     # compiler version constraint, not platform behaviour.
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@1.85.0
+      - uses: dtolnay/rust-toolchain@1.88.0
       - uses: Swatinem/rust-cache@v2
       - name: Check on MSRV
         run: cargo check --workspace --locked
