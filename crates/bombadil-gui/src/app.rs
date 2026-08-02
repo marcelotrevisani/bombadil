@@ -1,38 +1,94 @@
+use crate::job;
 use crate::sidebar;
 use bombadil_core::model::{Config, Project};
+use bombadil_core::venv_path;
 use iced::Task;
+use std::path::PathBuf;
+use std::time::Duration;
+
+/// How long a venv probe (a `pyvenv.cfg` read) gets before the sidebar shows
+/// that project as hollow instead of waiting on it. Reading a small local
+/// file is normally sub-millisecond; a few seconds already covers a slow
+/// disk, and nothing here is worth making the user stare at a frozen sidebar
+/// for longer than that.
+const VENV_PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// Everything the window shows. Deliberately plain data: `update` is the only
 /// place it changes, which is what makes the logic testable without a display.
 pub struct App {
-    // Not read yet: `projects` and `selected` are the only fields `view` and
-    // `update` need this task. Kept whole rather than trimmed to just the
-    // projects, because settings/index/save features in later tasks need the
-    // rest of the config and re-deriving `App` then would be needless churn.
+    // Not read yet outside `boot`: `projects`, `selected` and `entries` are
+    // what `view` and `update` need this task. Kept whole rather than
+    // trimmed to just the projects, because settings/index/save features in
+    // later tasks need the rest of the config and re-deriving `App` then
+    // would be needless churn.
     #[allow(dead_code)]
     pub config: Config,
     pub projects: Vec<Project>,
     pub selected: Option<usize>,
+    /// One row per project, in `sidebar::entries` order. Starts all-hollow;
+    /// `boot`'s probe tasks fill in real venv status as they complete.
+    pub entries: Vec<sidebar::Entry>,
 }
 
 #[derive(Debug, Clone)]
 pub enum Message {
     ProjectSelected(usize),
+    /// A background venv probe finished for `projects[usize]`. Carries the
+    /// Python version on success; `None` covers "no venv", a probe that
+    /// timed out, and a probe that failed -- all three degrade to hollow.
+    VenvProbed(usize, Option<String>),
 }
 
 impl App {
     pub fn new(config: Config) -> Self {
         let projects = config.projects.clone();
         let selected = (!projects.is_empty()).then_some(0);
+        // No probe yet at construction time -- every project starts hollow;
+        // `boot` kicks off the real probes and `update` fills results in as
+        // they land.
+        let entries = sidebar::entries(&config, &|_path| None);
         Self {
             config,
             projects,
             selected,
+            entries,
         }
     }
 
     pub fn selected_project(&self) -> Option<&Project> {
         self.selected.and_then(|i| self.projects.get(i))
+    }
+}
+
+/// The real boot function iced calls: builds the initial `App` plus one
+/// background task per project to fill in its venv status.
+///
+/// Wired through `job::run`, not called inline -- reading `pyvenv.cfg` can
+/// hang on a stale network mount, and doing that at startup on the render
+/// thread would freeze the window before it ever appears.
+pub fn boot(config: Config) -> (App, Task<Message>) {
+    let app = App::new(config);
+    let probes = app
+        .projects
+        .iter()
+        .enumerate()
+        .filter_map(|(i, project)| {
+            let path = venv_path::resolve(project, &app.config.settings).ok()?;
+            Some(Task::perform(probe_venv(path), move |version| {
+                Message::VenvProbed(i, version)
+            }))
+        })
+        .collect::<Vec<_>>();
+    (app, Task::batch(probes))
+}
+
+/// Runs the blocking `pyvenv.cfg` read off the render thread and collapses
+/// every non-success outcome to `None` -- a timed-out or panicking probe is
+/// exactly as hollow to the sidebar as a project with no venv at all.
+async fn probe_venv(path: PathBuf) -> Option<String> {
+    match job::run(move || venv_path::probe(&path), VENV_PROBE_TIMEOUT).await {
+        job::JobResult::Done(version) => version,
+        job::JobResult::TimedOut | job::JobResult::Failed => None,
     }
 }
 
@@ -44,18 +100,19 @@ pub fn update(app: &mut App, message: Message) -> Task<Message> {
             app.selected = Some(i);
         }
         Message::ProjectSelected(_) => {}
+        Message::VenvProbed(i, version) if i < app.entries.len() => {
+            app.entries[i].venv_exists = version.is_some();
+            app.entries[i].python_version = version;
+        }
+        // A stale probe result for a project that no longer exists.
+        Message::VenvProbed(_, _) => {}
     }
     Task::none()
 }
 
 pub fn view(app: &App) -> iced::Element<'_, Message> {
-    // No real interpreter probe is wired yet -- every project renders hollow
-    // until a later task supplies one (job::run is the seam for it, since a
-    // real probe touches disk/spawns a process). `entries` itself stays free
-    // of I/O regardless of what the caller passes here.
-    let entries = sidebar::entries(&app.config, &|_path| None);
     iced::widget::row![
-        iced::widget::container(sidebar::view(&entries, app.selected)).width(240),
+        iced::widget::container(sidebar::view(&app.entries, app.selected)).width(240),
         iced::widget::container(iced::widget::text(
             app.selected_project()
                 .map(|p| p.label.clone())

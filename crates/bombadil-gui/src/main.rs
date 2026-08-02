@@ -2,14 +2,13 @@ mod app;
 mod job;
 mod sidebar;
 
-use app::App;
 use bombadil_core::model::Config;
 use bombadil_core::store::{Store, paths};
 
 fn main() -> iced::Result {
     let config = load_config();
 
-    iced::application(move || App::new(config.clone()), app::update, app::view)
+    iced::application(move || app::boot(config.clone()), app::update, app::view)
         .title("Bombadil")
         .run()
 }

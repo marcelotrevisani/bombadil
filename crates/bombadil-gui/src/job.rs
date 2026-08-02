@@ -20,9 +20,6 @@ use std::sync::mpsc;
 use std::time::Duration;
 
 /// What became of a piece of background work.
-// Not called from `app` yet: this task builds the seam, wiring `update` to
-// route through it (startup probes, uv commands) is later work.
-#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum JobResult<T> {
     Done(T),
@@ -44,7 +41,6 @@ pub enum JobResult<T> {
 ///
 /// A timed-out thread is abandoned, not killed: there is no safe way to stop
 /// it, and leaking one thread beats leaving the UI wedged.
-#[allow(dead_code)]
 pub async fn run<T, F>(work: F, timeout: Duration) -> JobResult<T>
 where
     T: Send + 'static,

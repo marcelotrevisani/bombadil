@@ -63,9 +63,43 @@ pub fn resolve(project: &Project, settings: &Settings) -> Result<PathBuf, VenvPa
     })
 }
 
+/// The Python version a virtual environment reports about itself, read from
+/// `pyvenv.cfg`.
+///
+/// Every venv uv creates has one, so its presence is the cheapest reliable
+/// test that a directory really is a virtual environment rather than an
+/// empty folder someone pointed us at.
+///
+/// `pyvenv.cfg` is `key = value` lines. uv writes `version_info`; the
+/// stdlib `venv` module writes `version`. Both are accepted, `version`
+/// preferred if a file somehow carries both. A missing file, a missing key,
+/// or a malformed file all yield `None` -- this reads paths the caller
+/// chose, which may not be venvs at all, so it must never panic.
+pub fn probe(venv: &Path) -> Option<String> {
+    let text = std::fs::read_to_string(venv.join("pyvenv.cfg")).ok()?;
+
+    let mut version = None;
+    let mut version_info = None;
+    for line in text.lines() {
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        let value = value.trim();
+        if value.is_empty() {
+            continue;
+        }
+        match key.trim() {
+            "version" => version = Some(value.to_string()),
+            "version_info" => version_info = Some(value.to_string()),
+            _ => {}
+        }
+    }
+    version.or(version_info)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{central_dir_name, resolve};
+    use super::{central_dir_name, probe, resolve};
     use crate::model::{DefaultVenvLocation, Project, Settings, UvSource, VenvLocation};
     use std::path::{Path, PathBuf};
     use uuid::Uuid;
@@ -186,5 +220,98 @@ mod tests {
         let mut p = project(VenvLocation::Default);
         p.pyproject_path = PathBuf::from("pyproject.toml");
         assert!(resolve(&p, &settings(DefaultVenvLocation::Alongside)).is_err());
+    }
+
+    #[test]
+    fn a_real_uv_venv_yields_its_version() {
+        // Confirmed against a real `uv venv`: it writes `version_info`, not
+        // `version` -- `pyvenv.cfg` looked like:
+        //   home = /home/trevisani/miniforge3/bin
+        //   implementation = CPython
+        //   uv = 0.12.1
+        //   version_info = 3.13.14
+        //   include-system-site-packages = false
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("pyvenv.cfg"),
+            "home = /usr/bin\nimplementation = CPython\nuv = 0.12.1\nversion_info = 3.13.14\ninclude-system-site-packages = false\n",
+        )
+        .unwrap();
+        assert_eq!(probe(dir.path()).as_deref(), Some("3.13.14"));
+    }
+
+    #[test]
+    fn a_stdlib_venv_yields_its_version() {
+        // Confirmed against a real `python -m venv`: it writes `version`,
+        // not `version_info`.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("pyvenv.cfg"),
+            "home = /usr/bin\ninclude-system-site-packages = false\nversion = 3.13.14\nexecutable = /usr/bin/python3.13\n",
+        )
+        .unwrap();
+        assert_eq!(probe(dir.path()).as_deref(), Some("3.13.14"));
+    }
+
+    #[test]
+    fn version_is_preferred_over_version_info_when_both_are_present() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("pyvenv.cfg"),
+            "version = 3.11.0\nversion_info = 3.13.14\n",
+        )
+        .unwrap();
+        assert_eq!(probe(dir.path()).as_deref(), Some("3.11.0"));
+    }
+
+    #[test]
+    fn a_missing_pyvenv_cfg_yields_none() {
+        // The directory exists but was never a venv -- must not panic and
+        // must not be mistaken for one.
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(probe(dir.path()), None);
+    }
+
+    #[test]
+    fn a_missing_venv_directory_yields_none() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(probe(&dir.path().join("does-not-exist")), None);
+    }
+
+    #[test]
+    fn a_pyvenv_cfg_with_no_version_key_yields_none() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("pyvenv.cfg"), "home = /usr/bin\n").unwrap();
+        assert_eq!(probe(dir.path()), None);
+    }
+
+    #[test]
+    fn a_malformed_pyvenv_cfg_yields_none_rather_than_panicking() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("pyvenv.cfg"),
+            "not a key value file at all\n\0\0\0",
+        )
+        .unwrap();
+        assert_eq!(probe(dir.path()), None);
+    }
+
+    #[test]
+    fn a_real_uv_venv_created_on_disk_probes_correctly_then_none_once_the_file_is_gone() {
+        // The mutation this test earns its place against: a probe that
+        // returns Some unconditionally, or that trusts the directory's mere
+        // existence instead of reading pyvenv.cfg.
+        let dir = tempfile::tempdir().unwrap();
+        let venv = dir.path().join(".venv");
+        std::fs::create_dir_all(&venv).unwrap();
+        std::fs::write(
+            venv.join("pyvenv.cfg"),
+            "home = /usr/bin\nversion_info = 3.12.7\n",
+        )
+        .unwrap();
+        assert_eq!(probe(&venv).as_deref(), Some("3.12.7"));
+
+        std::fs::remove_file(venv.join("pyvenv.cfg")).unwrap();
+        assert_eq!(probe(&venv), None);
     }
 }
