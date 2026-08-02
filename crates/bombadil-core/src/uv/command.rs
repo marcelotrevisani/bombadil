@@ -94,6 +94,11 @@ pub fn add_editable(uv: &ResolvedUv, ctx: &ProjectContext, path: &Path) -> Comma
 }
 
 /// Drop a previously added editable dependency.
+///
+/// The package must be removed via uv *before* its `MemberRef` row is deleted
+/// from the selection: the name needed to call this at all lives only on that
+/// row for a project outside the registered tree (discovery never reports
+/// it), so deleting the row first loses the handle needed to un-wire it.
 pub fn remove_editable(uv: &ResolvedUv, ctx: &ProjectContext, package_name: &str) -> CommandSpec {
     project_spec(uv, ctx).args(["remove", package_name])
 }

@@ -19,6 +19,12 @@ pub struct MemberRef {
     pub path: PathBuf,
     pub origin: MemberOrigin,
     pub selected: bool,
+    /// `[project].name`, stored so an `Added` project outside the registered
+    /// tree can still be un-wired by name after discovery stops reporting it
+    /// (discovery never sees paths outside the tree at all). `#[serde(default)]`
+    /// keeps this an additive change with no schema bump.
+    #[serde(default)]
+    pub name: Option<String>,
 }
 
 /// Which of a project's packages are installed in editable mode.
@@ -74,11 +80,13 @@ mod tests {
                     path: PathBuf::from("packages/alpha"),
                     origin: MemberOrigin::Discovered,
                     selected: true,
+                    name: None,
                 },
                 MemberRef {
                     path: PathBuf::from("/work/shared-lib"),
                     origin: MemberOrigin::Added,
                     selected: false,
+                    name: Some("shared-lib".into()),
                 },
             ],
         };
@@ -87,6 +95,15 @@ mod tests {
         let back: MemberSelection = toml::from_str(&text).expect("deserialize");
 
         assert_eq!(back, selection);
+    }
+
+    #[test]
+    fn a_member_ref_without_a_name_deserializes_to_none() {
+        // No schema bump: a MemberRef written before `name` existed must still
+        // load, with the field defaulting rather than failing to parse.
+        let text = "path = \"packages/alpha\"\norigin = \"discovered\"\nselected = true\n";
+        let back: MemberRef = toml::from_str(text).expect("deserialize");
+        assert_eq!(back.name, None);
     }
 
     #[test]

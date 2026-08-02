@@ -84,3 +84,4 @@ selected = true
 path = "/work/shared-lib"
 origin = "added"
 selected = false
+name = "shared-lib"
