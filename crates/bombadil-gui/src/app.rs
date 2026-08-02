@@ -5220,9 +5220,22 @@ mod tests {
             joined.contains("no solution found"),
             "uv's own reason must survive; got {joined}"
         );
+        // Derived through the very function that built the path in the
+        // message, not written as a `/`-separated literal: `venv_path::resolve`
+        // assembles it with `PathBuf::join`, which separates with `\` on
+        // Windows, so a literal compared against the *displayed* path passes
+        // on Unix and fails on Windows for a message that was correct all
+        // along. Deriving it keeps the whole path asserted -- the message has
+        // to name which environment is gone, and a central-store venv is a
+        // hashed directory the user has never seen.
+        let expected = venv_path::resolve(&project, &config.settings)
+            .expect("this project's venv path must resolve")
+            .display()
+            .to_string();
         assert!(
-            joined.contains("/p/api/.venv") && joined.contains("deleted"),
-            "the user must be told the environment was deleted and not rebuilt; got {joined}"
+            joined.contains(&expected) && joined.contains("deleted"),
+            "the user must be told the environment was deleted and not rebuilt; \
+             expected {expected} to appear in {joined}"
         );
     }
 
