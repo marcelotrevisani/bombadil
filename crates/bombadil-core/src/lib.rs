@@ -6,6 +6,7 @@ pub mod process;
 pub mod pyproject;
 pub mod secrets;
 pub mod store;
+pub mod terminal;
 pub mod uv;
 pub mod validate;
 pub mod venv_path;

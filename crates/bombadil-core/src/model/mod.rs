@@ -13,6 +13,24 @@ pub use script::Script;
 pub use settings::{DefaultVenvLocation, Settings, UvSource};
 
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
+
+/// Which terminal to open, per operating system.
+///
+/// Adjacently tagged, not internally tagged: `Detected` is a newtype variant
+/// wrapping a unit enum, which serialises as a bare string, and serde's
+/// internally-tagged representation cannot carry that. `#[serde(tag = "kind")]`
+/// alone compiles and then fails at runtime.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "value", rename_all = "kebab-case")]
+pub enum TerminalChoice {
+    Detected(crate::terminal::TerminalKind),
+    /// A command template with `{cwd}` and `{shell}` placeholders, for a
+    /// terminal Bombadil does not recognise. Spec section 8.
+    Custom {
+        template: String,
+    },
+}
 
 /// Bumped only when a change cannot be expressed by adding `#[serde(default)]`
 /// fields. A config declaring a higher version opens read-only.
@@ -44,6 +62,8 @@ pub struct Config {
     pub global_scripts: Vec<Script>,
     #[serde(default)]
     pub projects: Vec<Project>,
+    #[serde(default)]
+    pub terminal_defaults: BTreeMap<crate::terminal::Os, TerminalChoice>,
 }
 
 impl Default for Config {
@@ -55,6 +75,7 @@ impl Default for Config {
             global_env: Vec::new(),
             global_scripts: Vec::new(),
             projects: Vec::new(),
+            terminal_defaults: BTreeMap::new(),
         }
     }
 }
@@ -124,6 +145,18 @@ mod tests {
                 }],
                 members: MemberSelection::default(),
             }],
+            terminal_defaults: BTreeMap::from([
+                (
+                    crate::terminal::Os::Linux,
+                    TerminalChoice::Detected(crate::terminal::TerminalKind::Kitty),
+                ),
+                (
+                    crate::terminal::Os::Windows,
+                    TerminalChoice::Custom {
+                        template: "myterm --cd {cwd} -e {shell}".into(),
+                    },
+                ),
+            ]),
         }
     }
 
