@@ -10,6 +10,7 @@ use crate::error::EnvError;
 use crate::model::{Config, EnvVar, Project};
 use crate::process::CommandRunner;
 use crate::secrets::{SecretKey, SecretStore};
+use crate::validate::index_credential_var;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
@@ -36,15 +37,17 @@ fn venv_bin_dir(venv: &std::path::Path) -> PathBuf {
     }
 }
 
+/// Resolve one variable into `into`, returning the value when it came from
+/// the keychain so the caller can track it for redaction.
 fn resolve_var(
     var: &EnvVar,
     key: SecretKey,
     store: &dyn SecretStore,
     into: &mut BTreeMap<String, String>,
-) -> Result<(), EnvError> {
+) -> Result<Option<String>, EnvError> {
     if !var.secret {
         into.insert(var.key.clone(), var.value.clone());
-        return Ok(());
+        return Ok(None);
     }
 
     // A secret with nothing stored is actively *removed* rather than set
@@ -59,10 +62,56 @@ fn resolve_var(
         message: source.to_string(),
     })?;
     match stored {
-        Some(value) => into.insert(var.key.clone(), value),
-        None => into.remove(&var.key),
-    };
-    Ok(())
+        Some(value) => {
+            into.insert(var.key.clone(), value.clone());
+            Ok(Some(value))
+        }
+        None => {
+            into.remove(&var.key);
+            Ok(None)
+        }
+    }
+}
+
+/// Replace every occurrence of a known secret value with `***`.
+///
+/// `compose` is the only place that knows which values it fetched from the
+/// keychain, so it is the only place that can redact them out of an error
+/// before it is shown to a user. A pre-activate script traced with `set -x`
+/// writes its commands to stderr with variables already expanded, so a
+/// failing script's stderr can otherwise carry a secret straight into
+/// [`EnvError::ScriptFailed`] verbatim.
+fn redact(mut text: String, secrets: &[String]) -> String {
+    for secret in secrets {
+        // An empty needle would match (and get replaced) everywhere.
+        if secret.is_empty() {
+            continue;
+        }
+        text = text.replace(secret.as_str(), "***");
+    }
+    text
+}
+
+/// Redact every collected secret out of an [`EnvError`] before it propagates,
+/// covering the two variants that can carry a script's raw stderr or spawn
+/// message.
+fn redact_env_error(err: EnvError, secrets: &[String]) -> EnvError {
+    match err {
+        EnvError::ScriptFailed {
+            script,
+            status,
+            stderr,
+        } => EnvError::ScriptFailed {
+            script,
+            status,
+            stderr: redact(stderr, secrets),
+        },
+        EnvError::ScriptSpawn { script, message } => EnvError::ScriptSpawn {
+            script,
+            message: redact(message, secrets),
+        },
+        other => other,
+    }
 }
 
 /// Compose the environment a child process runs in.
@@ -91,21 +140,28 @@ pub fn compose(
     // 1. parent
     let mut env = inputs.parent.clone();
 
+    // Values fetched from the keychain, collected as they resolve so a
+    // failing pre-activate script's error can be scrubbed of them before it
+    // is shown to a user.
+    let mut secrets: Vec<String> = Vec::new();
+
     // 2. global variables
     for var in &inputs.config.global_env {
-        resolve_var(
+        if let Some(value) = resolve_var(
             var,
             SecretKey::GlobalEnv {
                 key: var.key.clone(),
             },
             store,
             &mut env,
-        )?;
+        )? {
+            secrets.push(value);
+        }
     }
 
     // 3 and 4. project variables, secrets resolved from the keychain
     for var in &inputs.project.env {
-        resolve_var(
+        if let Some(value) = resolve_var(
             var,
             SecretKey::ProjectEnv {
                 project_id: inputs.project.id,
@@ -113,7 +169,9 @@ pub fn compose(
             },
             store,
             &mut env,
-        )?;
+        )? {
+            secrets.push(value);
+        }
     }
 
     // 5. indexes this project selected
@@ -124,6 +182,11 @@ pub fn compose(
         .filter(|i| inputs.project.index_names.contains(&i.name))
         .collect();
     inject(&selected, store, &mut env)?;
+    for index in &selected {
+        if let Some(password) = env.get(&index_credential_var(&index.name, "PASSWORD")) {
+            secrets.push(password.clone());
+        }
+    }
 
     // 6. pre-activate scripts, in order
     for script in inputs
@@ -132,7 +195,7 @@ pub fn compose(
         .iter()
         .chain(&inputs.project.scripts)
     {
-        env = apply(script, runner, &env)?;
+        env = apply(script, runner, &env).map_err(|err| redact_env_error(err, &secrets))?;
     }
 
     // 7. activation, last so a script cannot undo it. UV_PROJECT_ENVIRONMENT
@@ -462,7 +525,6 @@ mod tests {
         // environment -- one project's private-registry password leaking
         // into another project's child processes.
         use crate::model::{Index, IndexAuth, IndexKind};
-        use crate::validate::index_credential_var;
 
         let mine = Index {
             name: "mine".into(),
@@ -591,5 +653,61 @@ mod tests {
         );
         assert_eq!(got.get("HOME").map(String::as_str), Some("/home/t"));
         assert!(!got.contains_key("PYTHONHOME"), "got {got:?}");
+    }
+
+    #[test]
+    fn redact_replaces_every_occurrence_of_a_secret_in_one_string() {
+        let out = redact(
+            "leaked once: hunter2, and again: hunter2".to_string(),
+            &["hunter2".to_string()],
+        );
+        assert_eq!(out, "leaked once: ***, and again: ***");
+    }
+
+    #[test]
+    fn a_failing_pre_activate_script_never_leaks_a_secret_in_its_error() {
+        // A script traced with `set -x` writes its commands to stderr with
+        // variables already expanded, so a failing traced script can put a
+        // keychain secret straight into EnvError::ScriptFailed verbatim --
+        // exactly the kind of failure report the GUI shows the user.
+        let project = Project {
+            env: vec![EnvVar {
+                key: "TOKEN".into(),
+                value: String::new(),
+                secret: true,
+            }],
+            scripts: vec![Script {
+                path: PathBuf::from("/p/pre.sh"),
+                args: vec![],
+                enabled: true,
+            }],
+            ..project()
+        };
+        let store = InMemorySecretStore::new();
+        store
+            .set(
+                &SecretKey::ProjectEnv {
+                    project_id: Uuid::from_u128(7),
+                    key: "TOKEN".into(),
+                },
+                "s3cr3t-value",
+            )
+            .unwrap();
+        let runner = FakeCommandRunner::new();
+        runner.expect(
+            shell(),
+            &[],
+            CommandOutcome {
+                status: Some(1),
+                stdout: String::new(),
+                stderr: "+ curl -H 'Authorization: Bearer s3cr3t-value'".into(),
+            },
+        );
+
+        let err = compose(&inputs(Config::default(), project), &store, &runner).unwrap_err();
+
+        let rendered = err.to_string();
+        assert!(rendered.contains("***"), "got {rendered}");
+        assert!(!rendered.contains("s3cr3t-value"), "got {rendered}");
     }
 }
