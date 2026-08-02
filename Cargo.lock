@@ -401,6 +401,7 @@ dependencies = [
  "bombadil-uv-bin",
  "iced",
  "rfd",
+ "tempfile",
  "uuid",
 ]
 

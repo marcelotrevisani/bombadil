@@ -17,6 +17,11 @@ rfd = "0.17"
 uuid.workspace = true
 
 [dev-dependencies]
+# Already a workspace dependency (bombadil-core depends on it); the terminal
+# tests need a scratch directory to hand `run_open_terminal`, which used to
+# write its shell re-assertion init file into the real temp dir. Not a new
+# entry in Cargo.lock.
+tempfile.workspace = true
 # Enables `bombadil_core::process::FakeCommandRunner` for this crate's own
 # tests. Cargo unifies features across [dependencies] and [dev-dependencies]
 # for the same path dependency during test builds only, so `test-support`

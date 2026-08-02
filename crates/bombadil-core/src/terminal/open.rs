@@ -191,7 +191,10 @@ pub fn open(
     // and konsole self-daemonize; kitty, alacritty, foot, xterm, wezterm's
     // first window and every Windows console kind would hold the GUI hostage
     // for the terminal's whole lifetime. Nothing here reads the outcome
-    // anyway.
+    // anyway. Proved by `the_terminal_is_spawned_and_never_waited_on` -- until
+    // `FakeCommandRunner` learned to count blocking calls this comment was the
+    // only thing holding the rule, since the default `spawn` delegates to
+    // `run` and every other assertion below passes either way.
     runner
         .spawn(&spec)
         .map_err(|source| EnvError::TerminalSpawn {
@@ -545,6 +548,43 @@ mod tests {
             .join(ins.project.id.to_string())
             .join("bombadil-env.sh");
         assert_eq!(PathBuf::from(env_var), expected);
+    }
+
+    #[test]
+    fn the_terminal_is_spawned_and_never_waited_on() {
+        // The rule this file's own comment states -- `spawn`, never `run` --
+        // and which was unprovable until `FakeCommandRunner` learned to count
+        // blocking calls: the default `spawn` delegates to `run`, so every
+        // assertion here passed either way.
+        //
+        // `run` calls `output()`, which waits for the child. Only
+        // gnome-terminal and konsole self-daemonize; kitty, alacritty, foot,
+        // xterm, wezterm's first window and every Windows console kind live
+        // until the user closes the window, so `run` would hold the job
+        // thread -- and with it the single in-flight slot -- for that whole
+        // time.
+        let store = InMemorySecretStore::new();
+        let runner = FakeCommandRunner::new();
+        runner.expect("gnome-terminal", &[], success_outcome());
+        let tmp = tempfile::tempdir().unwrap();
+
+        open(
+            &TerminalChoice::Detected(TerminalKind::GnomeTerminal),
+            Os::Linux,
+            &inputs(project()),
+            "/bin/bash",
+            &store,
+            &runner,
+            tmp.path(),
+        )
+        .expect("opening must succeed");
+
+        assert_eq!(runner.calls().len(), 1, "the terminal must be launched");
+        assert_eq!(
+            runner.blocking_calls(),
+            0,
+            "the terminal must be spawned, not waited on"
+        );
     }
 
     #[test]

@@ -1,20 +1,29 @@
 use crate::add_project;
 use crate::banner;
 use crate::context_menu;
+use crate::deps;
 use crate::detail;
 use crate::drawer;
+use crate::env_editor;
+use crate::index_editor;
 use crate::interpreter;
 use crate::job;
+use crate::members_editor;
+use crate::scripts_editor;
+use crate::settings_editor;
 use crate::sidebar;
 use bombadil_core::envspec::{self, EnvInputs};
-use bombadil_core::model::{Config, Project, Settings, TerminalChoice};
+use bombadil_core::model::{
+    Config, DefaultVenvLocation, Project, Settings, TerminalChoice, UvSource,
+};
 use bombadil_core::process::CommandRunner;
-use bombadil_core::secrets::{KeyringSecretStore, SecretStore};
+use bombadil_core::pyproject::PyProject;
+use bombadil_core::secrets::{KeyringSecretStore, SecretKey, SecretStore};
 use bombadil_core::store::Loaded;
 use bombadil_core::terminal::open::secret_values;
 use bombadil_core::terminal::{self, Os, TerminalKind};
 use bombadil_core::uv;
-use bombadil_core::uv::results::Interpreter;
+use bombadil_core::uv::results::{InstalledPackage, Interpreter, TreeOutcome};
 use bombadil_core::venv_path;
 use iced::Task;
 use std::path::{Path, PathBuf};
@@ -33,6 +42,13 @@ const VENV_PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 /// download and build packages, unlike the sub-millisecond `pyvenv.cfg`
 /// read `VENV_PROBE_TIMEOUT` bounds, so this is generous rather than tight.
 const SYNC_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// How deep `uv tree` resolves before this build stops asking. Generous
+/// rather than the smallest number that satisfies today's fixtures: the
+/// Dependencies tab expands a direct dependency's whole transitive tree
+/// (spec §8), and a shallow depth would silently truncate it for a project
+/// with a deep dependency chain.
+const DEPS_TREE_DEPTH: u32 = 20;
 
 /// Saves the whole config to disk. A trait rather than a bare
 /// `bombadil_core::store::Store` so a test can hand in a fake that records
@@ -66,15 +82,21 @@ impl ConfigPersist for NullPersist {
 /// Everything the window shows. Deliberately plain data: `update` is the only
 /// place it changes, which is what makes the logic testable without a display.
 pub struct App {
-    // `projects`, `selected` and `entries` are what most of `view` and
-    // `update` need; `config` as a whole is also read directly by `view`,
-    // which recomputes `banner::problems(&app.config)` on every render
-    // rather than caching it on this struct -- see `banner`'s module doc.
-    // Kept whole rather than trimmed to just the projects, because
-    // settings/index/save features in later tasks need the rest of the
-    // config and re-deriving `App` then would be needless churn.
+    /// The whole config, and the *only* copy of the project list.
+    ///
+    /// There was once an `App::projects` beside this, a clone taken in
+    /// `App::new` and described as a convenience view. It was not one: every
+    /// editor writes `config.projects`, while Sync, Open terminal and
+    /// Recreate venv read the clone -- so a variable, script, index selection
+    /// or member choice edited in a session reached nothing Bombadil ran
+    /// until the app was restarted. Deleting the field is what makes that
+    /// whole class unrepresentable; `entries` below stays because it is
+    /// genuinely derived state (probe results) that no config field carries.
+    ///
+    /// `view` reads `config` as a whole too, recomputing
+    /// `banner::problems(&app.config)` on every render rather than caching it
+    /// here -- see `banner`'s module doc.
     pub config: Config,
-    pub projects: Vec<Project>,
     pub selected: Option<usize>,
     /// One row per project, in `sidebar::entries` order. Starts all-hollow;
     /// `boot`'s probe tasks fill in real venv status as they complete.
@@ -115,21 +137,126 @@ pub struct App {
     /// nothing else for the menu to show in either state, the same shape
     /// `add_project` uses for its own dialog.
     pub context_menu: Option<context_menu::ContextMenu>,
+    /// The pending Recreate venv confirmation (spec §8), if any. Deleting an
+    /// environment cannot be undone, so the press that starts the action only
+    /// fills this in -- `RecreateVenvConfirmed` is the only message that
+    /// reaches `venv_path::delete`.
+    pub confirm_recreate: Option<context_menu::ConfirmRecreate>,
     /// Whether the footer is showing the bundled uv licence in full.
     /// Apache-2.0 section 4 obliges the text to be reachable, and
     /// `bombadil_uv_bin::UV_LICENSE` is compiled in -- this is what reaches
     /// it. Collapsed by default: it is thousands of words of boilerplate,
     /// and the obligation is that the user *can* read it.
     pub about_expanded: bool,
+    /// The Dependencies tab (spec §8) for whichever project it was last
+    /// fetched for, paired with that project's index so a result that
+    /// arrives after the selection has moved on is never shown against the
+    /// wrong project -- the same staleness guard `entries`/`VenvProbed` uses.
+    /// `None` before the first fetch lands.
+    pub deps: Option<(usize, deps::DepsTab)>,
+    /// What the user has typed so far into each `config.indexes` row's
+    /// credential textbox (spec §7, Task 4) -- always the same length as
+    /// `config.indexes`, kept in step by `IndexAdded`/`IndexRemoved`.
+    ///
+    /// Deliberately *not* a `Config` field: `IndexAuth` has no plaintext
+    /// variant for a password to sit in even transiently (unlike
+    /// `EnvVar::value`), so there is nowhere in `Config` this could go
+    /// without writing credential material to disk. See `index_editor`'s
+    /// module doc for the fuller argument. Cleared the instant its text is
+    /// handed to the keychain job (`IndexCredentialSaveRequested`) -- so
+    /// this never holds a credential any longer than the user is actively
+    /// typing it.
+    pub index_credential_drafts: Vec<String>,
+    /// The Members tab (spec §5a, Task 5) raw fetch for whichever project it
+    /// was last fetched for, paired with that project's index -- same
+    /// staleness guard `deps` uses. Deliberately the *raw* fetch, not a
+    /// built `members_editor::MembersTab`: the built rows depend on
+    /// `app.config.projects[i].members`, which a toggle changes without a
+    /// new fetch, so `view` rebuilds the tab fresh from this every render
+    /// rather than caching one that a toggle would then have to remember to
+    /// invalidate.
+    pub members: Option<(usize, MembersFetch)>,
+    /// The pending "sync would remove members" confirmation (spec §5a
+    /// criterion 4), if any. `None` before the first press and after it
+    /// resolves -- same shape as `confirm_recreate`.
+    pub confirm_member_sync: Option<members_editor::ConfirmMemberSync>,
+    /// The Settings tab's (spec §5, Task 6) custom-uv-path textbox: what the
+    /// user has typed so far, kept separate from `Config` until it validates
+    /// (criterion 2) -- the same "typed text isn't committed yet" shape
+    /// `index_credential_drafts` uses. Seeded from the current
+    /// `UvSource::Custom` path, if any, so the box is not blank on reopening
+    /// a config that already names one.
+    pub uv_custom_path_draft: String,
+    /// The most recent validation of `uv_custom_path_draft` (criterion 2):
+    /// `None` before the first Validate press. `Ok` names the version that
+    /// was accepted and already written to `Settings`; `Err` is
+    /// `uv::resolve`'s own text for why it was refused -- including a
+    /// version below `MIN_UV_VERSION`, reported through
+    /// `UvResolveError::TooOld` -- and in that case `Settings::uv_source` was
+    /// never touched.
+    pub uv_custom_validation: Option<Result<String, String>>,
+    /// Which pane the detail area is showing (spec §8). See [`Tab`].
+    pub tab: Tab,
+}
+
+/// Which pane the detail area is showing (spec §8).
+///
+/// `view` renders exactly one of them. It used to concatenate all seven into
+/// a single column and then stack the add-project dialog, the context menu
+/// and both confirmations *below* that -- and `scrollable` appeared only in
+/// `about` and `drawer`, so nothing scrolled. With a real dependency tree
+/// rendered flat, "Delete and recreate" sat thousands of pixels below the
+/// viewport with no way to reach it. Every task built its own pane correctly;
+/// no task owned the container holding them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Tab {
+    #[default]
+    Dependencies,
+    Members,
+    EnvVars,
+    Scripts,
+    Indexes,
+    Settings,
+}
+
+impl Tab {
+    /// Every tab, in the order the selector renders them.
+    pub const ALL: [Tab; 6] = [
+        Tab::Dependencies,
+        Tab::Members,
+        Tab::EnvVars,
+        Tab::Scripts,
+        Tab::Indexes,
+        Tab::Settings,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Tab::Dependencies => "Dependencies",
+            Tab::Members => "Members",
+            Tab::EnvVars => "Env vars",
+            Tab::Scripts => "Scripts",
+            Tab::Indexes => "Indexes",
+            Tab::Settings => "Settings",
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
 pub enum Message {
     ProjectSelected(usize),
+    /// A tab in the detail area's selector was pressed (spec §8).
+    TabSelected(Tab),
     /// A background venv probe finished for `projects[usize]`. Carries the
     /// Python version on success; `None` covers "no venv", a probe that
     /// timed out, and a probe that failed -- all three degrade to hollow.
     VenvProbed(usize, Option<String>),
+    /// The background fetch for the Dependencies tab finished for
+    /// `projects[usize]` -- criterion 5: dispatched through `job::run`,
+    /// never run inline, because `uv tree` on a large project is slow.
+    /// Carries the index for the same staleness reason `VenvProbed` does:
+    /// the user can select a different project before this lands.
+    DepsLoaded(usize, DepsFetch),
     /// The Sync action was pressed for `projects[usize]`. Never gated on
     /// whether a venv already exists -- creating one is how the user
     /// recovers from not having one.
@@ -193,7 +320,7 @@ pub enum Message {
     /// config, persist it, and adopt or create its venv.
     AddProjectConfirmed,
     /// The background half of `AddProjectConfirmed` finished. `index` is
-    /// where the project landed in `projects`/`entries`, so the venv status
+    /// where the project landed in `config.projects`/`entries`, so the venv status
     /// can be refreshed the same way `boot`'s probes fill it in.
     AddProjectConfirmFinished {
         success: bool,
@@ -222,33 +349,227 @@ pub enum Message {
     /// secret the composed environment resolved.
     OpenTerminalFinished(Result<(), String>),
     /// "Remove from list" was picked for `projects[usize]`. Criterion 4:
-    /// removes the project from `config`/`projects`/`entries` in memory,
+    /// removes the project from `config.projects`/`entries` in memory,
     /// synchronously, and dispatches a background persist -- the same
     /// in-memory-first shape `AddProjectConfirmed` uses. Never touches the
-    /// venv on disk: nothing in this path calls a `CommandRunner`, and
-    /// `bombadil-core` has no function that could delete one anyway.
+    /// venv on disk -- "Remove from list" unregisters a project, it does not
+    /// destroy anything. That is now a rule this arm has to keep rather than
+    /// one the crate enforces: `venv_path::delete` exists, and it needs no
+    /// `CommandRunner`, so nothing outside this arm's own body prevents a
+    /// future edit from wiring it in. `RecreateVenvConfirmed` is the only
+    /// message that may reach it.
     RemoveProjectRequested(usize),
     /// The background persist for a removal finished.
     RemoveProjectFinished {
         success: bool,
     },
+    /// "Recreate venv" was picked for `projects[usize]` (spec §8). Opens the
+    /// confirmation and dispatches *nothing*: recreating is delete-then-sync,
+    /// the delete cannot be undone, and if the sync then fails the user has
+    /// no environment at all. `context_menu::recreate_confirmation` is the
+    /// sentence they get to read first.
+    RecreateVenvRequested(usize),
+    /// The confirmation was accepted: delete the environment and rebuild it.
+    /// The only message that reaches `venv_path::delete`.
+    RecreateVenvConfirmed,
+    /// The confirmation was dismissed. Nothing has been deleted.
+    RecreateVenvCancelled,
+    /// "Open folder" was picked for `projects[usize]` (spec §8): show the
+    /// project's directory in the platform's file manager. Non-destructive,
+    /// and dispatched as background work like every other process spawn here.
+    OpenFolderRequested(usize),
+    /// The background open finished. `Err` carries the spawn failure --
+    /// nothing composed reaches this path, so there is nothing to redact.
+    OpenFolderFinished(Result<(), String>),
     /// The footer's licence control was pressed: show or hide the bundled uv
     /// licence text. Apache-2.0 section 4 obliges the text to be reachable,
     /// and this is what reaches it.
     AboutLicenseToggled,
+    /// The Env vars tab's "Add variable" button was pressed for `scope`
+    /// (spec §5, Task 2).
+    EnvVarAdded(env_editor::EnvScope),
+    /// A row's "remove" button was pressed.
+    EnvVarRemoved(env_editor::EnvScope, usize),
+    /// A row's key textbox changed. Never secret material -- a variable's
+    /// name is never hidden from the keychain, only its value.
+    EnvVarKeyChanged(env_editor::EnvScope, usize, String),
+    /// A row's value textbox changed. Carries the typed text in plaintext,
+    /// which is sound only because `env_editor::rows` renders no value
+    /// textbox at all for a row that is already marked secret -- see
+    /// `env_editor`'s module doc for the whole argument. This can never be
+    /// produced for a secret row.
+    EnvVarValueChanged(env_editor::EnvScope, usize, String),
+    /// A row's "secret" checkbox was toggled. Carries no value at all --
+    /// marking secret moves the plaintext already sitting in `app.config`
+    /// (where `EnvVarValueChanged` put it) into a `job::run` closure by
+    /// ordinary move semantics inside `update`, never through this message.
+    /// See `env_editor`'s module doc.
+    EnvVarSecretToggled(env_editor::EnvScope, usize),
+    /// The background half of an env var edit finished: a plain edit's
+    /// persist, or a secret toggle's keychain write/delete plus persist.
+    EnvVarPersistFinished {
+        success: bool,
+    },
+    /// The Scripts tab's "Add script" button was pressed for `scope` (spec
+    /// §6, Task 3): open the async file picker for the script to run.
+    /// Dispatches `pick_script` through `Task::perform` rather than adding a
+    /// row synchronously -- there is no path to add until the picker
+    /// resolves, and `rfd::AsyncFileDialog` never blocks `update`.
+    ScriptAddRequested(scripts_editor::ScriptScope),
+    /// The script picker finished. `None` when the user cancelled it.
+    ScriptFilePicked(scripts_editor::ScriptScope, Option<PathBuf>),
+    /// A row's "remove" button was pressed.
+    ScriptRemoved(scripts_editor::ScriptScope, usize),
+    /// A row's "enabled" checkbox was toggled (criterion 2): flips the flag
+    /// in place, never removes the row.
+    ScriptEnabledToggled(scripts_editor::ScriptScope, usize),
+    /// A row's "up" button was pressed: move it one position earlier within
+    /// its own scope (criterion 1). Never crosses the global/project
+    /// boundary -- see `scripts_editor`'s module doc for why that would be
+    /// meaningless against `envspec::compose`'s own ordering.
+    ScriptMovedUp(scripts_editor::ScriptScope, usize),
+    /// A row's "down" button was pressed: the mirror of `ScriptMovedUp`.
+    ScriptMovedDown(scripts_editor::ScriptScope, usize),
+    /// The background half of a script edit finished: persisting the config.
+    ScriptPersistFinished {
+        success: bool,
+    },
+    /// The Indexes tab's "Add index" button was pressed (spec §7, Task 4).
+    IndexAdded,
+    /// A row's "remove" button was pressed.
+    IndexRemoved(usize),
+    /// A row's name textbox changed. Plaintext, and validated for
+    /// credential-variable collisions (criterion 2) by `index_editor::view`
+    /// re-deriving `collision_message` on every render -- never secret
+    /// material, the same as an env var's key.
+    IndexNameChanged(usize, String),
+    IndexUrlChanged(usize, String),
+    /// The kind button was pressed: flips `Default`/`Extra` for this row.
+    IndexKindChanged(usize, bombadil_core::model::IndexKind),
+    /// The "default for new projects" checkbox was toggled.
+    IndexDefaultToggled(usize),
+    /// One of the three auth-kind buttons was pressed.
+    IndexAuthChoiceChanged(usize, index_editor::AuthChoice),
+    /// The username textbox changed. Plaintext -- `IndexAuth::Basic`'s
+    /// username is not secret, only the password/token paired with it is.
+    IndexUsernameChanged(usize, String),
+    /// The credential textbox changed. Carries the typed text wrapped in
+    /// `index_editor::CredentialInput`, whose hand-written `Debug` never
+    /// prints it -- see `index_editor`'s module doc for why, unlike an env
+    /// var's value, this can never be an ordinary `String` field here.
+    IndexCredentialChanged(usize, index_editor::CredentialInput),
+    /// The "save credential" button was pressed for `config.indexes[usize]`.
+    /// Only ever dispatched when `index_editor::collision_message` is `None`
+    /// for this row's current name (criterion 2) -- `view` disables the
+    /// button otherwise, so this arm never has to re-check before writing.
+    IndexCredentialSaveRequested(usize),
+    /// The background half of an index edit finished: a plain field edit's
+    /// persist, a credential save's keychain write plus persist, or a
+    /// project's selection toggle's persist.
+    IndexPersistFinished {
+        success: bool,
+    },
+    /// A project index checkbox was toggled: `usize` is the project's index
+    /// in `app.config.projects`/`app.config.projects`, `String` the index name
+    /// (criterion 3). Adds or removes the association only -- never reaches
+    /// `Config::indexes`, so the index itself is untouched either way.
+    ProjectIndexToggled(usize, String),
+    /// The background fetch for the Members tab (spec §5a, Task 5) finished
+    /// for `projects[usize]`: discovery plus `uv pip list`, dispatched
+    /// through `job::run` for the same reason `DepsLoaded` is -- discovery
+    /// walks the filesystem and `uv pip list` spawns a process, neither of
+    /// which may run on the render thread. Carries the index for the same
+    /// staleness reason `DepsLoaded` does.
+    MembersLoaded(usize, MembersFetch),
+    /// A member's checkbox was pressed: `usize` is the project's index,
+    /// `PathBuf` the member's path as carried on its `MemberRow`. Flips the
+    /// selection through `members_editor::toggle` (criterion 3: that
+    /// function is the only place the flip is decided) and persists.
+    MemberToggled(usize, PathBuf),
+    /// The background half of a member selection edit: persisting the config.
+    MembersPersistFinished {
+        success: bool,
+    },
+    /// The Members tab's "Sync members" button was pressed for
+    /// `projects[usize]`. If nothing selected is currently installed and
+    /// about to be dropped, syncs immediately; otherwise opens
+    /// `confirm_member_sync` and dispatches nothing yet (criterion 4: the UI
+    /// states what will be removed before the user confirms).
+    MembersSyncRequested(usize),
+    /// The pending member-removal confirmation was accepted: run the
+    /// member-aware sync it described.
+    MembersSyncConfirmed,
+    /// The pending member-removal confirmation was dismissed. Nothing was synced.
+    MembersSyncCancelled,
+    /// One of the Settings tab's (spec §5, Task 6) three no-validation uv
+    /// source buttons was pressed: applies immediately and persists
+    /// (criterion 1) -- unlike `Custom`, none of these three names a path the
+    /// user just typed, so there is nothing to validate first.
+    SettingsUvSourceChoiceChanged(settings_editor::UvSourceChoice),
+    /// The custom-uv-path textbox changed. Plaintext, never secret material,
+    /// and never persisted on its own -- see `App::uv_custom_path_draft`.
+    SettingsUvCustomPathChanged(String),
+    /// "Validate and use" was pressed for the typed custom path (criterion
+    /// 2): dispatches `job::run`, never resolved inline -- probing a uv
+    /// binary spawns it, the same reason every other uv call in this file
+    /// goes through `job::run`.
+    SettingsUvCustomValidateRequested,
+    /// The background validation finished. Only `Ok` writes
+    /// `Settings::uv_source` and persists; `Err` -- including a version below
+    /// `MIN_UV_VERSION` -- only updates what the tab shows, so a bad path
+    /// never reaches `config.toml`.
+    SettingsUvCustomValidated(Result<uv::ResolvedUv, String>),
+    /// The background half of a Settings persist (a `uv_source` choice, or a
+    /// validated custom binary) finished.
+    SettingsPersistFinished {
+        success: bool,
+    },
+    /// "Alongside each project" was pressed for `default_venv_location`
+    /// (criterion 3): applies immediately and persists. Never touches any
+    /// project's existing venv -- see `settings_editor`'s module doc.
+    SettingsDefaultVenvLocationAlongsideSelected,
+    /// "Choose a central folder..." was pressed: open the async folder
+    /// picker, the same one `AddProjectPickVenvFolderRequested` uses.
+    SettingsDefaultVenvLocationPickFolderRequested,
+    /// The folder picker finished. `None` when the user cancelled it --
+    /// leaves the previous `default_venv_location` untouched.
+    SettingsDefaultVenvLocationFolderPicked(Option<PathBuf>),
+}
+
+/// What background loading produced for the Members tab (spec §5a): the
+/// project's workspace classification, every `pyproject.toml` discovery
+/// found below it, and what `uv pip list` reports installed.
+/// `members_editor::build` -- pure, tested on its own -- turns this into the
+/// tab; nothing here does that joining itself, the same split `DepsFetch`
+/// and `deps::build` use.
+#[derive(Debug, Clone)]
+pub struct MembersFetch {
+    kind: bombadil_core::members::WorkspaceKind,
+    discovered: Vec<bombadil_core::members::DiscoveredMember>,
+    installed: Vec<InstalledPackage>,
 }
 
 impl App {
     pub fn new(config: Config) -> Self {
-        let projects = config.projects.clone();
-        let selected = (!projects.is_empty()).then_some(0);
+        let selected = (!config.projects.is_empty()).then_some(0);
         // No probe yet at construction time -- every project starts hollow;
         // `boot` kicks off the real probes and `update` fills results in as
         // they land.
         let entries = sidebar::entries(&config);
+        // One blank draft per already-configured index, matching what
+        // `IndexAdded`/`IndexRemoved` keep in step with `config.indexes`
+        // from here on.
+        let index_credential_drafts = vec![String::new(); config.indexes.len()];
+        // Seeded from whatever `UvSource::Custom` path is already configured,
+        // if any, so the Settings tab's textbox is not blank on reopening a
+        // config that already names one -- an empty draft for every other
+        // source, since there is nothing to pre-fill.
+        let uv_custom_path_draft = match &config.settings.uv_source {
+            UvSource::Custom { path } => path.display().to_string(),
+            _ => String::new(),
+        };
         Self {
             config,
-            projects,
             selected,
             entries,
             drawer: drawer::Drawer::default(),
@@ -257,7 +578,15 @@ impl App {
             add_project: None,
             persist: Arc::new(NullPersist),
             context_menu: None,
+            confirm_recreate: None,
             about_expanded: false,
+            deps: None,
+            index_credential_drafts,
+            members: None,
+            confirm_member_sync: None,
+            uv_custom_path_draft,
+            uv_custom_validation: None,
+            tab: Tab::default(),
         }
     }
 }
@@ -275,18 +604,43 @@ impl App {
 pub fn boot(loaded: Loaded) -> (App, Task<Message>) {
     let mut app = App::new(loaded.config().clone());
     app.load_problems = banner::load_problems(&loaded);
-    let probes = app
-        .projects
-        .iter()
-        .enumerate()
-        .filter_map(|(i, project)| {
-            let path = venv_path::resolve(project, &app.config.settings).ok()?;
-            Some(Task::perform(probe_venv(path), move |version| {
-                Message::VenvProbed(i, version)
-            }))
-        })
-        .collect::<Vec<_>>();
+    let mut probes = vec![probe_every_venv(&app)];
+    // The initially selected project's Dependencies tab, so it is populated
+    // the moment the window appears rather than only after the user re-clicks
+    // the already-selected project. `boot` has no `CommandRunner` (`update`
+    // is the only place that gets one -- see its own doc), so this cannot
+    // call `fetch_deps_task` directly; re-dispatching the same message
+    // `ProjectSelected` handles reaches `update`, and so a real runner, on
+    // the very next step instead.
+    if let Some(i) = app.selected {
+        probes.push(Task::done(Message::ProjectSelected(i)));
+    }
     (app, Task::batch(probes))
+}
+
+/// One background venv probe per project, against wherever each one resolves
+/// *now*.
+///
+/// Shared by `boot` and by the two `SettingsDefaultVenvLocation*` arms.
+/// `entries[i].venv_exists` and `python_version` describe the location that
+/// was resolved when the probe ran, so a change to `default_venv_location`
+/// moves the ground under every `VenvLocation::Default` project: without
+/// this the sidebar goes on showing green ticks and Python versions for
+/// environments at the old path until the app is restarted.
+fn probe_every_venv(app: &App) -> Task<Message> {
+    Task::batch(
+        app.config
+            .projects
+            .iter()
+            .enumerate()
+            .filter_map(|(i, project)| {
+                let path = venv_path::resolve(project, &app.config.settings).ok()?;
+                Some(Task::perform(probe_venv(path), move |version| {
+                    Message::VenvProbed(i, version)
+                }))
+            })
+            .collect::<Vec<_>>(),
+    )
 }
 
 /// Runs the blocking `pyvenv.cfg` read off the render thread and collapses
@@ -299,6 +653,212 @@ async fn probe_venv(path: PathBuf) -> Option<String> {
     }
 }
 
+/// What background loading produced for the Dependencies tab (spec §8):
+/// the parsed manifest, what `uv pip list` reports installed, and (when it
+/// could be read) the resolved tree. `deps::build` -- pure, tested on its
+/// own -- turns this into the tab; nothing here does that joining itself.
+#[derive(Debug, Clone)]
+pub struct DepsFetch {
+    pyproject: PyProject,
+    installed: Vec<InstalledPackage>,
+    /// `None` covers both "no venv to ask yet" and "the command failed to
+    /// run" -- neither is uv answering with a schema this build does not
+    /// understand, which is the one case `deps::build` explains to the user.
+    /// See its own doc for why the two must stay distinguishable.
+    tree: Option<TreeOutcome>,
+}
+
+/// Resolves what a Dependencies fetch needs to run project-scoped uv
+/// commands: the project's own directory and its venv. `None` when either
+/// cannot be resolved (no directory component, an unresolvable venv
+/// location) -- the same two failure modes `run_sync` reports as errors, but
+/// there is no drawer line to write here, so this just leaves nothing to
+/// fetch.
+fn deps_command_context(project: &Project, config: &Config) -> Option<uv::command::ProjectContext> {
+    let project_dir = project
+        .pyproject_path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())?;
+    let venv_path = venv_path::resolve(project, &config.settings).ok()?;
+    Some(uv::command::ProjectContext {
+        project_dir: project_dir.to_path_buf(),
+        venv_path,
+    })
+}
+
+/// The blocking half of a Dependencies fetch: read the manifest, then (if a
+/// uv can be resolved and the project has a venv to ask about) run `uv pip
+/// list` and `uv tree`. Every failure along the way -- an unreadable
+/// manifest, no resolvable uv, a command that exits non-zero, output this
+/// build cannot parse -- degrades to an empty/absent result rather than
+/// erroring: a project that has never been synced has no installed packages
+/// and no tree yet, which is a normal state (the same "registered without a
+/// venv" state `sidebar` already treats as ordinary), not a failure to
+/// report.
+fn fetch_deps_blocking(
+    project: &Project,
+    config: &Config,
+    runner: &dyn CommandRunner,
+) -> DepsFetch {
+    let pyproject = bombadil_core::pyproject::load(&project.pyproject_path).unwrap_or_default();
+
+    let Some(resolved_uv) = resolve_uv_for(config, runner).ok() else {
+        return DepsFetch {
+            pyproject,
+            installed: Vec::new(),
+            tree: None,
+        };
+    };
+    let Some(ctx) = deps_command_context(project, config) else {
+        return DepsFetch {
+            pyproject,
+            installed: Vec::new(),
+            tree: None,
+        };
+    };
+
+    let installed = runner
+        .run(&uv::command::pip_list(&resolved_uv, &ctx))
+        .ok()
+        .filter(|outcome| outcome.success())
+        .and_then(|outcome| uv::results::parse_pip_list(&outcome.stdout).ok())
+        .unwrap_or_default();
+
+    let tree = runner
+        .run(&uv::command::tree(&resolved_uv, &ctx, DEPS_TREE_DEPTH))
+        .ok()
+        .filter(|outcome| outcome.success())
+        .and_then(|outcome| uv::results::parse_tree(&outcome.stdout).ok());
+
+    DepsFetch {
+        pyproject,
+        installed,
+        tree,
+    }
+}
+
+/// Runs a Dependencies fetch off the render thread via `job::run` --
+/// criterion 5: `uv tree` on a large project is slow, and `CommandRunner::run`
+/// blocks until the child exits, so calling `fetch_deps_blocking` from
+/// `update` would freeze the window exactly like `sync_project` would.
+/// `SYNC_TIMEOUT`, not `VENV_PROBE_TIMEOUT`, for the same reason `sync_project`
+/// uses it: this can run a full uv resolve, not a sub-millisecond file read.
+async fn load_deps(project: Project, config: Config, runner: Arc<dyn CommandRunner>) -> DepsFetch {
+    match job::run(
+        move || fetch_deps_blocking(&project, &config, runner.as_ref()),
+        SYNC_TIMEOUT,
+    )
+    .await
+    {
+        job::JobResult::Done(fetch) => fetch,
+        job::JobResult::TimedOut | job::JobResult::Failed => DepsFetch {
+            pyproject: PyProject::default(),
+            installed: Vec::new(),
+            tree: None,
+        },
+    }
+}
+
+/// Dispatches a Dependencies fetch for `projects[index]`, tagging the result
+/// with `index` so a later `Message::DepsLoaded` can be dropped if the
+/// selection has since moved on.
+fn fetch_deps_task(
+    index: usize,
+    project: Project,
+    config: Config,
+    runner: Arc<dyn CommandRunner>,
+) -> Task<Message> {
+    Task::perform(load_deps(project, config, runner), move |fetch| {
+        Message::DepsLoaded(index, fetch)
+    })
+}
+
+/// The blocking half of a Members fetch (spec §5a, Task 5): classify the
+/// project's own manifest, walk its tree for other `pyproject.toml` files,
+/// then (if a uv can be resolved and the project has a venv to ask about)
+/// run `uv pip list`. Mirrors `fetch_deps_blocking`'s degrade-don't-error
+/// discipline: an unreadable manifest, no resolvable uv, a project with no
+/// venv yet -- all leave `discovered`/`installed` empty rather than failing,
+/// since a project that has never been synced or has no siblings at all is a
+/// normal state for this tab, not an error to report.
+fn fetch_members_blocking(
+    project: &Project,
+    config: &Config,
+    runner: &dyn CommandRunner,
+) -> MembersFetch {
+    let project_dir = project
+        .pyproject_path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty());
+
+    let kind = project_dir
+        .and_then(|_| std::fs::read_to_string(&project.pyproject_path).ok())
+        .map(|text| bombadil_core::members::parse_workspace(&text))
+        .unwrap_or(bombadil_core::members::WorkspaceKind::Loose);
+
+    let discovered = match project_dir {
+        Some(dir) => bombadil_core::members::discover(dir, &kind),
+        None => Vec::new(),
+    };
+
+    let installed = match (
+        resolve_uv_for(config, runner).ok(),
+        deps_command_context(project, config),
+    ) {
+        (Some(resolved_uv), Some(ctx)) => runner
+            .run(&uv::command::pip_list(&resolved_uv, &ctx))
+            .ok()
+            .filter(|outcome| outcome.success())
+            .and_then(|outcome| uv::results::parse_pip_list(&outcome.stdout).ok())
+            .unwrap_or_default(),
+        _ => Vec::new(),
+    };
+
+    MembersFetch {
+        kind,
+        discovered,
+        installed,
+    }
+}
+
+/// Runs a Members fetch off the render thread via `job::run` -- discovery
+/// walks the filesystem and `uv pip list` spawns a process, neither of which
+/// may run on the render thread. `SYNC_TIMEOUT`, not `VENV_PROBE_TIMEOUT`,
+/// for the same reason `load_deps` uses it: this can spawn a real uv process.
+async fn load_members(
+    project: Project,
+    config: Config,
+    runner: Arc<dyn CommandRunner>,
+) -> MembersFetch {
+    match job::run(
+        move || fetch_members_blocking(&project, &config, runner.as_ref()),
+        SYNC_TIMEOUT,
+    )
+    .await
+    {
+        job::JobResult::Done(fetch) => fetch,
+        job::JobResult::TimedOut | job::JobResult::Failed => MembersFetch {
+            kind: bombadil_core::members::WorkspaceKind::Loose,
+            discovered: Vec::new(),
+            installed: Vec::new(),
+        },
+    }
+}
+
+/// Dispatches a Members fetch for `projects[index]`, tagging the result with
+/// `index` so a later `Message::MembersLoaded` can be dropped if the
+/// selection has since moved on -- mirrors `fetch_deps_task` exactly.
+fn fetch_members_task(
+    index: usize,
+    project: Project,
+    config: Config,
+    runner: Arc<dyn CommandRunner>,
+) -> Task<Message> {
+    Task::perform(load_members(project, config, runner), move |fetch| {
+        Message::MembersLoaded(index, fetch)
+    })
+}
+
 /// `runner` is a parameter rather than a field on `App` so a test can hand in
 /// a `FakeCommandRunner` and observe that `Message::SyncRequested` never
 /// calls it synchronously -- the exact freeze `job::run` exists to prevent.
@@ -308,16 +868,47 @@ pub fn update(app: &mut App, message: Message, runner: Arc<dyn CommandRunner>) -
     match message {
         // A stale index can arrive from a message queued before a project was
         // removed; ignoring it is better than taking the window down.
-        Message::ProjectSelected(i) if i < app.projects.len() => {
+        Message::ProjectSelected(i) if i < app.config.projects.len() => {
             app.selected = Some(i);
+            return Task::batch([
+                fetch_deps_task(
+                    i,
+                    app.config.projects[i].clone(),
+                    app.config.clone(),
+                    runner.clone(),
+                ),
+                fetch_members_task(
+                    i,
+                    app.config.projects[i].clone(),
+                    app.config.clone(),
+                    runner,
+                ),
+            ]);
         }
         Message::ProjectSelected(_) => {}
+        Message::TabSelected(tab) => {
+            app.tab = tab;
+        }
         Message::VenvProbed(i, version) if i < app.entries.len() => {
             app.entries[i].venv_exists = version.is_some();
             app.entries[i].python_version = version;
         }
         // A stale probe result for a project that no longer exists.
         Message::VenvProbed(_, _) => {}
+        Message::DepsLoaded(i, fetch) if i < app.config.projects.len() => {
+            let tab = deps::build(&fetch.pyproject, &fetch.installed, fetch.tree);
+            app.deps = Some((i, tab));
+        }
+        // A stale fetch for a project that no longer exists, or that the
+        // user has since moved away from -- `view` only ever reads
+        // `app.deps` when its index still matches the current selection.
+        Message::DepsLoaded(_, _) => {}
+        Message::MembersLoaded(i, fetch) if i < app.config.projects.len() => {
+            app.members = Some((i, fetch));
+        }
+        // A stale fetch for a project that no longer exists, or that the
+        // user has since moved away from -- same staleness guard `DepsLoaded` uses.
+        Message::MembersLoaded(_, _) => {}
         // A sync already in flight swallows the press. Without this the
         // button dispatches unconditionally, and a 300-second timeout makes
         // two concurrent `uv sync` processes on the same project easy to
@@ -330,8 +921,17 @@ pub fn update(app: &mut App, message: Message, runner: Arc<dyn CommandRunner>) -
         Message::SyncRequested(i) => {
             app.context_menu = None;
             if app.syncing.is_none()
-                && let Some(project) = app.projects.get(i).cloned()
+                && let Some(project) = sync_target(app, i)
             {
+                // A workspace root's plain `uv sync` installs no members at
+                // all, so this button produced an environment with none of
+                // the workspace's own packages in it and member-aware sync
+                // was reachable only from the Members tab. `members_context`
+                // answers `None` for an ordinary project, which is what keeps
+                // the substitution a no-op for everyone else.
+                if let Some((kind, discovered)) = members_context(app, i) {
+                    return dispatch_members_sync(app, project, kind, discovered, runner);
+                }
                 let config = app.config.clone();
                 app.syncing = Some(project.id.to_string());
                 // Fresh drawer per run, but showing a *running* status rather
@@ -475,13 +1075,12 @@ pub fn update(app: &mut App, message: Message, runner: Arc<dyn CommandRunner>) -
                 // thread below, the same as every other blocking call in
                 // this file.
                 app.config.projects.push(project.clone());
-                app.projects.push(project.clone());
                 app.entries.push(sidebar::Entry {
                     label: project.label.clone(),
                     venv_exists: false,
                     python_version: None,
                 });
-                let index = app.projects.len() - 1;
+                let index = app.config.projects.len() - 1;
                 app.selected = Some(index);
                 // This path runs `uv sync -p <version>` too, so it claims the
                 // same single in-flight slot `SyncRequested` does. Without
@@ -530,7 +1129,7 @@ pub fn update(app: &mut App, message: Message, runner: Arc<dyn CommandRunner>) -
             // Refreshes the sidebar entry the same way `boot` fills in every
             // other project's venv status, rather than trusting `success` to
             // imply a venv now exists.
-            if let Some(project) = app.projects.get(index).cloned()
+            if let Some(project) = app.config.projects.get(index).cloned()
                 && let Ok(path) = venv_path::resolve(&project, &app.config.settings)
             {
                 return Task::perform(probe_venv(path), move |version| {
@@ -539,7 +1138,7 @@ pub fn update(app: &mut App, message: Message, runner: Arc<dyn CommandRunner>) -
             }
         }
         // A stale index can arrive the same way `ProjectSelected`'s can.
-        Message::ContextMenuOpened(i) if i < app.projects.len() => {
+        Message::ContextMenuOpened(i) if i < app.config.projects.len() => {
             app.context_menu = Some(context_menu::ContextMenu {
                 project_index: i,
                 terminals: Vec::new(),
@@ -559,9 +1158,9 @@ pub fn update(app: &mut App, message: Message, runner: Arc<dyn CommandRunner>) -
                 menu.terminals = terminals;
             }
         }
-        Message::OpenTerminalRequested(i, choice) if i < app.projects.len() => {
+        Message::OpenTerminalRequested(i, choice) if i < app.config.projects.len() => {
             app.context_menu = None;
-            if let Some(project) = app.projects.get(i).cloned() {
+            if let Some(project) = app.config.projects.get(i).cloned() {
                 let config = app.config.clone();
                 return Task::perform(
                     open_terminal(choice, project, config, runner),
@@ -581,17 +1180,32 @@ pub fn update(app: &mut App, message: Message, runner: Arc<dyn CommandRunner>) -
                 app.drawer.expanded = true;
             }
         }
-        Message::RemoveProjectRequested(i) if i < app.projects.len() => {
+        Message::RemoveProjectRequested(i) if i < app.config.projects.len() => {
             // In-memory first, synchronously -- the same discipline
             // `AddProjectConfirmed` uses, so the sidebar reflects the removal
             // the instant `update` returns rather than only once the
             // background persist lands.
             app.config.projects.remove(i);
-            app.projects.remove(i);
             app.entries.remove(i);
+            // Indices shift on removal; `deps` is tagged with one, and a
+            // shifted-but-uncleared tag would show a stale tab against
+            // whichever project now sits at that index rather than the one
+            // it was actually fetched for. `ProjectSelected` refetches it
+            // the next time a selection lands.
+            app.deps = None;
+            // Same reasoning as `deps`, plus a pending removal confirmation
+            // that could now be naming a project index that no longer means
+            // what it did.
+            app.members = None;
+            app.confirm_member_sync = None;
+            // A pending Recreate venv confirmation describes the list as it
+            // was. Its `project_id` already refuses to resolve to a different
+            // project, but the sentence on screen still names one the user is
+            // no longer looking at, so it goes too.
+            app.confirm_recreate = None;
             app.selected = match app.selected {
-                Some(s) if s == i => (!app.projects.is_empty())
-                    .then_some(i.min(app.projects.len().saturating_sub(1))),
+                Some(s) if s == i => (!app.config.projects.is_empty())
+                    .then_some(i.min(app.config.projects.len().saturating_sub(1))),
                 Some(s) if s > i => Some(s - 1),
                 other => other,
             };
@@ -599,7 +1213,7 @@ pub fn update(app: &mut App, message: Message, runner: Arc<dyn CommandRunner>) -
 
             let config = app.config.clone();
             let persist = app.persist.clone();
-            return Task::perform(persist_removal(config, persist), |success| {
+            return Task::perform(persist_config(config, persist), |success| {
                 Message::RemoveProjectFinished { success }
             });
         }
@@ -609,11 +1223,657 @@ pub fn update(app: &mut App, message: Message, runner: Arc<dyn CommandRunner>) -
                 drawer::set_idle(&mut app.drawer, "remove failed to persist".to_string());
             }
         }
+        // Opens the confirmation and nothing else. The menu closes either
+        // way, like every other action taken from it.
+        Message::RecreateVenvRequested(i) => {
+            app.context_menu = None;
+            if let Some(project) = app.config.projects.get(i)
+                && let Ok(venv_path) = venv_path::resolve(project, &app.config.settings)
+            {
+                app.confirm_recreate = Some(context_menu::ConfirmRecreate {
+                    project_id: project.id,
+                    label: project.label.clone(),
+                    venv_path,
+                });
+            }
+        }
+        Message::RecreateVenvCancelled => {
+            app.confirm_recreate = None;
+        }
+        Message::RecreateVenvConfirmed => {
+            // `take` unconditionally: whether or not the work is dispatched,
+            // the user has answered the question and the dialog is done.
+            // Re-resolved by id, not by the index the press carried: the
+            // list can have shifted underneath the open confirmation (see
+            // `ConfirmRecreate`), and a project that no longer exists
+            // resolves to nothing rather than to whoever took its place.
+            if let Some(confirm) = app.confirm_recreate.take()
+                && app.syncing.is_none()
+                && let Some(project) = app
+                    .config
+                    .projects
+                    .iter()
+                    .find(|p| p.id == confirm.project_id)
+                    .cloned()
+            {
+                let config = app.config.clone();
+                app.syncing = Some(project.id.to_string());
+                app.drawer = drawer::Drawer {
+                    status: format!("recreating {}...", project.label),
+                    ..drawer::Drawer::default()
+                };
+                // Reuses `SyncFinished`: a recreate ends in the same `uv sync`
+                // with the same single-slot release, the same transcript and
+                // the same expand-on-failure. What it does NOT reuse is the
+                // status text's meaning -- `run_recreate_venv` appends a line
+                // saying the environment was deleted and not rebuilt, which
+                // is the part "sync failed" cannot express on its own.
+                return Task::perform(
+                    recreate_venv(project, config, runner),
+                    |(success, lines)| Message::SyncFinished { success, lines },
+                );
+            }
+        }
+        Message::OpenFolderRequested(i) => {
+            app.context_menu = None;
+            if let Some(project) = app.config.projects.get(i).cloned() {
+                return Task::perform(
+                    open_folder(Os::host(), project, runner),
+                    Message::OpenFolderFinished,
+                );
+            }
+        }
+        Message::OpenFolderFinished(Ok(())) => {}
+        Message::OpenFolderFinished(Err(message)) => {
+            drawer::push_line(&mut app.drawer, &message, &[]);
+            drawer::set_idle(&mut app.drawer, "open folder failed".to_string());
+            if !app.drawer.lines.is_empty() {
+                app.drawer.expanded = true;
+            }
+        }
         Message::AboutLicenseToggled => {
             app.about_expanded = !app.about_expanded;
         }
+        Message::EnvVarAdded(scope) => {
+            if let Some(vars) = env_editor::vars_mut(&mut app.config, scope) {
+                env_editor::add_var(vars);
+            }
+            return persist_env_edit(app);
+        }
+        Message::EnvVarRemoved(scope, index) => {
+            // Resolved before the row goes -- see `env_removal_secret_key`.
+            // `unmark_secret` deletes the keychain entry; removing the row
+            // entirely used not to, so the value stayed in the keychain
+            // unreachable while the row that named it was gone.
+            let owed = env_removal_secret_key(app, scope, index);
+            if let Some(vars) = env_editor::vars_mut(&mut app.config, scope) {
+                env_editor::remove_var(vars, index);
+            }
+            if let Some(key) = owed {
+                let config = app.config.clone();
+                let persist = app.persist.clone();
+                return Task::perform(unmark_secret_job(key, config, persist), |success| {
+                    Message::EnvVarPersistFinished { success }
+                });
+            }
+            return persist_env_edit(app);
+        }
+        Message::EnvVarKeyChanged(scope, index, key) => {
+            if let Some(vars) = env_editor::vars_mut(&mut app.config, scope) {
+                env_editor::set_key(vars, index, key);
+            }
+            return persist_env_edit(app);
+        }
+        // Sound only because `env_editor::rows` never produces this message
+        // for a row that is already secret -- see `env_editor`'s module doc.
+        Message::EnvVarValueChanged(scope, index, value) => {
+            if let Some(vars) = env_editor::vars_mut(&mut app.config, scope) {
+                env_editor::set_value(vars, index, value);
+            }
+            return persist_env_edit(app);
+        }
+        Message::EnvVarSecretToggled(scope, index) => {
+            // Resolved before the mutable borrow of `app.config` below, and
+            // before this row's own current state (secret or not) is known
+            // -- a `Project` scope's `SecretKey` needs the project's *id*,
+            // not its index, since a removal shifts every later index while
+            // the id is stable.
+            let project_id = match scope {
+                env_editor::EnvScope::Global => None,
+                env_editor::EnvScope::Project(i) => match app.config.projects.get(i) {
+                    Some(project) => Some(project.id),
+                    // A stale index for a project that no longer exists.
+                    None => return Task::none(),
+                },
+            };
+            let Some(vars) = env_editor::vars_mut(&mut app.config, scope) else {
+                return Task::none();
+            };
+            let Some(key_name) = vars.get(index).map(|var| var.key.clone()) else {
+                return Task::none();
+            };
+            let secret_key = env_editor::secret_key(scope, project_id, &key_name);
+
+            // In-memory first, synchronously -- the same discipline every
+            // other edit in this file uses -- then the keychain call and the
+            // persist that must agree with it happen together in one
+            // background job.
+            if let Some(plain_value) = env_editor::mark_secret(vars, index) {
+                let config = app.config.clone();
+                let persist = app.persist.clone();
+                return Task::perform(
+                    mark_secret_job(secret_key, plain_value, config, persist),
+                    |success| Message::EnvVarPersistFinished { success },
+                );
+            }
+            if env_editor::unmark_secret(vars, index) {
+                let config = app.config.clone();
+                let persist = app.persist.clone();
+                return Task::perform(unmark_secret_job(secret_key, config, persist), |success| {
+                    Message::EnvVarPersistFinished { success }
+                });
+            }
+        }
+        Message::EnvVarPersistFinished { success } => {
+            if !success {
+                drawer::set_idle(
+                    &mut app.drawer,
+                    "env var change failed to persist".to_string(),
+                );
+            }
+        }
+        Message::ScriptAddRequested(scope) => {
+            return Task::perform(pick_script(), move |path| {
+                Message::ScriptFilePicked(scope, path)
+            });
+        }
+        // Cancelled -- nothing chosen, nothing to add.
+        Message::ScriptFilePicked(_, None) => {}
+        Message::ScriptFilePicked(scope, Some(path)) => {
+            if let Some(scripts) = scripts_editor::scripts_mut(&mut app.config, scope) {
+                scripts_editor::add_script(scripts, path);
+            }
+            return persist_script_edit(app);
+        }
+        Message::ScriptRemoved(scope, index) => {
+            if let Some(scripts) = scripts_editor::scripts_mut(&mut app.config, scope) {
+                scripts_editor::remove_script(scripts, index);
+            }
+            return persist_script_edit(app);
+        }
+        Message::ScriptEnabledToggled(scope, index) => {
+            if let Some(scripts) = scripts_editor::scripts_mut(&mut app.config, scope) {
+                scripts_editor::toggle_enabled(scripts, index);
+            }
+            return persist_script_edit(app);
+        }
+        Message::ScriptMovedUp(scope, index) => {
+            if let Some(scripts) = scripts_editor::scripts_mut(&mut app.config, scope) {
+                scripts_editor::move_up(scripts, index);
+            }
+            return persist_script_edit(app);
+        }
+        Message::ScriptMovedDown(scope, index) => {
+            if let Some(scripts) = scripts_editor::scripts_mut(&mut app.config, scope) {
+                scripts_editor::move_down(scripts, index);
+            }
+            return persist_script_edit(app);
+        }
+        Message::ScriptPersistFinished { success } => {
+            if !success {
+                drawer::set_idle(
+                    &mut app.drawer,
+                    "script change failed to persist".to_string(),
+                );
+            }
+        }
+        Message::IndexAdded => {
+            index_editor::add_index(&mut app.config.indexes);
+            app.index_credential_drafts.push(String::new());
+            return persist_index_edit(app);
+        }
+        Message::IndexRemoved(i) => {
+            // Resolved before the row goes: `SecretKey::Index` is keyed on
+            // the index's name, and afterwards there is nothing left to find
+            // the entry by -- it would sit in the user's keychain forever.
+            let owed = index_credential_key(&app.config, i);
+            index_editor::remove_index(&mut app.config.indexes, i);
+            // Kept in step with `config.indexes` -- see
+            // `App::index_credential_drafts`'s own doc.
+            if i < app.index_credential_drafts.len() {
+                app.index_credential_drafts.remove(i);
+            }
+            if let Some(key) = owed {
+                let config = app.config.clone();
+                let persist = app.persist.clone();
+                return Task::perform(unmark_secret_job(key, config, persist), |success| {
+                    Message::IndexPersistFinished { success }
+                });
+            }
+            return persist_index_edit(app);
+        }
+        Message::IndexNameChanged(i, name) => {
+            // The credential follows the name: `SecretKey::Index` is keyed on
+            // it, so leaving the entry behind makes the next sync's
+            // `envspec::index::inject` look under a name nothing was stored
+            // under -- a 401 with nothing on screen explaining it -- and
+            // strands the old entry in the keychain. See
+            // `run_index_credential_rename`.
+            let from = index_credential_key(&app.config, i);
+            index_editor::set_name(&mut app.config.indexes, i, name);
+            let to = index_credential_key(&app.config, i);
+            if let (Some(from), Some(to)) = (from, to)
+                && from != to
+            {
+                let config = app.config.clone();
+                let persist = app.persist.clone();
+                return Task::perform(
+                    rename_index_credential_job(from, to, config, persist),
+                    |success| Message::IndexPersistFinished { success },
+                );
+            }
+            return persist_index_edit(app);
+        }
+        Message::IndexUrlChanged(i, url) => {
+            index_editor::set_url(&mut app.config.indexes, i, url);
+            return persist_index_edit(app);
+        }
+        Message::IndexKindChanged(i, kind) => {
+            index_editor::set_kind(&mut app.config.indexes, i, kind);
+            return persist_index_edit(app);
+        }
+        Message::IndexDefaultToggled(i) => {
+            index_editor::toggle_default_for_new_projects(&mut app.config.indexes, i);
+            return persist_index_edit(app);
+        }
+        Message::IndexAuthChoiceChanged(i, choice) => {
+            index_editor::set_auth_choice(&mut app.config.indexes, i, choice);
+            return persist_index_edit(app);
+        }
+        Message::IndexUsernameChanged(i, username) => {
+            index_editor::set_username(&mut app.config.indexes, i, username);
+            return persist_index_edit(app);
+        }
+        // Never persisted, and no job dispatched: this is App-local scratch
+        // state, never `Config` -- see `App::index_credential_drafts`'s doc.
+        Message::IndexCredentialChanged(i, input) => {
+            if let Some(slot) = app.index_credential_drafts.get_mut(i) {
+                *slot = input.0;
+            }
+        }
+        // Criterion 1 and criterion 2 together: writes to the keychain under
+        // `SecretKey::Index`, never `Config` (`mark_secret_job` -> `run_secret_write`
+        // -> `store.set`, then `persist.save(config)`, and `config` never
+        // gained a credential field to carry one in), and only for a name
+        // that does not currently collide with another's credential
+        // variable -- `view` already disables the button that sends this for
+        // a colliding row, but the guard is repeated here so nothing else
+        // that might someday construct this message can bypass it.
+        Message::IndexCredentialSaveRequested(i) => {
+            if let Some((key, plain_value)) =
+                index_editor::credential_save(&app.config, &app.index_credential_drafts, i)
+            {
+                // Cleared the instant it is handed off -- criterion 4's other
+                // angle: this must not keep sitting in `App` state, readable
+                // by a later render, any longer than typing takes.
+                app.index_credential_drafts[i] = String::new();
+                let config = app.config.clone();
+                let persist = app.persist.clone();
+                return Task::perform(
+                    mark_secret_job(key, plain_value, config, persist),
+                    |success| Message::IndexPersistFinished { success },
+                );
+            }
+        }
+        Message::IndexPersistFinished { success } => {
+            if !success {
+                drawer::set_idle(
+                    &mut app.drawer,
+                    "index change failed to persist".to_string(),
+                );
+            }
+        }
+        Message::ProjectIndexToggled(project_index, name) => {
+            if let Some(project) = app.config.projects.get_mut(project_index) {
+                index_editor::toggle_selected(&mut project.index_names, &name);
+            }
+            return persist_index_edit(app);
+        }
+        Message::MemberToggled(i, path) => {
+            // Only reachable when this project's Members fetch is the one
+            // cached -- without it there is no `discovered`/`kind` to read
+            // the current effective state from, and `members_editor::toggle`
+            // needs that to decide what a flip even means.
+            if let Some((mi, fetch)) = &app.members
+                && *mi == i
+                && let Some(project) = app.config.projects.get_mut(i)
+            {
+                members_editor::toggle(&mut project.members, &fetch.discovered, &fetch.kind, &path);
+                return persist_members_edit(app);
+            }
+        }
+        Message::MembersPersistFinished { success } => {
+            if !success {
+                drawer::set_idle(
+                    &mut app.drawer,
+                    "member selection failed to persist".to_string(),
+                );
+            }
+        }
+        Message::MembersSyncRequested(i) => {
+            if let Some((mi, fetch)) = &app.members
+                && *mi == i
+                && let Some(project) = app.config.projects.get(i).cloned()
+            {
+                let project_dir = project
+                    .pyproject_path
+                    .parent()
+                    .map(Path::to_path_buf)
+                    .unwrap_or_default();
+                let tab = members_editor::build(
+                    &project_dir,
+                    &project.members,
+                    &fetch.kind,
+                    &fetch.discovered,
+                    &fetch.installed,
+                );
+                if let Some(warning) = members_editor::removal_warning(&tab.rows) {
+                    app.confirm_member_sync = Some(members_editor::ConfirmMemberSync {
+                        project_index: i,
+                        label: project.label.clone(),
+                        warning,
+                    });
+                } else if app.syncing.is_none() {
+                    let kind = fetch.kind.clone();
+                    let discovered = fetch.discovered.clone();
+                    return dispatch_members_sync(app, project, kind, discovered, runner);
+                }
+            }
+        }
+        Message::MembersSyncCancelled => {
+            app.confirm_member_sync = None;
+        }
+        Message::MembersSyncConfirmed => {
+            // `take` unconditionally -- the same discipline
+            // `RecreateVenvConfirmed` follows: whether or not the work is
+            // dispatched, the user has answered the question and the dialog
+            // is done.
+            if let Some(confirm) = app.confirm_member_sync.take()
+                && app.syncing.is_none()
+                && let Some((mi, fetch)) = &app.members
+                && *mi == confirm.project_index
+                && let Some(project) = app.config.projects.get(confirm.project_index).cloned()
+            {
+                let kind = fetch.kind.clone();
+                let discovered = fetch.discovered.clone();
+                return dispatch_members_sync(app, project, kind, discovered, runner);
+            }
+        }
+        // Criterion 1: applies immediately and persists -- the write every
+        // later `resolve_uv_for(&app.config, ..)` call reads fresh.
+        Message::SettingsUvSourceChoiceChanged(choice) => {
+            settings_editor::apply_choice(&mut app.config.settings, choice);
+            // A stale result from a previous Custom validation no longer
+            // describes the current source.
+            app.uv_custom_validation = None;
+            return persist_settings_edit(app);
+        }
+        Message::SettingsUvCustomPathChanged(text) => {
+            app.uv_custom_path_draft = text;
+        }
+        Message::SettingsUvCustomValidateRequested => {
+            let path = PathBuf::from(app.uv_custom_path_draft.trim());
+            let config = app.config.clone();
+            return Task::perform(
+                validate_uv_source(path, config, runner),
+                Message::SettingsUvCustomValidated,
+            );
+        }
+        // Criterion 2: only a passing validation ever writes `Settings` --
+        // this is the only arm that does.
+        Message::SettingsUvCustomValidated(Ok(resolved)) => {
+            app.config.settings.uv_source = UvSource::Custom {
+                path: resolved.path.clone(),
+            };
+            app.uv_custom_validation = Some(Ok(resolved.version.to_string()));
+            return persist_settings_edit(app);
+        }
+        // A refused path -- including one below `MIN_UV_VERSION`, reported
+        // through `UvResolveError::TooOld`'s own text -- only updates what
+        // the tab shows. `Settings::uv_source` is untouched, so the bad path
+        // never reaches `config.toml`.
+        Message::SettingsUvCustomValidated(Err(message)) => {
+            app.uv_custom_validation = Some(Err(message));
+        }
+        Message::SettingsPersistFinished { success } => {
+            if !success {
+                drawer::set_idle(
+                    &mut app.drawer,
+                    "settings change failed to persist".to_string(),
+                );
+            }
+        }
+        Message::SettingsDefaultVenvLocationAlongsideSelected => {
+            settings_editor::apply_default_venv_location(
+                &mut app.config.settings,
+                DefaultVenvLocation::Alongside,
+            );
+            // Re-probed, not just persisted: the sidebar's venv status
+            // describes wherever each project resolved when it was last
+            // probed, and this just moved that. See `probe_every_venv`.
+            return Task::batch([persist_settings_edit(app), probe_every_venv(app)]);
+        }
+        Message::SettingsDefaultVenvLocationPickFolderRequested => {
+            return Task::perform(
+                pick_folder(),
+                Message::SettingsDefaultVenvLocationFolderPicked,
+            );
+        }
+        // Cancelled -- leave the previous location untouched.
+        Message::SettingsDefaultVenvLocationFolderPicked(None) => {}
+        Message::SettingsDefaultVenvLocationFolderPicked(Some(path)) => {
+            settings_editor::apply_default_venv_location(
+                &mut app.config.settings,
+                DefaultVenvLocation::Central { path },
+            );
+            return Task::batch([persist_settings_edit(app), probe_every_venv(app)]);
+        }
     }
     Task::none()
+}
+
+/// The project a Sync press for `projects[i]` acts on.
+///
+/// A function rather than an inline `.get(i)` so a test can assert the exact
+/// `Project` a press resolves to and hand it to `run_sync` -- the composed
+/// environment only exists on the job thread, so the resolution is the last
+/// point at which what the sync will run in is observable at all.
+fn sync_target(app: &App, i: usize) -> Option<Project> {
+    // `app.config.projects`, never a copy of it: this is the list every
+    // editor writes, so an edit made a moment ago is in the environment the
+    // sync composes. See `App::config`.
+    app.config.projects.get(i).cloned()
+}
+
+/// The blocking half of renaming an index: move its credential to the account
+/// the new name addresses, then persist.
+///
+/// `SecretKey::Index` is keyed on the index's *name*, so a rename that leaves
+/// the entry where it was makes `envspec::index::inject` look under a name
+/// nothing was stored under -- a 401 at sync time with nothing on screen
+/// explaining it -- while the old entry stays in the user's keychain with
+/// nothing left in the app able to name it.
+///
+/// The set comes before the delete deliberately: the other order loses the
+/// credential outright if the second call fails. `Ok(None)` -- no credential
+/// was ever saved under the old name -- is the commonest case by far, since
+/// this runs once per keystroke while the name is being typed, and it is
+/// nothing to move rather than a failure.
+///
+/// The persist is attempted whichever way the keychain half went: a machine
+/// with no usable Secret Service must still be able to rename an index, and
+/// making the config write depend on the keychain would be a worse bug than
+/// the orphan this fixes.
+fn run_index_credential_rename(
+    from: &SecretKey,
+    to: &SecretKey,
+    config: &Config,
+    store: &dyn SecretStore,
+    persist: &dyn ConfigPersist,
+) -> bool {
+    let moved = match store.get(from) {
+        Ok(Some(value)) => store.set(to, &value).is_ok() && store.delete(from).is_ok(),
+        Ok(None) => true,
+        Err(_) => false,
+    };
+    persist.save(config).is_ok() && moved
+}
+
+/// Runs an index credential rename off the render thread via `job::run`.
+/// `KeyringSecretStore` is constructed here, on the job thread, the same
+/// discipline `mark_secret_job` and every other keychain call in this file
+/// follow.
+async fn rename_index_credential_job(
+    from: SecretKey,
+    to: SecretKey,
+    config: Config,
+    persist: Arc<dyn ConfigPersist>,
+) -> bool {
+    match job::run(
+        move || {
+            run_index_credential_rename(
+                &from,
+                &to,
+                &config,
+                &KeyringSecretStore::new(),
+                persist.as_ref(),
+            )
+        },
+        SYNC_TIMEOUT,
+    )
+    .await
+    {
+        job::JobResult::Done(success) => success,
+        job::JobResult::TimedOut | job::JobResult::Failed => false,
+    }
+}
+
+/// The keychain account `config.indexes[i]`'s credential lives under.
+///
+/// Must be resolved *before* a rename or a removal takes the name away: after
+/// that there is nothing left to find the entry by, and it sits in the user's
+/// keychain forever.
+///
+/// An empty name is deliberately not filtered out. The name box is edited one
+/// keystroke at a time, so backspacing a name to nothing and retyping it is an
+/// ordinary way to rename -- filtering the empty step would break the chain
+/// there and strand the credential under the original name. (An index left
+/// permanently unnamed is M4's problem, which this round does not touch.)
+fn index_credential_key(config: &Config, i: usize) -> Option<SecretKey> {
+    let index = config.indexes.get(i)?;
+    Some(SecretKey::Index {
+        name: index.name.clone(),
+    })
+}
+
+/// The keychain account a removed env var row owes a delete of, if any.
+///
+/// Resolved before the row is dropped, for the same reason
+/// `index_credential_key` is: `SecretKey::GlobalEnv` and
+/// `SecretKey::ProjectEnv` are keyed on the variable's name, which the removal
+/// is about to take away. `env_editor::unmark_secret` already deletes;
+/// removing the row entirely did not, so the value stayed in the keychain
+/// unreachable while the row that named it was gone.
+///
+/// `None` for a plain row: it has no entry, and issuing a delete anyway would
+/// be a keychain call per removal on a machine that may have no keychain.
+fn env_removal_secret_key(
+    app: &App,
+    scope: env_editor::EnvScope,
+    index: usize,
+) -> Option<SecretKey> {
+    let (project_id, vars) = match scope {
+        env_editor::EnvScope::Global => (None, &app.config.global_env),
+        env_editor::EnvScope::Project(i) => {
+            let project = app.config.projects.get(i)?;
+            (Some(project.id), &project.env)
+        }
+    };
+    let var = vars.get(index)?;
+    var.secret
+        .then(|| env_editor::secret_key(scope, project_id, &var.key))
+}
+
+/// The member context a Sync press for `projects[i]` must use, or `None` when
+/// the plain `uv sync` `run_sync` builds is already the right command.
+///
+/// `None` covers two cases that behave the same and must not be conflated
+/// with each other in the drawer: no Members fetch for this project in hand
+/// yet, and a fetch whose plan is `SyncPlan::Plain` -- `members_editor`'s own
+/// way of saying an ordinary, non-monorepo project's sync command must not be
+/// touched by the member machinery at all.
+///
+/// This exists because plain `uv sync` in a workspace *root* installs no
+/// members -- verified against a real uv, which is why
+/// `uv::command::sync_all_members` exists. Without this the Sync button
+/// produced an environment with none of the workspace's own packages in it,
+/// and member-aware sync was reachable only from the Members tab.
+fn members_context(
+    app: &App,
+    i: usize,
+) -> Option<(
+    bombadil_core::members::WorkspaceKind,
+    Vec<bombadil_core::members::DiscoveredMember>,
+)> {
+    let (fetched_for, fetch) = app.members.as_ref()?;
+    if *fetched_for != i {
+        return None;
+    }
+    let project = app.config.projects.get(i)?;
+    match members_editor::sync_plan(&project.members, &fetch.kind, &fetch.discovered) {
+        members_editor::SyncPlan::Plain => None,
+        _ => Some((fetch.kind.clone(), fetch.discovered.clone())),
+    }
+}
+
+/// Dispatches a background persist of `app.config` as it stands right now,
+/// for a member selection edit (a checkbox toggle). Mirrors
+/// `persist_env_edit`/`persist_script_edit`/`persist_index_edit` exactly --
+/// this never touches the keychain, so a plain `persist_config` is the whole
+/// job.
+fn persist_members_edit(app: &App) -> Task<Message> {
+    let config = app.config.clone();
+    let persist = app.persist.clone();
+    Task::perform(persist_config(config, persist), |success| {
+        Message::MembersPersistFinished { success }
+    })
+}
+
+/// Claims the single sync slot, shows a running status naming the project,
+/// and dispatches the background members-aware sync -- shared by
+/// `MembersSyncRequested`'s no-warning-needed path and
+/// `MembersSyncConfirmed`, the same in-flight-guard discipline `SyncRequested`
+/// and `RecreateVenvConfirmed` each apply at their own call site.
+fn dispatch_members_sync(
+    app: &mut App,
+    project: Project,
+    kind: bombadil_core::members::WorkspaceKind,
+    discovered: Vec<bombadil_core::members::DiscoveredMember>,
+    runner: Arc<dyn CommandRunner>,
+) -> Task<Message> {
+    let config = app.config.clone();
+    app.syncing = Some(project.id.to_string());
+    app.drawer = drawer::Drawer {
+        status: format!("syncing members for {}...", project.label),
+        ..drawer::Drawer::default()
+    };
+    // Reuses `SyncFinished`: this is still an ordinary `uv sync` under the
+    // hood, with the same single-slot release, transcript handling and
+    // expand-on-failure.
+    Task::perform(
+        members_sync(project, config, kind, discovered, runner),
+        |(success, lines)| Message::SyncFinished { success, lines },
+    )
 }
 
 /// Dispatches the adopt-or-create probe for wherever the draft's venv choice
@@ -665,6 +1925,17 @@ async fn pick_pyproject() -> Option<PathBuf> {
 async fn pick_folder() -> Option<PathBuf> {
     rfd::AsyncFileDialog::new()
         .pick_folder()
+        .await
+        .map(|handle| handle.path().to_path_buf())
+}
+
+/// Opens the async file picker for a pre-activate script (criterion 3). Same
+/// reasoning as `pick_pyproject`: the blocking `rfd::FileDialog` must never
+/// be used, since a modal dialog on the render thread would freeze the
+/// window for as long as the user takes to answer it.
+async fn pick_script() -> Option<PathBuf> {
+    rfd::AsyncFileDialog::new()
+        .pick_file()
         .await
         .map(|handle| handle.path().to_path_buf())
 }
@@ -890,6 +2161,161 @@ fn run_sync(
     compose_and_run(spec, project, config, &venv_path, store, runner)
 }
 
+/// The blocking half of a members-aware sync (spec §5a, Task 5, criterion
+/// 4): builds the sync command from the project's own member selection
+/// through `members_editor::sync_plan` -- the only place that decision is
+/// made -- instead of `run_sync`'s unconditional plain `uv sync`. Reached
+/// only from the Members tab's own "Sync members" action
+/// (`Message::MembersSyncRequested`/`MembersSyncConfirmed`); the ordinary
+/// Sync button still calls `run_sync` unmodified, so an everyday project's
+/// sync behaviour is untouched by this feature.
+fn run_members_sync(
+    project: &Project,
+    config: &Config,
+    kind: &bombadil_core::members::WorkspaceKind,
+    discovered: &[bombadil_core::members::DiscoveredMember],
+    store: &dyn SecretStore,
+    runner: &dyn CommandRunner,
+) -> (bool, Vec<String>) {
+    let Some(project_dir) = project
+        .pyproject_path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+    else {
+        return (false, vec!["no project directory to run uv in".to_string()]);
+    };
+    let venv_path = match venv_path::resolve(project, &config.settings) {
+        Ok(path) => path,
+        Err(err) => return (false, vec![err.to_string()]),
+    };
+    let resolved_uv = match resolve_uv_for(config, runner) {
+        Ok(resolved) => resolved,
+        Err(err) => return (false, vec![err]),
+    };
+
+    let ctx = uv::command::ProjectContext {
+        project_dir: project_dir.to_path_buf(),
+        venv_path: venv_path.clone(),
+    };
+    let spec = match members_editor::sync_plan(&project.members, kind, discovered) {
+        members_editor::SyncPlan::Plain => uv::command::sync(&resolved_uv, &ctx),
+        members_editor::SyncPlan::AllPackages => uv::command::sync_all_members(&resolved_uv, &ctx),
+        members_editor::SyncPlan::Named(names) => {
+            uv::command::sync_members(&resolved_uv, &ctx, &names)
+        }
+    };
+    compose_and_run(spec, project, config, &venv_path, store, runner)
+}
+
+/// Runs a members-aware sync off the render thread -- same shape as
+/// `sync_project`, including `SYNC_TIMEOUT`, since this is also a real `uv
+/// sync` under the hood.
+async fn members_sync(
+    project: Project,
+    config: Config,
+    kind: bombadil_core::members::WorkspaceKind,
+    discovered: Vec<bombadil_core::members::DiscoveredMember>,
+    runner: Arc<dyn CommandRunner>,
+) -> (bool, Vec<String>) {
+    match job::run(
+        move || {
+            run_members_sync(
+                &project,
+                &config,
+                &kind,
+                &discovered,
+                &KeyringSecretStore::new(),
+                runner.as_ref(),
+            )
+        },
+        SYNC_TIMEOUT,
+    )
+    .await
+    {
+        job::JobResult::Done(result) => result,
+        job::JobResult::TimedOut => (false, vec!["sync timed out".to_string()]),
+        job::JobResult::Failed => (false, vec!["sync failed unexpectedly".to_string()]),
+    }
+}
+
+/// The blocking half of a recreate: delete the project's environment, then
+/// rebuild it with the same `uv sync` an ordinary Sync runs.
+///
+/// `delete` is a parameter, not `venv_path::delete` called directly, for the
+/// same reason `run_confirm_add_project` takes its `probe`: it is the one
+/// call in this file that removes a directory tree, and a GUI test must not
+/// touch the filesystem. The real caller supplies
+/// `bombadil_core::venv_path::delete`, which independently re-derives the
+/// project's venv location and refuses anything that is not exactly it -- so
+/// this function's `resolve` deciding wrongly cannot make it delete the
+/// wrong thing.
+///
+/// A refused delete stops the recreate rather than falling through to the
+/// sync: syncing anyway would silently do something other than what the user
+/// confirmed, and the reason core refused is what they need to see.
+fn run_recreate_venv(
+    project: &Project,
+    config: &Config,
+    store: &dyn SecretStore,
+    runner: &dyn CommandRunner,
+    delete: impl Fn(&Path) -> Result<(), String>,
+) -> (bool, Vec<String>) {
+    let venv_path = match venv_path::resolve(project, &config.settings) {
+        Ok(path) => path,
+        Err(err) => return (false, vec![err.to_string()]),
+    };
+
+    if let Err(err) = delete(&venv_path) {
+        return (false, vec![err, "nothing was deleted".to_string()]);
+    }
+
+    let (success, mut lines) = run_sync(project, config, store, runner);
+    if !success {
+        // The outcome the confirmation warned about. "sync failed" on its own
+        // leaves the user unaware that the environment they had is gone.
+        lines.push(format!(
+            "{} was deleted and could not be rebuilt; the environment no longer exists",
+            venv_path.display()
+        ));
+    }
+    (success, lines)
+}
+
+/// Runs a recreate off the render thread -- same shape as `sync_project`,
+/// including `SYNC_TIMEOUT`, since the rebuild half *is* a `uv sync`.
+async fn recreate_venv(
+    project: Project,
+    config: Config,
+    runner: Arc<dyn CommandRunner>,
+) -> (bool, Vec<String>) {
+    match job::run(
+        move || {
+            let settings = config.settings.clone();
+            let target = &project;
+            run_recreate_venv(
+                &project,
+                &config,
+                &KeyringSecretStore::new(),
+                runner.as_ref(),
+                |path| venv_path::delete(target, &settings, path).map_err(|err| err.to_string()),
+            )
+        },
+        SYNC_TIMEOUT,
+    )
+    .await
+    {
+        job::JobResult::Done(result) => result,
+        job::JobResult::TimedOut => (
+            false,
+            vec!["recreating the environment timed out".to_string()],
+        ),
+        job::JobResult::Failed => (
+            false,
+            vec!["recreating the environment failed unexpectedly".to_string()],
+        ),
+    }
+}
+
 /// The blocking half of confirming the add-project dialog: persist the
 /// updated config, then decide whether the chosen location already holds a
 /// venv (adopt it, run nothing) or needs one created
@@ -1074,12 +2500,19 @@ async fn detect_terminals(os: Os, runner: Arc<dyn CommandRunner>) -> Vec<Termina
 /// commonly is on Windows) degrades to an unrecognised shell family, which
 /// `terminal::open::open` already handles by opening without the
 /// re-assertion rather than refusing to open at all.
+/// `scratch_dir` is a parameter rather than derived from
+/// `std::env::temp_dir()` in here: `terminal::open::open` *writes* the
+/// re-assertion init file into it, and a test that reached this function
+/// therefore wrote into the machine's real temp directory -- the exact
+/// no-filesystem constraint these tests exist to honour. The real caller
+/// (`open_terminal`) supplies the Bombadil-owned temp directory.
 fn run_open_terminal(
     choice: &TerminalChoice,
     project: &Project,
     config: &Config,
     store: &dyn SecretStore,
     runner: &dyn CommandRunner,
+    scratch_dir: &Path,
 ) -> Result<(), String> {
     let venv_path = venv_path::resolve(project, &config.settings).map_err(|e| e.to_string())?;
     let inputs = EnvInputs {
@@ -1089,11 +2522,6 @@ fn run_open_terminal(
         venv_path,
     };
     let shell = std::env::var("SHELL").unwrap_or_default();
-    // A Bombadil-owned scratch directory for the re-assertion init file
-    // `terminal::open::open` writes -- namespaced per-project underneath by
-    // `open` itself, so two concurrent opens for different projects cannot
-    // collide (see its own doc comment).
-    let scratch_dir = std::env::temp_dir().join("bombadil-terminal-init");
     terminal::open::open(
         choice,
         Os::host(),
@@ -1101,7 +2529,7 @@ fn run_open_terminal(
         &shell,
         store,
         runner,
-        &scratch_dir,
+        scratch_dir,
     )
     .map_err(|err| err.to_string())
 }
@@ -1115,12 +2543,19 @@ async fn open_terminal(
 ) -> Result<(), String> {
     match job::run(
         move || {
+            // A Bombadil-owned scratch directory for the re-assertion init
+            // file `terminal::open::open` writes -- namespaced per-project
+            // underneath by `open` itself, so two concurrent opens for
+            // different projects cannot collide (see its own doc comment).
+            // Built here, at the boundary, so no test ever reaches it.
+            let scratch_dir = std::env::temp_dir().join("bombadil-terminal-init");
             run_open_terminal(
                 &choice,
                 &project,
                 &config,
                 &KeyringSecretStore::new(),
                 runner.as_ref(),
+                &scratch_dir,
             )
         },
         VENV_PROBE_TIMEOUT,
@@ -1133,18 +2568,249 @@ async fn open_terminal(
     }
 }
 
-/// The blocking half of persisting a removal: just a save. Its own function,
-/// mirroring `run_confirm_add_project`, so a test can exercise it directly
-/// with a `FakeConfigPersist` instead of through `update`'s opaque `Task`.
+/// The blocking half of Open folder: show the project's own directory --
+/// where `pyproject.toml` lives, the same place Open terminal opens in -- in
+/// the platform's file manager.
+///
+/// `os` is a parameter, never `Os::host()` read in here, for the reason the
+/// whole `terminal` module states: it is the only thing that lets the macOS
+/// and Windows commands be covered by tests running on Linux.
+///
+/// Nothing composed is involved: `folder::open` attaches no environment, so
+/// there is no secret to redact and no keychain to reach. That is why this
+/// takes no `SecretStore` while `run_open_terminal` does.
+fn run_open_folder(os: Os, project: &Project, runner: &dyn CommandRunner) -> Result<(), String> {
+    let dir = project
+        .pyproject_path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .ok_or_else(|| {
+            format!(
+                "{} has no directory to open",
+                project.pyproject_path.display()
+            )
+        })?;
+    bombadil_core::folder::open(os, dir, runner).map_err(|err| err.to_string())
+}
+
+/// Runs Open folder off the render thread. `VENV_PROBE_TIMEOUT`, like
+/// `open_terminal`: this only launches a file manager and returns, so a wait
+/// measured in seconds already means something is wrong.
+async fn open_folder(
+    os: Os,
+    project: Project,
+    runner: Arc<dyn CommandRunner>,
+) -> Result<(), String> {
+    match job::run(
+        move || run_open_folder(os, &project, runner.as_ref()),
+        VENV_PROBE_TIMEOUT,
+    )
+    .await
+    {
+        job::JobResult::Done(result) => result,
+        job::JobResult::TimedOut => Err("opening the folder timed out".to_string()),
+        job::JobResult::Failed => Err("opening the folder failed unexpectedly".to_string()),
+    }
+}
+
+/// The blocking half of persisting a config, with nothing else to do: just a
+/// save. Its own function, mirroring `run_confirm_add_project`, so a test can
+/// exercise it directly with a `FakeConfigPersist` instead of through
+/// `update`'s opaque `Task`. Shared by every caller that only needs a plain
+/// save -- a removal, and the plain (non-secret-toggling) env var edits.
 fn run_persist(config: &Config, persist: &dyn ConfigPersist) -> bool {
     persist.save(config).is_ok()
 }
 
-/// Runs off the render thread via `job::run`: persisting the config after a
-/// removal is a blocking file write, same as every other `ConfigPersist` call
-/// in this file.
-async fn persist_removal(config: Config, persist: Arc<dyn ConfigPersist>) -> bool {
+/// Dispatches a background persist of `app.config` as it stands right now
+/// (criterion 5). Shared by every plain env var edit (add, remove, rename,
+/// retype a non-secret value) -- none of them touch the keychain, so a plain
+/// `persist_config` is the whole job, unlike `EnvVarSecretToggled`, which
+/// also has a keychain call that must land in the same background step.
+fn persist_env_edit(app: &App) -> Task<Message> {
+    let config = app.config.clone();
+    let persist = app.persist.clone();
+    Task::perform(persist_config(config, persist), |success| {
+        Message::EnvVarPersistFinished { success }
+    })
+}
+
+/// Dispatches a background persist of `app.config` as it stands right now,
+/// for a script edit (add, remove, toggle enabled, reorder). Mirrors
+/// `persist_env_edit` exactly -- none of these edits touch the keychain, so a
+/// plain `persist_config` is the whole job.
+fn persist_script_edit(app: &App) -> Task<Message> {
+    let config = app.config.clone();
+    let persist = app.persist.clone();
+    Task::perform(persist_config(config, persist), |success| {
+        Message::ScriptPersistFinished { success }
+    })
+}
+
+/// Dispatches a background persist of `app.config` as it stands right now,
+/// for an index edit that does not touch the keychain (add, remove, a field
+/// edit, a project's selection toggle). Mirrors `persist_env_edit` and
+/// `persist_script_edit` exactly.
+///
+/// `IndexCredentialSaveRequested` does *not* go through this: a credential
+/// save's persist has to land in the same background job as the keychain
+/// write, the same pairing `EnvVarSecretToggled` needs -- see
+/// `mark_secret_job`, which it dispatches directly instead.
+fn persist_index_edit(app: &App) -> Task<Message> {
+    let config = app.config.clone();
+    let persist = app.persist.clone();
+    Task::perform(persist_config(config, persist), |success| {
+        Message::IndexPersistFinished { success }
+    })
+}
+
+/// Dispatches a background persist of `app.config` as it stands right now,
+/// for a Settings edit (spec §5, Task 6) that needs no keychain call --
+/// every one of them, since neither `uv_source` nor `default_venv_location`
+/// carries a secret. Mirrors `persist_env_edit`/`persist_script_edit`/
+/// `persist_index_edit` exactly.
+fn persist_settings_edit(app: &App) -> Task<Message> {
+    let config = app.config.clone();
+    let persist = app.persist.clone();
+    Task::perform(persist_config(config, persist), |success| {
+        Message::SettingsPersistFinished { success }
+    })
+}
+
+/// The blocking half of validating a candidate `uv_source: Custom { path }`
+/// (criterion 2): resolves it through the same `resolve_uv_for` every other
+/// uv call in this file uses, against a config whose `uv_source` has been
+/// swapped for the candidate -- so a version below `MIN_UV_VERSION` comes
+/// back as `UvResolveError::TooOld`'s own text, the same as it would for a
+/// real sync, and nothing here re-derives that check.
+///
+/// Its own function, mirroring `list_interpreters_blocking`, so a test can
+/// call it directly with a `FakeCommandRunner` instead of only through the
+/// `Task` `SettingsUvCustomValidateRequested` returns.
+fn validate_uv_source_blocking(
+    path: PathBuf,
+    mut config: Config,
+    runner: &dyn CommandRunner,
+) -> Result<uv::ResolvedUv, String> {
+    config.settings.uv_source = UvSource::Custom { path };
+    resolve_uv_for(&config, runner)
+}
+
+/// Runs `validate_uv_source_blocking` off the render thread via `job::run` --
+/// criterion 2's "through `job::run`": probing a uv binary spawns it, the
+/// same reason `sync_project` and `list_interpreters` do the same.
+async fn validate_uv_source(
+    path: PathBuf,
+    config: Config,
+    runner: Arc<dyn CommandRunner>,
+) -> Result<uv::ResolvedUv, String> {
+    match job::run(
+        move || validate_uv_source_blocking(path, config, runner.as_ref()),
+        SYNC_TIMEOUT,
+    )
+    .await
+    {
+        job::JobResult::Done(result) => result,
+        job::JobResult::TimedOut => Err("validating uv timed out".to_string()),
+        job::JobResult::Failed => Err("validating uv failed unexpectedly".to_string()),
+    }
+}
+
+/// Runs off the render thread via `job::run`: persisting the config is a
+/// blocking file write, same as every other `ConfigPersist` call in this
+/// file.
+async fn persist_config(config: Config, persist: Arc<dyn ConfigPersist>) -> bool {
     match job::run(move || run_persist(&config, persist.as_ref()), SYNC_TIMEOUT).await {
+        job::JobResult::Done(success) => success,
+        job::JobResult::TimedOut | job::JobResult::Failed => false,
+    }
+}
+
+/// The blocking half of marking an env var secret (criterion 2): write the
+/// plaintext to the keychain, then persist the config -- which by the time
+/// this runs already has the value blanked in memory by
+/// `env_editor::mark_secret`. Both under one `job::run` call so a keychain
+/// write can never land while the on-disk config still disagrees with it.
+///
+/// `store` is a parameter so a test can hand in an `InMemorySecretStore` and
+/// assert both halves of criterion 2 -- the store holds the value, and
+/// `persist`'s recorded config does not; the real caller (`mark_secret_job`)
+/// supplies the keychain.
+fn run_secret_write(
+    key: &SecretKey,
+    plain_value: &str,
+    config: &Config,
+    store: &dyn SecretStore,
+    persist: &dyn ConfigPersist,
+) -> bool {
+    store.set(key, plain_value).is_ok() && persist.save(config).is_ok()
+}
+
+/// The blocking half of unmarking an env var secret (criterion 3): delete the
+/// keychain entry, then persist. Same pairing discipline as
+/// `run_secret_write`, and the same reason: an orphaned keychain entry (a
+/// delete that never happened) or a config that still claims secret (a
+/// persist that never happened) are each exactly the bug the two criteria
+/// exist to catch.
+fn run_secret_delete(
+    key: &SecretKey,
+    config: &Config,
+    store: &dyn SecretStore,
+    persist: &dyn ConfigPersist,
+) -> bool {
+    store.delete(key).is_ok() && persist.save(config).is_ok()
+}
+
+/// Runs off the render thread via `job::run`. `KeyringSecretStore` is
+/// constructed here, on the job thread, never taken as a parameter of
+/// `update` -- the same discipline `sync_project` and every other keychain
+/// call in this file follow, so no test can reach the real keychain through
+/// it.
+///
+/// Shared verbatim by `IndexCredentialSaveRequested` (Task 4): writing a
+/// plaintext value under some `SecretKey` and persisting the config that no
+/// longer carries it is exactly the same pairing an index credential save
+/// needs, and index credentials have no analogue of `mark_secret`'s
+/// in-memory half to call first -- `IndexAuth` never held the plaintext to
+/// begin with, so there is nothing to blank.
+async fn mark_secret_job(
+    key: SecretKey,
+    plain_value: String,
+    config: Config,
+    persist: Arc<dyn ConfigPersist>,
+) -> bool {
+    match job::run(
+        move || {
+            run_secret_write(
+                &key,
+                &plain_value,
+                &config,
+                &KeyringSecretStore::new(),
+                persist.as_ref(),
+            )
+        },
+        SYNC_TIMEOUT,
+    )
+    .await
+    {
+        job::JobResult::Done(success) => success,
+        job::JobResult::TimedOut | job::JobResult::Failed => false,
+    }
+}
+
+/// Runs off the render thread via `job::run`. Same discipline as
+/// `mark_secret_job`.
+async fn unmark_secret_job(
+    key: SecretKey,
+    config: Config,
+    persist: Arc<dyn ConfigPersist>,
+) -> bool {
+    match job::run(
+        move || run_secret_delete(&key, &config, &KeyringSecretStore::new(), persist.as_ref()),
+        SYNC_TIMEOUT,
+    )
+    .await
+    {
         job::JobResult::Done(success) => success,
         job::JobResult::TimedOut | job::JobResult::Failed => false,
     }
@@ -1156,7 +2822,7 @@ pub fn view(app: &App) -> iced::Element<'_, Message> {
     // selected index has to survive as far as the button.
     let selected = app
         .selected
-        .and_then(|i| app.projects.get(i).map(|project| (i, project)));
+        .and_then(|i| app.config.projects.get(i).map(|project| (i, project)));
     let detail: iced::Element<'_, Message> = match selected {
         // The probe answers from the already-probed `entries` cache rather
         // than touching disk again on every frame -- `boot`'s background
@@ -1169,7 +2835,81 @@ pub fn view(app: &App) -> iced::Element<'_, Message> {
         None => iced::widget::text("").into(),
     };
 
-    let detail_and_drawer = iced::widget::column![detail, drawer::view(&app.drawer)].spacing(8);
+    // Exactly one pane, chosen by `app.tab` (spec §8). This used to be all
+    // seven concatenated into one column -- see `Tab`'s own doc for what that
+    // did to the confirmations sitting below them.
+    let pane: iced::Element<'_, Message> = match app.tab {
+        // Only rendered once its index still matches the current selection --
+        // `Message::DepsLoaded` guards the same way when it lands.
+        Tab::Dependencies => match &app.deps {
+            Some((i, tab)) if Some(*i) == app.selected => deps::view(tab),
+            _ => iced::widget::text("").into(),
+        },
+        // Rebuilt fresh from `app.config` on every render, unlike the
+        // Dependencies tab above: a member toggle changes
+        // `app.config.projects[i].members` without a new fetch, and this is
+        // what keeps the checklist reflecting it immediately rather than
+        // waiting on `MembersLoaded` to land again -- the same "recompute,
+        // don't cache" trick `banner::problems` and
+        // `add_project::resolved_venv_path_display` use for the same reason.
+        Tab::Members => match &app.members {
+            Some((i, fetch)) if Some(*i) == app.selected => match app.config.projects.get(*i) {
+                Some(project) => {
+                    let project_dir = project
+                        .pyproject_path
+                        .parent()
+                        .map(Path::to_path_buf)
+                        .unwrap_or_default();
+                    let tab = members_editor::build(
+                        &project_dir,
+                        &project.members,
+                        &fetch.kind,
+                        &fetch.discovered,
+                        &fetch.installed,
+                    );
+                    members_editor::view(&tab, *i)
+                }
+                None => iced::widget::text("").into(),
+            },
+            _ => iced::widget::text("").into(),
+        },
+        // Global variables are always shown; the project half only once a
+        // project is selected -- the same `app.selected` `env_editor::view`
+        // needs to know which project's `env` to show alongside them.
+        Tab::EnvVars => env_editor::view(&app.config, app.selected),
+        // Same shape as the Env vars tab: global scripts always shown, the
+        // project's own scripts once one is selected.
+        Tab::Scripts => scripts_editor::view(&app.config, app.selected),
+        // Every configured index, plus (once a project is selected) that
+        // project's own selection among them (spec §7, Task 4).
+        Tab::Indexes => index_editor::view(&app.config, app.selected, &app.index_credential_drafts),
+        // Which uv binary to run and where new venvs go (spec §5, Task 6).
+        // `resolved_default_venv_paths` recomputes fresh from `app.config` on
+        // every render, the same "recompute, don't cache" trick the Env vars
+        // and Indexes tabs already rely on, which is what makes criterion 3
+        // visible the instant a location change lands, with no restart.
+        Tab::Settings => settings_editor::view(
+            &app.config.settings,
+            &app.config.projects,
+            &app.uv_custom_path_draft,
+            app.uv_custom_validation.as_ref(),
+        ),
+    };
+
+    // The current tab's own button is disabled rather than hidden -- the
+    // same "no press needed, no press possible" treatment `index_editor`'s
+    // auth buttons and `scripts_editor`'s move buttons give a control whose
+    // action is already the state.
+    let mut tab_bar = iced::widget::row![].spacing(4);
+    for tab in Tab::ALL {
+        tab_bar = tab_bar.push(
+            iced::widget::button(iced::widget::text(tab.label()))
+                .on_press_maybe((tab != app.tab).then_some(Message::TabSelected(tab))),
+        );
+    }
+
+    let detail_and_drawer =
+        iced::widget::column![detail, tab_bar, pane, drawer::view(&app.drawer)].spacing(8);
 
     let add_project_button = iced::widget::button(iced::widget::text("Add project"))
         .on_press(Message::AddProjectPickManifestRequested);
@@ -1213,14 +2953,41 @@ pub fn view(app: &App) -> iced::Element<'_, Message> {
         None => iced::widget::text("").into(),
     };
 
+    // The Recreate venv confirmation (spec §8). Rendered from the resolved
+    // path captured when it opened, not re-resolved here: the sentence the
+    // user agrees to and the path that gets deleted must be the same one.
+    let confirm_recreate_view: iced::Element<'_, Message> = match &app.confirm_recreate {
+        Some(confirm) => context_menu::confirm_view(confirm),
+        None => iced::widget::text("").into(),
+    };
+
+    // The pending "sync would remove members" confirmation (spec §5a
+    // criterion 4), rendered from the warning captured when it opened --
+    // same freshness argument as `confirm_recreate_view`.
+    let confirm_member_sync_view: iced::Element<'_, Message> = match &app.confirm_member_sync {
+        Some(confirm) => members_editor::confirm_view(confirm),
+        None => iced::widget::text("").into(),
+    };
+
     let mut problems = app.load_problems.clone();
     problems.extend(banner::problems(&app.config));
     let footer = crate::about::view(app.about_expanded);
+    // The dialog, the context menu and both confirmations sit *above* the
+    // scrollable, not inside it. Nothing here is modal, so a confirmation
+    // rendered after the body is a confirmation the user has to scroll to --
+    // and with a real dependency tree that meant thousands of pixels below
+    // the viewport, in a column that did not scroll at all. Each is an empty
+    // `text("")` when closed, so they cost nothing when there is nothing to
+    // answer.
     iced::widget::column![
         banner::view(&problems),
-        body,
         add_project_dialog,
         context_menu_view,
+        confirm_recreate_view,
+        confirm_member_sync_view,
+        iced::widget::scrollable(body)
+            .width(iced::Length::Fill)
+            .height(iced::Length::Fill),
         footer
     ]
     .into()
@@ -1239,7 +3006,7 @@ mod tests {
     /// project, because the header's Sync button has to name what it acts on.
     fn selected_label(app: &App) -> Option<&str> {
         app.selected
-            .and_then(|i| app.projects.get(i))
+            .and_then(|i| app.config.projects.get(i))
             .map(|p| p.label.as_str())
     }
 
@@ -1270,7 +3037,7 @@ mod tests {
         // first frame, so the empty case has to be representable.
         let app = App::new(Config::default());
         assert!(app.selected.is_none());
-        assert!(app.projects.is_empty());
+        assert!(app.config.projects.is_empty());
     }
 
     #[test]
@@ -1292,6 +3059,193 @@ mod tests {
         let mut app = App::new(config);
         let _ = update(&mut app, Message::ProjectSelected(1), unused_runner());
         assert_eq!(selected_label(&app), Some("web"));
+    }
+
+    // --- the tab container (spec §8) ---
+
+    #[test]
+    fn the_detail_area_starts_on_the_dependencies_tab() {
+        assert_eq!(App::new(Config::default()).tab, Tab::Dependencies);
+    }
+
+    #[test]
+    fn selecting_a_tab_switches_which_pane_renders() {
+        let mut app = App::new(Config {
+            projects: vec![project("api")],
+            ..Config::default()
+        });
+
+        let task = update(
+            &mut app,
+            Message::TabSelected(Tab::Indexes),
+            unused_runner(),
+        );
+
+        assert_eq!(app.tab, Tab::Indexes);
+        assert_eq!(
+            task.units(),
+            0,
+            "switching tabs is pure state -- nothing to fetch, nothing to persist"
+        );
+    }
+
+    #[test]
+    fn every_tab_renders_with_both_confirmations_open() {
+        // The container nobody owned: `view` concatenated all seven panes and
+        // then stacked the dialog, the context menu and both confirmations
+        // below them, in a column with no `scrollable` anywhere. This does not
+        // prove the layout scrolls -- no test here can drive a renderer -- but
+        // it does exercise every arm of the new `match app.tab` with the
+        // overlays present, which is where a pane and an overlay could
+        // otherwise disagree about what they may borrow.
+        let mut app = App::new(Config {
+            projects: vec![project("api")],
+            indexes: vec![index_with_auth(
+                "corp",
+                bombadil_core::model::IndexAuth::Token,
+            )],
+            ..Config::default()
+        });
+        app.deps = Some((0, deps::build(&PyProject::default(), &[], None)));
+        app.members = Some((
+            0,
+            MembersFetch {
+                kind: bombadil_core::members::WorkspaceKind::Loose,
+                discovered: vec![],
+                installed: vec![],
+            },
+        ));
+        app.confirm_recreate = Some(context_menu::ConfirmRecreate {
+            project_id: app.config.projects[0].id,
+            label: "api".to_string(),
+            venv_path: PathBuf::from("/p/api/.venv"),
+        });
+        app.confirm_member_sync = Some(members_editor::ConfirmMemberSync {
+            project_index: 0,
+            label: "api".to_string(),
+            warning: "would remove alpha".to_string(),
+        });
+        app.context_menu = Some(context_menu::ContextMenu {
+            project_index: 0,
+            terminals: vec![host_terminal_kind()],
+        });
+
+        for tab in Tab::ALL {
+            app.tab = tab;
+            let _ = view(&app);
+        }
+    }
+
+    // --- Task 1: the Dependencies tab ---
+
+    #[test]
+    fn selecting_a_project_fetches_its_dependencies_through_job_run_not_inline() {
+        // Criterion 5: `uv tree` on a large project is slow, so this must
+        // never run inside `update` itself -- the same "nothing recorded
+        // synchronously, but real work dispatched" proof `SyncRequested` and
+        // `OpenFolderRequested` use.
+        let config = Config {
+            projects: vec![project("api")],
+            ..Config::default()
+        };
+        let mut app = App::new(config);
+        let fake = Arc::new(FakeCommandRunner::new());
+
+        let task = update(&mut app, Message::ProjectSelected(0), fake.clone());
+
+        assert!(
+            fake.calls().is_empty(),
+            "the dependency fetch must not call the runner synchronously inside update; got {:?}",
+            fake.calls()
+        );
+        assert!(
+            task.units() > 0,
+            "selecting a project must dispatch a real background fetch, not Task::none()"
+        );
+    }
+
+    #[test]
+    fn booting_with_a_selected_project_also_fetches_its_dependencies_without_blocking() {
+        // `boot` has no `CommandRunner` to fetch with directly; it must
+        // re-dispatch through `ProjectSelected` rather than skip the fetch
+        // for whichever project starts selected.
+        let (_app, task) = boot(Loaded::Fresh(Config {
+            projects: vec![project("api")],
+            ..Config::default()
+        }));
+        assert!(
+            task.units() > 0,
+            "boot must dispatch work for the initially selected project's dependencies"
+        );
+    }
+
+    #[test]
+    fn a_deps_fetch_result_is_built_and_stored_against_its_project_index() {
+        let mut app = App::new(Config {
+            projects: vec![project("api")],
+            ..Config::default()
+        });
+        let fetch = DepsFetch {
+            pyproject: bombadil_core::pyproject::PyProject {
+                dependencies: vec!["httpx>=0.27".to_string()],
+                ..Default::default()
+            },
+            installed: vec![],
+            tree: None,
+        };
+
+        let _ = update(&mut app, Message::DepsLoaded(0, fetch), unused_runner());
+
+        let (index, tab) = app
+            .deps
+            .as_ref()
+            .expect("a landed fetch must populate app.deps");
+        assert_eq!(*index, 0);
+        assert!(
+            tab.groups[0].rows.iter().any(|r| r.name == "httpx"),
+            "the tab must be built from the fetched manifest; got {:?}",
+            tab.groups
+        );
+    }
+
+    #[test]
+    fn a_stale_deps_fetch_for_a_project_that_no_longer_exists_is_dropped() {
+        let mut app = App::new(Config::default());
+        let fetch = DepsFetch {
+            pyproject: PyProject::default(),
+            installed: vec![],
+            tree: None,
+        };
+
+        let _ = update(&mut app, Message::DepsLoaded(0, fetch), unused_runner());
+
+        assert!(
+            app.deps.is_none(),
+            "a fetch result for an index with no matching project must be dropped"
+        );
+    }
+
+    #[test]
+    fn removing_the_displayed_project_clears_its_stale_dependency_tab() {
+        // `deps` is tagged with an index; removal shifts every later index,
+        // so an uncleared tag would show a stale tab against whichever
+        // project now sits there instead of the one it was fetched for.
+        let mut app = App::new(Config {
+            projects: vec![project("api"), project("web")],
+            ..Config::default()
+        });
+        app.deps = Some((0, deps::build(&PyProject::default(), &[], None)));
+
+        let _ = update(
+            &mut app,
+            Message::RemoveProjectRequested(0),
+            unused_runner(),
+        );
+
+        assert!(
+            app.deps.is_none(),
+            "removal must clear a dependency tab that may now describe the wrong project"
+        );
     }
 
     #[test]
@@ -1377,7 +3331,7 @@ mod tests {
             message: "expected `=` at line 4".into(),
         });
 
-        assert!(app.projects.is_empty());
+        assert!(app.config.projects.is_empty());
         assert!(
             app.load_problems
                 .iter()
@@ -1525,7 +3479,7 @@ mod tests {
             ..Config::default()
         });
         assert_eq!(app.selected, Some(0), "api must be the selected project");
-        let web_id = app.projects[1].id.to_string();
+        let web_id = app.config.projects[1].id.to_string();
 
         let _ = update(&mut app, Message::ContextMenuOpened(1), unused_runner());
         assert_eq!(
@@ -1758,6 +3712,70 @@ mod tests {
             app.drawer.lines.iter().any(|l| l.contains("***")),
             "the failing line must still be shown, redacted; got {:?}",
             app.drawer.lines
+        );
+    }
+
+    #[test]
+    fn a_project_env_var_typed_this_session_reaches_the_very_next_sync() {
+        // `App` used to hold a startup clone of `config.projects` alongside
+        // `config.projects` itself. Every editor wrote the config; Sync, Open
+        // terminal and Recreate venv read the clone -- so a variable typed
+        // this session was simply absent from the environment uv ran in, an
+        // index credential was never injected (a 401 the drawer could not
+        // explain), and a pre-activate script never ran. Restarting "fixed"
+        // all of it, which is exactly why manual testing never caught it.
+        //
+        // Nothing in `App` distinguishes the two: `syncing` holds the same
+        // id and the drawer the same label either way. The resolution itself
+        // is the last observable point, so this asserts on the `Project` the
+        // press resolves and hands it to the same `run_sync` the dispatched
+        // job runs.
+        let config = Config {
+            projects: vec![project("api")],
+            settings: fake_uv_settings(),
+            ..Config::default()
+        };
+        let mut app = App::new(config);
+
+        for message in [
+            Message::EnvVarAdded(env_editor::EnvScope::Project(0)),
+            Message::EnvVarKeyChanged(env_editor::EnvScope::Project(0), 0, "MARKER".into()),
+            Message::EnvVarValueChanged(env_editor::EnvScope::Project(0), 0, "set".into()),
+        ] {
+            let _ = update(&mut app, message, unused_runner());
+        }
+
+        let task = update(&mut app, Message::SyncRequested(0), unused_runner());
+        assert!(task.units() > 0, "the Sync press must dispatch real work");
+
+        let target = sync_target(&app, 0).expect("the press must resolve a project");
+        let store = bombadil_core::secrets::InMemorySecretStore::new();
+        let runner = FakeCommandRunner::new();
+        version_probe(&runner);
+        runner.expect(
+            "uv",
+            &["sync"],
+            bombadil_core::process::CommandOutcome {
+                status: Some(0),
+                stdout: String::new(),
+                stderr: String::new(),
+            },
+        );
+
+        let (success, lines) = run_sync(&target, &app.config, &store, &runner);
+        assert!(success, "got {lines:?}");
+
+        let calls = runner.calls();
+        let sync = calls
+            .iter()
+            .find(|c| c.args.iter().any(|a| a == "sync"))
+            .expect("uv sync must have been run");
+        assert_eq!(
+            sync.env.get("MARKER").map(String::as_str),
+            Some("set"),
+            "a variable typed this session must be in the environment the very next sync \
+             runs in, not only after a restart; got {:?}",
+            sync.env.keys().collect::<Vec<_>>()
         );
     }
 
@@ -2144,8 +4162,8 @@ mod tests {
             "got {:?}",
             app.config.projects
         );
-        assert_eq!(app.projects.len(), 1);
-        assert_eq!(app.projects[0].label, "my-api");
+        assert_eq!(app.config.projects.len(), 1);
+        assert_eq!(app.config.projects[0].label, "my-api");
         assert_eq!(app.entries.len(), 1);
         assert!(
             app.add_project.is_none(),
@@ -2563,8 +4581,8 @@ mod tests {
             app.config.projects
         );
         assert_eq!(app.config.projects[0].label, "web");
-        assert_eq!(app.projects.len(), 1);
-        assert_eq!(app.projects[0].label, "web");
+        assert_eq!(app.config.projects.len(), 1);
+        assert_eq!(app.config.projects[0].label, "web");
         assert_eq!(app.entries.len(), 1);
         assert!(
             task.units() > 0,
@@ -2615,19 +4633,21 @@ mod tests {
             unused_runner(),
         );
 
-        assert!(app.projects.is_empty());
+        assert!(app.config.projects.is_empty());
         assert!(app.selected.is_none());
     }
 
     #[test]
     fn removing_a_project_never_touches_the_venv_on_disk() {
-        // bombadil-core has no function capable of deleting a venv at all --
-        // confirmed by inspection: the only `fs::remove_*` call in the whole
-        // crate lives inside `venv_path`'s own test fixture teardown, not in
-        // any code `update` can reach. So this proves the removal path we
-        // built calls no `CommandRunner` at all, which is everything there
-        // is to guard against today; there is no delete-venv primitive for a
-        // future regression to accidentally wire up removal into yet.
+        // What this proves: the removal path runs and spawns nothing at all,
+        // so it cannot reach uv or any other process.
+        //
+        // What it cannot prove any more: `venv_path::delete` now exists and
+        // needs no `CommandRunner`, so a regression that called it from this
+        // arm would leave `fake.calls()` empty and still destroy the user's
+        // environment. Closing that in a GUI test would mean giving this test
+        // a real venv on disk to watch, which the no-filesystem constraint
+        // forbids -- the guard is the arm's own body, which touches no path.
         let mut app = App::new(Config {
             projects: vec![project("api")],
             ..Config::default()
@@ -2657,7 +4677,7 @@ mod tests {
         );
 
         assert_eq!(
-            app.projects.len(),
+            app.config.projects.len(),
             1,
             "an invalid index must change nothing"
         );
@@ -2776,17 +4796,46 @@ mod tests {
             );
         }
 
+        // A scratch directory of this test's own: `terminal::open::open`
+        // WRITES the shell re-assertion init file into whatever it is given,
+        // and this test used to hand it `std::env::temp_dir()` by way of
+        // `run_open_terminal` -- leaving files on the machine running the
+        // suite, which is exactly what the no-filesystem constraint forbids.
+        let scratch = tempfile::tempdir().unwrap();
+
         let result = run_open_terminal(
             &TerminalChoice::Detected(host_terminal_kind()),
             &project,
             &config,
             &store,
             &runner,
+            scratch.path(),
         );
 
         assert!(result.is_ok(), "got {result:?}");
         let calls = runner.calls();
         assert_eq!(calls.len(), 1, "the terminal must actually be spawned");
+        // Whether an init file is written at all depends on `$SHELL`, which
+        // is not this test's to control -- but if one was, every reference to
+        // it must live under `scratch`. "bombadil-terminal-init" is the real
+        // temp directory's name and must appear nowhere.
+        // `terminal::open::open` namespaces the init file by project id, so
+        // the id is what identifies an init path among argv and a composed
+        // environment that legitimately mentions plenty of other paths.
+        let marker = project.id.to_string();
+        let referenced: Vec<&String> = calls[0]
+            .args
+            .iter()
+            .chain(calls[0].env.values())
+            .filter(|v| v.contains(&marker))
+            .collect();
+        let scratch_prefix = scratch.path().to_string_lossy().into_owned();
+        for value in referenced {
+            assert!(
+                value.starts_with(&scratch_prefix),
+                "an init file was written outside the scratch dir {scratch_prefix}: {value}"
+            );
+        }
         assert!(
             calls[0].clear_env,
             "the composition must be authoritative, not layered on the ambient environment"
@@ -2811,12 +4860,15 @@ mod tests {
         let store = bombadil_core::secrets::InMemorySecretStore::new();
         let runner = FakeCommandRunner::new();
 
+        let scratch = tempfile::tempdir().unwrap();
+
         let result = run_open_terminal(
             &TerminalChoice::Detected(host_terminal_kind()),
             &project("api"),
             &config,
             &store,
             &runner,
+            scratch.path(),
         );
 
         let err =
@@ -2830,6 +4882,506 @@ mod tests {
             !err.contains("not a terminal available"),
             "the failure must come from the spawn, not the wrong-OS guard; got {err}"
         );
+    }
+
+    // --- 7b: Recreate venv ---
+    //
+    // No test here touches the filesystem: `run_recreate_venv` takes the
+    // delete as a parameter, the way `run_confirm_add_project` takes its
+    // probe, so the destructive half is exercised as a recorded call. The
+    // real deletion is `bombadil_core::venv_path::delete`, tested against
+    // `tempfile` in the crate that owns it.
+
+    /// Records every path it was asked to delete and answers with `outcome`.
+    fn recording_delete(
+        log: &std::sync::Mutex<Vec<PathBuf>>,
+        outcome: Result<(), String>,
+    ) -> impl Fn(&Path) -> Result<(), String> + '_ {
+        move |path: &Path| {
+            log.lock().unwrap().push(path.to_path_buf());
+            outcome.clone()
+        }
+    }
+
+    #[test]
+    fn requesting_a_recreate_only_asks_for_confirmation_and_deletes_nothing_yet() {
+        // The whole point of the confirmation. A press that went straight to
+        // work would delete an environment the user has not agreed to lose,
+        // and there is no undo.
+        let mut app = App::new(Config {
+            projects: vec![project("api")],
+            ..Config::default()
+        });
+        let fake = Arc::new(FakeCommandRunner::new());
+        let _ = update(&mut app, Message::ContextMenuOpened(0), fake.clone());
+
+        let task = update(&mut app, Message::RecreateVenvRequested(0), fake.clone());
+
+        assert_eq!(
+            task.units(),
+            0,
+            "requesting a recreate must dispatch NOTHING until it is confirmed"
+        );
+        assert!(
+            fake.calls().is_empty(),
+            "nothing may run before the user confirms; got {:?}",
+            fake.calls()
+        );
+        assert!(
+            app.confirm_recreate.is_some(),
+            "the confirmation must be on screen"
+        );
+        assert!(
+            app.context_menu.is_none(),
+            "the menu should close once an action is taken from it"
+        );
+    }
+
+    #[test]
+    fn the_confirmation_names_the_right_clicked_projects_own_venv_path() {
+        // Two projects with the FIRST selected and the SECOND right-clicked:
+        // a confirmation resolved against the selection would name -- and
+        // then delete -- an environment the user never pointed at.
+        let mut app = App::new(Config {
+            projects: vec![project("api"), project("web")],
+            ..Config::default()
+        });
+        assert_eq!(app.selected, Some(0));
+
+        let _ = update(&mut app, Message::RecreateVenvRequested(1), unused_runner());
+
+        let confirm = app.confirm_recreate.as_ref().expect("must be pending");
+        assert_eq!(confirm.project_id, app.config.projects[1].id);
+        assert_eq!(confirm.label, "web");
+        assert_eq!(
+            confirm.venv_path,
+            PathBuf::from("/p/web/.venv"),
+            "the confirmation must state the right-clicked project's resolved venv path"
+        );
+    }
+
+    #[test]
+    fn a_pending_recreate_never_deletes_a_project_the_user_did_not_name() {
+        // Nothing here is modal, so the whole sequence is reachable with the
+        // mouse: right-click B, pick Recreate venv, then right-click A and
+        // pick Remove from list, then press Confirm. `RemoveProjectRequested`
+        // clears `deps`, `members` and `confirm_member_sync` -- with a comment
+        // naming exactly this hazard -- and used to leave `confirm_recreate`
+        // holding an index that every later project had just shifted out of.
+        // C's environment was what got deleted. `venv_path::delete`'s
+        // refusals all still held; it was handed the wrong project.
+        let mut app = App::new(Config {
+            projects: vec![project("a"), project("b"), project("c")],
+            ..Config::default()
+        });
+        let c_id = app.config.projects[2].id.to_string();
+
+        let _ = update(&mut app, Message::RecreateVenvRequested(1), unused_runner());
+        assert!(
+            app.confirm_recreate.is_some(),
+            "the confirmation for b must be pending"
+        );
+
+        let _ = update(
+            &mut app,
+            Message::RemoveProjectRequested(0),
+            unused_runner(),
+        );
+
+        let task = update(&mut app, Message::RecreateVenvConfirmed, unused_runner());
+
+        assert_ne!(
+            app.syncing.as_deref(),
+            Some(c_id.as_str()),
+            "confirming a recreate for b must never delete c's environment"
+        );
+        assert_eq!(
+            task.units(),
+            0,
+            "a confirmation whose list shifted underneath it must dispatch nothing"
+        );
+        assert!(app.syncing.is_none());
+    }
+
+    #[test]
+    fn a_recreate_confirmation_resolves_its_project_by_id_not_by_position() {
+        // Defence in depth behind the clear-on-removal proven above, and the
+        // half that makes the class unrepresentable rather than merely
+        // unreached: with `RemoveProjectRequested` clearing the confirmation,
+        // no state reachable today distinguishes an id from an index, so
+        // without this the id would go untested and the next edit that moves
+        // a project by some other route would put the defect straight back.
+        let mut app = App::new(Config {
+            projects: vec![project("a"), project("b")],
+            ..Config::default()
+        });
+        let b_id = app.config.projects[1].id.to_string();
+
+        let _ = update(&mut app, Message::RecreateVenvRequested(1), unused_runner());
+        // The list moves under the open confirmation without going through
+        // the removal path that clears it.
+        app.config.projects.swap(0, 1);
+
+        let _ = update(&mut app, Message::RecreateVenvConfirmed, unused_runner());
+
+        assert_eq!(
+            app.syncing.as_deref(),
+            Some(b_id.as_str()),
+            "the confirmation must act on the project it named, wherever that \
+             project now sits"
+        );
+        assert!(
+            app.drawer.status.contains('b'),
+            "the running status must name it too; got {:?}",
+            app.drawer.status
+        );
+    }
+
+    #[test]
+    fn cancelling_a_recreate_dispatches_nothing_and_clears_the_confirmation() {
+        let mut app = App::new(Config {
+            projects: vec![project("api")],
+            ..Config::default()
+        });
+        let fake = Arc::new(FakeCommandRunner::new());
+        let _ = update(&mut app, Message::RecreateVenvRequested(0), fake.clone());
+
+        let task = update(&mut app, Message::RecreateVenvCancelled, fake.clone());
+
+        assert_eq!(task.units(), 0);
+        assert!(fake.calls().is_empty(), "got {:?}", fake.calls());
+        assert!(app.confirm_recreate.is_none());
+    }
+
+    #[test]
+    fn confirming_a_recreate_dispatches_background_work_without_running_anything_inline() {
+        // Deleting a directory tree and then running `uv sync` both block;
+        // doing either inside `update` freezes the window.
+        let mut app = App::new(Config {
+            projects: vec![project("api")],
+            ..Config::default()
+        });
+        let fake = Arc::new(FakeCommandRunner::new());
+        let _ = update(&mut app, Message::RecreateVenvRequested(0), fake.clone());
+
+        let task = update(&mut app, Message::RecreateVenvConfirmed, fake.clone());
+
+        assert!(
+            fake.calls().is_empty(),
+            "runner.run must not be called synchronously inside update; got {:?}",
+            fake.calls()
+        );
+        assert!(
+            task.units() > 0,
+            "a confirmed recreate must dispatch real background work"
+        );
+        assert!(
+            app.confirm_recreate.is_none(),
+            "the confirmation must close once it has been acted on"
+        );
+        assert!(
+            app.syncing.is_some(),
+            "a recreate runs uv sync, so it must claim the single in-flight slot"
+        );
+    }
+
+    #[test]
+    fn a_recreate_deletes_the_projects_venv_and_then_rebuilds_it() {
+        let project = project("api");
+        let config = Config {
+            projects: vec![project.clone()],
+            settings: fake_uv_settings(),
+            ..Config::default()
+        };
+        let store = bombadil_core::secrets::InMemorySecretStore::new();
+        let runner = FakeCommandRunner::new();
+        version_probe(&runner);
+        runner.expect(
+            "uv",
+            &["sync"],
+            bombadil_core::process::CommandOutcome {
+                status: Some(0),
+                stdout: String::new(),
+                stderr: String::new(),
+            },
+        );
+        let deleted = std::sync::Mutex::new(Vec::new());
+
+        let (success, _lines) = run_recreate_venv(
+            &project,
+            &config,
+            &store,
+            &runner,
+            recording_delete(&deleted, Ok(())),
+        );
+
+        assert!(success);
+        assert_eq!(
+            deleted.lock().unwrap().as_slice(),
+            [PathBuf::from("/p/api/.venv")],
+            "exactly the project's own resolved venv path must be deleted, once"
+        );
+        assert!(
+            runner
+                .calls()
+                .iter()
+                .any(|c| c.args.iter().any(|a| a == "sync")),
+            "the environment must be rebuilt after being deleted; got {:?}",
+            runner.calls()
+        );
+    }
+
+    #[test]
+    fn a_recreate_whose_delete_is_refused_never_runs_uv_sync() {
+        // Also the ordering proof: if the rebuild ran before the delete, a
+        // refused delete would still leave a `uv sync` call recorded here.
+        // And a refusal is not "just sync instead" -- that would silently do
+        // something other than what the user confirmed.
+        let project = project("api");
+        let config = Config {
+            projects: vec![project.clone()],
+            settings: fake_uv_settings(),
+            ..Config::default()
+        };
+        let store = bombadil_core::secrets::InMemorySecretStore::new();
+        let runner = FakeCommandRunner::new();
+        version_probe(&runner);
+        runner.expect(
+            "uv",
+            &["sync"],
+            bombadil_core::process::CommandOutcome {
+                status: Some(0),
+                stdout: String::new(),
+                stderr: String::new(),
+            },
+        );
+        let deleted = std::sync::Mutex::new(Vec::new());
+
+        let (success, lines) = run_recreate_venv(
+            &project,
+            &config,
+            &store,
+            &runner,
+            recording_delete(
+                &deleted,
+                Err("/p/api/.venv holds no pyvenv.cfg".to_string()),
+            ),
+        );
+
+        assert!(!success);
+        assert!(
+            runner.calls().is_empty(),
+            "a refused delete must stop the recreate dead; got {:?}",
+            runner.calls()
+        );
+        assert!(
+            lines.iter().any(|l| l.contains("pyvenv.cfg")),
+            "core's own refusal text must reach the user; got {lines:?}"
+        );
+    }
+
+    #[test]
+    fn a_recreate_whose_rebuild_fails_says_the_environment_is_gone() {
+        // The worst outcome of this action, and the one the confirmation
+        // warned about: the delete worked and the sync did not. "sync failed"
+        // alone leaves the user unaware that their environment no longer
+        // exists.
+        let project = project("api");
+        let config = Config {
+            projects: vec![project.clone()],
+            settings: fake_uv_settings(),
+            ..Config::default()
+        };
+        let store = bombadil_core::secrets::InMemorySecretStore::new();
+        let runner = FakeCommandRunner::new();
+        version_probe(&runner);
+        runner.expect(
+            "uv",
+            &["sync"],
+            bombadil_core::process::CommandOutcome {
+                status: Some(1),
+                stdout: String::new(),
+                stderr: "error: no solution found".into(),
+            },
+        );
+        let deleted = std::sync::Mutex::new(Vec::new());
+
+        let (success, lines) = run_recreate_venv(
+            &project,
+            &config,
+            &store,
+            &runner,
+            recording_delete(&deleted, Ok(())),
+        );
+
+        assert!(!success);
+        let joined = lines.join("\n");
+        assert!(
+            joined.contains("no solution found"),
+            "uv's own reason must survive; got {joined}"
+        );
+        // Derived through the very function that built the path in the
+        // message, not written as a `/`-separated literal: `venv_path::resolve`
+        // assembles it with `PathBuf::join`, which separates with `\` on
+        // Windows, so a literal compared against the *displayed* path passes
+        // on Unix and fails on Windows for a message that was correct all
+        // along. Deriving it keeps the whole path asserted -- the message has
+        // to name which environment is gone, and a central-store venv is a
+        // hashed directory the user has never seen.
+        let expected = venv_path::resolve(&project, &config.settings)
+            .expect("this project's venv path must resolve")
+            .display()
+            .to_string();
+        assert!(
+            joined.contains(&expected) && joined.contains("deleted"),
+            "the user must be told the environment was deleted and not rebuilt; \
+             expected {expected} to appear in {joined}"
+        );
+    }
+
+    #[test]
+    fn a_recreate_confirmed_while_a_sync_is_in_flight_dispatches_nothing() {
+        // Same single-slot rule `SyncRequested` follows: one mutating uv
+        // command at a time, one shared drawer.
+        let mut app = App::new(Config {
+            projects: vec![project("api")],
+            ..Config::default()
+        });
+        let fake = Arc::new(FakeCommandRunner::new());
+        let _ = update(&mut app, Message::SyncRequested(0), fake.clone());
+        let _ = update(&mut app, Message::RecreateVenvRequested(0), fake.clone());
+
+        let task = update(&mut app, Message::RecreateVenvConfirmed, fake.clone());
+
+        assert_eq!(
+            task.units(),
+            0,
+            "a recreate must not start while a sync is already running"
+        );
+        assert!(fake.calls().is_empty(), "got {:?}", fake.calls());
+    }
+
+    #[test]
+    fn requesting_a_recreate_for_an_out_of_range_project_asks_nothing() {
+        let mut app = App::new(Config {
+            projects: vec![project("api")],
+            ..Config::default()
+        });
+
+        let task = update(
+            &mut app,
+            Message::RecreateVenvRequested(99),
+            unused_runner(),
+        );
+
+        assert_eq!(task.units(), 0);
+        assert!(app.confirm_recreate.is_none());
+    }
+
+    // --- 7c: Open folder ---
+
+    #[test]
+    fn opening_a_folder_never_calls_the_runner_synchronously() {
+        let mut app = App::new(Config {
+            projects: vec![project("api")],
+            ..Config::default()
+        });
+        let fake = Arc::new(FakeCommandRunner::new());
+        let _ = update(&mut app, Message::ContextMenuOpened(0), fake.clone());
+
+        let task = update(&mut app, Message::OpenFolderRequested(0), fake.clone());
+
+        assert!(
+            fake.calls().is_empty(),
+            "runner.spawn must not be called synchronously inside update; got {:?}",
+            fake.calls()
+        );
+        assert!(
+            task.units() > 0,
+            "opening a folder must dispatch real background work, not Task::none()"
+        );
+        assert!(
+            app.context_menu.is_none(),
+            "the menu should close once an action is taken from it"
+        );
+    }
+
+    #[test]
+    fn opening_a_folder_shows_the_project_directory_not_the_venv() {
+        // Spec §8's Open folder is the folder the user recognises -- where
+        // `pyproject.toml` lives, the same directory Open terminal opens in.
+        // A central-store venv is a hashed directory somewhere else entirely.
+        let runner = FakeCommandRunner::new();
+        runner.expect(
+            "xdg-open",
+            &[],
+            bombadil_core::process::CommandOutcome {
+                status: Some(0),
+                stdout: String::new(),
+                stderr: String::new(),
+            },
+        );
+
+        let result = run_open_folder(Os::Linux, &project("api"), &runner);
+
+        assert!(result.is_ok(), "got {result:?}");
+        let calls = runner.calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].args, vec!["/p/api"]);
+        assert_eq!(
+            runner.blocking_calls(),
+            0,
+            "the file manager must be spawned, not waited on"
+        );
+    }
+
+    #[test]
+    fn opening_a_folder_uses_each_platforms_own_file_manager() {
+        // `Os` is a parameter, never `cfg!`, exactly so all three are covered
+        // wherever CI runs. A test that paired one hardcoded program with
+        // `Os::host()` would silently cover one platform out of three.
+        for (os, program) in [
+            (Os::Linux, "xdg-open"),
+            (Os::MacOs, "open"),
+            (Os::Windows, "explorer"),
+        ] {
+            let runner = FakeCommandRunner::new();
+            runner.expect(
+                program,
+                &[],
+                bombadil_core::process::CommandOutcome {
+                    status: Some(0),
+                    stdout: String::new(),
+                    stderr: String::new(),
+                },
+            );
+
+            run_open_folder(os, &project("api"), &runner)
+                .unwrap_or_else(|e| panic!("{os:?} must open with {program}: {e}"));
+
+            assert_eq!(
+                runner.calls()[0].program.to_string_lossy(),
+                program,
+                "{os:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_project_whose_manifest_has_no_directory_reports_rather_than_opening_nothing() {
+        let mut project = project("api");
+        project.pyproject_path = PathBuf::from("pyproject.toml");
+        let runner = FakeCommandRunner::new();
+
+        let err = run_open_folder(Os::Linux, &project, &runner)
+            .expect_err("there is no directory to open");
+
+        assert!(
+            runner.calls().is_empty(),
+            "nothing may be spawned; got {:?}",
+            runner.calls()
+        );
+        assert!(err.contains("pyproject.toml"), "got {err}");
     }
 
     #[test]
@@ -2846,6 +5398,1677 @@ mod tests {
 
         let _ = update(&mut app, Message::AboutLicenseToggled, unused_runner());
         assert!(!app.about_expanded);
+    }
+
+    // --- Task 2: the Env vars tab ---
+    //
+    // Criterion 1 (a project variable overriding a global one is shown as
+    // overriding, with both values visible) is covered by
+    // `env_editor::overrides`'s own tests in `env_editor.rs`: it is a pure
+    // function, and testing it directly there is a stronger proof than
+    // re-deriving the same claim by driving `update`'s opaque `Task`.
+
+    #[test]
+    fn marking_a_variable_secret_writes_the_store_and_leaves_config_empty() {
+        // Criterion 2, both halves the brief asks for in one test: the value
+        // ends up in the store, and nothing resembling it is left in the
+        // config that gets written to config.toml.
+        let key = SecretKey::GlobalEnv {
+            key: "TOKEN".into(),
+        };
+        let mut config = Config {
+            global_env: vec![bombadil_core::model::EnvVar {
+                key: "TOKEN".into(),
+                value: "hunter2".into(),
+                secret: false,
+            }],
+            ..Config::default()
+        };
+
+        // The in-memory half `update` runs synchronously before dispatching
+        // the background job.
+        let plain_value = env_editor::mark_secret(&mut config.global_env, 0)
+            .expect("a non-secret row must yield its plaintext");
+        assert_eq!(
+            config.global_env[0].value, "",
+            "got {:?}",
+            config.global_env[0].value
+        );
+        assert!(config.global_env[0].secret);
+
+        // The background half: never touches a real keychain, per the hard
+        // security constraint -- `InMemorySecretStore` only.
+        let store = bombadil_core::secrets::InMemorySecretStore::new();
+        let persist = FakeConfigPersist::default();
+        let success = run_secret_write(&key, &plain_value, &config, &store, &persist);
+
+        assert!(success);
+        assert_eq!(
+            store.get(&key).unwrap().as_deref(),
+            Some("hunter2"),
+            "the store must hold the value the user typed"
+        );
+        let saved = persist.saved();
+        assert_eq!(
+            saved.len(),
+            1,
+            "the config must be persisted alongside the write"
+        );
+        assert_eq!(
+            saved[0].global_env[0].value, "",
+            "the persisted config must never carry the secret's value"
+        );
+    }
+
+    #[test]
+    fn unmarking_a_variable_secret_deletes_the_keychain_entry() {
+        // Criterion 3, for a project-scoped secret -- the account shape
+        // (`SecretKey::ProjectEnv`) that `GlobalEnv` alone would not catch a
+        // mix-up in.
+        let project_id = uuid::Uuid::from_u128(9);
+        let key = SecretKey::ProjectEnv {
+            project_id,
+            key: "TOKEN".into(),
+        };
+        let store = bombadil_core::secrets::InMemorySecretStore::new();
+        store.set(&key, "hunter2").unwrap();
+
+        let mut proj = project("api");
+        proj.id = project_id;
+        proj.env = vec![bombadil_core::model::EnvVar {
+            key: "TOKEN".into(),
+            value: String::new(),
+            secret: true,
+        }];
+        let mut config = Config {
+            projects: vec![proj],
+            ..Config::default()
+        };
+
+        let owed = env_editor::unmark_secret(&mut config.projects[0].env, 0);
+        assert!(owed, "a secret row must report a delete as owed");
+        assert!(!config.projects[0].env[0].secret);
+
+        let persist = FakeConfigPersist::default();
+        let success = run_secret_delete(&key, &config, &store, &persist);
+
+        assert!(success);
+        assert_eq!(
+            store.get(&key).unwrap(),
+            None,
+            "the keychain entry must be gone, not orphaned"
+        );
+        assert!(
+            !persist.saved()[0].projects[0].env[0].secret,
+            "the persisted config must record the row as no longer secret"
+        );
+    }
+
+    #[test]
+    fn the_message_that_triggers_marking_secret_never_carries_the_value() {
+        // Criterion 4, and the design question the brief asks to be
+        // answered rather than guessed at: `EnvVarSecretToggled` is what a
+        // real checkbox press sends into `update` to start the whole
+        // mark-secret flow, and it carries only `scope` and `index` -- there
+        // is no field for a value to hide in, so its derived `Debug` cannot
+        // print one no matter what the row's plaintext was.
+        let mut app = App::new(Config {
+            global_env: vec![bombadil_core::model::EnvVar {
+                key: "TOKEN".into(),
+                value: "hunter2".into(),
+                secret: false,
+            }],
+            ..Config::default()
+        });
+
+        let toggle = Message::EnvVarSecretToggled(env_editor::EnvScope::Global, 0);
+        assert!(
+            !format!("{toggle:?}").contains("hunter2"),
+            "the message that triggers the write must not carry the value"
+        );
+
+        let _ = update(&mut app, toggle, unused_runner());
+
+        // The value has now actually moved out of `Config` (see the
+        // previous test for where it went) -- so there is nothing left in
+        // `app.config` for any later `Debug` render to print either.
+        assert_eq!(app.config.global_env[0].value, "");
+        assert!(app.config.global_env[0].secret);
+
+        let finished = Message::EnvVarPersistFinished { success: true };
+        assert!(!format!("{finished:?}").contains("hunter2"));
+    }
+
+    #[test]
+    fn adding_a_global_env_var_persists_through_config_persist() {
+        // Criterion 5.
+        let mut app = App::new(Config::default());
+        let persist = Arc::new(FakeConfigPersist::default());
+        app.persist = persist.clone();
+
+        let task = update(
+            &mut app,
+            Message::EnvVarAdded(env_editor::EnvScope::Global),
+            unused_runner(),
+        );
+
+        assert_eq!(
+            app.config.global_env.len(),
+            1,
+            "in-memory must reflect the add the instant update returns"
+        );
+        assert!(
+            task.units() > 0,
+            "the add must dispatch a background persist"
+        );
+        assert!(
+            persist.saved().is_empty(),
+            "persist.save must not be called synchronously inside update"
+        );
+
+        // `Task` is opaque and never driven in a unit test in this file;
+        // every other background call is proven by running its async half
+        // directly instead, and this follows the same convention.
+        let success = block_on(persist_config(app.config.clone(), persist.clone()));
+
+        assert!(success);
+        assert_eq!(
+            persist.saved().last().unwrap().global_env.len(),
+            1,
+            "the persisted config must carry the edit, or it vanishes on restart"
+        );
+    }
+
+    #[test]
+    fn editing_a_value_persists_through_config_persist() {
+        // Criterion 5 again, for a plain (non-secret) edit rather than an
+        // add -- a different message, so it earns its own proof rather than
+        // trusting the shared `persist_env_edit` helper by association.
+        let mut app = App::new(Config {
+            global_env: vec![bombadil_core::model::EnvVar {
+                key: "HTTP_PROXY".into(),
+                value: "http://old".into(),
+                secret: false,
+            }],
+            ..Config::default()
+        });
+        let persist = Arc::new(FakeConfigPersist::default());
+        app.persist = persist.clone();
+
+        let _ = update(
+            &mut app,
+            Message::EnvVarValueChanged(env_editor::EnvScope::Global, 0, "http://new".into()),
+            unused_runner(),
+        );
+
+        assert_eq!(app.config.global_env[0].value, "http://new");
+
+        let success = block_on(persist_config(app.config.clone(), persist.clone()));
+
+        assert!(success);
+        assert_eq!(
+            persist.saved().last().unwrap().global_env[0].value,
+            "http://new",
+            "the persisted config must carry the retyped value"
+        );
+    }
+
+    // --- Task 3: the Scripts tab ---
+    //
+    // Reordering (criterion 1) and disable-not-delete (criterion 2) as pure
+    // logic are covered by `scripts_editor`'s own tests -- `move_up`/
+    // `move_down`/`toggle_enabled`/`execution_order` are pure functions, and
+    // testing them directly there is a stronger proof than re-deriving the
+    // same claim by driving `update`'s opaque `Task`. What belongs here is
+    // the wiring: that the messages a real button press sends actually reach
+    // those functions and actually persist.
+
+    fn script(path: &str, enabled: bool) -> bombadil_core::model::Script {
+        bombadil_core::model::Script {
+            path: std::path::PathBuf::from(path),
+            args: Vec::new(),
+            enabled,
+        }
+    }
+
+    #[test]
+    fn requesting_to_add_a_script_dispatches_work_without_touching_config_synchronously() {
+        // Criterion 3: the whole point of going through `pick_script`
+        // (`rfd::AsyncFileDialog`) instead of adding a row inline is that
+        // nothing about the new script is known -- there is no path -- until
+        // the async picker resolves. A synchronous add here would mean the
+        // handler bypassed the picker entirely, the exact freeze criterion 3
+        // exists to prevent (a modal `rfd::FileDialog` on this same thread
+        // would look identical from `update`'s side: config unchanged until
+        // the call returns).
+        let mut app = App::new(Config::default());
+
+        let task = update(
+            &mut app,
+            Message::ScriptAddRequested(scripts_editor::ScriptScope::Global),
+            unused_runner(),
+        );
+
+        assert!(
+            task.units() > 0,
+            "requesting to add a script must dispatch background work"
+        );
+        assert!(
+            app.config.global_scripts.is_empty(),
+            "nothing may be added to the config before the picker has answered; got {:?}",
+            app.config.global_scripts
+        );
+    }
+
+    #[test]
+    fn a_picked_script_is_appended_and_persisted() {
+        let mut app = App::new(Config::default());
+        let persist = Arc::new(FakeConfigPersist::default());
+        app.persist = persist.clone();
+
+        let task = update(
+            &mut app,
+            Message::ScriptFilePicked(
+                scripts_editor::ScriptScope::Global,
+                Some(std::path::PathBuf::from("/etc/bombadil/pre.sh")),
+            ),
+            unused_runner(),
+        );
+
+        assert_eq!(app.config.global_scripts.len(), 1);
+        assert_eq!(
+            app.config.global_scripts[0].path,
+            std::path::PathBuf::from("/etc/bombadil/pre.sh")
+        );
+        assert!(
+            task.units() > 0,
+            "the add must dispatch a background persist"
+        );
+        assert!(
+            persist.saved().is_empty(),
+            "persist.save must not be called synchronously inside update"
+        );
+
+        let success = block_on(persist_config(app.config.clone(), persist.clone()));
+        assert!(success);
+        assert_eq!(persist.saved().last().unwrap().global_scripts.len(), 1);
+    }
+
+    #[test]
+    fn cancelling_the_script_picker_adds_nothing() {
+        let mut app = App::new(Config::default());
+        let _ = update(
+            &mut app,
+            Message::ScriptFilePicked(scripts_editor::ScriptScope::Global, None),
+            unused_runner(),
+        );
+        assert!(app.config.global_scripts.is_empty());
+    }
+
+    #[test]
+    fn disabling_a_script_through_update_leaves_it_in_the_config() {
+        // Criterion 2, at the wiring level: the message a real checkbox press
+        // sends must land on `toggle_enabled`, not on `remove_script`.
+        let mut app = App::new(Config {
+            global_scripts: vec![script("/etc/pre.sh", true)],
+            ..Config::default()
+        });
+
+        let _ = update(
+            &mut app,
+            Message::ScriptEnabledToggled(scripts_editor::ScriptScope::Global, 0),
+            unused_runner(),
+        );
+
+        assert_eq!(
+            app.config.global_scripts.len(),
+            1,
+            "a disabled script must still be in the config, not removed"
+        );
+        assert!(!app.config.global_scripts[0].enabled);
+    }
+
+    #[test]
+    fn removing_a_script_through_update_actually_drops_it() {
+        // The opposite mistake from the previous test: `ScriptRemoved` must
+        // still really remove, so disable-not-delete is not proven by a
+        // handler that never deletes anything at all.
+        let mut app = App::new(Config {
+            global_scripts: vec![script("/etc/pre.sh", true)],
+            ..Config::default()
+        });
+
+        let _ = update(
+            &mut app,
+            Message::ScriptRemoved(scripts_editor::ScriptScope::Global, 0),
+            unused_runner(),
+        );
+
+        assert!(app.config.global_scripts.is_empty());
+    }
+
+    #[test]
+    fn moving_a_script_down_through_update_persists_the_new_order() {
+        // Criterion 1, at the wiring level.
+        let mut app = App::new(Config {
+            global_scripts: vec![script("/a.sh", true), script("/b.sh", true)],
+            ..Config::default()
+        });
+        let persist = Arc::new(FakeConfigPersist::default());
+        app.persist = persist.clone();
+
+        let task = update(
+            &mut app,
+            Message::ScriptMovedDown(scripts_editor::ScriptScope::Global, 0),
+            unused_runner(),
+        );
+
+        assert_eq!(
+            app.config.global_scripts[0].path,
+            std::path::PathBuf::from("/b.sh"),
+            "the order must change the instant update returns; got {:?}",
+            app.config.global_scripts
+        );
+        assert!(task.units() > 0);
+
+        let success = block_on(persist_config(app.config.clone(), persist.clone()));
+        assert!(success);
+        assert_eq!(
+            persist.saved().last().unwrap().global_scripts[0].path,
+            std::path::PathBuf::from("/b.sh"),
+            "the persisted config must carry the new order, or it reverts on restart"
+        );
+    }
+
+    #[test]
+    fn moving_a_project_scripts_row_never_touches_global_scripts() {
+        // The reordering scoping the module doc argues for: a `Project`
+        // scope's move must resolve to that project's own list, the same
+        // guarantee `project_scope_addresses_that_projects_own_list_not_global`
+        // proves for `scripts_mut` directly -- this is the same claim through
+        // `update`'s real message.
+        let mut proj = project("api");
+        proj.scripts = vec![script("/p-a.sh", true), script("/p-b.sh", true)];
+        let mut app = App::new(Config {
+            global_scripts: vec![script("/g.sh", true)],
+            projects: vec![proj],
+            ..Config::default()
+        });
+
+        let _ = update(
+            &mut app,
+            Message::ScriptMovedDown(scripts_editor::ScriptScope::Project(0), 0),
+            unused_runner(),
+        );
+
+        assert_eq!(
+            app.config.global_scripts,
+            vec![script("/g.sh", true)],
+            "a project-scope reorder must never touch global_scripts"
+        );
+        assert_eq!(
+            app.config.projects[0].scripts[0].path,
+            PathBuf::from("/p-b.sh")
+        );
+    }
+
+    // --- Task 4: the Indexes tab ---
+    //
+    // The collision check (criterion 2) and the selection invariant
+    // (criterion 3) are proven directly against `index_editor`'s own pure
+    // functions in its own test module -- a stronger proof than re-deriving
+    // the same claim by driving `update`'s opaque `Task`. What belongs here
+    // is the wiring: that a real message reaches those functions, that a
+    // credential save actually lands in the store and nowhere in `Config`
+    // (criterion 1), and that nothing here can ever print one (criterion 4).
+
+    fn index_with_auth(
+        name: &str,
+        auth: bombadil_core::model::IndexAuth,
+    ) -> bombadil_core::model::Index {
+        bombadil_core::model::Index {
+            name: name.into(),
+            url: format!("https://{name}.example/simple"),
+            kind: bombadil_core::model::IndexKind::Extra,
+            default_for_new_projects: false,
+            auth,
+        }
+    }
+
+    #[test]
+    fn renaming_an_index_moves_its_credential_instead_of_orphaning_it() {
+        // `SecretKey::Index` is keyed on the index's *name*. `set_name`
+        // changed the name and touched nothing else, so the next sync's
+        // `envspec::index::inject` looked under the new name, found nothing,
+        // and failed with a 401 that nothing on screen explained -- while the
+        // old entry stayed in the user's keychain with no way for the app to
+        // name it again.
+        let config = Config {
+            indexes: vec![index_with_auth(
+                "corp",
+                bombadil_core::model::IndexAuth::Token,
+            )],
+            ..Config::default()
+        };
+        let from = SecretKey::Index {
+            name: "internal".into(),
+        };
+        let to = SecretKey::Index {
+            name: "corp".into(),
+        };
+        let store = bombadil_core::secrets::InMemorySecretStore::new();
+        store.set(&from, "hunter2").unwrap();
+        let persist = FakeConfigPersist::default();
+
+        let success = run_index_credential_rename(&from, &to, &config, &store, &persist);
+
+        assert!(success);
+        assert_eq!(
+            store.get(&to).unwrap().as_deref(),
+            Some("hunter2"),
+            "the credential must follow the rename, or the next sync is a 401"
+        );
+        assert_eq!(
+            store.get(&from).unwrap(),
+            None,
+            "the old account must not stay in the user's keychain forever"
+        );
+        assert_eq!(
+            persist.saved().len(),
+            1,
+            "the renamed config must be persisted alongside the move"
+        );
+    }
+
+    #[test]
+    fn renaming_an_index_that_never_had_a_credential_still_persists() {
+        // The commonest case by far -- an index typed for the first time,
+        // one keystroke at a time. Nothing to move must not read as a
+        // failure.
+        let config = Config::default();
+        let store = bombadil_core::secrets::InMemorySecretStore::new();
+        let persist = FakeConfigPersist::default();
+
+        let success = run_index_credential_rename(
+            &SecretKey::Index { name: "c".into() },
+            &SecretKey::Index { name: "co".into() },
+            &config,
+            &store,
+            &persist,
+        );
+
+        assert!(success);
+        assert_eq!(persist.saved().len(), 1);
+    }
+
+    #[test]
+    fn removing_an_index_deletes_the_credential_it_leaves_behind() {
+        // The other half of the same defect: `remove_index` never touched
+        // `SecretKey::Index`, so a removed index's credential stayed in the
+        // keychain forever with nothing left in the app able to name it.
+        // The account has to be resolved *before* the row goes -- afterwards
+        // there is no name to find it by.
+        let mut app = App::new(Config {
+            indexes: vec![index_with_auth(
+                "corp",
+                bombadil_core::model::IndexAuth::Token,
+            )],
+            ..Config::default()
+        });
+        let key = index_credential_key(&app.config, 0)
+            .expect("a removed index must name the credential it owes a delete of");
+        assert_eq!(
+            key,
+            SecretKey::Index {
+                name: "corp".into()
+            }
+        );
+
+        let store = bombadil_core::secrets::InMemorySecretStore::new();
+        store.set(&key, "hunter2").unwrap();
+        let persist = FakeConfigPersist::default();
+
+        let task = update(&mut app, Message::IndexRemoved(0), unused_runner());
+        assert!(task.units() > 0, "the removal must dispatch its own job");
+        assert!(app.config.indexes.is_empty());
+
+        // The background half, with the fake store the real job's
+        // `KeyringSecretStore` stands in for.
+        assert!(run_secret_delete(&key, &app.config, &store, &persist));
+        assert_eq!(
+            store.get(&key).unwrap(),
+            None,
+            "the credential must be gone, not orphaned"
+        );
+    }
+
+    #[test]
+    fn removing_a_secret_env_var_row_deletes_its_keychain_entry() {
+        // The asymmetry the review found: `env_editor::unmark_secret` deletes,
+        // but removing the row entirely did not -- so the value stayed in the
+        // keychain forever, unreachable, while the row that named it was gone.
+        let project_id = uuid::Uuid::from_u128(9);
+        let mut proj = project("api");
+        proj.id = project_id;
+        proj.env = vec![bombadil_core::model::EnvVar {
+            key: "TOKEN".into(),
+            value: String::new(),
+            secret: true,
+        }];
+        let mut app = App::new(Config {
+            projects: vec![proj],
+            ..Config::default()
+        });
+
+        // Resolved before the row goes: `SecretKey::ProjectEnv` is keyed on
+        // the variable's name, which the removal is about to take away.
+        let key = env_removal_secret_key(&app, env_editor::EnvScope::Project(0), 0)
+            .expect("removing a secret row must name the entry it owes a delete of");
+        assert_eq!(
+            key,
+            SecretKey::ProjectEnv {
+                project_id,
+                key: "TOKEN".into(),
+            }
+        );
+
+        let store = bombadil_core::secrets::InMemorySecretStore::new();
+        store.set(&key, "hunter2").unwrap();
+        let persist = FakeConfigPersist::default();
+
+        let task = update(
+            &mut app,
+            Message::EnvVarRemoved(env_editor::EnvScope::Project(0), 0),
+            unused_runner(),
+        );
+        assert!(task.units() > 0, "the removal must dispatch its own job");
+        assert!(app.config.projects[0].env.is_empty());
+
+        assert!(run_secret_delete(&key, &app.config, &store, &persist));
+        assert_eq!(store.get(&key).unwrap(), None);
+    }
+
+    #[test]
+    fn removing_a_plain_env_var_row_owes_no_keychain_delete() {
+        // The opposite mistake: an ordinary variable has no keychain entry,
+        // and issuing a delete for one would be a keychain call per removal
+        // on a machine that may have no keychain at all.
+        let mut proj = project("api");
+        proj.env = vec![bombadil_core::model::EnvVar {
+            key: "HTTP_PROXY".into(),
+            value: "http://proxy:8080".into(),
+            secret: false,
+        }];
+        let app = App::new(Config {
+            projects: vec![proj],
+            ..Config::default()
+        });
+
+        assert!(env_removal_secret_key(&app, env_editor::EnvScope::Project(0), 0).is_none());
+    }
+
+    #[test]
+    fn saving_an_index_credential_writes_the_store_and_leaves_config_untouched() {
+        // Criterion 1: assert both halves -- the store holds the value the
+        // user typed, and the persisted `Config` carries no trace of it
+        // anywhere. `Index` has no plaintext field a credential could land in
+        // even by accident (see `index_editor`'s module doc), so the
+        // equality check below and the `Debug`-text check are both
+        // belt-and-suspenders against a future field addition doing exactly
+        // that, not just a claim that passes by the type's current shape.
+        let idx = index_with_auth(
+            "priv",
+            bombadil_core::model::IndexAuth::Basic {
+                username: "alice".into(),
+            },
+        );
+        let mut app = App::new(Config {
+            indexes: vec![idx.clone()],
+            ..Config::default()
+        });
+        let persist = Arc::new(FakeConfigPersist::default());
+        app.persist = persist.clone();
+        app.index_credential_drafts = vec!["hunter2".to_string()];
+
+        // What `update` is actually expected to hand the keychain job --
+        // derived the same way `update` derives it (`index_editor::credential_save`),
+        // not hardcoded here, so a mutation to either the key or the value it
+        // builds is caught below rather than only by `index_editor`'s own
+        // test of that function in isolation.
+        let (key, value) =
+            index_editor::credential_save(&app.config, &app.index_credential_drafts, 0)
+                .expect("nothing here should block the save");
+        assert_eq!(
+            key,
+            SecretKey::Index {
+                name: "priv".into()
+            },
+            "a credential must be addressed by SecretKey::Index, not any other shape"
+        );
+
+        let task = update(
+            &mut app,
+            Message::IndexCredentialSaveRequested(0),
+            unused_runner(),
+        );
+
+        assert!(
+            task.units() > 0,
+            "the keychain write must be dispatched as background work, not run inline"
+        );
+        assert_eq!(
+            app.index_credential_drafts[0], "",
+            "the draft must be cleared the instant it is handed off"
+        );
+        assert!(
+            persist.saved().is_empty(),
+            "persist.save must not be called synchronously inside update"
+        );
+
+        // The background half: never touches a real keychain, per the hard
+        // security constraint -- `InMemorySecretStore` only, driven through
+        // `run_secret_write` directly rather than the real caller
+        // (`mark_secret_job`), which always constructs a `KeyringSecretStore`.
+        // Same substitution the existing env-var secret test makes for the
+        // same reason.
+        let store = bombadil_core::secrets::InMemorySecretStore::new();
+        let success = run_secret_write(&key, &value, &app.config, &store, persist.as_ref());
+
+        assert!(success);
+        assert_eq!(
+            store.get(&key).unwrap().as_deref(),
+            Some("hunter2"),
+            "the store must hold the value the user typed"
+        );
+
+        let saved = persist.saved();
+        assert_eq!(
+            saved.len(),
+            1,
+            "the config must be persisted alongside the write"
+        );
+        assert_eq!(
+            saved[0].indexes[0], idx,
+            "the persisted index must be unchanged -- no field gained the credential"
+        );
+        let rendered = format!("{:?}", saved[0]);
+        assert!(
+            !rendered.contains("hunter2"),
+            "the persisted config must never carry the credential, even in Debug; got:\n{rendered}"
+        );
+    }
+
+    #[test]
+    fn a_colliding_index_name_dispatches_no_credential_save() {
+        // Criterion 2: the message a real "save credential" press sends
+        // never reaches the keychain when the row's current name collides
+        // with another's credential variable -- caught here, before the
+        // background job (and so before `inject`'s own later refusal) rather
+        // than only at sync time.
+        let a = index_with_auth("my-index", bombadil_core::model::IndexAuth::None);
+        let b = index_with_auth(
+            "my_index",
+            bombadil_core::model::IndexAuth::Basic {
+                username: "alice".into(),
+            },
+        );
+        let mut app = App::new(Config {
+            indexes: vec![a, b],
+            ..Config::default()
+        });
+        app.index_credential_drafts = vec![String::new(), "hunter2".to_string()];
+        let persist = Arc::new(FakeConfigPersist::default());
+        app.persist = persist.clone();
+
+        let task = update(
+            &mut app,
+            Message::IndexCredentialSaveRequested(1),
+            unused_runner(),
+        );
+
+        assert_eq!(
+            task.units(),
+            0,
+            "a colliding row must dispatch nothing, not attempt the write anyway"
+        );
+        assert_eq!(
+            app.index_credential_drafts[1], "hunter2",
+            "the draft must be left untouched since nothing was saved"
+        );
+        assert!(persist.saved().is_empty());
+    }
+
+    #[test]
+    fn no_index_message_ever_prints_the_credential_in_debug() {
+        // Criterion 4, at the `Message` level: every message this tab's
+        // widgets can actually send, checked against the one string that
+        // must never appear in any of their `Debug` renderings.
+        let secret = "hunter2";
+        let messages: Vec<Message> = vec![
+            Message::IndexCredentialChanged(0, index_editor::CredentialInput(secret.to_string())),
+            Message::IndexCredentialSaveRequested(0),
+            Message::IndexPersistFinished { success: true },
+            Message::IndexPersistFinished { success: false },
+        ];
+        for msg in &messages {
+            let rendered = format!("{msg:?}");
+            assert!(
+                !rendered.contains(secret),
+                "message must never print the credential; got {rendered:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn toggling_a_project_index_updates_only_that_projects_selection() {
+        // Criterion 3, the wiring: the message a real checkbox press sends
+        // reaches `index_editor::toggle_selected` on the right project's
+        // `index_names`, and `Config::indexes` -- the shared configuration --
+        // is provably still there afterwards.
+        let idx = index_with_auth("priv", bombadil_core::model::IndexAuth::None);
+        let mut proj = project("api");
+        proj.index_names = vec!["priv".to_string()];
+        let mut app = App::new(Config {
+            indexes: vec![idx],
+            projects: vec![proj],
+            ..Config::default()
+        });
+        let persist = Arc::new(FakeConfigPersist::default());
+        app.persist = persist.clone();
+
+        let task = update(
+            &mut app,
+            Message::ProjectIndexToggled(0, "priv".to_string()),
+            unused_runner(),
+        );
+
+        assert!(
+            app.config.projects[0].index_names.is_empty(),
+            "deselecting must remove the association"
+        );
+        assert_eq!(
+            app.config.indexes.len(),
+            1,
+            "deselecting must never remove the configured index itself"
+        );
+        assert_eq!(app.config.indexes[0].name, "priv");
+        assert!(
+            task.units() > 0,
+            "the change must dispatch a background persist"
+        );
+        assert!(persist.saved().is_empty());
+
+        let success = block_on(persist_config(app.config.clone(), persist.clone()));
+        assert!(success);
+        assert!(
+            persist.saved().last().unwrap().projects[0]
+                .index_names
+                .is_empty(),
+            "the persisted config must carry the deselection"
+        );
+        assert_eq!(
+            persist.saved().last().unwrap().indexes.len(),
+            1,
+            "the persisted config must still carry the configured index"
+        );
+    }
+
+    #[test]
+    fn adding_and_removing_an_index_keeps_the_credential_drafts_in_step() {
+        let mut app = App::new(Config::default());
+
+        let _ = update(&mut app, Message::IndexAdded, unused_runner());
+        let _ = update(&mut app, Message::IndexAdded, unused_runner());
+        assert_eq!(app.config.indexes.len(), 2);
+        assert_eq!(
+            app.index_credential_drafts.len(),
+            2,
+            "one draft slot per configured index"
+        );
+
+        let _ = update(
+            &mut app,
+            Message::IndexCredentialChanged(1, index_editor::CredentialInput("typing".into())),
+            unused_runner(),
+        );
+        assert_eq!(app.index_credential_drafts[1], "typing");
+
+        let _ = update(&mut app, Message::IndexRemoved(0), unused_runner());
+        assert_eq!(app.config.indexes.len(), 1);
+        assert_eq!(
+            app.index_credential_drafts.len(),
+            1,
+            "removing a row must remove its draft slot too"
+        );
+    }
+
+    // --- Task 5: the monorepo member checklist ---
+    //
+    // The five criteria (join on path, select-all-by-default, `effective`
+    // decides, removal-warns-first, exclude-not-offered) are proven directly
+    // against `members_editor`'s own pure functions in its own test module --
+    // a stronger proof than re-deriving the same claims by driving `update`'s
+    // opaque `Task`. What belongs here is the wiring: that selecting a
+    // project fetches its members off the render thread, that a landed fetch
+    // is staleness-guarded the same way `DepsLoaded` is, that a toggle
+    // persists, and that the sync confirmation actually gates dispatch on
+    // `members_editor::removal_warning`.
+
+    fn workspace_kind(globs: &[&str]) -> bombadil_core::members::WorkspaceKind {
+        bombadil_core::members::WorkspaceKind::Workspace {
+            member_globs: globs.iter().map(|s| s.to_string()).collect(),
+            exclude_globs: Vec::new(),
+        }
+    }
+
+    fn discovered_member(
+        path: &str,
+        name: Option<&str>,
+        is_workspace_member: bool,
+    ) -> bombadil_core::members::DiscoveredMember {
+        bombadil_core::members::DiscoveredMember {
+            relative_path: std::path::PathBuf::from(path),
+            name: name.map(String::from),
+            is_workspace_member,
+        }
+    }
+
+    fn installed_editable(location: &str) -> InstalledPackage {
+        InstalledPackage {
+            name: "whatever-uv-calls-it".to_string(),
+            version: "0.1.0".to_string(),
+            editable_project_location: Some(std::path::PathBuf::from(location)),
+        }
+    }
+
+    #[test]
+    fn selecting_a_project_fetches_its_members_through_job_run_not_inline() {
+        let config = Config {
+            projects: vec![project("api")],
+            ..Config::default()
+        };
+        let mut app = App::new(config);
+        let fake = Arc::new(FakeCommandRunner::new());
+
+        let task = update(&mut app, Message::ProjectSelected(0), fake.clone());
+
+        assert!(
+            fake.calls().is_empty(),
+            "the members fetch must not call the runner synchronously inside update; got {:?}",
+            fake.calls()
+        );
+        assert!(
+            task.units() > 0,
+            "selecting a project must dispatch real background work, not Task::none()"
+        );
+    }
+
+    #[test]
+    fn a_members_fetch_result_is_stored_against_its_project_index() {
+        let mut app = App::new(Config {
+            projects: vec![project("api")],
+            ..Config::default()
+        });
+        let fetch = MembersFetch {
+            kind: bombadil_core::members::WorkspaceKind::Loose,
+            discovered: vec![discovered_member("packages/alpha", Some("alpha"), false)],
+            installed: vec![],
+        };
+
+        let _ = update(&mut app, Message::MembersLoaded(0, fetch), unused_runner());
+
+        let (index, stored) = app
+            .members
+            .as_ref()
+            .expect("a landed fetch must populate app.members");
+        assert_eq!(*index, 0);
+        assert_eq!(stored.discovered.len(), 1);
+    }
+
+    #[test]
+    fn a_stale_members_fetch_for_a_project_that_no_longer_exists_is_dropped() {
+        let mut app = App::new(Config::default());
+        let fetch = MembersFetch {
+            kind: bombadil_core::members::WorkspaceKind::Loose,
+            discovered: vec![],
+            installed: vec![],
+        };
+
+        let _ = update(&mut app, Message::MembersLoaded(0, fetch), unused_runner());
+
+        assert!(app.members.is_none());
+    }
+
+    #[test]
+    fn removing_the_displayed_project_clears_its_stale_members_state() {
+        let mut app = App::new(Config {
+            projects: vec![project("api"), project("web")],
+            ..Config::default()
+        });
+        app.members = Some((
+            0,
+            MembersFetch {
+                kind: bombadil_core::members::WorkspaceKind::Loose,
+                discovered: vec![],
+                installed: vec![],
+            },
+        ));
+        app.confirm_member_sync = Some(members_editor::ConfirmMemberSync {
+            project_index: 0,
+            label: "api".to_string(),
+            warning: "would remove alpha".to_string(),
+        });
+
+        let _ = update(
+            &mut app,
+            Message::RemoveProjectRequested(0),
+            unused_runner(),
+        );
+
+        assert!(app.members.is_none());
+        assert!(app.confirm_member_sync.is_none());
+    }
+
+    #[test]
+    fn toggling_a_member_updates_the_selection_in_memory_and_dispatches_a_persist() {
+        let mut app = App::new(Config {
+            projects: vec![project("api")],
+            ..Config::default()
+        });
+        app.members = Some((
+            0,
+            MembersFetch {
+                kind: workspace_kind(&["packages/*"]),
+                discovered: vec![discovered_member("packages/alpha", Some("alpha"), true)],
+                installed: vec![],
+            },
+        ));
+
+        let task = update(
+            &mut app,
+            Message::MemberToggled(0, std::path::PathBuf::from("packages/alpha")),
+            unused_runner(),
+        );
+
+        assert_eq!(
+            app.config.projects[0].members.entries.len(),
+            1,
+            "the deselection must land in the project's own selection, in memory, synchronously"
+        );
+        assert!(!app.config.projects[0].members.entries[0].selected);
+        assert!(
+            task.units() > 0,
+            "a selection change must dispatch a background persist"
+        );
+    }
+
+    #[test]
+    fn sync_requested_opens_a_confirmation_instead_of_syncing_when_something_would_be_removed() {
+        let mut app = App::new(Config {
+            projects: vec![project("api")],
+            ..Config::default()
+        });
+        app.selected = Some(0);
+        // alpha is installed editable, but deselected -- exactly criterion 4's case.
+        app.config.projects[0].members = bombadil_core::model::MemberSelection {
+            all_discovered: true,
+            entries: vec![bombadil_core::model::MemberRef {
+                path: std::path::PathBuf::from("packages/alpha"),
+                origin: bombadil_core::model::MemberOrigin::Discovered,
+                selected: false,
+                name: None,
+            }],
+        };
+        app.members = Some((
+            0,
+            MembersFetch {
+                kind: workspace_kind(&["packages/*"]),
+                discovered: vec![discovered_member("packages/alpha", Some("alpha"), true)],
+                installed: vec![installed_editable("/p/api/packages/alpha")],
+            },
+        ));
+
+        let task = update(&mut app, Message::MembersSyncRequested(0), unused_runner());
+
+        let confirm = app
+            .confirm_member_sync
+            .as_ref()
+            .expect("must open a confirmation before removing anything");
+        assert!(confirm.warning.contains("alpha"), "got {confirm:?}");
+        assert_eq!(
+            task.units(),
+            0,
+            "nothing must be synced before the user confirms"
+        );
+        assert!(app.syncing.is_none());
+    }
+
+    #[test]
+    fn the_sync_button_in_a_workspace_root_installs_its_members() {
+        // Plain `uv sync` in a workspace root installs *no* members --
+        // verified against a real uv, which is why
+        // `uv::command::sync_all_members` exists at all. The header's Sync
+        // button ran the bare `["sync"]` anyway, so member-aware sync was
+        // reachable only from the Members tab and the obvious button quietly
+        // produced an environment with none of the workspace's own packages
+        // in it.
+        //
+        // `app.members` is already populated by the time Sync is pressable:
+        // `ProjectSelected` dispatches the deps and members fetches together.
+        let mut app = App::new(Config {
+            projects: vec![project("api")],
+            settings: fake_uv_settings(),
+            ..Config::default()
+        });
+        app.members = Some((
+            0,
+            MembersFetch {
+                kind: workspace_kind(&["packages/*"]),
+                discovered: vec![discovered_member("packages/alpha", Some("alpha"), true)],
+                installed: vec![],
+            },
+        ));
+
+        let task = update(&mut app, Message::SyncRequested(0), unused_runner());
+        assert!(task.units() > 0, "the Sync press must dispatch real work");
+        assert!(
+            app.drawer.status.contains("members"),
+            "the dispatched job must be the member-aware one -- the plain path \
+             names no members; got {:?}",
+            app.drawer.status
+        );
+
+        let target = sync_target(&app, 0).expect("the press must resolve a project");
+        let (kind, discovered) = members_context(&app, 0)
+            .expect("a Sync press must route through this project's member-aware plan");
+
+        let store = bombadil_core::secrets::InMemorySecretStore::new();
+        let runner = FakeCommandRunner::new();
+        version_probe(&runner);
+        runner.expect(
+            "uv",
+            &["sync", "--all-packages"],
+            bombadil_core::process::CommandOutcome {
+                status: Some(0),
+                stdout: String::new(),
+                stderr: String::new(),
+            },
+        );
+
+        let (success, lines) =
+            run_members_sync(&target, &app.config, &kind, &discovered, &store, &runner);
+        assert!(success, "got {lines:?}");
+
+        let calls = runner.calls();
+        assert!(
+            calls
+                .iter()
+                .any(|c| c.args.iter().any(|a| a == "--all-packages")),
+            "a workspace root's Sync must install its members; got {:?}",
+            calls.iter().map(|c| c.args.clone()).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn an_ordinary_project_sync_is_left_exactly_as_it_was() {
+        // The other half: `SyncPlan::Plain` is what makes routing every Sync
+        // through the member machinery a no-op for a project that is not a
+        // workspace at all. If this ever became `--all-packages` or
+        // `--no-install-workspace`, every everyday sync would change shape.
+        let mut app = App::new(Config {
+            projects: vec![project("api")],
+            settings: fake_uv_settings(),
+            ..Config::default()
+        });
+        // A landed fetch for a project that is not a workspace at all: the
+        // case `SyncPlan::Plain` exists for, and the one that makes routing
+        // every Sync through the member machinery safe.
+        app.members = Some((
+            0,
+            MembersFetch {
+                kind: bombadil_core::members::WorkspaceKind::Loose,
+                discovered: vec![],
+                installed: vec![],
+            },
+        ));
+        let target = sync_target(&app, 0).expect("the press must resolve a project");
+
+        let store = bombadil_core::secrets::InMemorySecretStore::new();
+        let runner = FakeCommandRunner::new();
+        version_probe(&runner);
+        runner.expect(
+            "uv",
+            &["sync"],
+            bombadil_core::process::CommandOutcome {
+                status: Some(0),
+                stdout: String::new(),
+                stderr: String::new(),
+            },
+        );
+
+        assert!(
+            members_context(&app, 0).is_none(),
+            "a project whose plan is Plain must take the plain path, argv and \
+             status line included"
+        );
+        let (success, lines) = run_sync(&target, &app.config, &store, &runner);
+        assert!(success, "got {lines:?}");
+
+        let calls = runner.calls();
+        let sync = calls
+            .iter()
+            .find(|c| c.args.iter().any(|a| a == "sync"))
+            .expect("uv sync must have been run");
+        assert_eq!(
+            sync.args,
+            vec!["sync".to_string()],
+            "an ordinary project's sync must stay a bare `uv sync`"
+        );
+    }
+
+    #[test]
+    fn sync_requested_syncs_immediately_when_nothing_would_be_removed() {
+        let mut app = App::new(Config {
+            projects: vec![project("api")],
+            ..Config::default()
+        });
+        app.selected = Some(0);
+        app.members = Some((
+            0,
+            MembersFetch {
+                kind: workspace_kind(&["packages/*"]),
+                discovered: vec![discovered_member("packages/alpha", Some("alpha"), true)],
+                installed: vec![],
+            },
+        ));
+
+        let task = update(&mut app, Message::MembersSyncRequested(0), unused_runner());
+
+        assert!(
+            app.confirm_member_sync.is_none(),
+            "nothing selected is being removed, so no confirmation is needed"
+        );
+        assert!(
+            task.units() > 0,
+            "syncing must be dispatched immediately when nothing would be removed"
+        );
+        assert!(app.syncing.is_some());
+    }
+
+    #[test]
+    fn confirming_a_member_sync_dispatches_it_and_clears_the_confirmation() {
+        let mut app = App::new(Config {
+            projects: vec![project("api")],
+            ..Config::default()
+        });
+        app.members = Some((
+            0,
+            MembersFetch {
+                kind: workspace_kind(&["packages/*"]),
+                discovered: vec![discovered_member("packages/alpha", Some("alpha"), true)],
+                installed: vec![installed_editable("/p/api/packages/alpha")],
+            },
+        ));
+        app.confirm_member_sync = Some(members_editor::ConfirmMemberSync {
+            project_index: 0,
+            label: "api".to_string(),
+            warning: "would remove alpha".to_string(),
+        });
+
+        let task = update(&mut app, Message::MembersSyncConfirmed, unused_runner());
+
+        assert!(app.confirm_member_sync.is_none());
+        assert!(task.units() > 0, "confirming must dispatch the sync");
+        assert!(app.syncing.is_some());
+    }
+
+    #[test]
+    fn cancelling_a_member_sync_dispatches_nothing_and_clears_the_confirmation() {
+        let mut app = App::new(Config {
+            projects: vec![project("api")],
+            ..Config::default()
+        });
+        app.confirm_member_sync = Some(members_editor::ConfirmMemberSync {
+            project_index: 0,
+            label: "api".to_string(),
+            warning: "would remove alpha".to_string(),
+        });
+
+        let task = update(&mut app, Message::MembersSyncCancelled, unused_runner());
+
+        assert!(app.confirm_member_sync.is_none());
+        assert_eq!(task.units(), 0);
+        assert!(app.syncing.is_none());
+    }
+
+    // --- Task 6: the Settings tab ---
+
+    fn version_outcome(line: &str) -> bombadil_core::process::CommandOutcome {
+        bombadil_core::process::CommandOutcome {
+            status: Some(0),
+            stdout: line.into(),
+            stderr: String::new(),
+        }
+    }
+
+    // --- criterion 1: a `uv_source` change takes effect on the next
+    // resolve, without restarting ---
+
+    #[test]
+    fn changing_uv_source_takes_effect_on_the_next_resolve_without_restarting() {
+        // The bug this catches: a uv binary resolved once (at boot, or on
+        // first use) and cached somewhere on `App`, so the UI and the next
+        // `uv sync` disagree until the process restarts. There is no such
+        // cache to poke directly -- `resolve_uv_for` takes `&Config` fresh on
+        // every call -- so the proof is behavioural: resolve twice against
+        // the SAME running `App`, with the settings change landing via
+        // `update` in between, using two runners that each answer for only
+        // one of the two paths. If the change had not really landed in
+        // `app.config`, or `update` mutated some other copy of it, the
+        // second resolve would be asked of a runner with no rule for the old
+        // path and fail instead of succeeding against the new one.
+        let mut app = App::new(Config {
+            settings: Settings {
+                uv_source: UvSource::Custom {
+                    path: PathBuf::from("/bin/uv-old"),
+                },
+                ..Settings::default()
+            },
+            ..Config::default()
+        });
+
+        let old_runner = FakeCommandRunner::new();
+        old_runner.expect("uv-old", &["--version"], version_outcome("uv 0.12.1"));
+        let before =
+            resolve_uv_for(&app.config, &old_runner).expect("the configured old source resolves");
+        assert_eq!(before.path, PathBuf::from("/bin/uv-old"));
+
+        // Simulates a validated "use this uv" press landing -- criterion 2's
+        // own message is what a real change goes through; this test's
+        // subject is what happens to *resolution* afterward, not the
+        // validation itself.
+        let _ = update(
+            &mut app,
+            Message::SettingsUvCustomValidated(Ok(uv::ResolvedUv {
+                path: PathBuf::from("/bin/uv-new"),
+                version: uv::UvVersion {
+                    major: 0,
+                    minor: 12,
+                    patch: 1,
+                },
+                origin: uv::UvOrigin::Configured,
+                newer_than_bundled: false,
+            })),
+            unused_runner(),
+        );
+        assert_eq!(
+            app.config.settings.uv_source,
+            UvSource::Custom {
+                path: PathBuf::from("/bin/uv-new")
+            },
+            "the landed validation must write Settings::uv_source immediately"
+        );
+
+        let new_runner = FakeCommandRunner::new();
+        new_runner.expect("uv-new", &["--version"], version_outcome("uv 0.12.1"));
+        let after = resolve_uv_for(&app.config, &new_runner)
+            .expect("the new source must resolve on the very next call, with no restart");
+        assert_eq!(after.path, PathBuf::from("/bin/uv-new"));
+    }
+
+    // --- criterion 2: a custom uv binary is validated, through `job::run`,
+    // before it is ever saved ---
+
+    #[test]
+    fn requesting_custom_uv_validation_never_probes_the_runner_synchronously() {
+        let mut app = App::new(Config::default());
+        app.uv_custom_path_draft = "/opt/uv".to_string();
+        let fake = Arc::new(FakeCommandRunner::new());
+
+        let task = update(
+            &mut app,
+            Message::SettingsUvCustomValidateRequested,
+            fake.clone(),
+        );
+
+        assert!(
+            fake.calls().is_empty(),
+            "validating a uv binary must spawn it through job::run, not inline inside update; got {:?}",
+            fake.calls()
+        );
+        assert!(
+            task.units() > 0,
+            "a validate request must dispatch real background work"
+        );
+    }
+
+    #[test]
+    fn a_custom_binary_below_the_minimum_version_is_refused_and_reported_as_such() {
+        // Criterion 2's version check: `uv::resolve`'s own `TooOld` text,
+        // not a second copy of the comparison.
+        let runner = FakeCommandRunner::new();
+        runner.expect("uv", &["--version"], version_outcome("uv 0.9.0"));
+
+        let err = validate_uv_source_blocking(PathBuf::from("/opt/uv"), Config::default(), &runner)
+            .expect_err("a version below MIN_UV_VERSION must be refused");
+
+        assert!(
+            err.contains("0.9.0"),
+            "the offending version must be named; got {err}"
+        );
+        assert!(
+            err.contains("0.12.1"),
+            "the minimum it fell short of must be named too; got {err}"
+        );
+    }
+
+    #[test]
+    fn a_refused_custom_validation_never_writes_settings_or_persists() {
+        // The exact bug criterion 2 exists to catch: a bad path saved before
+        // it was ever confirmed to run, discovered later at spawn time far
+        // from this screen. `SettingsUvCustomValidated(Err(_))` -- the only
+        // message a failed validation can produce -- must leave `Settings`
+        // and the persisted config exactly as they were.
+        let original = UvSource::Bundled;
+        let mut app = App::new(Config {
+            settings: Settings {
+                uv_source: original.clone(),
+                ..Settings::default()
+            },
+            ..Config::default()
+        });
+        let persist = Arc::new(FakeConfigPersist::default());
+        app.persist = persist.clone();
+
+        let runner = FakeCommandRunner::new();
+        runner.expect("uv", &["--version"], version_outcome("uv 0.9.0"));
+        let err =
+            validate_uv_source_blocking(PathBuf::from("/opt/uv"), app.config.clone(), &runner)
+                .unwrap_err();
+
+        let task = update(
+            &mut app,
+            Message::SettingsUvCustomValidated(Err(err)),
+            unused_runner(),
+        );
+
+        assert_eq!(
+            app.config.settings.uv_source, original,
+            "a refused path must never reach Settings"
+        );
+        assert_eq!(
+            task.units(),
+            0,
+            "a refusal must not dispatch a persist -- there is nothing new to save"
+        );
+        assert!(
+            persist.saved().is_empty(),
+            "a refused validation must never be persisted"
+        );
+    }
+
+    #[test]
+    fn an_accepted_custom_validation_writes_settings_and_persists_the_probed_path() {
+        let mut app = App::new(Config::default());
+        let persist = Arc::new(FakeConfigPersist::default());
+        app.persist = persist.clone();
+
+        let runner = FakeCommandRunner::new();
+        runner.expect("uv", &["--version"], version_outcome("uv 0.12.1"));
+        let resolved =
+            validate_uv_source_blocking(PathBuf::from("/opt/uv"), app.config.clone(), &runner)
+                .expect("uv 0.12.1 meets MIN_UV_VERSION");
+
+        let _ = update(
+            &mut app,
+            Message::SettingsUvCustomValidated(Ok(resolved)),
+            unused_runner(),
+        );
+
+        assert_eq!(
+            app.config.settings.uv_source,
+            UvSource::Custom {
+                path: PathBuf::from("/opt/uv")
+            }
+        );
+
+        let success = block_on(persist_config(app.config.clone(), persist.clone()));
+        assert!(success);
+        assert_eq!(
+            persist.saved().last().unwrap().settings.uv_source,
+            UvSource::Custom {
+                path: PathBuf::from("/opt/uv")
+            },
+            "the accepted, probed path must be what is persisted"
+        );
+    }
+
+    // --- criterion 3: `default_venv_location` changes the resolved path
+    // for Default projects, and never moves or deletes an existing venv ---
+
+    #[test]
+    fn changing_the_default_venv_location_changes_the_resolved_path_for_a_default_project() {
+        let project_at = |dir: &Path| Project {
+            venv: bombadil_core::model::VenvLocation::Default,
+            pyproject_path: dir.join("pyproject.toml"),
+            ..project("api")
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = App::new(Config {
+            projects: vec![project_at(dir.path())],
+            settings: Settings {
+                default_venv_location: bombadil_core::model::DefaultVenvLocation::Alongside,
+                ..Settings::default()
+            },
+            ..Config::default()
+        });
+        let before = venv_path::resolve(&app.config.projects[0], &app.config.settings).unwrap();
+        assert_eq!(before, dir.path().join(".venv"));
+
+        let central = tempfile::tempdir().unwrap();
+        let _ = update(
+            &mut app,
+            Message::SettingsDefaultVenvLocationFolderPicked(Some(central.path().to_path_buf())),
+            unused_runner(),
+        );
+
+        assert_eq!(
+            app.config.settings.default_venv_location,
+            bombadil_core::model::DefaultVenvLocation::Central {
+                path: central.path().to_path_buf()
+            }
+        );
+        let after = venv_path::resolve(&app.config.projects[0], &app.config.settings).unwrap();
+        assert_ne!(
+            after, before,
+            "the resolved path for a Default project must change with the setting"
+        );
+        assert!(
+            after.starts_with(central.path()),
+            "got {after:?}, expected it under {central:?}",
+            central = central.path()
+        );
+    }
+
+    #[test]
+    fn changing_the_default_venv_location_reprobes_every_project() {
+        // `entries[i].venv_exists` and `python_version` describe the location
+        // that was resolved when the probe ran. Changing the default moves
+        // where every `VenvLocation::Default` project resolves, so without a
+        // re-probe the sidebar goes on describing an environment nothing is
+        // going to use -- green ticks and Python versions for venvs at the
+        // old path -- until the app is restarted.
+        // `AddProjectConfirmFinished` already re-dispatches for exactly this
+        // reason.
+        let default_project = |label: &str| Project {
+            venv: bombadil_core::model::VenvLocation::Default,
+            ..project(label)
+        };
+        let mut app = App::new(Config {
+            projects: vec![default_project("api"), default_project("web")],
+            ..Config::default()
+        });
+
+        let alongside = update(
+            &mut app,
+            Message::SettingsDefaultVenvLocationAlongsideSelected,
+            unused_runner(),
+        );
+        assert_eq!(
+            alongside.units(),
+            3,
+            "the persist plus one venv probe per project; got {}",
+            alongside.units()
+        );
+
+        let picked = update(
+            &mut app,
+            Message::SettingsDefaultVenvLocationFolderPicked(Some(PathBuf::from("/central"))),
+            unused_runner(),
+        );
+        assert_eq!(
+            picked.units(),
+            3,
+            "picking a central folder must re-probe too; got {}",
+            picked.units()
+        );
+    }
+
+    #[test]
+    fn changing_the_default_venv_location_never_touches_an_existing_venv_on_disk() {
+        // The half of criterion 3 that matters most: Bombadil must never
+        // move or delete a venv as a side effect of a settings change.
+        // `venv_path::resolve` performs no filesystem access at all (see its
+        // own doc), and the only call site for the crate's one destructive
+        // operation, `venv_path::delete`, is `RecreateVenvConfirmed`, gated
+        // on an explicit user confirmation -- nothing reachable from
+        // `SettingsDefaultVenvLocation*` calls it. This does not take that on
+        // faith: it puts a real venv on disk at the old location and checks
+        // it is untouched after the setting changes.
+        let dir = tempfile::tempdir().unwrap();
+        let old_venv = dir.path().join(".venv");
+        std::fs::create_dir_all(old_venv.join("lib")).unwrap();
+        std::fs::write(
+            old_venv.join("pyvenv.cfg"),
+            "home = /usr/bin\nversion_info = 3.12.1\n",
+        )
+        .unwrap();
+        std::fs::write(old_venv.join("lib").join("marker"), "still here").unwrap();
+
+        let mut app = App::new(Config {
+            projects: vec![Project {
+                venv: bombadil_core::model::VenvLocation::Default,
+                pyproject_path: dir.path().join("pyproject.toml"),
+                ..project("api")
+            }],
+            settings: Settings {
+                default_venv_location: bombadil_core::model::DefaultVenvLocation::Alongside,
+                ..Settings::default()
+            },
+            ..Config::default()
+        });
+
+        let central = tempfile::tempdir().unwrap();
+        let fake = Arc::new(FakeCommandRunner::new());
+        let _ = update(
+            &mut app,
+            Message::SettingsDefaultVenvLocationFolderPicked(Some(central.path().to_path_buf())),
+            fake.clone(),
+        );
+
+        let new_path = venv_path::resolve(&app.config.projects[0], &app.config.settings).unwrap();
+        assert!(
+            old_venv.exists() && old_venv.join("pyvenv.cfg").exists(),
+            "the venv at the OLD resolved location must survive the settings change untouched"
+        );
+        assert_eq!(
+            std::fs::read_to_string(old_venv.join("lib").join("marker")).unwrap(),
+            "still here",
+            "the old venv's contents must be byte-for-byte untouched, not just its directory"
+        );
+        assert!(
+            !new_path.exists(),
+            "nothing may be created at the new location either -- only the computed path changes, \
+             the venv is neither moved nor recreated"
+        );
+        assert!(
+            fake.calls().is_empty(),
+            "a settings change must spawn no process at all; got {:?}",
+            fake.calls()
+        );
+    }
+
+    #[test]
+    fn selecting_alongside_after_a_central_location_also_leaves_the_central_venv_alone() {
+        // The mirror direction of the test above -- moving back toward
+        // Alongside must be exactly as inert as moving away from it. Without
+        // this, a fix that only guarded the Alongside-to-Central direction
+        // would still pass the other test above and still be able to
+        // silently strand or delete a venv on the way back.
+        let central = tempfile::tempdir().unwrap();
+        let central_venv = central.path().join("api-000000");
+        // Not a real `central_dir_name` hash -- irrelevant here, since this
+        // test never resolves through it; it only has to be *some* existing
+        // directory under the old central root that must survive.
+        std::fs::create_dir_all(central_venv.join("lib")).unwrap();
+        std::fs::write(
+            central_venv.join("pyvenv.cfg"),
+            "home = /usr/bin\nversion_info = 3.12.1\n",
+        )
+        .unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = App::new(Config {
+            projects: vec![Project {
+                venv: bombadil_core::model::VenvLocation::Default,
+                pyproject_path: dir.path().join("pyproject.toml"),
+                ..project("api")
+            }],
+            settings: Settings {
+                default_venv_location: bombadil_core::model::DefaultVenvLocation::Central {
+                    path: central.path().to_path_buf(),
+                },
+                ..Settings::default()
+            },
+            ..Config::default()
+        });
+
+        let _ = update(
+            &mut app,
+            Message::SettingsDefaultVenvLocationAlongsideSelected,
+            unused_runner(),
+        );
+
+        assert_eq!(
+            app.config.settings.default_venv_location,
+            bombadil_core::model::DefaultVenvLocation::Alongside
+        );
+        assert!(
+            central_venv.join("pyvenv.cfg").exists(),
+            "the venv left behind under the old central location must survive"
+        );
+    }
+
+    #[test]
+    fn picking_a_default_venv_folder_dispatches_no_filesystem_or_process_work_synchronously() {
+        // "Choose a central folder..." opens the async picker; the choice
+        // itself does not run through job::run (there is nothing blocking
+        // about assigning a path), but this pins that the message that
+        // requests the picker touches neither the runner nor `Settings`
+        // until a folder actually comes back.
+        let mut app = App::new(Config::default());
+        let fake = Arc::new(FakeCommandRunner::new());
+        let before = app.config.settings.default_venv_location.clone();
+
+        let task = update(
+            &mut app,
+            Message::SettingsDefaultVenvLocationPickFolderRequested,
+            fake.clone(),
+        );
+
+        assert_eq!(app.config.settings.default_venv_location, before);
+        assert!(fake.calls().is_empty());
+        assert!(task.units() > 0, "must open the async folder picker");
     }
 
     fn project(label: &str) -> bombadil_core::model::Project {

@@ -1,4 +1,4 @@
-use crate::error::VenvPathError;
+use crate::error::{VenvDeleteError, VenvPathError};
 use crate::model::{DefaultVenvLocation, Project, Settings, VenvLocation};
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
@@ -97,9 +97,65 @@ pub fn probe(venv: &Path) -> Option<String> {
     version.or(version_info)
 }
 
+/// Delete `path`, but only if it really is `project`'s virtual environment.
+///
+/// This is the only destructive filesystem operation in the crate, so it
+/// refuses far more than it accepts. Four things must hold before anything is
+/// removed, and each failure is a distinct [`VenvDeleteError`] so the caller
+/// can say *why* rather than "could not delete":
+///
+/// 1. `path` is exactly where [`resolve`] puts this project's environment.
+///    Equality, not a prefix test: a caller must not be able to hand in an
+///    arbitrary path, and no caller has a reason to delete part of a venv.
+/// 2. `path` is a real directory, checked with `symlink_metadata` so a
+///    symlink is refused rather than followed. [`probe`] *does* follow
+///    symlinks, so this check has to come first -- otherwise a link pointing
+///    at someone else's environment would satisfy check 3.
+/// 3. `path` holds a `pyvenv.cfg` [`probe`] can read a version out of. Same
+///    test the rest of the crate uses to decide something is a virtual
+///    environment at all: uv writes `version_info`, the stdlib writes
+///    `version`, and a directory with neither is not an environment however
+///    plausible its name.
+/// 4. The removal itself succeeded.
+///
+/// Deliberately *not* handled: a `pyvenv.cfg` whose `home` points somewhere
+/// unexpected, and a project configured with `VenvLocation::Custom` pointing
+/// at a directory the user cares about -- if they wrote a `pyvenv.cfg` into
+/// it, it is a virtual environment by every test uv itself applies.
+pub fn delete(project: &Project, settings: &Settings, path: &Path) -> Result<(), VenvDeleteError> {
+    let expected = resolve(project, settings)?;
+    if path != expected {
+        return Err(VenvDeleteError::OutsideProject {
+            path: path.to_path_buf(),
+            expected,
+        });
+    }
+
+    // `symlink_metadata`, never `metadata`: a symlink at the venv path must
+    // be refused, not followed. A path that does not exist lands here too,
+    // which is the honest answer -- there is no environment to delete.
+    if !std::fs::symlink_metadata(path).is_ok_and(|meta| meta.is_dir()) {
+        return Err(VenvDeleteError::NotADirectory {
+            path: path.to_path_buf(),
+        });
+    }
+
+    if probe(path).is_none() {
+        return Err(VenvDeleteError::NotAVenv {
+            path: path.to_path_buf(),
+        });
+    }
+
+    std::fs::remove_dir_all(path).map_err(|source| VenvDeleteError::Io {
+        path: path.to_path_buf(),
+        source,
+    })
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{central_dir_name, probe, resolve};
+    use super::{central_dir_name, delete, probe, resolve};
+    use crate::error::VenvDeleteError;
     use crate::model::{DefaultVenvLocation, Project, Settings, UvSource, VenvLocation};
     use std::path::{Path, PathBuf};
     use uuid::Uuid;
@@ -313,5 +369,214 @@ mod tests {
 
         std::fs::remove_file(venv.join("pyvenv.cfg")).unwrap();
         assert_eq!(probe(&venv), None);
+    }
+
+    // --- delete: the crate's only destructive operation ---
+    //
+    // Every test below asserts BOTH the returned outcome and what is still on
+    // disk afterwards. A refusal that returns `Err` after having already
+    // removed the directory would pass an outcome-only assertion, which on
+    // this function is the exact failure that costs a user their environment.
+
+    /// A project whose venv resolves to `<dir>/proj/.venv`, so a refusal can
+    /// be tested against a path inside the same tempdir.
+    fn project_in(dir: &Path) -> Project {
+        Project {
+            pyproject_path: dir.join("proj").join("pyproject.toml"),
+            venv: VenvLocation::Alongside,
+            ..project(VenvLocation::Alongside)
+        }
+    }
+
+    /// A directory shaped like a real venv: `pyvenv.cfg` plus something
+    /// underneath it, so a delete that only unlinked the marker file would
+    /// leave evidence.
+    fn make_venv(path: &Path) {
+        std::fs::create_dir_all(path.join("lib")).unwrap();
+        std::fs::write(
+            path.join("pyvenv.cfg"),
+            "home = /usr/bin\nversion_info = 3.13.1\n",
+        )
+        .unwrap();
+        std::fs::write(path.join("lib").join("marker"), "x").unwrap();
+    }
+
+    #[test]
+    fn a_real_venv_at_the_projects_resolved_location_is_removed() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = project_in(dir.path());
+        let settings = settings(DefaultVenvLocation::Alongside);
+        let venv = resolve(&project, &settings).unwrap();
+        make_venv(&venv);
+
+        delete(&project, &settings, &venv).expect("a real venv must be removable");
+
+        assert!(!venv.exists(), "{venv:?} must be gone");
+        assert!(
+            dir.path().join("proj").exists(),
+            "only the venv may be removed, not the project directory around it"
+        );
+    }
+
+    #[test]
+    fn a_directory_without_a_pyvenv_cfg_is_refused_and_survives() {
+        // The refusal that matters most: a user who set the venv location to
+        // their source folder, or to a directory that merely looks like an
+        // environment. A plausible name is not evidence.
+        let dir = tempfile::tempdir().unwrap();
+        let project = project_in(dir.path());
+        let settings = settings(DefaultVenvLocation::Alongside);
+        let venv = resolve(&project, &settings).unwrap();
+        std::fs::create_dir_all(venv.join("src")).unwrap();
+        std::fs::write(venv.join("src").join("main.py"), "print(1)").unwrap();
+
+        let err = delete(&project, &settings, &venv).unwrap_err();
+
+        assert!(
+            matches!(err, VenvDeleteError::NotAVenv { .. }),
+            "got {err:?}"
+        );
+        assert!(
+            venv.join("src").join("main.py").exists(),
+            "nothing may be removed when the path is not a virtual environment"
+        );
+    }
+
+    #[test]
+    fn a_path_outside_the_projects_resolved_location_is_refused_and_survives() {
+        // Deliberately a REAL venv: only the location check can refuse it, so
+        // this cannot pass off the pyvenv.cfg check by accident.
+        let dir = tempfile::tempdir().unwrap();
+        let project = project_in(dir.path());
+        let settings = settings(DefaultVenvLocation::Alongside);
+        let elsewhere = dir.path().join("someone-elses-venv");
+        make_venv(&elsewhere);
+
+        let err = delete(&project, &settings, &elsewhere).unwrap_err();
+
+        assert!(
+            matches!(err, VenvDeleteError::OutsideProject { .. }),
+            "got {err:?}"
+        );
+        assert!(
+            elsewhere.join("pyvenv.cfg").exists(),
+            "a path this project does not own must not be deleted"
+        );
+    }
+
+    #[test]
+    fn a_path_that_does_not_exist_is_refused_rather_than_reported_as_deleted() {
+        // Recreate-venv on a project that never had one arrives here. It must
+        // read as "there is no environment", not as a successful delete.
+        let dir = tempfile::tempdir().unwrap();
+        let project = project_in(dir.path());
+        let settings = settings(DefaultVenvLocation::Alongside);
+        let venv = resolve(&project, &settings).unwrap();
+
+        let err = delete(&project, &settings, &venv).unwrap_err();
+
+        assert!(
+            matches!(err, VenvDeleteError::NotADirectory { .. }),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn a_venv_path_that_is_a_file_is_refused_and_survives() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = project_in(dir.path());
+        let settings = settings(DefaultVenvLocation::Alongside);
+        let venv = resolve(&project, &settings).unwrap();
+        std::fs::create_dir_all(venv.parent().unwrap()).unwrap();
+        std::fs::write(&venv, "not a directory").unwrap();
+
+        let err = delete(&project, &settings, &venv).unwrap_err();
+
+        assert!(
+            matches!(err, VenvDeleteError::NotADirectory { .. }),
+            "got {err:?}"
+        );
+        assert!(venv.exists(), "the file must survive");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_venv_path_that_is_a_symlink_is_refused_and_its_target_survives() {
+        // `probe` follows symlinks, so a symlink pointing at a real venv --
+        // or at a home directory containing one -- passes the pyvenv.cfg test
+        // while naming something the project does not own. The check has to
+        // be on the link itself, which means `symlink_metadata`, not
+        // `metadata`.
+        //
+        // unix-only: creating a symlink on Windows needs a privilege CI does
+        // not have. The guard itself is not platform-specific.
+        let dir = tempfile::tempdir().unwrap();
+        let project = project_in(dir.path());
+        let settings = settings(DefaultVenvLocation::Alongside);
+        let venv = resolve(&project, &settings).unwrap();
+        let target = dir.path().join("real-venv");
+        make_venv(&target);
+        std::fs::create_dir_all(venv.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(&target, &venv).unwrap();
+        assert!(probe(&venv).is_some(), "the symlink must probe as a venv");
+
+        let err = delete(&project, &settings, &venv).unwrap_err();
+
+        assert!(
+            matches!(err, VenvDeleteError::NotADirectory { .. }),
+            "got {err:?}"
+        );
+        assert!(
+            target.join("pyvenv.cfg").exists(),
+            "the symlink's target must not be touched"
+        );
+        assert!(
+            std::fs::symlink_metadata(&venv).is_ok(),
+            "the symlink itself must not be removed either"
+        );
+    }
+
+    #[test]
+    fn a_project_with_no_directory_is_refused_before_anything_is_touched() {
+        let mut project = project(VenvLocation::Alongside);
+        project.pyproject_path = PathBuf::from("pyproject.toml");
+        let err = delete(
+            &project,
+            &settings(DefaultVenvLocation::Alongside),
+            Path::new(".venv"),
+        )
+        .unwrap_err();
+        assert!(matches!(err, VenvDeleteError::Resolve(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn every_refusal_names_the_path_it_refused() {
+        // The whole reason these are distinct variants: the GUI hands the
+        // rendered message straight to the drawer, and "could not delete"
+        // with no path is not something a user can act on.
+        let dir = tempfile::tempdir().unwrap();
+        let project = project_in(dir.path());
+        let settings = settings(DefaultVenvLocation::Alongside);
+        let venv = resolve(&project, &settings).unwrap();
+
+        std::fs::create_dir_all(&venv).unwrap();
+        let not_a_venv = delete(&project, &settings, &venv).unwrap_err().to_string();
+        assert!(
+            not_a_venv.contains(&venv.display().to_string()),
+            "got {not_a_venv}"
+        );
+
+        let elsewhere = dir.path().join("elsewhere");
+        let outside = delete(&project, &settings, &elsewhere)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            outside.contains(&elsewhere.display().to_string()),
+            "got {outside}"
+        );
+        assert!(
+            outside.contains(&venv.display().to_string()),
+            "the refusal must also name where the venv actually is; got {outside}"
+        );
     }
 }
