@@ -115,6 +115,12 @@ pub struct App {
     /// nothing else for the menu to show in either state, the same shape
     /// `add_project` uses for its own dialog.
     pub context_menu: Option<context_menu::ContextMenu>,
+    /// Whether the footer is showing the bundled uv licence in full.
+    /// Apache-2.0 section 4 obliges the text to be reachable, and
+    /// `bombadil_uv_bin::UV_LICENSE` is compiled in -- this is what reaches
+    /// it. Collapsed by default: it is thousands of words of boilerplate,
+    /// and the obligation is that the user *can* read it.
+    pub about_expanded: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -216,6 +222,10 @@ pub enum Message {
     RemoveProjectFinished {
         success: bool,
     },
+    /// The footer's licence control was pressed: show or hide the bundled uv
+    /// licence text. Apache-2.0 section 4 obliges the text to be reachable,
+    /// and this is what reaches it.
+    AboutLicenseToggled,
 }
 
 impl App {
@@ -237,6 +247,7 @@ impl App {
             add_project: None,
             persist: Arc::new(NullPersist),
             context_menu: None,
+            about_expanded: false,
         }
     }
 }
@@ -562,6 +573,9 @@ pub fn update(app: &mut App, message: Message, runner: Arc<dyn CommandRunner>) -
             if !success {
                 drawer::set_idle(&mut app.drawer, "remove failed to persist".to_string());
             }
+        }
+        Message::AboutLicenseToggled => {
+            app.about_expanded = !app.about_expanded;
         }
     }
     Task::none()
@@ -1133,7 +1147,7 @@ pub fn view(app: &App) -> iced::Element<'_, Message> {
 
     let mut problems = app.load_problems.clone();
     problems.extend(banner::problems(&app.config));
-    let footer = iced::widget::text(crate::about::attribution()).size(11);
+    let footer = crate::about::view(app.about_expanded);
     iced::widget::column![
         banner::view(&problems),
         body,
@@ -2602,6 +2616,22 @@ mod tests {
         );
 
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn the_bundled_licence_can_be_shown_and_hidden_again() {
+        // Apache-2.0 section 4 obliges the text to be reachable. It is
+        // compiled into the executable (`bombadil_uv_bin::UV_LICENSE`) and
+        // had no consumer at all; this flag is what `view` renders it from,
+        // so a toggle that never flips leaves the obligation unmet.
+        let mut app = App::new(Config::default());
+        assert!(!app.about_expanded, "the licence starts collapsed");
+
+        let _ = update(&mut app, Message::AboutLicenseToggled, unused_runner());
+        assert!(app.about_expanded);
+
+        let _ = update(&mut app, Message::AboutLicenseToggled, unused_runner());
+        assert!(!app.about_expanded);
     }
 
     fn project(label: &str) -> bombadil_core::model::Project {
