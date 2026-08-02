@@ -10,15 +10,22 @@
 //! nothing about whether the terminal actually opened -- that is handled
 //! later, at spawn time, not here.
 //!
-//! ## Known limitation: three terminals cannot carry the shell
+//! ## Known limitation: six terminals cannot carry the shell
 //!
-//! `open -a Terminal <cwd>` and `open -a iTerm <cwd>` (macOS), and
-//! `cmd.exe /K cd /d <cwd>` (Windows) launch the user's own default shell --
-//! they have no flag to hand it a specific shell binary or arguments. Task 2's
-//! activation re-assertion (the generated init file, passed in here as
-//! `shell`/`shell_args`) therefore never reaches those three. The GUI should
-//! surface this as a known limitation rather than Bombadil silently doing
-//! nothing.
+//! `TerminalApp` and `ITerm2` (`open -a Terminal <cwd>` / `open -a iTerm
+//! <cwd>`, both macOS kinds) launch the user's own default shell. So do four
+//! of Windows' five kinds: `Cmd` (`cmd.exe /K cd /d <cwd>`), `PowerShell`
+//! (`powershell.exe -NoExit -Command Set-Location ...`), `GitBash`
+//! (`bash.exe --login -i`), and `Wsl` (`wsl.exe --cd <cwd>`). None of these
+//! six has a flag to hand the emulator a specific shell binary or arguments,
+//! so Task 2's activation re-assertion (the generated init file, passed in
+//! here as `shell`/`shell_args`) never reaches them.
+//!
+//! `WindowsTerminal` is the *only* Windows kind where activation works,
+//! alongside all seven Linux kinds. The GUI should steer Windows users
+//! toward `WindowsTerminal` and surface the other four Windows kinds and
+//! both macOS kinds as a known limitation, rather than let Bombadil report
+//! the venv as active when the spawned shell never saw the re-assertion.
 
 use super::{Os, TerminalChoice, TerminalKind};
 use crate::error::TerminalError;
@@ -107,7 +114,10 @@ fn build_detected(
             .arg("-Command")
             .arg("Set-Location")
             .arg("-LiteralPath")
-            .arg(format!("'{cwd_str}'")),
+            // PowerShell's single-quoted strings escape an embedded quote by
+            // doubling it; this project has shipped an unescaped-quote bug
+            // in a shell interpolation once before (see activation.rs).
+            .arg(format!("'{}'", cwd_str.replace('\'', "''"))),
         Cmd => CommandSpec::new("cmd.exe")
             .arg("/K")
             .arg("cd")
@@ -121,15 +131,18 @@ fn build_detected(
 }
 
 fn build_custom(template: &str, cwd: &Path, shell: &str) -> Result<CommandSpec, TerminalError> {
-    let substituted = template
-        .replace("{cwd}", &cwd.to_string_lossy())
-        .replace("{shell}", shell);
+    // Tokenize first, then substitute into each token: substituting into the
+    // whole template before splitting would split a cwd containing a space
+    // (ordinary on Windows and macOS) into two arguments.
+    let cwd_str = cwd.to_string_lossy();
+    let mut tokens = template
+        .split_whitespace()
+        .map(|tok| tok.replace("{cwd}", &cwd_str).replace("{shell}", shell));
 
-    let mut tokens = substituted.split_whitespace();
     let program = tokens.next().ok_or(TerminalError::EmptyTemplate)?;
 
     Ok(CommandSpec::new(program)
-        .args(tokens.map(str::to_string))
+        .args(tokens)
         .cwd(cwd.to_path_buf()))
 }
 
@@ -191,7 +204,10 @@ mod tests {
 
     #[test]
     fn every_terminal_on_every_os_builds_without_erroring() {
-        // A missing arm would mean a detected terminal that cannot be opened.
+        // The exhaustive match in build_detected (no wildcard arm) is what
+        // actually guarantees every kind is handled: a missing arm fails to
+        // compile. This test only checks that the arm which exists for each
+        // kind produces a spawnable spec.
         for os in [Os::Linux, Os::MacOs, Os::Windows] {
             for kind in TerminalKind::for_os(os) {
                 let spec = build(&TerminalChoice::Detected(kind), os, cwd(), "/bin/bash", &[])
@@ -253,6 +269,42 @@ mod tests {
         .unwrap();
         assert_eq!(spec.program, std::path::PathBuf::from("myterm"));
         assert_eq!(spec.args, vec!["--cd", "/proj/my-api", "-e", "/bin/zsh"]);
+    }
+
+    #[test]
+    fn a_custom_template_keeps_a_spacy_cwd_as_one_argument() {
+        // Substituting into the whole string before splitting on whitespace
+        // would split "/proj/my api" into two arguments.
+        let spec = build(
+            &TerminalChoice::Custom {
+                template: "myterm --cd {cwd} -e {shell}".into(),
+            },
+            Os::Linux,
+            Path::new("/proj/my api"),
+            "/bin/zsh",
+            &[],
+        )
+        .unwrap();
+        assert_eq!(spec.args, vec!["--cd", "/proj/my api", "-e", "/bin/zsh"]);
+    }
+
+    #[test]
+    fn powershell_escapes_an_apostrophe_in_the_working_directory() {
+        // A single quote inside -LiteralPath '<cwd>' would otherwise close
+        // the quoted string early; PowerShell's escape is a doubled quote.
+        let spec = build(
+            &TerminalChoice::Detected(TerminalKind::PowerShell),
+            Os::Windows,
+            Path::new("/proj/o'brien"),
+            "powershell.exe",
+            &[],
+        )
+        .unwrap();
+        assert!(
+            spec.args.iter().any(|a| a == "'/proj/o''brien'"),
+            "got {:?}",
+            spec.args
+        );
     }
 
     #[test]
