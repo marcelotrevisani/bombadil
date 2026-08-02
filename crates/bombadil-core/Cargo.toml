@@ -8,6 +8,7 @@ license.workspace = true
 [features]
 default = []
 test-support = []
+uv-integration = []
 
 [dependencies]
 serde.workspace = true
