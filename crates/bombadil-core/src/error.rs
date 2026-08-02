@@ -172,4 +172,17 @@ pub enum EnvError {
         second: String,
         var: String,
     },
+
+    #[error("could not build the terminal command: {0}")]
+    Terminal(#[from] TerminalError),
+
+    #[error("could not write the terminal init file to {path}: {message}")]
+    TerminalInitFile { path: PathBuf, message: String },
+
+    /// `CommandError::Spawn` carries only the program name, which is not
+    /// enough for spec section 9 -- a user whose chosen terminal has been
+    /// uninstalled needs to see the flags that were tried, not just that
+    /// "something" failed to launch.
+    #[error("could not open a terminal ({argv}): {message}")]
+    TerminalSpawn { argv: String, message: String },
 }
