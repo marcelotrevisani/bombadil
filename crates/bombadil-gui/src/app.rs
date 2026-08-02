@@ -195,11 +195,58 @@ pub struct App {
     /// `UvResolveError::TooOld` -- and in that case `Settings::uv_source` was
     /// never touched.
     pub uv_custom_validation: Option<Result<String, String>>,
+    /// Which pane the detail area is showing (spec §8). See [`Tab`].
+    pub tab: Tab,
+}
+
+/// Which pane the detail area is showing (spec §8).
+///
+/// `view` renders exactly one of them. It used to concatenate all seven into
+/// a single column and then stack the add-project dialog, the context menu
+/// and both confirmations *below* that -- and `scrollable` appeared only in
+/// `about` and `drawer`, so nothing scrolled. With a real dependency tree
+/// rendered flat, "Delete and recreate" sat thousands of pixels below the
+/// viewport with no way to reach it. Every task built its own pane correctly;
+/// no task owned the container holding them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Tab {
+    #[default]
+    Dependencies,
+    Members,
+    EnvVars,
+    Scripts,
+    Indexes,
+    Settings,
+}
+
+impl Tab {
+    /// Every tab, in the order the selector renders them.
+    pub const ALL: [Tab; 6] = [
+        Tab::Dependencies,
+        Tab::Members,
+        Tab::EnvVars,
+        Tab::Scripts,
+        Tab::Indexes,
+        Tab::Settings,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Tab::Dependencies => "Dependencies",
+            Tab::Members => "Members",
+            Tab::EnvVars => "Env vars",
+            Tab::Scripts => "Scripts",
+            Tab::Indexes => "Indexes",
+            Tab::Settings => "Settings",
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
 pub enum Message {
     ProjectSelected(usize),
+    /// A tab in the detail area's selector was pressed (spec §8).
+    TabSelected(Tab),
     /// A background venv probe finished for `projects[usize]`. Carries the
     /// Python version on success; `None` covers "no venv", a probe that
     /// timed out, and a probe that failed -- all three degrade to hollow.
@@ -539,6 +586,7 @@ impl App {
             confirm_member_sync: None,
             uv_custom_path_draft,
             uv_custom_validation: None,
+            tab: Tab::default(),
         }
     }
 }
@@ -838,6 +886,9 @@ pub fn update(app: &mut App, message: Message, runner: Arc<dyn CommandRunner>) -
             ]);
         }
         Message::ProjectSelected(_) => {}
+        Message::TabSelected(tab) => {
+            app.tab = tab;
+        }
         Message::VenvProbed(i, version) if i < app.entries.len() => {
             app.entries[i].venv_exists = version.is_some();
             app.entries[i].python_version = version;
@@ -2784,77 +2835,81 @@ pub fn view(app: &App) -> iced::Element<'_, Message> {
         None => iced::widget::text("").into(),
     };
 
-    // Only rendered once its index still matches the current selection --
-    // `Message::DepsLoaded` guards the same way when it lands.
-    let deps_tab: iced::Element<'_, Message> = match &app.deps {
-        Some((i, tab)) if Some(*i) == app.selected => deps::view(tab),
-        _ => iced::widget::text("").into(),
-    };
-
-    // Rebuilt fresh from `app.config` on every render, unlike `deps_tab`
-    // above: a member toggle changes `app.config.projects[i].members`
-    // without a new fetch, and this is what keeps the checklist reflecting
-    // it immediately rather than waiting on `MembersLoaded` to land again --
-    // the same "recompute, don't cache" trick `banner::problems` and
-    // `add_project::resolved_venv_path_display` use for the same reason.
-    let members_tab: iced::Element<'_, Message> = match &app.members {
-        Some((i, fetch)) if Some(*i) == app.selected => match app.config.projects.get(*i) {
-            Some(project) => {
-                let project_dir = project
-                    .pyproject_path
-                    .parent()
-                    .map(Path::to_path_buf)
-                    .unwrap_or_default();
-                let tab = members_editor::build(
-                    &project_dir,
-                    &project.members,
-                    &fetch.kind,
-                    &fetch.discovered,
-                    &fetch.installed,
-                );
-                members_editor::view(&tab, *i)
-            }
-            None => iced::widget::text("").into(),
+    // Exactly one pane, chosen by `app.tab` (spec §8). This used to be all
+    // seven concatenated into one column -- see `Tab`'s own doc for what that
+    // did to the confirmations sitting below them.
+    let pane: iced::Element<'_, Message> = match app.tab {
+        // Only rendered once its index still matches the current selection --
+        // `Message::DepsLoaded` guards the same way when it lands.
+        Tab::Dependencies => match &app.deps {
+            Some((i, tab)) if Some(*i) == app.selected => deps::view(tab),
+            _ => iced::widget::text("").into(),
         },
-        _ => iced::widget::text("").into(),
+        // Rebuilt fresh from `app.config` on every render, unlike the
+        // Dependencies tab above: a member toggle changes
+        // `app.config.projects[i].members` without a new fetch, and this is
+        // what keeps the checklist reflecting it immediately rather than
+        // waiting on `MembersLoaded` to land again -- the same "recompute,
+        // don't cache" trick `banner::problems` and
+        // `add_project::resolved_venv_path_display` use for the same reason.
+        Tab::Members => match &app.members {
+            Some((i, fetch)) if Some(*i) == app.selected => match app.config.projects.get(*i) {
+                Some(project) => {
+                    let project_dir = project
+                        .pyproject_path
+                        .parent()
+                        .map(Path::to_path_buf)
+                        .unwrap_or_default();
+                    let tab = members_editor::build(
+                        &project_dir,
+                        &project.members,
+                        &fetch.kind,
+                        &fetch.discovered,
+                        &fetch.installed,
+                    );
+                    members_editor::view(&tab, *i)
+                }
+                None => iced::widget::text("").into(),
+            },
+            _ => iced::widget::text("").into(),
+        },
+        // Global variables are always shown; the project half only once a
+        // project is selected -- the same `app.selected` `env_editor::view`
+        // needs to know which project's `env` to show alongside them.
+        Tab::EnvVars => env_editor::view(&app.config, app.selected),
+        // Same shape as the Env vars tab: global scripts always shown, the
+        // project's own scripts once one is selected.
+        Tab::Scripts => scripts_editor::view(&app.config, app.selected),
+        // Every configured index, plus (once a project is selected) that
+        // project's own selection among them (spec §7, Task 4).
+        Tab::Indexes => index_editor::view(&app.config, app.selected, &app.index_credential_drafts),
+        // Which uv binary to run and where new venvs go (spec §5, Task 6).
+        // `resolved_default_venv_paths` recomputes fresh from `app.config` on
+        // every render, the same "recompute, don't cache" trick the Env vars
+        // and Indexes tabs already rely on, which is what makes criterion 3
+        // visible the instant a location change lands, with no restart.
+        Tab::Settings => settings_editor::view(
+            &app.config.settings,
+            &app.config.projects,
+            &app.uv_custom_path_draft,
+            app.uv_custom_validation.as_ref(),
+        ),
     };
 
-    // Global variables are always shown; the project half only once a
-    // project is selected -- the same `app.selected` `env_editor::view`
-    // needs to know which project's `env` to show alongside them.
-    let env_vars_tab = env_editor::view(&app.config, app.selected);
+    // The current tab's own button is disabled rather than hidden -- the
+    // same "no press needed, no press possible" treatment `index_editor`'s
+    // auth buttons and `scripts_editor`'s move buttons give a control whose
+    // action is already the state.
+    let mut tab_bar = iced::widget::row![].spacing(4);
+    for tab in Tab::ALL {
+        tab_bar = tab_bar.push(
+            iced::widget::button(iced::widget::text(tab.label()))
+                .on_press_maybe((tab != app.tab).then_some(Message::TabSelected(tab))),
+        );
+    }
 
-    // Same shape as `env_vars_tab`: global scripts always shown, the
-    // project's own scripts once one is selected.
-    let scripts_tab = scripts_editor::view(&app.config, app.selected);
-
-    // Every configured index, plus (once a project is selected) that
-    // project's own selection among them (spec §7, Task 4).
-    let indexes_tab = index_editor::view(&app.config, app.selected, &app.index_credential_drafts);
-
-    // Which uv binary to run and where new venvs go (spec §5, Task 6).
-    // `resolved_default_venv_paths` recomputes fresh from `app.config` on
-    // every render, the same "recompute, don't cache" trick `env_vars_tab`
-    // and `indexes_tab` already rely on, which is what makes criterion 3
-    // visible the instant a location change lands, with no restart.
-    let settings_tab = settings_editor::view(
-        &app.config.settings,
-        &app.config.projects,
-        &app.uv_custom_path_draft,
-        app.uv_custom_validation.as_ref(),
-    );
-
-    let detail_and_drawer = iced::widget::column![
-        detail,
-        deps_tab,
-        members_tab,
-        env_vars_tab,
-        scripts_tab,
-        indexes_tab,
-        settings_tab,
-        drawer::view(&app.drawer)
-    ]
-    .spacing(8);
+    let detail_and_drawer =
+        iced::widget::column![detail, tab_bar, pane, drawer::view(&app.drawer)].spacing(8);
 
     let add_project_button = iced::widget::button(iced::widget::text("Add project"))
         .on_press(Message::AddProjectPickManifestRequested);
@@ -2917,13 +2972,22 @@ pub fn view(app: &App) -> iced::Element<'_, Message> {
     let mut problems = app.load_problems.clone();
     problems.extend(banner::problems(&app.config));
     let footer = crate::about::view(app.about_expanded);
+    // The dialog, the context menu and both confirmations sit *above* the
+    // scrollable, not inside it. Nothing here is modal, so a confirmation
+    // rendered after the body is a confirmation the user has to scroll to --
+    // and with a real dependency tree that meant thousands of pixels below
+    // the viewport, in a column that did not scroll at all. Each is an empty
+    // `text("")` when closed, so they cost nothing when there is nothing to
+    // answer.
     iced::widget::column![
         banner::view(&problems),
-        body,
         add_project_dialog,
         context_menu_view,
         confirm_recreate_view,
         confirm_member_sync_view,
+        iced::widget::scrollable(body)
+            .width(iced::Length::Fill)
+            .height(iced::Length::Fill),
         footer
     ]
     .into()
@@ -2995,6 +3059,81 @@ mod tests {
         let mut app = App::new(config);
         let _ = update(&mut app, Message::ProjectSelected(1), unused_runner());
         assert_eq!(selected_label(&app), Some("web"));
+    }
+
+    // --- the tab container (spec §8) ---
+
+    #[test]
+    fn the_detail_area_starts_on_the_dependencies_tab() {
+        assert_eq!(App::new(Config::default()).tab, Tab::Dependencies);
+    }
+
+    #[test]
+    fn selecting_a_tab_switches_which_pane_renders() {
+        let mut app = App::new(Config {
+            projects: vec![project("api")],
+            ..Config::default()
+        });
+
+        let task = update(
+            &mut app,
+            Message::TabSelected(Tab::Indexes),
+            unused_runner(),
+        );
+
+        assert_eq!(app.tab, Tab::Indexes);
+        assert_eq!(
+            task.units(),
+            0,
+            "switching tabs is pure state -- nothing to fetch, nothing to persist"
+        );
+    }
+
+    #[test]
+    fn every_tab_renders_with_both_confirmations_open() {
+        // The container nobody owned: `view` concatenated all seven panes and
+        // then stacked the dialog, the context menu and both confirmations
+        // below them, in a column with no `scrollable` anywhere. This does not
+        // prove the layout scrolls -- no test here can drive a renderer -- but
+        // it does exercise every arm of the new `match app.tab` with the
+        // overlays present, which is where a pane and an overlay could
+        // otherwise disagree about what they may borrow.
+        let mut app = App::new(Config {
+            projects: vec![project("api")],
+            indexes: vec![index_with_auth(
+                "corp",
+                bombadil_core::model::IndexAuth::Token,
+            )],
+            ..Config::default()
+        });
+        app.deps = Some((0, deps::build(&PyProject::default(), &[], None)));
+        app.members = Some((
+            0,
+            MembersFetch {
+                kind: bombadil_core::members::WorkspaceKind::Loose,
+                discovered: vec![],
+                installed: vec![],
+            },
+        ));
+        app.confirm_recreate = Some(context_menu::ConfirmRecreate {
+            project_id: app.config.projects[0].id,
+            label: "api".to_string(),
+            venv_path: PathBuf::from("/p/api/.venv"),
+        });
+        app.confirm_member_sync = Some(members_editor::ConfirmMemberSync {
+            project_index: 0,
+            label: "api".to_string(),
+            warning: "would remove alpha".to_string(),
+        });
+        app.context_menu = Some(context_menu::ContextMenu {
+            project_index: 0,
+            terminals: vec![host_terminal_kind()],
+        });
+
+        for tab in Tab::ALL {
+            app.tab = tab;
+            let _ = view(&app);
+        }
     }
 
     // --- Task 1: the Dependencies tab ---
