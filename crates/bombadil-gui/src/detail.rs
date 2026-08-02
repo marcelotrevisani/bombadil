@@ -69,7 +69,12 @@ fn project_dir(project: &Project) -> PathBuf {
 /// Renders the header. Deliberately dumb: all the logic worth testing lives
 /// in `header`. The Sync button is unconditional -- it does not read
 /// `venv_status` at all.
-pub fn view<'a>(header: &Header) -> iced::Element<'a, Message> {
+///
+/// `index` is the project's position in `App::projects`, carried into
+/// `Message::SyncRequested` so one message shape serves this button and the
+/// context menu's Sync entry -- see that message's own doc for why resolving
+/// against the selection instead is a bug.
+pub fn view<'a>(header: &Header, index: usize) -> iced::Element<'a, Message> {
     let status = match header.venv_status {
         VenvStatus::Present => match &header.python_version {
             Some(version) => format!("Python {version}"),
@@ -82,7 +87,7 @@ pub fn view<'a>(header: &Header) -> iced::Element<'a, Message> {
         iced::widget::text(header.label.clone()).size(20),
         iced::widget::text(header.path.display().to_string()),
         iced::widget::text(status),
-        iced::widget::button(iced::widget::text("Sync")).on_press(Message::SyncRequested),
+        iced::widget::button(iced::widget::text("Sync")).on_press(Message::SyncRequested(index)),
     ]
     .spacing(4)
     .into()

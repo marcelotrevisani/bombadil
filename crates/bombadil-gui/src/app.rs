@@ -124,10 +124,17 @@ pub enum Message {
     /// Python version on success; `None` covers "no venv", a probe that
     /// timed out, and a probe that failed -- all three degrade to hollow.
     VenvProbed(usize, Option<String>),
-    /// The Sync action was pressed for the selected project. Never gated on
+    /// The Sync action was pressed for `projects[usize]`. Never gated on
     /// whether a venv already exists -- creating one is how the user
     /// recovers from not having one.
-    SyncRequested,
+    ///
+    /// Carries the index rather than resolving against `app.selected`, the
+    /// same shape `OpenTerminalRequested` and `RemoveProjectRequested` use:
+    /// the context menu is opened by a right-press that deliberately does
+    /// *not* move the selection, so a selection-resolved Sync would run
+    /// `uv sync` -- which prunes packages absent from the target's lockfile
+    /// -- against an environment the user never named.
+    SyncRequested(usize),
     /// A background sync finished. `success` is true only on a zero exit;
     /// `lines` is the transcript to hand to the output drawer -- uv's stdout
     /// and stderr on a real run, or a single line describing a failed
@@ -227,10 +234,6 @@ impl App {
             context_menu: None,
         }
     }
-
-    pub fn selected_project(&self) -> Option<&Project> {
-        self.selected.and_then(|i| self.projects.get(i))
-    }
 }
 
 /// The real boot function iced calls: builds the initial `App` plus one
@@ -294,9 +297,15 @@ pub fn update(app: &mut App, message: Message, runner: Arc<dyn CommandRunner>) -
         // two concurrent `uv sync` processes on the same project easy to
         // reach: the job times out, the user presses Sync again, and the
         // abandoned child is still running.
-        Message::SyncRequested if app.syncing.is_some() => {}
-        Message::SyncRequested => {
-            if let Some(project) = app.selected_project().cloned() {
+        //
+        // The menu closes either way, the same as `OpenTerminalRequested`
+        // and `RemoveProjectRequested`: an action taken from the menu
+        // dismisses it, whether or not the press was swallowed.
+        Message::SyncRequested(i) => {
+            app.context_menu = None;
+            if app.syncing.is_none()
+                && let Some(project) = app.projects.get(i).cloned()
+            {
                 let config = app.config.clone();
                 app.syncing = Some(project.id.to_string());
                 // Fresh drawer per run, but showing a *running* status rather
@@ -1018,14 +1027,20 @@ async fn persist_removal(config: Config, persist: Arc<dyn ConfigPersist>) -> boo
 }
 
 pub fn view(app: &App) -> iced::Element<'_, Message> {
-    let detail: iced::Element<'_, Message> = match app.selected_project() {
+    // The index is carried through rather than dropped: the header's Sync
+    // button names the project it acts on (`Message::SyncRequested`), so the
+    // selected index has to survive as far as the button.
+    let selected = app
+        .selected
+        .and_then(|i| app.projects.get(i).map(|project| (i, project)));
+    let detail: iced::Element<'_, Message> = match selected {
         // The probe answers from the already-probed `entries` cache rather
         // than touching disk again on every frame -- `boot`'s background
         // tasks are what keep that cache current.
-        Some(project) => {
-            let entry = app.selected.and_then(|i| app.entries.get(i));
+        Some((i, project)) => {
+            let entry = app.entries.get(i);
             let header = detail::header(project, &|_| entry.and_then(|e| e.python_version.clone()));
-            detail::view(&header)
+            detail::view(&header, i)
         }
         None => iced::widget::text("").into(),
     };
@@ -1094,6 +1109,16 @@ mod tests {
     use bombadil_core::process::FakeCommandRunner;
     use std::path::Path;
 
+    /// The selected project's label. A test helper rather than a method on
+    /// `App`: nothing in the real code path resolves a project from the
+    /// selection alone any more -- `view` carries the index alongside the
+    /// project, because the header's Sync button has to name what it acts on.
+    fn selected_label(app: &App) -> Option<&str> {
+        app.selected
+            .and_then(|i| app.projects.get(i))
+            .map(|p| p.label.as_str())
+    }
+
     /// A runner for tests that don't care about it -- most of them, since
     /// most messages here never touch a `CommandRunner` at all.
     fn unused_runner() -> Arc<dyn CommandRunner> {
@@ -1116,10 +1141,7 @@ mod tests {
             ..Config::default()
         };
         let app = App::new(config);
-        assert_eq!(
-            app.selected_project().map(|p| p.label.as_str()),
-            Some("api")
-        );
+        assert_eq!(selected_label(&app), Some("api"));
     }
 
     #[test]
@@ -1130,10 +1152,7 @@ mod tests {
         };
         let mut app = App::new(config);
         let _ = update(&mut app, Message::ProjectSelected(1), unused_runner());
-        assert_eq!(
-            app.selected_project().map(|p| p.label.as_str()),
-            Some("web")
-        );
+        assert_eq!(selected_label(&app), Some("web"));
     }
 
     #[test]
@@ -1149,7 +1168,7 @@ mod tests {
         let mut app = App::new(config);
         let _ = update(&mut app, Message::ProjectSelected(99), unused_runner());
         assert_eq!(
-            app.selected_project().map(|p| p.label.as_str()),
+            selected_label(&app),
             Some("api"),
             "an out-of-range selection must be ignored, not clamped to the last project"
         );
@@ -1171,7 +1190,7 @@ mod tests {
         let fake = Arc::new(FakeCommandRunner::new());
         let runner: Arc<dyn CommandRunner> = fake.clone();
 
-        let task = update(&mut app, Message::SyncRequested, runner);
+        let task = update(&mut app, Message::SyncRequested(0), runner);
 
         assert!(
             fake.calls().is_empty(),
@@ -1199,7 +1218,7 @@ mod tests {
             "a freshly constructed App has not been probed yet -- entries start hollow"
         );
 
-        let task = update(&mut app, Message::SyncRequested, unused_runner());
+        let task = update(&mut app, Message::SyncRequested(0), unused_runner());
 
         assert!(
             task.units() > 0,
@@ -1304,7 +1323,7 @@ mod tests {
             ..Config::default()
         });
 
-        let _ = update(&mut app, Message::SyncRequested, unused_runner());
+        let _ = update(&mut app, Message::SyncRequested(0), unused_runner());
 
         assert!(
             app.drawer.status.contains("syncing"),
@@ -1333,10 +1352,10 @@ mod tests {
         });
         let fake = Arc::new(FakeCommandRunner::new());
 
-        let first = update(&mut app, Message::SyncRequested, fake.clone());
+        let first = update(&mut app, Message::SyncRequested(0), fake.clone());
         assert!(first.units() > 0, "the first Sync must dispatch work");
 
-        let second = update(&mut app, Message::SyncRequested, fake.clone());
+        let second = update(&mut app, Message::SyncRequested(0), fake.clone());
 
         assert_eq!(
             second.units(),
@@ -1351,6 +1370,83 @@ mod tests {
     }
 
     #[test]
+    fn syncing_from_the_context_menu_targets_the_right_clicked_project_not_the_selected_one() {
+        // The whole reason `SyncRequested` carries an index. A right-press
+        // opens the menu for a project without moving `app.selected` (see
+        // `sidebar::view`), so a Sync resolved against the selection runs
+        // `uv sync` -- which prunes packages absent from the target's
+        // lockfile -- against an environment the user never named.
+        //
+        // Two projects with the FIRST selected and the SECOND right-clicked
+        // is what separates the two behaviours: every other `SyncRequested`
+        // test uses a single-project config, where right and wrong are the
+        // same value, which is exactly why this was invisible.
+        let mut app = App::new(Config {
+            projects: vec![project("api"), project("web")],
+            ..Config::default()
+        });
+        assert_eq!(app.selected, Some(0), "api must be the selected project");
+        let web_id = app.projects[1].id.to_string();
+
+        let _ = update(&mut app, Message::ContextMenuOpened(1), unused_runner());
+        assert_eq!(
+            app.selected,
+            Some(0),
+            "right-pressing must NOT move the selection -- that would silently \
+             change what the detail pane shows"
+        );
+
+        let _ = update(&mut app, Message::SyncRequested(1), unused_runner());
+
+        // `syncing` holds the id of the project the dispatched job was built
+        // for, and the drawer names it: both are the observable end of the
+        // same resolution, and the spec handed to `run_sync` is built from
+        // that very `Project`.
+        assert_eq!(
+            app.syncing.as_deref(),
+            Some(web_id.as_str()),
+            "the sync must target the right-clicked project (web), not the selected one (api)"
+        );
+        assert!(
+            app.drawer.status.contains("web"),
+            "the running status must name the project actually being synced; got {:?}",
+            app.drawer.status
+        );
+    }
+
+    #[test]
+    fn syncing_from_the_context_menu_closes_it() {
+        // `OpenTerminalRequested` and `RemoveProjectRequested` both clear the
+        // menu; leaving it open for Sync alone is an inconsistency the user
+        // has to clean up by hand.
+        let mut app = App::new(Config {
+            projects: vec![project("api")],
+            ..Config::default()
+        });
+        let _ = update(&mut app, Message::ContextMenuOpened(0), unused_runner());
+        assert!(app.context_menu.is_some());
+
+        let _ = update(&mut app, Message::SyncRequested(0), unused_runner());
+
+        assert!(app.context_menu.is_none());
+    }
+
+    #[test]
+    fn syncing_an_out_of_range_project_dispatches_nothing() {
+        // A stale index can arrive from a message queued before a project was
+        // removed, the same way `ProjectSelected`'s can.
+        let mut app = App::new(Config {
+            projects: vec![project("api")],
+            ..Config::default()
+        });
+
+        let task = update(&mut app, Message::SyncRequested(99), unused_runner());
+
+        assert_eq!(task.units(), 0);
+        assert!(app.syncing.is_none());
+    }
+
+    #[test]
     fn a_sync_that_finishes_releases_the_in_flight_slot() {
         // The guard above is a deadlock if it is never cleared: Sync would
         // work exactly once per launch.
@@ -1358,7 +1454,7 @@ mod tests {
             projects: vec![project("api")],
             ..Config::default()
         });
-        let _ = update(&mut app, Message::SyncRequested, unused_runner());
+        let _ = update(&mut app, Message::SyncRequested(0), unused_runner());
         let _ = update(
             &mut app,
             Message::SyncFinished {
@@ -1368,7 +1464,7 @@ mod tests {
             unused_runner(),
         );
 
-        let again = update(&mut app, Message::SyncRequested, unused_runner());
+        let again = update(&mut app, Message::SyncRequested(0), unused_runner());
         assert!(
             again.units() > 0,
             "Sync must dispatch again once the previous run has finished"
@@ -2195,7 +2291,7 @@ mod tests {
         );
 
         assert_eq!(
-            app.selected_project().map(|p| p.label.as_str()),
+            selected_label(&app),
             Some("web"),
             "removing the selected project must not leave a dangling index"
         );

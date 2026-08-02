@@ -165,7 +165,10 @@ pub fn view<'a>(
     }
 
     column
-        .push(iced::widget::button(iced::widget::text("Sync")).on_press(Message::SyncRequested))
+        .push(
+            iced::widget::button(iced::widget::text("Sync"))
+                .on_press(Message::SyncRequested(index)),
+        )
         .push(
             iced::widget::button(iced::widget::text("Remove from list"))
                 .on_press(Message::RemoveProjectRequested(index)),
