@@ -52,14 +52,17 @@ where
 {
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
-        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(work));
-        let _ = tx.send(outcome);
+        let _ = tx.send(work());
     });
 
     match rx.recv_timeout(timeout) {
-        Ok(Ok(value)) => JobResult::Done(value),
-        Ok(Err(_)) => JobResult::Failed,
+        Ok(value) => JobResult::Done(value),
         Err(mpsc::RecvTimeoutError::Timeout) => JobResult::TimedOut,
+        // A panicking job arrives here as `Disconnected`, not as a caught
+        // unwind: the panic happens before the send, so the sender is
+        // dropped during unwinding and the channel closes. `std::thread`
+        // already isolates the panic from this thread, so catching it would
+        // add nothing.
         Err(mpsc::RecvTimeoutError::Disconnected) => JobResult::Failed,
     }
 }
