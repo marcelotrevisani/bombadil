@@ -60,13 +60,16 @@ fn resolve_var(
 
 /// Compose the environment a child process runs in.
 ///
-/// Layers, each overriding the previous, per spec section 6:
+/// Layers, each overriding the previous, per spec section 6 (amended):
 /// parent environment; global variables; project variables; secrets;
-/// index configuration; `UV_PROJECT_ENVIRONMENT`; pre-activate scripts;
-/// activation.
+/// index configuration; pre-activate scripts; activation.
 ///
 /// Scripts run second to last so they can see the project's configuration but
 /// cannot undo activation, which is applied afterwards and wins.
+/// `UV_PROJECT_ENVIRONMENT` and `VIRTUAL_ENV` name the same venv and are set
+/// together in the final layer: if a script could redirect one but not the
+/// other, uv would operate on one venv while the shell showed another --
+/// silent and near-undiagnosable.
 ///
 /// Known limitation: `PYTHONHOME` is only removed at the final (activation)
 /// layer, so a pre-activate script still sees whatever stale value the
@@ -117,13 +120,7 @@ pub fn compose(
         message: source.to_string(),
     })?;
 
-    // 6. point uv at this project's venv
-    env.insert(
-        "UV_PROJECT_ENVIRONMENT".to_string(),
-        inputs.venv_path.to_string_lossy().into_owned(),
-    );
-
-    // 7. pre-activate scripts, in order
+    // 6. pre-activate scripts, in order
     for script in inputs
         .config
         .global_scripts
@@ -133,7 +130,10 @@ pub fn compose(
         env = apply(script, runner, &env)?;
     }
 
-    // 8. activation, last so a script cannot undo it
+    // 7. activation, last so a script cannot undo it. UV_PROJECT_ENVIRONMENT
+    //    and VIRTUAL_ENV name the same venv and are set together: if a script
+    //    could redirect one but not the other, uv would operate on one venv
+    //    while the shell showed another.
     let bin = venv_bin_dir(&inputs.venv_path);
     let bin = bin.to_string_lossy().into_owned();
     let path = match env.get("PATH") {
@@ -143,10 +143,9 @@ pub fn compose(
         _ => bin.clone(),
     };
     env.insert("PATH".to_string(), path);
-    env.insert(
-        "VIRTUAL_ENV".to_string(),
-        inputs.venv_path.to_string_lossy().into_owned(),
-    );
+    let venv = inputs.venv_path.to_string_lossy().into_owned();
+    env.insert("UV_PROJECT_ENVIRONMENT".to_string(), venv.clone());
+    env.insert("VIRTUAL_ENV".to_string(), venv);
     // A stale PYTHONHOME silently redirects the stdlib search.
     env.remove("PYTHONHOME");
 
@@ -305,6 +304,82 @@ mod tests {
     }
 
     #[test]
+    fn a_project_only_gets_credentials_for_indexes_it_selected() {
+        // A regression that drops or inverts the index_names filter would
+        // inject every configured index's credentials into every project's
+        // environment -- one project's private-registry password leaking
+        // into another project's child processes.
+        use crate::model::{Index, IndexAuth, IndexKind};
+        use crate::validate::index_credential_var;
+
+        let mine = Index {
+            name: "mine".into(),
+            url: "https://mine.example/simple".into(),
+            kind: IndexKind::Extra,
+            default_for_new_projects: false,
+            auth: IndexAuth::Basic {
+                username: "alice".into(),
+            },
+        };
+        let theirs = Index {
+            name: "theirs".into(),
+            url: "https://theirs.example/simple".into(),
+            kind: IndexKind::Extra,
+            default_for_new_projects: false,
+            auth: IndexAuth::Basic {
+                username: "bob".into(),
+            },
+        };
+        let config = Config {
+            indexes: vec![mine.clone(), theirs.clone()],
+            ..Config::default()
+        };
+        let project = Project {
+            index_names: vec!["mine".into()],
+            ..project()
+        };
+        let store = InMemorySecretStore::new();
+        store
+            .set(
+                &crate::secrets::SecretKey::Index {
+                    name: "mine".into(),
+                },
+                "my-secret",
+            )
+            .unwrap();
+        store
+            .set(
+                &crate::secrets::SecretKey::Index {
+                    name: "theirs".into(),
+                },
+                "their-secret",
+            )
+            .unwrap();
+        let runner = FakeCommandRunner::new();
+
+        let got = compose(&inputs(config, project), &store, &runner).unwrap();
+
+        assert_eq!(
+            got.get(&index_credential_var("mine", "USERNAME"))
+                .map(String::as_str),
+            Some("alice")
+        );
+        assert_eq!(
+            got.get(&index_credential_var("mine", "PASSWORD"))
+                .map(String::as_str),
+            Some("my-secret")
+        );
+        assert!(
+            !got.contains_key(&index_credential_var("theirs", "USERNAME")),
+            "got {got:?}"
+        );
+        assert!(
+            !got.contains_key(&index_credential_var("theirs", "PASSWORD")),
+            "got {got:?}"
+        );
+    }
+
+    #[test]
     fn a_script_runs_after_the_variables_and_before_activation() {
         // Order matters: the script must see the project's configuration, and
         // must not be able to undo activation.
@@ -325,8 +400,9 @@ mod tests {
         let runner = FakeCommandRunner::new();
         // The script sees the whole environment up to this point (a real
         // `env -0` dump contains everything, not just what the script
-        // changed), echoes back its own export, and tries to clobber
-        // VIRTUAL_ENV -- which activation must overwrite afterwards.
+        // changed), echoes back its own export, and tries to clobber both
+        // VIRTUAL_ENV and UV_PROJECT_ENVIRONMENT -- which activation must
+        // overwrite afterwards, since they name the same venv.
         runner.expect(
             "sh",
             &[],
@@ -337,7 +413,7 @@ mod tests {
                     "HOME=/home/t\0",
                     "PYTHONHOME=/stale\0",
                     "SEEN_BY_SCRIPT=yes\0",
-                    "UV_PROJECT_ENVIRONMENT=/envs/my-api\0",
+                    "UV_PROJECT_ENVIRONMENT=/wrong-from-script\0",
                     "FROM_SCRIPT=set\0",
                     "VIRTUAL_ENV=/wrong\0",
                 )
@@ -358,7 +434,7 @@ mod tests {
         assert_eq!(
             got.get("UV_PROJECT_ENVIRONMENT").map(String::as_str),
             Some("/envs/my-api"),
-            "layer 6 must survive the script's wholesale environment replacement"
+            "a script must not be able to redirect which venv uv operates on"
         );
         assert_eq!(got.get("HOME").map(String::as_str), Some("/home/t"));
         assert!(!got.contains_key("PYTHONHOME"), "got {got:?}");
