@@ -126,3 +126,19 @@ pub enum SecretError {
     #[error("could not read or write the secret for {account}: {message}")]
     Backend { account: String, message: String },
 }
+
+#[derive(Debug, thiserror::Error)]
+pub enum EnvError {
+    #[error("could not run the pre-activate script {script}: {message}")]
+    ScriptSpawn {
+        script: std::path::PathBuf,
+        message: String,
+    },
+
+    #[error("the pre-activate script {script} failed (exit {status:?}): {output}")]
+    ScriptFailed {
+        script: std::path::PathBuf,
+        status: Option<i32>,
+        output: String,
+    },
+}
