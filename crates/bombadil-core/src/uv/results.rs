@@ -88,6 +88,10 @@ impl DependencyGraph {
     /// The direct dependencies of a package, resolved from ids to nodes.
     /// Ids with no entry in `packages` are skipped rather than erroring —
     /// uv's schema is `preview`, and a dangling id must not take out the view.
+    ///
+    /// One level deep and safe as it stands, but Python dependency graphs
+    /// contain cycles: a caller that recurses through this must carry its own
+    /// visited set to avoid looping forever.
     pub fn dependencies_of(&self, id: &str) -> Vec<&TreePackage> {
         self.packages
             .get(id)

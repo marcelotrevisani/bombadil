@@ -9,7 +9,10 @@ use std::path::{Component, Path, PathBuf};
 /// drives, or a target that is already relative.
 ///
 /// Pure: operates on path components and never touches the filesystem, so it
-/// works for paths that do not exist yet.
+/// works for paths that do not exist yet. Inputs are assumed lexically
+/// normal — no `..` components — since purity means no canonicalisation
+/// happens here to clean them up first; a caller holding a path that may
+/// contain `..` must normalise it before calling.
 ///
 /// Note: The fallback for differing `Component::Prefix` values (Windows drive
 /// letters) is reachable only on Windows. On Unix, all absolute paths share

@@ -5,10 +5,7 @@ mod system;
 pub use fake::FakeCommandRunner;
 pub use system::SystemCommandRunner;
 
-/// Re-exported so existing `use bombadil_core::process::CommandError` paths
-/// keep working now that the type lives in `error` alongside the crate's
-/// other error types.
-pub use crate::error::CommandError;
+use crate::error::CommandError;
 
 use std::collections::BTreeMap;
 #[cfg(any(test, feature = "test-support"))]
