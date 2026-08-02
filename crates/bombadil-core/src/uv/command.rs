@@ -1,6 +1,6 @@
 use super::ResolvedUv;
 use crate::process::CommandSpec;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// Which part of `pyproject.toml` a dependency operation targets.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -46,6 +46,56 @@ pub fn sync(uv: &ResolvedUv, ctx: &ProjectContext) -> CommandSpec {
 
 pub fn sync_with_python(uv: &ResolvedUv, ctx: &ProjectContext, python: &str) -> CommandSpec {
     project_spec(uv, ctx).args(["sync", "-p", python])
+}
+
+/// Install every workspace member in editable mode.
+///
+/// `--all-packages` is required and not a nicety: plain `uv sync` in a
+/// workspace root installs no members at all. Verified against uv 0.12.1.
+pub fn sync_all_members(uv: &ResolvedUv, ctx: &ProjectContext) -> CommandSpec {
+    project_spec(uv, ctx).args(["sync", "--all-packages"])
+}
+
+/// Install exactly the named members and remove the rest.
+///
+/// Re-syncing with a smaller set removes the members no longer named —
+/// verified against uv 0.12.1 — which is what lets a user's selection live in
+/// Bombadil's own config instead of being written into the shared
+/// `[tool.uv.workspace] members` list.
+pub fn sync_members(
+    uv: &ResolvedUv,
+    ctx: &ProjectContext,
+    package_names: &[String],
+) -> CommandSpec {
+    if package_names.is_empty() {
+        // Say what is meant rather than relying on plain `uv sync` happening
+        // to install nothing.
+        return project_spec(uv, ctx).args(["sync", "--no-install-workspace"]);
+    }
+
+    let mut spec = project_spec(uv, ctx).arg("sync");
+    for name in package_names {
+        // Two `.arg` calls rather than `.args(["--package", name])`: the array
+        // form would mix `&str` and `&String` elements, which does not compile.
+        spec = spec.arg("--package").arg(name.clone());
+    }
+    spec
+}
+
+/// Add a project as an editable path dependency.
+///
+/// `path` is written verbatim by uv into `[tool.uv.sources]`, so callers
+/// should pass the output of `members::path_for_manifest` rather than an
+/// absolute path — `pyproject.toml` is shared with teammates.
+pub fn add_editable(uv: &ResolvedUv, ctx: &ProjectContext, path: &Path) -> CommandSpec {
+    project_spec(uv, ctx)
+        .args(["add", "--editable"])
+        .arg(path.to_string_lossy())
+}
+
+/// Drop a previously added editable dependency.
+pub fn remove_editable(uv: &ResolvedUv, ctx: &ProjectContext, package_name: &str) -> CommandSpec {
+    project_spec(uv, ctx).args(["remove", package_name])
 }
 
 pub fn add(
@@ -320,6 +370,78 @@ mod tests {
             assert!(
                 !spec.env.contains_key("UV_PROJECT_ENVIRONMENT"),
                 "{name} must not carry UV_PROJECT_ENVIRONMENT"
+            );
+        }
+    }
+
+    #[test]
+    fn syncing_all_members_uses_all_packages() {
+        // Plain `uv sync` in a workspace installs NO members -- verified
+        // against uv 0.12.1. "Everything" is specifically --all-packages.
+        assert_eq!(
+            sync_all_members(&uv(), &ctx()).args,
+            vec!["sync", "--all-packages"]
+        );
+    }
+
+    #[test]
+    fn syncing_a_subset_repeats_the_package_flag() {
+        let names = vec!["alpha".to_string(), "beta".to_string()];
+        assert_eq!(
+            sync_members(&uv(), &ctx(), &names).args,
+            vec!["sync", "--package", "alpha", "--package", "beta"]
+        );
+    }
+
+    #[test]
+    fn syncing_an_empty_selection_says_so_explicitly() {
+        // Plain `uv sync` happens to install no members today, but relying on
+        // that coincidence would break if uv changed its default.
+        assert_eq!(
+            sync_members(&uv(), &ctx(), &[]).args,
+            vec!["sync", "--no-install-workspace"]
+        );
+    }
+
+    #[test]
+    fn adding_an_editable_project_passes_the_path_through() {
+        let spec = add_editable(&uv(), &ctx(), std::path::Path::new("../shared-lib"));
+        assert_eq!(spec.args, vec!["add", "--editable", "../shared-lib"]);
+    }
+
+    #[test]
+    fn removing_an_editable_project_names_the_package() {
+        assert_eq!(
+            remove_editable(&uv(), &ctx(), "shared-lib").args,
+            vec!["remove", "shared-lib"]
+        );
+    }
+
+    #[test]
+    fn the_new_builders_are_project_scoped_like_the_rest() {
+        // Same invariant the parametrized test enforces for the others: a
+        // builder that bypassed project_spec would put the venv elsewhere.
+        for (name, spec) in [
+            ("sync_all_members", sync_all_members(&uv(), &ctx())),
+            (
+                "sync_members",
+                sync_members(&uv(), &ctx(), &["alpha".to_string()]),
+            ),
+            (
+                "add_editable",
+                add_editable(&uv(), &ctx(), std::path::Path::new("../x")),
+            ),
+            ("remove_editable", remove_editable(&uv(), &ctx(), "x")),
+        ] {
+            assert_eq!(
+                spec.cwd.as_deref(),
+                Some(std::path::Path::new("/proj/my-api")),
+                "{name} must run in the project directory"
+            );
+            assert_eq!(
+                spec.env.get("UV_PROJECT_ENVIRONMENT").map(String::as_str),
+                Some("/envs/my-api-3f9c1a"),
+                "{name} must point uv at the resolved venv"
             );
         }
     }
