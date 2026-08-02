@@ -238,6 +238,46 @@ mod tests {
     }
 
     #[test]
+    fn exactly_the_fully_activating_kinds_carry_the_shell_and_its_arguments() {
+        // The test above builds with `&[]`, so nothing would fail if someone
+        // dropped the shell from WindowsTerminal or bolted it onto Cmd. The
+        // expectation is derived from `activation_support()` rather than
+        // written out again, so the two cannot drift: a kind that stops
+        // carrying the shell must be re-bucketed in the same commit.
+        use crate::terminal::ActivationSupport;
+
+        const MARKER: &str = "--bombadil-marker";
+
+        for os in [Os::Linux, Os::MacOs, Os::Windows] {
+            for kind in TerminalKind::for_os(os) {
+                let spec = build(
+                    &TerminalChoice::Detected(kind),
+                    os,
+                    cwd(),
+                    "/bin/bash",
+                    &[MARKER.to_string()],
+                )
+                .unwrap_or_else(|e| panic!("{kind:?} on {os:?} failed: {e}"));
+
+                let carries = spec.args.iter().any(|a| a == MARKER);
+                match kind.activation_support() {
+                    ActivationSupport::Full => assert!(
+                        carries,
+                        "{kind:?} is Full but drops shell_args; got {:?}",
+                        spec.args
+                    ),
+                    ActivationSupport::PathOnly | ActivationSupport::None => assert!(
+                        !carries,
+                        "{kind:?} is degraded but carries shell_args -- if it can \
+                         really run our init file it belongs in Full; got {:?}",
+                        spec.args
+                    ),
+                }
+            }
+        }
+    }
+
+    #[test]
     fn a_terminal_from_the_wrong_os_is_refused() {
         // Offering konsole on Windows would produce an argv that cannot run.
         let err = build(
