@@ -556,18 +556,7 @@ impl App {
 pub fn boot(loaded: Loaded) -> (App, Task<Message>) {
     let mut app = App::new(loaded.config().clone());
     app.load_problems = banner::load_problems(&loaded);
-    let mut probes = app
-        .config
-        .projects
-        .iter()
-        .enumerate()
-        .filter_map(|(i, project)| {
-            let path = venv_path::resolve(project, &app.config.settings).ok()?;
-            Some(Task::perform(probe_venv(path), move |version| {
-                Message::VenvProbed(i, version)
-            }))
-        })
-        .collect::<Vec<_>>();
+    let mut probes = vec![probe_every_venv(&app)];
     // The initially selected project's Dependencies tab, so it is populated
     // the moment the window appears rather than only after the user re-clicks
     // the already-selected project. `boot` has no `CommandRunner` (`update`
@@ -579,6 +568,31 @@ pub fn boot(loaded: Loaded) -> (App, Task<Message>) {
         probes.push(Task::done(Message::ProjectSelected(i)));
     }
     (app, Task::batch(probes))
+}
+
+/// One background venv probe per project, against wherever each one resolves
+/// *now*.
+///
+/// Shared by `boot` and by the two `SettingsDefaultVenvLocation*` arms.
+/// `entries[i].venv_exists` and `python_version` describe the location that
+/// was resolved when the probe ran, so a change to `default_venv_location`
+/// moves the ground under every `VenvLocation::Default` project: without
+/// this the sidebar goes on showing green ticks and Python versions for
+/// environments at the old path until the app is restarted.
+fn probe_every_venv(app: &App) -> Task<Message> {
+    Task::batch(
+        app.config
+            .projects
+            .iter()
+            .enumerate()
+            .filter_map(|(i, project)| {
+                let path = venv_path::resolve(project, &app.config.settings).ok()?;
+                Some(Task::perform(probe_venv(path), move |version| {
+                    Message::VenvProbed(i, version)
+                }))
+            })
+            .collect::<Vec<_>>(),
+    )
 }
 
 /// Runs the blocking `pyvenv.cfg` read off the render thread and collapses
@@ -1593,7 +1607,10 @@ pub fn update(app: &mut App, message: Message, runner: Arc<dyn CommandRunner>) -
                 &mut app.config.settings,
                 DefaultVenvLocation::Alongside,
             );
-            return persist_settings_edit(app);
+            // Re-probed, not just persisted: the sidebar's venv status
+            // describes wherever each project resolved when it was last
+            // probed, and this just moved that. See `probe_every_venv`.
+            return Task::batch([persist_settings_edit(app), probe_every_venv(app)]);
         }
         Message::SettingsDefaultVenvLocationPickFolderRequested => {
             return Task::perform(
@@ -1608,7 +1625,7 @@ pub fn update(app: &mut App, message: Message, runner: Arc<dyn CommandRunner>) -
                 &mut app.config.settings,
                 DefaultVenvLocation::Central { path },
             );
-            return persist_settings_edit(app);
+            return Task::batch([persist_settings_edit(app), probe_every_venv(app)]);
         }
     }
     Task::none()
@@ -6684,6 +6701,50 @@ mod tests {
             after.starts_with(central.path()),
             "got {after:?}, expected it under {central:?}",
             central = central.path()
+        );
+    }
+
+    #[test]
+    fn changing_the_default_venv_location_reprobes_every_project() {
+        // `entries[i].venv_exists` and `python_version` describe the location
+        // that was resolved when the probe ran. Changing the default moves
+        // where every `VenvLocation::Default` project resolves, so without a
+        // re-probe the sidebar goes on describing an environment nothing is
+        // going to use -- green ticks and Python versions for venvs at the
+        // old path -- until the app is restarted.
+        // `AddProjectConfirmFinished` already re-dispatches for exactly this
+        // reason.
+        let default_project = |label: &str| Project {
+            venv: bombadil_core::model::VenvLocation::Default,
+            ..project(label)
+        };
+        let mut app = App::new(Config {
+            projects: vec![default_project("api"), default_project("web")],
+            ..Config::default()
+        });
+
+        let alongside = update(
+            &mut app,
+            Message::SettingsDefaultVenvLocationAlongsideSelected,
+            unused_runner(),
+        );
+        assert_eq!(
+            alongside.units(),
+            3,
+            "the persist plus one venv probe per project; got {}",
+            alongside.units()
+        );
+
+        let picked = update(
+            &mut app,
+            Message::SettingsDefaultVenvLocationFolderPicked(Some(PathBuf::from("/central"))),
+            unused_runner(),
+        );
+        assert_eq!(
+            picked.units(),
+            3,
+            "picking a central folder must re-probe too; got {}",
+            picked.units()
         );
     }
 
