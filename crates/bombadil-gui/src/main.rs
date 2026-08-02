@@ -1,3 +1,25 @@
+//! Bombadil's iced front end.
+//!
+//! # Conventions these modules follow
+//!
+//! - `view` is deliberately dumb and untested. Logic worth a test lives in a
+//!   free function that `view` calls.
+//! - Runners, secret stores, config persisters and filesystem probes are
+//!   **parameters**, never constructed inline, so tests stay hermetic.
+//! - Everything that spawns a process or blocks on I/O goes through
+//!   [`job::run`], never `update` directly.
+//! - A secret must never enter a `Message`, which derives `Debug`.
+//!
+//! ## Never compare a `display()`ed path against a string literal
+//!
+//! `PathBuf::join` uses `\` on Windows, so `"/p/api/.venv"` never equals a
+//! joined `/p/api\.venv`. Derive the expected value through the same function
+//! production uses, or compare `Path`s — `Path` comparison is component-based
+//! and accepts either separator.
+//!
+//! Two CI failures on this project came from a platform assumption hiding in an
+//! assertion rather than in the code, invisible on Linux and macOS both times.
+
 mod about;
 mod add_project;
 mod app;
