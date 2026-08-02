@@ -1,6 +1,7 @@
 use crate::add_project;
 use crate::banner;
 use crate::context_menu;
+use crate::deps;
 use crate::detail;
 use crate::drawer;
 use crate::interpreter;
@@ -9,12 +10,13 @@ use crate::sidebar;
 use bombadil_core::envspec::{self, EnvInputs};
 use bombadil_core::model::{Config, Project, Settings, TerminalChoice};
 use bombadil_core::process::CommandRunner;
+use bombadil_core::pyproject::PyProject;
 use bombadil_core::secrets::{KeyringSecretStore, SecretStore};
 use bombadil_core::store::Loaded;
 use bombadil_core::terminal::open::secret_values;
 use bombadil_core::terminal::{self, Os, TerminalKind};
 use bombadil_core::uv;
-use bombadil_core::uv::results::Interpreter;
+use bombadil_core::uv::results::{InstalledPackage, Interpreter, TreeOutcome};
 use bombadil_core::venv_path;
 use iced::Task;
 use std::path::{Path, PathBuf};
@@ -33,6 +35,13 @@ const VENV_PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 /// download and build packages, unlike the sub-millisecond `pyvenv.cfg`
 /// read `VENV_PROBE_TIMEOUT` bounds, so this is generous rather than tight.
 const SYNC_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// How deep `uv tree` resolves before this build stops asking. Generous
+/// rather than the smallest number that satisfies today's fixtures: the
+/// Dependencies tab expands a direct dependency's whole transitive tree
+/// (spec §8), and a shallow depth would silently truncate it for a project
+/// with a deep dependency chain.
+const DEPS_TREE_DEPTH: u32 = 20;
 
 /// Saves the whole config to disk. A trait rather than a bare
 /// `bombadil_core::store::Store` so a test can hand in a fake that records
@@ -126,6 +135,12 @@ pub struct App {
     /// it. Collapsed by default: it is thousands of words of boilerplate,
     /// and the obligation is that the user *can* read it.
     pub about_expanded: bool,
+    /// The Dependencies tab (spec §8) for whichever project it was last
+    /// fetched for, paired with that project's index so a result that
+    /// arrives after the selection has moved on is never shown against the
+    /// wrong project -- the same staleness guard `entries`/`VenvProbed` uses.
+    /// `None` before the first fetch lands.
+    pub deps: Option<(usize, deps::DepsTab)>,
 }
 
 #[derive(Debug, Clone)]
@@ -135,6 +150,12 @@ pub enum Message {
     /// Python version on success; `None` covers "no venv", a probe that
     /// timed out, and a probe that failed -- all three degrade to hollow.
     VenvProbed(usize, Option<String>),
+    /// The background fetch for the Dependencies tab finished for
+    /// `projects[usize]` -- criterion 5: dispatched through `job::run`,
+    /// never run inline, because `uv tree` on a large project is slow.
+    /// Carries the index for the same staleness reason `VenvProbed` does:
+    /// the user can select a different project before this lands.
+    DepsLoaded(usize, DepsFetch),
     /// The Sync action was pressed for `projects[usize]`. Never gated on
     /// whether a venv already exists -- creating one is how the user
     /// recovers from not having one.
@@ -286,6 +307,7 @@ impl App {
             context_menu: None,
             confirm_recreate: None,
             about_expanded: false,
+            deps: None,
         }
     }
 }
@@ -303,7 +325,7 @@ impl App {
 pub fn boot(loaded: Loaded) -> (App, Task<Message>) {
     let mut app = App::new(loaded.config().clone());
     app.load_problems = banner::load_problems(&loaded);
-    let probes = app
+    let mut probes = app
         .projects
         .iter()
         .enumerate()
@@ -314,6 +336,16 @@ pub fn boot(loaded: Loaded) -> (App, Task<Message>) {
             }))
         })
         .collect::<Vec<_>>();
+    // The initially selected project's Dependencies tab, so it is populated
+    // the moment the window appears rather than only after the user re-clicks
+    // the already-selected project. `boot` has no `CommandRunner` (`update`
+    // is the only place that gets one -- see its own doc), so this cannot
+    // call `fetch_deps_task` directly; re-dispatching the same message
+    // `ProjectSelected` handles reaches `update`, and so a real runner, on
+    // the very next step instead.
+    if let Some(i) = app.selected {
+        probes.push(Task::done(Message::ProjectSelected(i)));
+    }
     (app, Task::batch(probes))
 }
 
@@ -327,6 +359,126 @@ async fn probe_venv(path: PathBuf) -> Option<String> {
     }
 }
 
+/// What background loading produced for the Dependencies tab (spec §8):
+/// the parsed manifest, what `uv pip list` reports installed, and (when it
+/// could be read) the resolved tree. `deps::build` -- pure, tested on its
+/// own -- turns this into the tab; nothing here does that joining itself.
+#[derive(Debug, Clone)]
+pub struct DepsFetch {
+    pyproject: PyProject,
+    installed: Vec<InstalledPackage>,
+    /// `None` covers both "no venv to ask yet" and "the command failed to
+    /// run" -- neither is uv answering with a schema this build does not
+    /// understand, which is the one case `deps::build` explains to the user.
+    /// See its own doc for why the two must stay distinguishable.
+    tree: Option<TreeOutcome>,
+}
+
+/// Resolves what a Dependencies fetch needs to run project-scoped uv
+/// commands: the project's own directory and its venv. `None` when either
+/// cannot be resolved (no directory component, an unresolvable venv
+/// location) -- the same two failure modes `run_sync` reports as errors, but
+/// there is no drawer line to write here, so this just leaves nothing to
+/// fetch.
+fn deps_command_context(project: &Project, config: &Config) -> Option<uv::command::ProjectContext> {
+    let project_dir = project
+        .pyproject_path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())?;
+    let venv_path = venv_path::resolve(project, &config.settings).ok()?;
+    Some(uv::command::ProjectContext {
+        project_dir: project_dir.to_path_buf(),
+        venv_path,
+    })
+}
+
+/// The blocking half of a Dependencies fetch: read the manifest, then (if a
+/// uv can be resolved and the project has a venv to ask about) run `uv pip
+/// list` and `uv tree`. Every failure along the way -- an unreadable
+/// manifest, no resolvable uv, a command that exits non-zero, output this
+/// build cannot parse -- degrades to an empty/absent result rather than
+/// erroring: a project that has never been synced has no installed packages
+/// and no tree yet, which is a normal state (the same "registered without a
+/// venv" state `sidebar` already treats as ordinary), not a failure to
+/// report.
+fn fetch_deps_blocking(
+    project: &Project,
+    config: &Config,
+    runner: &dyn CommandRunner,
+) -> DepsFetch {
+    let pyproject = bombadil_core::pyproject::load(&project.pyproject_path).unwrap_or_default();
+
+    let Some(resolved_uv) = resolve_uv_for(config, runner).ok() else {
+        return DepsFetch {
+            pyproject,
+            installed: Vec::new(),
+            tree: None,
+        };
+    };
+    let Some(ctx) = deps_command_context(project, config) else {
+        return DepsFetch {
+            pyproject,
+            installed: Vec::new(),
+            tree: None,
+        };
+    };
+
+    let installed = runner
+        .run(&uv::command::pip_list(&resolved_uv, &ctx))
+        .ok()
+        .filter(|outcome| outcome.success())
+        .and_then(|outcome| uv::results::parse_pip_list(&outcome.stdout).ok())
+        .unwrap_or_default();
+
+    let tree = runner
+        .run(&uv::command::tree(&resolved_uv, &ctx, DEPS_TREE_DEPTH))
+        .ok()
+        .filter(|outcome| outcome.success())
+        .and_then(|outcome| uv::results::parse_tree(&outcome.stdout).ok());
+
+    DepsFetch {
+        pyproject,
+        installed,
+        tree,
+    }
+}
+
+/// Runs a Dependencies fetch off the render thread via `job::run` --
+/// criterion 5: `uv tree` on a large project is slow, and `CommandRunner::run`
+/// blocks until the child exits, so calling `fetch_deps_blocking` from
+/// `update` would freeze the window exactly like `sync_project` would.
+/// `SYNC_TIMEOUT`, not `VENV_PROBE_TIMEOUT`, for the same reason `sync_project`
+/// uses it: this can run a full uv resolve, not a sub-millisecond file read.
+async fn load_deps(project: Project, config: Config, runner: Arc<dyn CommandRunner>) -> DepsFetch {
+    match job::run(
+        move || fetch_deps_blocking(&project, &config, runner.as_ref()),
+        SYNC_TIMEOUT,
+    )
+    .await
+    {
+        job::JobResult::Done(fetch) => fetch,
+        job::JobResult::TimedOut | job::JobResult::Failed => DepsFetch {
+            pyproject: PyProject::default(),
+            installed: Vec::new(),
+            tree: None,
+        },
+    }
+}
+
+/// Dispatches a Dependencies fetch for `projects[index]`, tagging the result
+/// with `index` so a later `Message::DepsLoaded` can be dropped if the
+/// selection has since moved on.
+fn fetch_deps_task(
+    index: usize,
+    project: Project,
+    config: Config,
+    runner: Arc<dyn CommandRunner>,
+) -> Task<Message> {
+    Task::perform(load_deps(project, config, runner), move |fetch| {
+        Message::DepsLoaded(index, fetch)
+    })
+}
+
 /// `runner` is a parameter rather than a field on `App` so a test can hand in
 /// a `FakeCommandRunner` and observe that `Message::SyncRequested` never
 /// calls it synchronously -- the exact freeze `job::run` exists to prevent.
@@ -338,6 +490,7 @@ pub fn update(app: &mut App, message: Message, runner: Arc<dyn CommandRunner>) -
         // removed; ignoring it is better than taking the window down.
         Message::ProjectSelected(i) if i < app.projects.len() => {
             app.selected = Some(i);
+            return fetch_deps_task(i, app.projects[i].clone(), app.config.clone(), runner);
         }
         Message::ProjectSelected(_) => {}
         Message::VenvProbed(i, version) if i < app.entries.len() => {
@@ -346,6 +499,14 @@ pub fn update(app: &mut App, message: Message, runner: Arc<dyn CommandRunner>) -
         }
         // A stale probe result for a project that no longer exists.
         Message::VenvProbed(_, _) => {}
+        Message::DepsLoaded(i, fetch) if i < app.projects.len() => {
+            let tab = deps::build(&fetch.pyproject, &fetch.installed, fetch.tree);
+            app.deps = Some((i, tab));
+        }
+        // A stale fetch for a project that no longer exists, or that the
+        // user has since moved away from -- `view` only ever reads
+        // `app.deps` when its index still matches the current selection.
+        Message::DepsLoaded(_, _) => {}
         // A sync already in flight swallows the press. Without this the
         // button dispatches unconditionally, and a 300-second timeout makes
         // two concurrent `uv sync` processes on the same project easy to
@@ -617,6 +778,12 @@ pub fn update(app: &mut App, message: Message, runner: Arc<dyn CommandRunner>) -
             app.config.projects.remove(i);
             app.projects.remove(i);
             app.entries.remove(i);
+            // Indices shift on removal; `deps` is tagged with one, and a
+            // shifted-but-uncleared tag would show a stale tab against
+            // whichever project now sits at that index rather than the one
+            // it was actually fetched for. `ProjectSelected` refetches it
+            // the next time a selection lands.
+            app.deps = None;
             app.selected = match app.selected {
                 Some(s) if s == i => (!app.projects.is_empty())
                     .then_some(i.min(app.projects.len().saturating_sub(1))),
@@ -1388,7 +1555,15 @@ pub fn view(app: &App) -> iced::Element<'_, Message> {
         None => iced::widget::text("").into(),
     };
 
-    let detail_and_drawer = iced::widget::column![detail, drawer::view(&app.drawer)].spacing(8);
+    // Only rendered once its index still matches the current selection --
+    // `Message::DepsLoaded` guards the same way when it lands.
+    let deps_tab: iced::Element<'_, Message> = match &app.deps {
+        Some((i, tab)) if Some(*i) == app.selected => deps::view(tab),
+        _ => iced::widget::text("").into(),
+    };
+
+    let detail_and_drawer =
+        iced::widget::column![detail, deps_tab, drawer::view(&app.drawer)].spacing(8);
 
     let add_project_button = iced::widget::button(iced::widget::text("Add project"))
         .on_press(Message::AddProjectPickManifestRequested);
@@ -1520,6 +1695,118 @@ mod tests {
         let mut app = App::new(config);
         let _ = update(&mut app, Message::ProjectSelected(1), unused_runner());
         assert_eq!(selected_label(&app), Some("web"));
+    }
+
+    // --- Task 1: the Dependencies tab ---
+
+    #[test]
+    fn selecting_a_project_fetches_its_dependencies_through_job_run_not_inline() {
+        // Criterion 5: `uv tree` on a large project is slow, so this must
+        // never run inside `update` itself -- the same "nothing recorded
+        // synchronously, but real work dispatched" proof `SyncRequested` and
+        // `OpenFolderRequested` use.
+        let config = Config {
+            projects: vec![project("api")],
+            ..Config::default()
+        };
+        let mut app = App::new(config);
+        let fake = Arc::new(FakeCommandRunner::new());
+
+        let task = update(&mut app, Message::ProjectSelected(0), fake.clone());
+
+        assert!(
+            fake.calls().is_empty(),
+            "the dependency fetch must not call the runner synchronously inside update; got {:?}",
+            fake.calls()
+        );
+        assert!(
+            task.units() > 0,
+            "selecting a project must dispatch a real background fetch, not Task::none()"
+        );
+    }
+
+    #[test]
+    fn booting_with_a_selected_project_also_fetches_its_dependencies_without_blocking() {
+        // `boot` has no `CommandRunner` to fetch with directly; it must
+        // re-dispatch through `ProjectSelected` rather than skip the fetch
+        // for whichever project starts selected.
+        let (_app, task) = boot(Loaded::Fresh(Config {
+            projects: vec![project("api")],
+            ..Config::default()
+        }));
+        assert!(
+            task.units() > 0,
+            "boot must dispatch work for the initially selected project's dependencies"
+        );
+    }
+
+    #[test]
+    fn a_deps_fetch_result_is_built_and_stored_against_its_project_index() {
+        let mut app = App::new(Config {
+            projects: vec![project("api")],
+            ..Config::default()
+        });
+        let fetch = DepsFetch {
+            pyproject: bombadil_core::pyproject::PyProject {
+                dependencies: vec!["httpx>=0.27".to_string()],
+                ..Default::default()
+            },
+            installed: vec![],
+            tree: None,
+        };
+
+        let _ = update(&mut app, Message::DepsLoaded(0, fetch), unused_runner());
+
+        let (index, tab) = app
+            .deps
+            .as_ref()
+            .expect("a landed fetch must populate app.deps");
+        assert_eq!(*index, 0);
+        assert!(
+            tab.groups[0].rows.iter().any(|r| r.name == "httpx"),
+            "the tab must be built from the fetched manifest; got {:?}",
+            tab.groups
+        );
+    }
+
+    #[test]
+    fn a_stale_deps_fetch_for_a_project_that_no_longer_exists_is_dropped() {
+        let mut app = App::new(Config::default());
+        let fetch = DepsFetch {
+            pyproject: PyProject::default(),
+            installed: vec![],
+            tree: None,
+        };
+
+        let _ = update(&mut app, Message::DepsLoaded(0, fetch), unused_runner());
+
+        assert!(
+            app.deps.is_none(),
+            "a fetch result for an index with no matching project must be dropped"
+        );
+    }
+
+    #[test]
+    fn removing_the_displayed_project_clears_its_stale_dependency_tab() {
+        // `deps` is tagged with an index; removal shifts every later index,
+        // so an uncleared tag would show a stale tab against whichever
+        // project now sits there instead of the one it was fetched for.
+        let mut app = App::new(Config {
+            projects: vec![project("api"), project("web")],
+            ..Config::default()
+        });
+        app.deps = Some((0, deps::build(&PyProject::default(), &[], None)));
+
+        let _ = update(
+            &mut app,
+            Message::RemoveProjectRequested(0),
+            unused_runner(),
+        );
+
+        assert!(
+            app.deps.is_none(),
+            "removal must clear a dependency tab that may now describe the wrong project"
+        );
     }
 
     #[test]

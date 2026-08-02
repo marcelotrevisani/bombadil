@@ -3,6 +3,7 @@ mod add_project;
 mod app;
 mod banner;
 mod context_menu;
+mod deps;
 mod detail;
 mod drawer;
 mod interpreter;
