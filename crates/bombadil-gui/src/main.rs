@@ -1,4 +1,5 @@
 mod app;
+mod job;
 
 use app::App;
 use bombadil_core::model::Config;
