@@ -437,6 +437,14 @@ pub fn update(app: &mut App, message: Message, runner: Arc<dyn CommandRunner>) -
                 });
                 let index = app.projects.len() - 1;
                 app.selected = Some(index);
+                // This path runs `uv sync -p <version>` too, so it claims the
+                // same single in-flight slot `SyncRequested` does. Without
+                // it, confirming the dialog -- which also selects the new
+                // project, and the detail header always renders Sync --
+                // leaves the user one press away from two concurrent
+                // `uv sync` on the same venv, interleaving into the one
+                // shared drawer. See `App::syncing`'s own doc.
+                app.syncing = Some(project.id.to_string());
 
                 let config = app.config.clone();
                 let persist = app.persist.clone();
@@ -455,6 +463,10 @@ pub fn update(app: &mut App, message: Message, runner: Arc<dyn CommandRunner>) -
             lines,
             index,
         } => {
+            // Releases the slot `AddProjectConfirmed` claimed. Never
+            // clearing it would make the guard a deadlock: Sync would work
+            // exactly zero times after adding a project.
+            app.syncing = None;
             // Already redacted on the job thread, same reasoning as
             // `SyncFinished`.
             for line in &lines {
@@ -1930,6 +1942,63 @@ mod tests {
         assert!(
             app.add_project.is_none(),
             "the dialog must close once confirmed"
+        );
+    }
+
+    #[test]
+    fn a_sync_pressed_right_after_confirming_the_dialog_dispatches_nothing() {
+        // Confirming runs `uv sync -p <version>` and also selects the new
+        // project, and the detail header always renders Sync -- so without
+        // claiming the in-flight slot the user is one press away from two
+        // concurrent `uv sync` on the same venv, interleaving into the one
+        // shared drawer. `App::syncing`'s own doc names both consequences as
+        // the reason the slot exists.
+        let mut app = App::new(Config::default());
+        app.add_project = Some(manifest_draft(
+            "[project]\nname = \"my-api\"\nrequires-python = \">=3.11\"\n",
+        ));
+        let fake = Arc::new(FakeCommandRunner::new());
+
+        let confirm = update(&mut app, Message::AddProjectConfirmed, fake.clone());
+        assert!(confirm.units() > 0, "confirming must dispatch work");
+
+        let sync = update(&mut app, Message::SyncRequested(0), fake.clone());
+
+        assert_eq!(
+            sync.units(),
+            0,
+            "a Sync pressed while the confirm's own uv sync is in flight must dispatch nothing"
+        );
+        assert!(
+            fake.calls().is_empty(),
+            "no uv command may be issued by the ignored press; got {:?}",
+            fake.calls()
+        );
+    }
+
+    #[test]
+    fn a_finished_confirm_releases_the_in_flight_slot() {
+        // The other half: a guard that is never cleared is a deadlock, and
+        // Sync would work exactly zero times after adding a project.
+        let mut app = App::new(Config::default());
+        app.add_project = Some(manifest_draft("[project]\nname = \"my-api\"\n"));
+
+        let _ = update(&mut app, Message::AddProjectConfirmed, unused_runner());
+        let _ = update(
+            &mut app,
+            Message::AddProjectConfirmFinished {
+                success: true,
+                lines: vec![],
+                index: 0,
+            },
+            unused_runner(),
+        );
+
+        assert!(app.syncing.is_none());
+        let again = update(&mut app, Message::SyncRequested(0), unused_runner());
+        assert!(
+            again.units() > 0,
+            "Sync must dispatch again once the confirm has finished"
         );
     }
 
