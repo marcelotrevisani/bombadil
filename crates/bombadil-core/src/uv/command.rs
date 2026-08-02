@@ -70,7 +70,13 @@ pub fn remove(
         .args(group.flags())
 }
 
-pub fn upgrade_package(uv: &ResolvedUv, ctx: &ProjectContext, package: &str) -> CommandSpec {
+/// Lock a new version for one package, without touching the environment.
+///
+/// This is `uv lock -P <package>` only. `uv lock` never installs anything, so
+/// an "Upgrade" action wired to this alone changes the lockfile but leaves
+/// the venv running the old version; it **must** be followed by [`sync`] to
+/// actually apply the upgrade.
+pub fn lock_upgrade_package(uv: &ResolvedUv, ctx: &ProjectContext, package: &str) -> CommandSpec {
     project_spec(uv, ctx).args(["lock", "-P", package])
 }
 
@@ -202,7 +208,7 @@ mod tests {
     #[test]
     fn upgrading_one_package_locks_only_that_package() {
         assert_eq!(
-            upgrade_package(&uv(), &ctx(), "httpx").args,
+            lock_upgrade_package(&uv(), &ctx(), "httpx").args,
             vec!["lock", "-P", "httpx"]
         );
     }
@@ -259,7 +265,10 @@ mod tests {
             ("sync_with_python", sync_with_python(&uv, &ctx, "3.12")),
             ("add", add(&uv, &ctx, "httpx", DependencyGroup::Main)),
             ("remove", remove(&uv, &ctx, "httpx", DependencyGroup::Main)),
-            ("upgrade_package", upgrade_package(&uv, &ctx, "httpx")),
+            (
+                "lock_upgrade_package",
+                lock_upgrade_package(&uv, &ctx, "httpx"),
+            ),
             ("tree", tree(&uv, &ctx, 2)),
             ("pip_list", pip_list(&uv, &ctx)),
         ];
