@@ -1,9 +1,133 @@
 {
-  "schema": { "version": "preview" },
-  "workspace_root": "/proj/jsonprobe",
-  "workspace": { "path": "/proj/jsonprobe", "id": "workspace+/proj/jsonprobe" },
+  "schema": {
+    "version": "preview"
+  },
+  "workspace_root": "/work/repo",
+  "workspace": {
+    "path": "/work/repo",
+    "id": "workspace+/work/repo"
+  },
   "roots": [
-    { "id": "jsonprobe:dev==0.1.0@virtual+/proj/jsonprobe/" },
-    { "id": "jsonprobe==0.1.0@virtual+/proj/jsonprobe/" }
-  ]
+    {
+      "id": "treeshape==0.1.0@virtual+/work/repo/"
+    }
+  ],
+  "inverted": false,
+  "members": [
+    {
+      "name": "treeshape",
+      "path": "/work/repo/",
+      "id": "treeshape==0.1.0@virtual+/work/repo/"
+    }
+  ],
+  "resolution": {
+    "anyio==4.14.2@registry+https://pypi.org/simple": {
+      "name": "anyio",
+      "version": "4.14.2",
+      "source": {
+        "registry": {
+          "url": "https://pypi.org/simple"
+        }
+      },
+      "kind": "package",
+      "dependencies": [
+        {
+          "id": "idna==3.18@registry+https://pypi.org/simple"
+        }
+      ]
+    },
+    "certifi==2026.7.22@registry+https://pypi.org/simple": {
+      "name": "certifi",
+      "version": "2026.7.22",
+      "source": {
+        "registry": {
+          "url": "https://pypi.org/simple"
+        }
+      },
+      "kind": "package",
+      "dependencies": []
+    },
+    "h11==0.16.0@registry+https://pypi.org/simple": {
+      "name": "h11",
+      "version": "0.16.0",
+      "source": {
+        "registry": {
+          "url": "https://pypi.org/simple"
+        }
+      },
+      "kind": "package",
+      "dependencies": []
+    },
+    "httpcore==1.0.9@registry+https://pypi.org/simple": {
+      "name": "httpcore",
+      "version": "1.0.9",
+      "source": {
+        "registry": {
+          "url": "https://pypi.org/simple"
+        }
+      },
+      "kind": "package",
+      "dependencies": [
+        {
+          "id": "certifi==2026.7.22@registry+https://pypi.org/simple"
+        },
+        {
+          "id": "h11==0.16.0@registry+https://pypi.org/simple"
+        }
+      ]
+    },
+    "httpx==0.28.1@registry+https://pypi.org/simple": {
+      "name": "httpx",
+      "version": "0.28.1",
+      "source": {
+        "registry": {
+          "url": "https://pypi.org/simple"
+        }
+      },
+      "kind": "package",
+      "dependencies": [
+        {
+          "id": "anyio==4.14.2@registry+https://pypi.org/simple"
+        },
+        {
+          "id": "certifi==2026.7.22@registry+https://pypi.org/simple"
+        },
+        {
+          "id": "httpcore==1.0.9@registry+https://pypi.org/simple"
+        },
+        {
+          "id": "idna==3.18@registry+https://pypi.org/simple"
+        }
+      ]
+    },
+    "idna==3.18@registry+https://pypi.org/simple": {
+      "name": "idna",
+      "version": "3.18",
+      "source": {
+        "registry": {
+          "url": "https://pypi.org/simple"
+        }
+      },
+      "kind": "package",
+      "dependencies": []
+    },
+    "treeshape==0.1.0@virtual+/work/repo/": {
+      "name": "treeshape",
+      "version": "0.1.0",
+      "source": {
+        "virtual": "/work/repo/"
+      },
+      "kind": "package",
+      "dependencies": [
+        {
+          "id": "httpx==0.28.1@registry+https://pypi.org/simple"
+        }
+      ]
+    },
+    "workspace+/work/repo": {
+      "kind": "workspace",
+      "path": "/work/repo",
+      "dependencies": []
+    }
+  }
 }
