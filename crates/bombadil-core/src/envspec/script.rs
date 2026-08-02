@@ -160,7 +160,7 @@ pub fn apply(
         return Err(EnvError::ScriptFailed {
             script: script.path.clone(),
             status: outcome.status,
-            output: outcome.stderr,
+            stderr: outcome.stderr,
         });
     }
 

@@ -135,11 +135,11 @@ pub enum EnvError {
         message: String,
     },
 
-    #[error("the pre-activate script {script} failed (exit {status:?}): {output}")]
+    #[error("the pre-activate script {script} failed (exit {status:?}): {stderr}")]
     ScriptFailed {
         script: std::path::PathBuf,
         status: Option<i32>,
-        output: String,
+        stderr: String,
     },
 
     #[error(
