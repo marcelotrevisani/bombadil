@@ -16,7 +16,11 @@ use std::path::PathBuf;
 ///
 /// `BTreeMap` rather than `HashMap` so the environment is ordered: tests can
 /// assert on it, and failure reports render the same way twice.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+///
+/// `Debug` is hand-written to print `env` as a count rather than its contents:
+/// it now carries the whole composed environment, including keychain secrets
+/// and private-index passwords, and specs get logged.
+#[derive(Clone, PartialEq, Eq, Default)]
 pub struct CommandSpec {
     pub program: PathBuf,
     pub args: Vec<String>,
@@ -25,6 +29,18 @@ pub struct CommandSpec {
     /// When true the child starts from an empty environment and sees only
     /// `env`. Plan 2b composes a full environment and sets this.
     pub clear_env: bool,
+}
+
+impl std::fmt::Debug for CommandSpec {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CommandSpec")
+            .field("program", &self.program)
+            .field("args", &self.args)
+            .field("cwd", &self.cwd)
+            .field("env", &format_args!("<{} variables>", self.env.len()))
+            .field("clear_env", &self.clear_env)
+            .finish()
+    }
 }
 
 impl CommandSpec {
@@ -139,6 +155,27 @@ mod tests {
             stderr: String::new(),
         };
         assert!(!outcome.success());
+    }
+
+    #[test]
+    fn a_secret_in_the_environment_never_appears_in_a_debug_rendering() {
+        // `env` now holds the whole composed environment -- keychain secrets
+        // and private-index passwords included -- and specs get logged.
+        let spec = CommandSpec::new("uv")
+            .arg("sync")
+            .env("UV_INDEX_PRIV_PASSWORD", "hunter2");
+
+        let rendered = format!("{spec:?}");
+
+        assert!(!rendered.contains("hunter2"), "got {rendered}");
+        assert!(
+            !rendered.contains("UV_INDEX_PRIV_PASSWORD"),
+            "got {rendered}"
+        );
+        assert!(
+            rendered.contains("uv") && rendered.contains("sync"),
+            "program and args carry no secrets and are worth keeping; got {rendered}"
+        );
     }
 
     #[test]

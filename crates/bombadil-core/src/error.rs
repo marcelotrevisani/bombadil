@@ -117,3 +117,37 @@ pub enum CommandError {
     #[error("no fake outcome was programmed for {program} {args:?}")]
     Unexpected { program: PathBuf, args: Vec<String> },
 }
+
+#[derive(Debug, thiserror::Error)]
+pub enum SecretError {
+    #[error("the OS keychain is not available on this machine: {message}")]
+    Unavailable { message: String },
+
+    #[error("could not read or write the secret for {account}: {message}")]
+    Backend { account: String, message: String },
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum EnvError {
+    #[error("could not run the pre-activate script {script}: {message}")]
+    ScriptSpawn {
+        script: std::path::PathBuf,
+        message: String,
+    },
+
+    #[error("the pre-activate script {script} failed (exit {status:?}): {output}")]
+    ScriptFailed {
+        script: std::path::PathBuf,
+        status: Option<i32>,
+        output: String,
+    },
+
+    #[error(
+        "the pre-activate script {script} did not produce a complete environment dump; \
+         it may have called `exit`"
+    )]
+    ScriptDumpIncomplete { script: std::path::PathBuf },
+
+    #[error("could not read a secret while composing the environment: {message}")]
+    Secret { message: String },
+}
