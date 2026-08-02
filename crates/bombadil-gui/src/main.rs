@@ -10,6 +10,7 @@ mod env_editor;
 mod index_editor;
 mod interpreter;
 mod job;
+mod members_editor;
 mod scripts_editor;
 mod sidebar;
 

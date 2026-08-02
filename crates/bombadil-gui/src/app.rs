@@ -8,6 +8,7 @@ use crate::env_editor;
 use crate::index_editor;
 use crate::interpreter;
 use crate::job;
+use crate::members_editor;
 use crate::scripts_editor;
 use crate::sidebar;
 use bombadil_core::envspec::{self, EnvInputs};
@@ -157,6 +158,19 @@ pub struct App {
     /// this never holds a credential any longer than the user is actively
     /// typing it.
     pub index_credential_drafts: Vec<String>,
+    /// The Members tab (spec §5a, Task 5) raw fetch for whichever project it
+    /// was last fetched for, paired with that project's index -- same
+    /// staleness guard `deps` uses. Deliberately the *raw* fetch, not a
+    /// built `members_editor::MembersTab`: the built rows depend on
+    /// `app.config.projects[i].members`, which a toggle changes without a
+    /// new fetch, so `view` rebuilds the tab fresh from this every render
+    /// rather than caching one that a toggle would then have to remember to
+    /// invalidate.
+    pub members: Option<(usize, MembersFetch)>,
+    /// The pending "sync would remove members" confirmation (spec §5a
+    /// criterion 4), if any. `None` before the first press and after it
+    /// resolves -- same shape as `confirm_recreate`.
+    pub confirm_member_sync: Option<members_editor::ConfirmMemberSync>,
 }
 
 #[derive(Debug, Clone)]
@@ -389,6 +403,46 @@ pub enum Message {
     /// (criterion 3). Adds or removes the association only -- never reaches
     /// `Config::indexes`, so the index itself is untouched either way.
     ProjectIndexToggled(usize, String),
+    /// The background fetch for the Members tab (spec §5a, Task 5) finished
+    /// for `projects[usize]`: discovery plus `uv pip list`, dispatched
+    /// through `job::run` for the same reason `DepsLoaded` is -- discovery
+    /// walks the filesystem and `uv pip list` spawns a process, neither of
+    /// which may run on the render thread. Carries the index for the same
+    /// staleness reason `DepsLoaded` does.
+    MembersLoaded(usize, MembersFetch),
+    /// A member's checkbox was pressed: `usize` is the project's index,
+    /// `PathBuf` the member's path as carried on its `MemberRow`. Flips the
+    /// selection through `members_editor::toggle` (criterion 3: that
+    /// function is the only place the flip is decided) and persists.
+    MemberToggled(usize, PathBuf),
+    /// The background half of a member selection edit: persisting the config.
+    MembersPersistFinished {
+        success: bool,
+    },
+    /// The Members tab's "Sync members" button was pressed for
+    /// `projects[usize]`. If nothing selected is currently installed and
+    /// about to be dropped, syncs immediately; otherwise opens
+    /// `confirm_member_sync` and dispatches nothing yet (criterion 4: the UI
+    /// states what will be removed before the user confirms).
+    MembersSyncRequested(usize),
+    /// The pending member-removal confirmation was accepted: run the
+    /// member-aware sync it described.
+    MembersSyncConfirmed,
+    /// The pending member-removal confirmation was dismissed. Nothing was synced.
+    MembersSyncCancelled,
+}
+
+/// What background loading produced for the Members tab (spec §5a): the
+/// project's workspace classification, every `pyproject.toml` discovery
+/// found below it, and what `uv pip list` reports installed.
+/// `members_editor::build` -- pure, tested on its own -- turns this into the
+/// tab; nothing here does that joining itself, the same split `DepsFetch`
+/// and `deps::build` use.
+#[derive(Debug, Clone)]
+pub struct MembersFetch {
+    kind: bombadil_core::members::WorkspaceKind,
+    discovered: Vec<bombadil_core::members::DiscoveredMember>,
+    installed: Vec<InstalledPackage>,
 }
 
 impl App {
@@ -418,6 +472,8 @@ impl App {
             about_expanded: false,
             deps: None,
             index_credential_drafts,
+            members: None,
+            confirm_member_sync: None,
         }
     }
 }
@@ -589,6 +645,92 @@ fn fetch_deps_task(
     })
 }
 
+/// The blocking half of a Members fetch (spec §5a, Task 5): classify the
+/// project's own manifest, walk its tree for other `pyproject.toml` files,
+/// then (if a uv can be resolved and the project has a venv to ask about)
+/// run `uv pip list`. Mirrors `fetch_deps_blocking`'s degrade-don't-error
+/// discipline: an unreadable manifest, no resolvable uv, a project with no
+/// venv yet -- all leave `discovered`/`installed` empty rather than failing,
+/// since a project that has never been synced or has no siblings at all is a
+/// normal state for this tab, not an error to report.
+fn fetch_members_blocking(
+    project: &Project,
+    config: &Config,
+    runner: &dyn CommandRunner,
+) -> MembersFetch {
+    let project_dir = project
+        .pyproject_path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty());
+
+    let kind = project_dir
+        .and_then(|_| std::fs::read_to_string(&project.pyproject_path).ok())
+        .map(|text| bombadil_core::members::parse_workspace(&text))
+        .unwrap_or(bombadil_core::members::WorkspaceKind::Loose);
+
+    let discovered = match project_dir {
+        Some(dir) => bombadil_core::members::discover(dir, &kind),
+        None => Vec::new(),
+    };
+
+    let installed = match (
+        resolve_uv_for(config, runner).ok(),
+        deps_command_context(project, config),
+    ) {
+        (Some(resolved_uv), Some(ctx)) => runner
+            .run(&uv::command::pip_list(&resolved_uv, &ctx))
+            .ok()
+            .filter(|outcome| outcome.success())
+            .and_then(|outcome| uv::results::parse_pip_list(&outcome.stdout).ok())
+            .unwrap_or_default(),
+        _ => Vec::new(),
+    };
+
+    MembersFetch {
+        kind,
+        discovered,
+        installed,
+    }
+}
+
+/// Runs a Members fetch off the render thread via `job::run` -- discovery
+/// walks the filesystem and `uv pip list` spawns a process, neither of which
+/// may run on the render thread. `SYNC_TIMEOUT`, not `VENV_PROBE_TIMEOUT`,
+/// for the same reason `load_deps` uses it: this can spawn a real uv process.
+async fn load_members(
+    project: Project,
+    config: Config,
+    runner: Arc<dyn CommandRunner>,
+) -> MembersFetch {
+    match job::run(
+        move || fetch_members_blocking(&project, &config, runner.as_ref()),
+        SYNC_TIMEOUT,
+    )
+    .await
+    {
+        job::JobResult::Done(fetch) => fetch,
+        job::JobResult::TimedOut | job::JobResult::Failed => MembersFetch {
+            kind: bombadil_core::members::WorkspaceKind::Loose,
+            discovered: Vec::new(),
+            installed: Vec::new(),
+        },
+    }
+}
+
+/// Dispatches a Members fetch for `projects[index]`, tagging the result with
+/// `index` so a later `Message::MembersLoaded` can be dropped if the
+/// selection has since moved on -- mirrors `fetch_deps_task` exactly.
+fn fetch_members_task(
+    index: usize,
+    project: Project,
+    config: Config,
+    runner: Arc<dyn CommandRunner>,
+) -> Task<Message> {
+    Task::perform(load_members(project, config, runner), move |fetch| {
+        Message::MembersLoaded(index, fetch)
+    })
+}
+
 /// `runner` is a parameter rather than a field on `App` so a test can hand in
 /// a `FakeCommandRunner` and observe that `Message::SyncRequested` never
 /// calls it synchronously -- the exact freeze `job::run` exists to prevent.
@@ -600,7 +742,15 @@ pub fn update(app: &mut App, message: Message, runner: Arc<dyn CommandRunner>) -
         // removed; ignoring it is better than taking the window down.
         Message::ProjectSelected(i) if i < app.projects.len() => {
             app.selected = Some(i);
-            return fetch_deps_task(i, app.projects[i].clone(), app.config.clone(), runner);
+            return Task::batch([
+                fetch_deps_task(
+                    i,
+                    app.projects[i].clone(),
+                    app.config.clone(),
+                    runner.clone(),
+                ),
+                fetch_members_task(i, app.projects[i].clone(), app.config.clone(), runner),
+            ]);
         }
         Message::ProjectSelected(_) => {}
         Message::VenvProbed(i, version) if i < app.entries.len() => {
@@ -617,6 +767,12 @@ pub fn update(app: &mut App, message: Message, runner: Arc<dyn CommandRunner>) -
         // user has since moved away from -- `view` only ever reads
         // `app.deps` when its index still matches the current selection.
         Message::DepsLoaded(_, _) => {}
+        Message::MembersLoaded(i, fetch) if i < app.projects.len() => {
+            app.members = Some((i, fetch));
+        }
+        // A stale fetch for a project that no longer exists, or that the
+        // user has since moved away from -- same staleness guard `DepsLoaded` uses.
+        Message::MembersLoaded(_, _) => {}
         // A sync already in flight swallows the press. Without this the
         // button dispatches unconditionally, and a 300-second timeout makes
         // two concurrent `uv sync` processes on the same project easy to
@@ -894,6 +1050,11 @@ pub fn update(app: &mut App, message: Message, runner: Arc<dyn CommandRunner>) -
             // it was actually fetched for. `ProjectSelected` refetches it
             // the next time a selection lands.
             app.deps = None;
+            // Same reasoning as `deps`, plus a pending removal confirmation
+            // that could now be naming a project index that no longer means
+            // what it did.
+            app.members = None;
+            app.confirm_member_sync = None;
             app.selected = match app.selected {
                 Some(s) if s == i => (!app.projects.is_empty())
                     .then_some(i.min(app.projects.len().saturating_sub(1))),
@@ -1181,8 +1342,118 @@ pub fn update(app: &mut App, message: Message, runner: Arc<dyn CommandRunner>) -
             }
             return persist_index_edit(app);
         }
+        Message::MemberToggled(i, path) => {
+            // Only reachable when this project's Members fetch is the one
+            // cached -- without it there is no `discovered`/`kind` to read
+            // the current effective state from, and `members_editor::toggle`
+            // needs that to decide what a flip even means.
+            if let Some((mi, fetch)) = &app.members
+                && *mi == i
+                && let Some(project) = app.config.projects.get_mut(i)
+            {
+                members_editor::toggle(&mut project.members, &fetch.discovered, &fetch.kind, &path);
+                return persist_members_edit(app);
+            }
+        }
+        Message::MembersPersistFinished { success } => {
+            if !success {
+                drawer::set_idle(
+                    &mut app.drawer,
+                    "member selection failed to persist".to_string(),
+                );
+            }
+        }
+        Message::MembersSyncRequested(i) => {
+            if let Some((mi, fetch)) = &app.members
+                && *mi == i
+                && let Some(project) = app.config.projects.get(i).cloned()
+            {
+                let project_dir = project
+                    .pyproject_path
+                    .parent()
+                    .map(Path::to_path_buf)
+                    .unwrap_or_default();
+                let tab = members_editor::build(
+                    &project_dir,
+                    &project.members,
+                    &fetch.kind,
+                    &fetch.discovered,
+                    &fetch.installed,
+                );
+                if let Some(warning) = members_editor::removal_warning(&tab.rows) {
+                    app.confirm_member_sync = Some(members_editor::ConfirmMemberSync {
+                        project_index: i,
+                        label: project.label.clone(),
+                        warning,
+                    });
+                } else if app.syncing.is_none() {
+                    let kind = fetch.kind.clone();
+                    let discovered = fetch.discovered.clone();
+                    return dispatch_members_sync(app, project, kind, discovered, runner);
+                }
+            }
+        }
+        Message::MembersSyncCancelled => {
+            app.confirm_member_sync = None;
+        }
+        Message::MembersSyncConfirmed => {
+            // `take` unconditionally -- the same discipline
+            // `RecreateVenvConfirmed` follows: whether or not the work is
+            // dispatched, the user has answered the question and the dialog
+            // is done.
+            if let Some(confirm) = app.confirm_member_sync.take()
+                && app.syncing.is_none()
+                && let Some((mi, fetch)) = &app.members
+                && *mi == confirm.project_index
+                && let Some(project) = app.config.projects.get(confirm.project_index).cloned()
+            {
+                let kind = fetch.kind.clone();
+                let discovered = fetch.discovered.clone();
+                return dispatch_members_sync(app, project, kind, discovered, runner);
+            }
+        }
     }
     Task::none()
+}
+
+/// Dispatches a background persist of `app.config` as it stands right now,
+/// for a member selection edit (a checkbox toggle). Mirrors
+/// `persist_env_edit`/`persist_script_edit`/`persist_index_edit` exactly --
+/// this never touches the keychain, so a plain `persist_config` is the whole
+/// job.
+fn persist_members_edit(app: &App) -> Task<Message> {
+    let config = app.config.clone();
+    let persist = app.persist.clone();
+    Task::perform(persist_config(config, persist), |success| {
+        Message::MembersPersistFinished { success }
+    })
+}
+
+/// Claims the single sync slot, shows a running status naming the project,
+/// and dispatches the background members-aware sync -- shared by
+/// `MembersSyncRequested`'s no-warning-needed path and
+/// `MembersSyncConfirmed`, the same in-flight-guard discipline `SyncRequested`
+/// and `RecreateVenvConfirmed` each apply at their own call site.
+fn dispatch_members_sync(
+    app: &mut App,
+    project: Project,
+    kind: bombadil_core::members::WorkspaceKind,
+    discovered: Vec<bombadil_core::members::DiscoveredMember>,
+    runner: Arc<dyn CommandRunner>,
+) -> Task<Message> {
+    let config = app.config.clone();
+    app.syncing = Some(project.id.to_string());
+    app.drawer = drawer::Drawer {
+        status: format!("syncing members for {}...", project.label),
+        ..drawer::Drawer::default()
+    };
+    // Reuses `SyncFinished`: this is still an ordinary `uv sync` under the
+    // hood, with the same single-slot release, transcript handling and
+    // expand-on-failure.
+    Task::perform(
+        members_sync(project, config, kind, discovered, runner),
+        |(success, lines)| Message::SyncFinished { success, lines },
+    )
 }
 
 /// Dispatches the adopt-or-create probe for wherever the draft's venv choice
@@ -1468,6 +1739,83 @@ fn run_sync(
     };
     let spec = uv::command::sync(&resolved_uv, &ctx);
     compose_and_run(spec, project, config, &venv_path, store, runner)
+}
+
+/// The blocking half of a members-aware sync (spec §5a, Task 5, criterion
+/// 4): builds the sync command from the project's own member selection
+/// through `members_editor::sync_plan` -- the only place that decision is
+/// made -- instead of `run_sync`'s unconditional plain `uv sync`. Reached
+/// only from the Members tab's own "Sync members" action
+/// (`Message::MembersSyncRequested`/`MembersSyncConfirmed`); the ordinary
+/// Sync button still calls `run_sync` unmodified, so an everyday project's
+/// sync behaviour is untouched by this feature.
+fn run_members_sync(
+    project: &Project,
+    config: &Config,
+    kind: &bombadil_core::members::WorkspaceKind,
+    discovered: &[bombadil_core::members::DiscoveredMember],
+    store: &dyn SecretStore,
+    runner: &dyn CommandRunner,
+) -> (bool, Vec<String>) {
+    let Some(project_dir) = project
+        .pyproject_path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+    else {
+        return (false, vec!["no project directory to run uv in".to_string()]);
+    };
+    let venv_path = match venv_path::resolve(project, &config.settings) {
+        Ok(path) => path,
+        Err(err) => return (false, vec![err.to_string()]),
+    };
+    let resolved_uv = match resolve_uv_for(config, runner) {
+        Ok(resolved) => resolved,
+        Err(err) => return (false, vec![err]),
+    };
+
+    let ctx = uv::command::ProjectContext {
+        project_dir: project_dir.to_path_buf(),
+        venv_path: venv_path.clone(),
+    };
+    let spec = match members_editor::sync_plan(&project.members, kind, discovered) {
+        members_editor::SyncPlan::Plain => uv::command::sync(&resolved_uv, &ctx),
+        members_editor::SyncPlan::AllPackages => uv::command::sync_all_members(&resolved_uv, &ctx),
+        members_editor::SyncPlan::Named(names) => {
+            uv::command::sync_members(&resolved_uv, &ctx, &names)
+        }
+    };
+    compose_and_run(spec, project, config, &venv_path, store, runner)
+}
+
+/// Runs a members-aware sync off the render thread -- same shape as
+/// `sync_project`, including `SYNC_TIMEOUT`, since this is also a real `uv
+/// sync` under the hood.
+async fn members_sync(
+    project: Project,
+    config: Config,
+    kind: bombadil_core::members::WorkspaceKind,
+    discovered: Vec<bombadil_core::members::DiscoveredMember>,
+    runner: Arc<dyn CommandRunner>,
+) -> (bool, Vec<String>) {
+    match job::run(
+        move || {
+            run_members_sync(
+                &project,
+                &config,
+                &kind,
+                &discovered,
+                &KeyringSecretStore::new(),
+                runner.as_ref(),
+            )
+        },
+        SYNC_TIMEOUT,
+    )
+    .await
+    {
+        job::JobResult::Done(result) => result,
+        job::JobResult::TimedOut => (false, vec!["sync timed out".to_string()]),
+        job::JobResult::Failed => (false, vec!["sync failed unexpectedly".to_string()]),
+    }
 }
 
 /// The blocking half of a recreate: delete the project's environment, then
@@ -2022,6 +2370,34 @@ pub fn view(app: &App) -> iced::Element<'_, Message> {
         _ => iced::widget::text("").into(),
     };
 
+    // Rebuilt fresh from `app.config` on every render, unlike `deps_tab`
+    // above: a member toggle changes `app.config.projects[i].members`
+    // without a new fetch, and this is what keeps the checklist reflecting
+    // it immediately rather than waiting on `MembersLoaded` to land again --
+    // the same "recompute, don't cache" trick `banner::problems` and
+    // `add_project::resolved_venv_path_display` use for the same reason.
+    let members_tab: iced::Element<'_, Message> = match &app.members {
+        Some((i, fetch)) if Some(*i) == app.selected => match app.config.projects.get(*i) {
+            Some(project) => {
+                let project_dir = project
+                    .pyproject_path
+                    .parent()
+                    .map(Path::to_path_buf)
+                    .unwrap_or_default();
+                let tab = members_editor::build(
+                    &project_dir,
+                    &project.members,
+                    &fetch.kind,
+                    &fetch.discovered,
+                    &fetch.installed,
+                );
+                members_editor::view(&tab, *i)
+            }
+            None => iced::widget::text("").into(),
+        },
+        _ => iced::widget::text("").into(),
+    };
+
     // Global variables are always shown; the project half only once a
     // project is selected -- the same `app.selected` `env_editor::view`
     // needs to know which project's `env` to show alongside them.
@@ -2038,6 +2414,7 @@ pub fn view(app: &App) -> iced::Element<'_, Message> {
     let detail_and_drawer = iced::widget::column![
         detail,
         deps_tab,
+        members_tab,
         env_vars_tab,
         scripts_tab,
         indexes_tab,
@@ -2095,6 +2472,14 @@ pub fn view(app: &App) -> iced::Element<'_, Message> {
         None => iced::widget::text("").into(),
     };
 
+    // The pending "sync would remove members" confirmation (spec §5a
+    // criterion 4), rendered from the warning captured when it opened --
+    // same freshness argument as `confirm_recreate_view`.
+    let confirm_member_sync_view: iced::Element<'_, Message> = match &app.confirm_member_sync {
+        Some(confirm) => members_editor::confirm_view(confirm),
+        None => iced::widget::text("").into(),
+    };
+
     let mut problems = app.load_problems.clone();
     problems.extend(banner::problems(&app.config));
     let footer = crate::about::view(app.about_expanded);
@@ -2104,6 +2489,7 @@ pub fn view(app: &App) -> iced::Element<'_, Message> {
         add_project_dialog,
         context_menu_view,
         confirm_recreate_view,
+        confirm_member_sync_view,
         footer
     ]
     .into()
@@ -4955,6 +5341,282 @@ mod tests {
             1,
             "removing a row must remove its draft slot too"
         );
+    }
+
+    // --- Task 5: the monorepo member checklist ---
+    //
+    // The five criteria (join on path, select-all-by-default, `effective`
+    // decides, removal-warns-first, exclude-not-offered) are proven directly
+    // against `members_editor`'s own pure functions in its own test module --
+    // a stronger proof than re-deriving the same claims by driving `update`'s
+    // opaque `Task`. What belongs here is the wiring: that selecting a
+    // project fetches its members off the render thread, that a landed fetch
+    // is staleness-guarded the same way `DepsLoaded` is, that a toggle
+    // persists, and that the sync confirmation actually gates dispatch on
+    // `members_editor::removal_warning`.
+
+    fn workspace_kind(globs: &[&str]) -> bombadil_core::members::WorkspaceKind {
+        bombadil_core::members::WorkspaceKind::Workspace {
+            member_globs: globs.iter().map(|s| s.to_string()).collect(),
+            exclude_globs: Vec::new(),
+        }
+    }
+
+    fn discovered_member(
+        path: &str,
+        name: Option<&str>,
+        is_workspace_member: bool,
+    ) -> bombadil_core::members::DiscoveredMember {
+        bombadil_core::members::DiscoveredMember {
+            relative_path: std::path::PathBuf::from(path),
+            name: name.map(String::from),
+            is_workspace_member,
+        }
+    }
+
+    fn installed_editable(location: &str) -> InstalledPackage {
+        InstalledPackage {
+            name: "whatever-uv-calls-it".to_string(),
+            version: "0.1.0".to_string(),
+            editable_project_location: Some(std::path::PathBuf::from(location)),
+        }
+    }
+
+    #[test]
+    fn selecting_a_project_fetches_its_members_through_job_run_not_inline() {
+        let config = Config {
+            projects: vec![project("api")],
+            ..Config::default()
+        };
+        let mut app = App::new(config);
+        let fake = Arc::new(FakeCommandRunner::new());
+
+        let task = update(&mut app, Message::ProjectSelected(0), fake.clone());
+
+        assert!(
+            fake.calls().is_empty(),
+            "the members fetch must not call the runner synchronously inside update; got {:?}",
+            fake.calls()
+        );
+        assert!(
+            task.units() > 0,
+            "selecting a project must dispatch real background work, not Task::none()"
+        );
+    }
+
+    #[test]
+    fn a_members_fetch_result_is_stored_against_its_project_index() {
+        let mut app = App::new(Config {
+            projects: vec![project("api")],
+            ..Config::default()
+        });
+        let fetch = MembersFetch {
+            kind: bombadil_core::members::WorkspaceKind::Loose,
+            discovered: vec![discovered_member("packages/alpha", Some("alpha"), false)],
+            installed: vec![],
+        };
+
+        let _ = update(&mut app, Message::MembersLoaded(0, fetch), unused_runner());
+
+        let (index, stored) = app
+            .members
+            .as_ref()
+            .expect("a landed fetch must populate app.members");
+        assert_eq!(*index, 0);
+        assert_eq!(stored.discovered.len(), 1);
+    }
+
+    #[test]
+    fn a_stale_members_fetch_for_a_project_that_no_longer_exists_is_dropped() {
+        let mut app = App::new(Config::default());
+        let fetch = MembersFetch {
+            kind: bombadil_core::members::WorkspaceKind::Loose,
+            discovered: vec![],
+            installed: vec![],
+        };
+
+        let _ = update(&mut app, Message::MembersLoaded(0, fetch), unused_runner());
+
+        assert!(app.members.is_none());
+    }
+
+    #[test]
+    fn removing_the_displayed_project_clears_its_stale_members_state() {
+        let mut app = App::new(Config {
+            projects: vec![project("api"), project("web")],
+            ..Config::default()
+        });
+        app.members = Some((
+            0,
+            MembersFetch {
+                kind: bombadil_core::members::WorkspaceKind::Loose,
+                discovered: vec![],
+                installed: vec![],
+            },
+        ));
+        app.confirm_member_sync = Some(members_editor::ConfirmMemberSync {
+            project_index: 0,
+            label: "api".to_string(),
+            warning: "would remove alpha".to_string(),
+        });
+
+        let _ = update(
+            &mut app,
+            Message::RemoveProjectRequested(0),
+            unused_runner(),
+        );
+
+        assert!(app.members.is_none());
+        assert!(app.confirm_member_sync.is_none());
+    }
+
+    #[test]
+    fn toggling_a_member_updates_the_selection_in_memory_and_dispatches_a_persist() {
+        let mut app = App::new(Config {
+            projects: vec![project("api")],
+            ..Config::default()
+        });
+        app.members = Some((
+            0,
+            MembersFetch {
+                kind: workspace_kind(&["packages/*"]),
+                discovered: vec![discovered_member("packages/alpha", Some("alpha"), true)],
+                installed: vec![],
+            },
+        ));
+
+        let task = update(
+            &mut app,
+            Message::MemberToggled(0, std::path::PathBuf::from("packages/alpha")),
+            unused_runner(),
+        );
+
+        assert_eq!(
+            app.config.projects[0].members.entries.len(),
+            1,
+            "the deselection must land in the project's own selection, in memory, synchronously"
+        );
+        assert!(!app.config.projects[0].members.entries[0].selected);
+        assert!(
+            task.units() > 0,
+            "a selection change must dispatch a background persist"
+        );
+    }
+
+    #[test]
+    fn sync_requested_opens_a_confirmation_instead_of_syncing_when_something_would_be_removed() {
+        let mut app = App::new(Config {
+            projects: vec![project("api")],
+            ..Config::default()
+        });
+        app.selected = Some(0);
+        // alpha is installed editable, but deselected -- exactly criterion 4's case.
+        app.config.projects[0].members = bombadil_core::model::MemberSelection {
+            all_discovered: true,
+            entries: vec![bombadil_core::model::MemberRef {
+                path: std::path::PathBuf::from("packages/alpha"),
+                origin: bombadil_core::model::MemberOrigin::Discovered,
+                selected: false,
+                name: None,
+            }],
+        };
+        app.members = Some((
+            0,
+            MembersFetch {
+                kind: workspace_kind(&["packages/*"]),
+                discovered: vec![discovered_member("packages/alpha", Some("alpha"), true)],
+                installed: vec![installed_editable("/p/api/packages/alpha")],
+            },
+        ));
+
+        let task = update(&mut app, Message::MembersSyncRequested(0), unused_runner());
+
+        let confirm = app
+            .confirm_member_sync
+            .as_ref()
+            .expect("must open a confirmation before removing anything");
+        assert!(confirm.warning.contains("alpha"), "got {confirm:?}");
+        assert_eq!(
+            task.units(),
+            0,
+            "nothing must be synced before the user confirms"
+        );
+        assert!(app.syncing.is_none());
+    }
+
+    #[test]
+    fn sync_requested_syncs_immediately_when_nothing_would_be_removed() {
+        let mut app = App::new(Config {
+            projects: vec![project("api")],
+            ..Config::default()
+        });
+        app.selected = Some(0);
+        app.members = Some((
+            0,
+            MembersFetch {
+                kind: workspace_kind(&["packages/*"]),
+                discovered: vec![discovered_member("packages/alpha", Some("alpha"), true)],
+                installed: vec![],
+            },
+        ));
+
+        let task = update(&mut app, Message::MembersSyncRequested(0), unused_runner());
+
+        assert!(
+            app.confirm_member_sync.is_none(),
+            "nothing selected is being removed, so no confirmation is needed"
+        );
+        assert!(
+            task.units() > 0,
+            "syncing must be dispatched immediately when nothing would be removed"
+        );
+        assert!(app.syncing.is_some());
+    }
+
+    #[test]
+    fn confirming_a_member_sync_dispatches_it_and_clears_the_confirmation() {
+        let mut app = App::new(Config {
+            projects: vec![project("api")],
+            ..Config::default()
+        });
+        app.members = Some((
+            0,
+            MembersFetch {
+                kind: workspace_kind(&["packages/*"]),
+                discovered: vec![discovered_member("packages/alpha", Some("alpha"), true)],
+                installed: vec![installed_editable("/p/api/packages/alpha")],
+            },
+        ));
+        app.confirm_member_sync = Some(members_editor::ConfirmMemberSync {
+            project_index: 0,
+            label: "api".to_string(),
+            warning: "would remove alpha".to_string(),
+        });
+
+        let task = update(&mut app, Message::MembersSyncConfirmed, unused_runner());
+
+        assert!(app.confirm_member_sync.is_none());
+        assert!(task.units() > 0, "confirming must dispatch the sync");
+        assert!(app.syncing.is_some());
+    }
+
+    #[test]
+    fn cancelling_a_member_sync_dispatches_nothing_and_clears_the_confirmation() {
+        let mut app = App::new(Config {
+            projects: vec![project("api")],
+            ..Config::default()
+        });
+        app.confirm_member_sync = Some(members_editor::ConfirmMemberSync {
+            project_index: 0,
+            label: "api".to_string(),
+            warning: "would remove alpha".to_string(),
+        });
+
+        let task = update(&mut app, Message::MembersSyncCancelled, unused_runner());
+
+        assert!(app.confirm_member_sync.is_none());
+        assert_eq!(task.units(), 0);
+        assert!(app.syncing.is_none());
     }
 
     fn project(label: &str) -> bombadil_core::model::Project {
