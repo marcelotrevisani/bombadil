@@ -181,8 +181,14 @@ pub fn open(
     // interpolate an environment value into argv -- redact both fields with
     // the same set, not just `message`.
     let secrets = secret_values(inputs, &env);
+    // `spawn`, never `run`: `run` waits for the child, and a terminal
+    // emulator lives until the user closes its window. Only gnome-terminal
+    // and konsole self-daemonize; kitty, alacritty, foot, xterm, wezterm's
+    // first window and every Windows console kind would hold the GUI hostage
+    // for the terminal's whole lifetime. Nothing here reads the outcome
+    // anyway.
     runner
-        .run(&spec)
+        .spawn(&spec)
         .map_err(|source| EnvError::TerminalSpawn {
             argv: redact(argv_line, &secrets),
             message: redact(source.to_string(), &secrets),

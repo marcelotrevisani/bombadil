@@ -504,6 +504,35 @@ fn the_real_keychain_round_trips_where_one_exists() {
     assert_eq!(after_delete.unwrap(), None, "the secret must be gone");
 }
 
+#[test]
+#[cfg(unix)]
+fn spawn_returns_before_the_child_exits() {
+    // `open` must return as soon as the terminal is launched: `run` uses
+    // Command::output(), which waits for the child, and a terminal emulator
+    // lives until the user closes its window. gnome-terminal and konsole
+    // self-daemonize, which is why nothing caught this; kitty, alacritty,
+    // foot, xterm and every Windows console kind do not.
+    //
+    // Unix-only: `sleep` is the portable long-running child here, and this
+    // is a property of SystemCommandRunner rather than of any OS.
+    let Some(sleep) = locate_on_path("sleep") else {
+        panic!("sleep is required for this test on unix");
+    };
+
+    let spec = CommandSpec::new(&sleep).arg("30");
+
+    let started = std::time::Instant::now();
+    SystemCommandRunner
+        .spawn(&spec)
+        .expect("spawn must succeed");
+    let elapsed = started.elapsed();
+
+    assert!(
+        elapsed < std::time::Duration::from_secs(5),
+        "spawn waited for the child ({elapsed:?}); under `run` this would take 30s"
+    );
+}
+
 fn which_bash() -> Option<std::path::PathBuf> {
     locate_on_path("bash")
 }
