@@ -22,6 +22,7 @@ fn main() {
     .expect("uv-manifest.toml parses");
 
     let version = manifest["version"].as_str().expect("version is a string");
+    println!("cargo:rustc-env=BOMBADIL_UV_VERSION={version}");
     let entry = manifest
         .get("targets")
         .and_then(|t| t.get(&target))

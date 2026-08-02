@@ -8,7 +8,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 /// The uv release embedded in this build.
-pub const BUNDLED_VERSION: &str = "0.12.1";
+pub const BUNDLED_VERSION: &str = env!("BOMBADIL_UV_VERSION");
 
 /// uv's license text, redistributed with the embedded binary as Apache-2.0
 /// section 4 requires. Surface this in an About dialog.

@@ -10,6 +10,12 @@ pub struct UvVersion {
 }
 
 /// The uv shipped inside our binary.
+///
+/// Must be kept in step by hand with `version` in
+/// `crates/bombadil-uv-bin/uv-manifest.toml`. The two are deliberately not
+/// linked: unifying them would need `bombadil-core` to depend on
+/// `bombadil-uv-bin` (or vice versa), which the workspace design avoids so
+/// `bombadil-core` stays independent of the binary crate.
 pub const BUNDLED_UV_VERSION: UvVersion = UvVersion {
     major: 0,
     minor: 12,
