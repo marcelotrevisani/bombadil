@@ -100,3 +100,20 @@ pub enum ResultsError {
         source: serde_json::Error,
     },
 }
+
+#[derive(Debug, thiserror::Error)]
+pub enum CommandError {
+    #[error("could not run {program}: {source}")]
+    Spawn {
+        program: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+
+    /// Only `FakeCommandRunner` constructs this; gated the same way so it
+    /// does not appear in production docs or need handling by every
+    /// production `match` over `CommandError`.
+    #[cfg(any(test, feature = "test-support"))]
+    #[error("no fake outcome was programmed for {program} {args:?}")]
+    Unexpected { program: PathBuf, args: Vec<String> },
+}

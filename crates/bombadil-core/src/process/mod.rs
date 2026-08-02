@@ -5,6 +5,11 @@ mod system;
 pub use fake::FakeCommandRunner;
 pub use system::SystemCommandRunner;
 
+/// Re-exported so existing `use bombadil_core::process::CommandError` paths
+/// keep working now that the type lives in `error` alongside the crate's
+/// other error types.
+pub use crate::error::CommandError;
+
 use std::collections::BTreeMap;
 #[cfg(any(test, feature = "test-support"))]
 use std::path::Path;
@@ -84,23 +89,6 @@ impl CommandOutcome {
     pub fn success(&self) -> bool {
         self.status == Some(0)
     }
-}
-
-#[derive(Debug, thiserror::Error)]
-pub enum CommandError {
-    #[error("could not run {program}: {source}")]
-    Spawn {
-        program: PathBuf,
-        #[source]
-        source: std::io::Error,
-    },
-
-    /// Only `FakeCommandRunner` constructs this; gated the same way so it
-    /// does not appear in production docs or need handling by every
-    /// production `match` over `CommandError`.
-    #[cfg(any(test, feature = "test-support"))]
-    #[error("no fake outcome was programmed for {program} {args:?}")]
-    Unexpected { program: PathBuf, args: Vec<String> },
 }
 
 /// The single seam through which Bombadil launches processes.
