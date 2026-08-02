@@ -24,13 +24,18 @@ pub fn config_file_in(dir: &Path) -> PathBuf {
 /// binary and anything else too big or too local-machine-specific to belong
 /// in the config directory.
 ///
-/// This is a *different* directory from [`default_config_dir`]. It is
-/// whatever `directories`' `ProjectDirs::data_local_dir()` returns for
-/// `("", "", "bombadil")`, verified against `directories` 6.0.0:
-/// `~/.local/share/bombadil` on Linux, `~/Library/Application Support/bombadil`
-/// on macOS, and `%LOCALAPPDATA%\bombadil\data` on Windows — notably
-/// `%LOCALAPPDATA%`, not the `%APPDATA%` that [`default_config_dir`] uses, so
-/// this data does not roam with a Windows user's profile.
+/// This is whatever `directories`' `ProjectDirs::data_local_dir()` returns
+/// for `("", "", "bombadil")`, verified against `directories` 6.0.0. On
+/// Linux and Windows it is a distinct directory from [`default_config_dir`]:
+/// `~/.local/share/bombadil` vs `~/.config/bombadil` on Linux, and
+/// `%LOCALAPPDATA%\bombadil\data` vs `%APPDATA%\bombadil\config` on Windows
+/// — notably `%LOCALAPPDATA%`, not the roaming `%APPDATA%`, so this data
+/// does not roam with a Windows user's profile. On macOS it is the *same*
+/// directory as the config dir, `~/Library/Application Support/bombadil`:
+/// Apple's convention collocates config and data there, and `directories`
+/// follows it. This is not a collision either way — the extracted uv lives
+/// under a `uv/<version>-<hash>/` subdirectory while the config file is
+/// `config.toml`, so the two never write to the same path.
 pub fn default_data_dir() -> Result<PathBuf, StoreError> {
     directories::ProjectDirs::from("", "", "bombadil")
         .map(|dirs| dirs.data_local_dir().to_path_buf())
@@ -65,10 +70,13 @@ mod tests {
         );
     }
 
+    #[cfg(not(target_os = "macos"))]
     #[test]
     fn the_data_directory_differs_from_the_config_directory() {
-        // The whole point of adding a separate function: uv's extracted
-        // binary must not land inside the config directory.
+        // True on Linux and Windows, where data and config live under
+        // different roots. Not true on macOS, where Apple's convention
+        // collocates them both under `Library/Application Support` — see the
+        // doc comment on `default_data_dir`.
         let config = default_config_dir().unwrap();
         let data = default_data_dir().unwrap();
         assert_ne!(config, data, "config and data dirs must not coincide");
