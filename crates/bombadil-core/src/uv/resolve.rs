@@ -57,27 +57,37 @@ fn use_bundled(
 /// bundled copy. `FromPath` and `Custom` are explicit pins: they fail loudly
 /// rather than falling back, because silently ignoring a user's pin hides the
 /// very problem they need to see.
+///
+/// `locate` resolves a bare program name (e.g. `"uv"`) to an absolute path,
+/// the way a shell's PATH search would. `Auto` and `FromPath` call it once
+/// and probe *that* absolute path, so the resolved [`ResolvedUv::path`] is
+/// always verifiable and always the exact binary that will later be run —
+/// never the literal string `"uv"`, which a venv's `bin`/`Scripts` prepended
+/// to `PATH` could otherwise cause to resolve to a different binary at spawn
+/// time than the one just probed. `Bundled` and `Custom` never call it:
+/// `Custom` already has an explicit path.
 pub fn resolve(
     source: &UvSource,
     runner: &dyn CommandRunner,
+    locate: &dyn Fn(&str) -> Option<PathBuf>,
     bundled: &dyn Fn() -> Result<PathBuf, String>,
 ) -> Result<ResolvedUv, UvResolveError> {
     match source {
         UvSource::Bundled => use_bundled(bundled),
 
-        UvSource::Auto => {
-            let on_path = PathBuf::from("uv");
-            match probe(&on_path, runner) {
+        UvSource::Auto => match locate("uv") {
+            None => use_bundled(bundled),
+            Some(on_path) => match probe(&on_path, runner) {
                 Some(version) if version >= MIN_UV_VERSION => {
                     Ok(resolved(on_path, version, UvOrigin::Path))
                 }
                 _ => use_bundled(bundled),
-            }
-        }
+            },
+        },
 
-        UvSource::FromPath => {
-            let on_path = PathBuf::from("uv");
-            match probe(&on_path, runner) {
+        UvSource::FromPath => match locate("uv") {
+            None => Err(UvResolveError::PathUvUnavailable),
+            Some(on_path) => match probe(&on_path, runner) {
                 Some(version) if version >= MIN_UV_VERSION => {
                     Ok(resolved(on_path, version, UvOrigin::Path))
                 }
@@ -87,8 +97,8 @@ pub fn resolve(
                     minimum: MIN_UV_VERSION.to_string(),
                 }),
                 None => Err(UvResolveError::PathUvUnavailable),
-            }
-        }
+            },
+        },
 
         UvSource::Custom { path } => match probe(path, runner) {
             Some(version) if version >= MIN_UV_VERSION => {
@@ -102,6 +112,32 @@ pub fn resolve(
             None => Err(UvResolveError::ConfiguredUnavailable { path: path.clone() }),
         },
     }
+}
+
+/// Find an executable on PATH, the way a shell would.
+///
+/// Kept separate from `resolve` so resolution stays testable without
+/// depending on what happens to be installed on the machine running the tests.
+pub fn locate_on_path(program: &str) -> Option<PathBuf> {
+    let path_var = std::env::var_os("PATH")?;
+    std::env::split_paths(&path_var).find_map(|dir| candidate(&dir, program))
+}
+
+#[cfg(unix)]
+fn candidate(dir: &Path, program: &str) -> Option<PathBuf> {
+    let path = dir.join(program);
+    path.is_file().then_some(path)
+}
+
+#[cfg(windows)]
+fn candidate(dir: &Path, program: &str) -> Option<PathBuf> {
+    // `uv` on Windows is `uv.exe`: a bare-name probe would find nothing, so
+    // try every extension PATHEXT lists, the way cmd.exe resolves a command.
+    let pathext = std::env::var("PATHEXT").unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".to_string());
+    pathext.split(';').find_map(|ext| {
+        let path = dir.join(format!("{program}{ext}"));
+        path.is_file().then_some(path)
+    })
 }
 
 #[cfg(test)]
@@ -118,8 +154,26 @@ mod tests {
         }
     }
 
+    type Locator = Box<dyn Fn(&str) -> Option<PathBuf>>;
+
     fn bundled_ok() -> Box<dyn Fn() -> Result<PathBuf, String>> {
         Box::new(|| Ok(PathBuf::from("/data/uv/0.12.1-abc/uv")))
+    }
+
+    /// A locator that always finds uv at a fixed absolute path — distinct
+    /// from the bare string `"uv"`, so tests can tell the two apart.
+    fn locate_found() -> Locator {
+        Box::new(|_| Some(PathBuf::from("/usr/bin/uv")))
+    }
+
+    fn locate_missing() -> Locator {
+        Box::new(|_| None)
+    }
+
+    /// A locator that fails the test if called at all, for branches that
+    /// must never consult PATH.
+    fn locate_must_not_be_called() -> Locator {
+        Box::new(|program| panic!("locate must not be called, but was called with {program:?}"))
     }
 
     #[test]
@@ -131,9 +185,14 @@ mod tests {
             version_outcome("uv 0.12.1 (x86_64-unknown-linux-gnu)"),
         );
 
-        let got = resolve(&UvSource::Auto, &runner, &*bundled_ok()).unwrap();
+        let got = resolve(&UvSource::Auto, &runner, &*locate_found(), &*bundled_ok()).unwrap();
 
         assert_eq!(got.origin, UvOrigin::Path);
+        assert_eq!(
+            got.path,
+            PathBuf::from("/usr/bin/uv"),
+            "the resolved path must be the absolute path the locator returned, not the literal \"uv\""
+        );
         assert_eq!(
             got.version,
             UvVersion {
@@ -150,7 +209,7 @@ mod tests {
         let runner = FakeCommandRunner::new();
         runner.expect("uv", &["--version"], version_outcome("uv 0.9.0 (x)"));
 
-        let got = resolve(&UvSource::Auto, &runner, &*bundled_ok()).unwrap();
+        let got = resolve(&UvSource::Auto, &runner, &*locate_found(), &*bundled_ok()).unwrap();
 
         assert_eq!(got.origin, UvOrigin::Bundled);
         assert_eq!(got.path, PathBuf::from("/data/uv/0.12.1-abc/uv"));
@@ -158,13 +217,18 @@ mod tests {
 
     #[test]
     fn auto_falls_back_to_bundled_when_no_uv_is_on_path() {
-        // The fake errors on unprogrammed calls, which is exactly what a
-        // missing binary looks like.
+        // The locator reports no uv on PATH, so Auto must fall back without
+        // ever attempting to probe anything.
         let runner = FakeCommandRunner::new();
 
-        let got = resolve(&UvSource::Auto, &runner, &*bundled_ok()).unwrap();
+        let got = resolve(&UvSource::Auto, &runner, &*locate_missing(), &*bundled_ok()).unwrap();
 
         assert_eq!(got.origin, UvOrigin::Bundled);
+        assert!(
+            runner.calls().is_empty(),
+            "Auto must not probe when locate finds nothing; got {:?}",
+            runner.calls()
+        );
     }
 
     #[test]
@@ -172,7 +236,7 @@ mod tests {
         let runner = FakeCommandRunner::new();
         runner.expect("uv", &["--version"], version_outcome("uv 0.99.0 (x)"));
 
-        let got = resolve(&UvSource::Auto, &runner, &*bundled_ok()).unwrap();
+        let got = resolve(&UvSource::Auto, &runner, &*locate_found(), &*bundled_ok()).unwrap();
 
         assert_eq!(got.origin, UvOrigin::Path);
         assert!(
@@ -186,7 +250,13 @@ mod tests {
         let runner = FakeCommandRunner::new();
         runner.expect("uv", &["--version"], version_outcome("uv 0.99.0 (x)"));
 
-        let got = resolve(&UvSource::Bundled, &runner, &*bundled_ok()).unwrap();
+        let got = resolve(
+            &UvSource::Bundled,
+            &runner,
+            &*locate_must_not_be_called(),
+            &*bundled_ok(),
+        )
+        .unwrap();
 
         assert_eq!(got.origin, UvOrigin::Bundled);
         assert_eq!(got.version, BUNDLED_UV_VERSION);
@@ -201,7 +271,13 @@ mod tests {
     fn from_path_fails_loudly_when_uv_is_missing() {
         let runner = FakeCommandRunner::new();
 
-        let err = resolve(&UvSource::FromPath, &runner, &*bundled_ok()).unwrap_err();
+        let err = resolve(
+            &UvSource::FromPath,
+            &runner,
+            &*locate_missing(),
+            &*bundled_ok(),
+        )
+        .unwrap_err();
 
         assert!(
             matches!(err, UvResolveError::PathUvUnavailable),
@@ -214,7 +290,13 @@ mod tests {
         let runner = FakeCommandRunner::new();
         runner.expect("uv", &["--version"], version_outcome("uv 0.9.0 (x)"));
 
-        let err = resolve(&UvSource::FromPath, &runner, &*bundled_ok()).unwrap_err();
+        let err = resolve(
+            &UvSource::FromPath,
+            &runner,
+            &*locate_found(),
+            &*bundled_ok(),
+        )
+        .unwrap_err();
 
         assert!(matches!(err, UvResolveError::TooOld { .. }), "got {err:?}");
     }
@@ -230,9 +312,20 @@ mod tests {
             version_outcome("uv 0.12.1 (x86_64-unknown-linux-gnu)"),
         );
 
-        let got = resolve(&UvSource::FromPath, &runner, &*bundled_ok()).unwrap();
+        let got = resolve(
+            &UvSource::FromPath,
+            &runner,
+            &*locate_found(),
+            &*bundled_ok(),
+        )
+        .unwrap();
 
         assert_eq!(got.origin, UvOrigin::Path);
+        assert_eq!(
+            got.path,
+            PathBuf::from("/usr/bin/uv"),
+            "the resolved path must be the absolute path the locator returned, not the literal \"uv\""
+        );
         assert_eq!(
             got.version,
             UvVersion {
@@ -252,7 +345,13 @@ mod tests {
         let source = UvSource::Custom {
             path: PathBuf::from("/opt/uv/bin/uv"),
         };
-        let got = resolve(&source, &runner, &*bundled_ok()).unwrap();
+        let got = resolve(
+            &source,
+            &runner,
+            &*locate_must_not_be_called(),
+            &*bundled_ok(),
+        )
+        .unwrap();
 
         assert_eq!(got.origin, UvOrigin::Configured);
         assert_eq!(got.path, PathBuf::from("/opt/uv/bin/uv"));
@@ -273,7 +372,13 @@ mod tests {
             path: PathBuf::from("/opt/uv/bin/uv"),
         };
 
-        let err = resolve(&source, &runner, &*bundled_ok()).unwrap_err();
+        let err = resolve(
+            &source,
+            &runner,
+            &*locate_must_not_be_called(),
+            &*bundled_ok(),
+        )
+        .unwrap_err();
 
         assert!(
             matches!(err, UvResolveError::ConfiguredUnavailable { .. }),
@@ -289,7 +394,13 @@ mod tests {
         let source = UvSource::Custom {
             path: PathBuf::from("/opt/uv/bin/uv"),
         };
-        let err = resolve(&source, &runner, &*bundled_ok()).unwrap_err();
+        let err = resolve(
+            &source,
+            &runner,
+            &*locate_must_not_be_called(),
+            &*bundled_ok(),
+        )
+        .unwrap_err();
 
         match err {
             UvResolveError::TooOld { path, found, .. } => {
@@ -306,11 +417,32 @@ mod tests {
         let failing: Box<dyn Fn() -> Result<PathBuf, String>> =
             Box::new(|| Err("disk full".to_string()));
 
-        let err = resolve(&UvSource::Bundled, &runner, &*failing).unwrap_err();
+        let err = resolve(
+            &UvSource::Bundled,
+            &runner,
+            &*locate_must_not_be_called(),
+            &*failing,
+        )
+        .unwrap_err();
 
         assert!(
             matches!(err, UvResolveError::BundledUnavailable { .. }),
             "got {err:?}"
         );
+    }
+
+    #[test]
+    fn locate_on_path_returns_none_for_a_program_that_cannot_exist() {
+        assert_eq!(locate_on_path("definitely-not-a-real-program-xyzzy"), None);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn locate_on_path_finds_a_program_known_to_exist_on_this_platform() {
+        // `sh` is POSIX-mandated and present on every unix this workspace
+        // targets (Linux, macOS), so this is robust without being fragile.
+        // No equivalent guarantee exists on Windows, so this test is
+        // unix-only rather than attempting a fragile cross-platform pick.
+        assert!(locate_on_path("sh").is_some());
     }
 }

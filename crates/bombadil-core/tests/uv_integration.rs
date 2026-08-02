@@ -6,8 +6,8 @@
 use bombadil_core::model::UvSource;
 use bombadil_core::process::{CommandRunner, SystemCommandRunner};
 use bombadil_core::uv::command::{self, DependencyGroup, ProjectContext};
-use bombadil_core::uv::resolve;
 use bombadil_core::uv::results::{parse_pip_list, parse_tree};
+use bombadil_core::uv::{ResolvedUv, locate_on_path, resolve};
 
 fn write_project(dir: &std::path::Path) {
     std::fs::write(
@@ -17,13 +17,17 @@ fn write_project(dir: &std::path::Path) {
     .unwrap();
 }
 
+fn resolve_uv(runner: &SystemCommandRunner) -> ResolvedUv {
+    resolve(&UvSource::FromPath, runner, &locate_on_path, &|| {
+        Err("bundled uv is not used by this test".to_string())
+    })
+    .expect("a uv on PATH at or above MIN_UV_VERSION is required for this test")
+}
+
 #[test]
 fn sync_add_and_list_agree_with_a_real_uv() {
     let runner = SystemCommandRunner;
-    let uv = resolve(&UvSource::FromPath, &runner, &|| {
-        Err("bundled uv is not used by this test".to_string())
-    })
-    .expect("a uv on PATH at or above MIN_UV_VERSION is required for this test");
+    let uv = resolve_uv(&runner);
 
     let tmp = tempfile::tempdir().unwrap();
     let project_dir = tmp.path().join("proj");
