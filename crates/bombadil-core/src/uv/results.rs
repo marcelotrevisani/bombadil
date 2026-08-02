@@ -11,6 +11,18 @@ pub const TESTED_TREE_SCHEMA: &str = "preview";
 pub struct InstalledPackage {
     pub name: String,
     pub version: String,
+    /// Present when uv installed this package in editable mode, naming the
+    /// directory it was installed from. Absent for ordinary dependencies.
+    #[serde(default)]
+    pub editable_project_location: Option<PathBuf>,
+}
+
+impl InstalledPackage {
+    /// Whether this package is a dev-mode install rather than an ordinary
+    /// dependency. Distinguishing the two is the point of the members list.
+    pub fn is_editable(&self) -> bool {
+        self.editable_project_location.is_some()
+    }
 }
 
 pub fn parse_pip_list(json: &str) -> Result<Vec<InstalledPackage>, ResultsError> {
@@ -200,9 +212,27 @@ mod tests {
     #[test]
     fn reads_installed_packages() {
         let got = parse_pip_list(PIP_LIST).unwrap();
-        assert_eq!(got.len(), 2);
+        assert_eq!(got.len(), 3);
         assert_eq!(got[0].name, "idna");
         assert_eq!(got[0].version, "3.18");
+    }
+
+    #[test]
+    fn an_editable_install_reports_where_it_came_from() {
+        // This is what distinguishes a dev-installed member from an ordinary
+        // dependency that happens to share its name.
+        let got = parse_pip_list(PIP_LIST).unwrap();
+
+        let ordinary = got.iter().find(|p| p.name == "idna").unwrap();
+        assert!(!ordinary.is_editable());
+        assert_eq!(ordinary.editable_project_location, None);
+
+        let editable = got.iter().find(|p| p.name == "beta").unwrap();
+        assert!(editable.is_editable());
+        assert_eq!(
+            editable.editable_project_location.as_deref(),
+            Some(std::path::Path::new("/work/repo/packages/beta"))
+        );
     }
 
     #[test]
