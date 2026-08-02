@@ -3,8 +3,11 @@ use crate::detail;
 use crate::drawer;
 use crate::job;
 use crate::sidebar;
-use bombadil_core::model::{Config, Project, Settings};
+use bombadil_core::envspec::{self, EnvInputs};
+use bombadil_core::model::{Config, Project};
 use bombadil_core::process::CommandRunner;
+use bombadil_core::secrets::{KeyringSecretStore, SecretStore};
+use bombadil_core::terminal::open::secret_values;
 use bombadil_core::uv;
 use bombadil_core::venv_path;
 use iced::Task;
@@ -163,7 +166,7 @@ pub fn update(app: &mut App, message: Message, runner: Arc<dyn CommandRunner>) -
         Message::SyncRequested if app.syncing.is_some() => {}
         Message::SyncRequested => {
             if let Some(project) = app.selected_project().cloned() {
-                let settings = app.config.settings.clone();
+                let config = app.config.clone();
                 app.syncing = Some(project.id.to_string());
                 // Fresh drawer per run, but showing a *running* status rather
                 // than the default "idle": for the whole duration of the sync
@@ -173,10 +176,9 @@ pub fn update(app: &mut App, message: Message, runner: Arc<dyn CommandRunner>) -
                     status: format!("syncing {}...", project.label),
                     ..drawer::Drawer::default()
                 };
-                return Task::perform(
-                    sync_project(project, settings, runner),
-                    |(success, lines)| Message::SyncFinished { success, lines },
-                );
+                return Task::perform(sync_project(project, config, runner), |(success, lines)| {
+                    Message::SyncFinished { success, lines }
+                });
             }
         }
         Message::SyncFinished { success, lines } => {
@@ -216,13 +218,25 @@ pub fn update(app: &mut App, message: Message, runner: Arc<dyn CommandRunner>) -
 /// Runs off the render thread via `job::run` -- resolving uv and running
 /// `uv sync` both spawn a process, and `CommandRunner::run` blocks until it
 /// exits.
+///
+/// `KeyringSecretStore` is constructed here, on the job thread, rather than
+/// taken as a parameter of `update`: it is the one piece of this path a test
+/// must never reach, so it lives at the boundary and `run_sync` below takes
+/// the store abstractly.
 async fn sync_project(
     project: Project,
-    settings: Settings,
+    config: Config,
     runner: Arc<dyn CommandRunner>,
 ) -> (bool, Vec<String>) {
     match job::run(
-        move || run_sync(&project, &settings, runner.as_ref()),
+        move || {
+            run_sync(
+                &project,
+                &config,
+                &KeyringSecretStore::new(),
+                runner.as_ref(),
+            )
+        },
         SYNC_TIMEOUT,
     )
     .await
@@ -233,16 +247,26 @@ async fn sync_project(
     }
 }
 
-/// The blocking half of a sync: resolve which uv to run, build the `uv sync`
-/// spec (`bombadil_core::uv::command::sync`), and run it through `runner`.
-/// Any resolution failure -- no project directory, no usable uv -- is
-/// reported as `false` plus a one-line explanation rather than panicking,
-/// same as `venv_path::probe`'s approach to a path that turns out not to be
-/// what was expected. A real run's `lines` is uv's stdout followed by its
-/// stderr, in the order `CommandOutcome` carries them.
+/// The blocking half of a sync: resolve which uv to run, compose the
+/// environment it runs in (`envspec::compose`), build the `uv sync` spec
+/// (`bombadil_core::uv::command::sync`), and run it through `runner`.
+/// Any resolution failure -- no project directory, no usable uv, a
+/// pre-activate script that fails -- is reported as `false` plus the error's
+/// own text rather than panicking, same as `venv_path::probe`'s approach to
+/// a path that turns out not to be what was expected. A real run's `lines`
+/// is uv's stdout followed by its stderr, in the order `CommandOutcome`
+/// carries them.
+///
+/// Redaction happens *here*, not in `update`: this is the only place the
+/// composed environment exists, and `Message` derives `Debug`, so a secrets
+/// list must never be threaded through one.
+///
+/// `store` is a parameter so tests can hand in an `InMemorySecretStore`;
+/// `sync_project` supplies the real keychain.
 fn run_sync(
     project: &Project,
-    settings: &Settings,
+    config: &Config,
+    store: &dyn SecretStore,
     runner: &dyn CommandRunner,
 ) -> (bool, Vec<String>) {
     let Some(project_dir) = project
@@ -252,37 +276,72 @@ fn run_sync(
     else {
         return (false, vec!["no project directory to run uv in".to_string()]);
     };
-    let Ok(venv_path) = venv_path::resolve(project, settings) else {
-        return (
-            false,
-            vec!["could not resolve a virtual environment path".to_string()],
-        );
+    // `match`, not `let ... else`: the error names the offending path, and
+    // "could not resolve a virtual environment path" tells the user nothing
+    // they can act on.
+    let venv_path = match venv_path::resolve(project, &config.settings) {
+        Ok(path) => path,
+        Err(err) => return (false, vec![err.to_string()]),
     };
 
-    // bombadil-gui does not yet bundle uv (no dependency on
-    // bombadil-uv-bin), so `Auto`/`Bundled` sources can only ever resolve
-    // through PATH here. Documented gap, not a silent one -- filling it in
-    // is follow-up work once the GUI wires the bundled binary at all.
+    // bombadil-gui does not bundle uv (no dependency on bombadil-uv-bin), so
+    // `Auto`/`Bundled` sources can only ever resolve through PATH here. The
+    // message below is the actionable one, and surfacing it is why the error
+    // is matched rather than discarded.
     let bundled = || -> Result<PathBuf, String> {
         Err("bombadil-gui does not bundle uv yet; install uv on PATH".to_string())
     };
-    let Ok(resolved_uv) = uv::resolve(&settings.uv_source, runner, &uv::locate_on_path, &bundled)
-    else {
-        return (false, vec!["could not resolve a uv binary".to_string()]);
+    let resolved_uv = match uv::resolve(
+        &config.settings.uv_source,
+        runner,
+        &uv::locate_on_path,
+        &bundled,
+    ) {
+        Ok(resolved) => resolved,
+        Err(err) => return (false, vec![err.to_string()]),
     };
+
+    // Without this, `uv sync` inherits Bombadil's *ambient* environment plus
+    // whatever one variable `uv::command::sync` sets -- so behaviour depends
+    // on whether the user launched from a shell or a desktop icon, and
+    // project/global variables, keychain secrets and private index
+    // credentials are all absent, which makes private-index authentication
+    // impossible.
+    let inputs = EnvInputs {
+        parent: std::env::vars().collect(),
+        config: config.clone(),
+        project: project.clone(),
+        venv_path: venv_path.clone(),
+    };
+    let env = match envspec::compose(&inputs, store, runner) {
+        // `compose` already scrubs its own errors of the secrets it resolved.
+        Ok(env) => env,
+        Err(err) => return (false, vec![err.to_string()]),
+    };
+    let secrets = secret_values(&inputs, &env);
 
     let ctx = uv::command::ProjectContext {
         project_dir: project_dir.to_path_buf(),
         venv_path,
     };
-    let spec = uv::command::sync(&resolved_uv, &ctx);
+    let mut spec = uv::command::sync(&resolved_uv, &ctx);
+    // `clear_env`, the discipline plan 2b established and `uv::command::sync`
+    // leaves off: the composition is authoritative, not a layer on top of
+    // whatever launched Bombadil.
+    spec.env = env;
+    spec.clear_env = true;
+
     match runner.run(&spec) {
         Ok(outcome) => {
             let mut lines: Vec<String> = outcome.stdout.lines().map(str::to_string).collect();
             lines.extend(outcome.stderr.lines().map(str::to_string));
+            let lines = lines
+                .into_iter()
+                .map(|line| envspec::redact(line, &secrets))
+                .collect();
             (outcome.success(), lines)
         }
-        Err(err) => (false, vec![err.to_string()]),
+        Err(err) => (false, vec![envspec::redact(err.to_string(), &secrets)]),
     }
 }
 
@@ -574,6 +633,184 @@ mod tests {
         assert!(
             again.units() > 0,
             "Sync must dispatch again once the previous run has finished"
+        );
+    }
+
+    /// A uv that resolves through `UvSource::Custom`, which probes the given
+    /// path through `runner` and never touches PATH or the filesystem.
+    fn fake_uv_settings() -> bombadil_core::model::Settings {
+        bombadil_core::model::Settings {
+            uv_source: bombadil_core::model::UvSource::Custom {
+                path: PathBuf::from("/fake/bin/uv"),
+            },
+            ..Default::default()
+        }
+    }
+
+    fn version_probe(runner: &FakeCommandRunner) {
+        runner.expect(
+            "uv",
+            &["--version"],
+            bombadil_core::process::CommandOutcome {
+                status: Some(0),
+                stdout: "uv 0.12.1".into(),
+                stderr: String::new(),
+            },
+        );
+    }
+
+    #[test]
+    fn sync_runs_uv_with_the_composed_environment_and_nothing_ambient() {
+        // Without `envspec::compose`, `uv sync` inherits Bombadil's ambient
+        // environment plus one variable: project and global env vars,
+        // keychain secrets and private index credentials are all absent, so
+        // private-index authentication cannot work, and behaviour depends on
+        // whether the user launched from a shell or a desktop icon.
+        let project = bombadil_core::model::Project {
+            env: vec![bombadil_core::model::EnvVar {
+                key: "MARKER".into(),
+                value: "set".into(),
+                secret: false,
+            }],
+            ..project("api")
+        };
+        let config = Config {
+            projects: vec![project.clone()],
+            settings: fake_uv_settings(),
+            ..Config::default()
+        };
+        let store = bombadil_core::secrets::InMemorySecretStore::new();
+        let runner = FakeCommandRunner::new();
+        version_probe(&runner);
+        runner.expect(
+            "uv",
+            &["sync"],
+            bombadil_core::process::CommandOutcome {
+                status: Some(0),
+                stdout: String::new(),
+                stderr: String::new(),
+            },
+        );
+
+        let (success, _lines) = run_sync(&project, &config, &store, &runner);
+        assert!(success);
+
+        let calls = runner.calls();
+        let sync = calls
+            .iter()
+            .find(|c| c.args.iter().any(|a| a == "sync"))
+            .expect("uv sync must have been run");
+        assert!(
+            sync.clear_env,
+            "the composition must be authoritative, not layered on the ambient environment"
+        );
+        assert_eq!(
+            sync.env.get("MARKER").map(String::as_str),
+            Some("set"),
+            "a project env var must reach uv; got {:?}",
+            sync.env.keys().collect::<Vec<_>>()
+        );
+        assert!(
+            sync.env.contains_key("VIRTUAL_ENV"),
+            "the composed activation layer must be present"
+        );
+    }
+
+    #[test]
+    fn a_secret_in_the_composed_environment_never_reaches_the_drawer() {
+        // uv echoing a credential back in its own error output is exactly how
+        // a private-index failure looks. The composed environment is the only
+        // place the secret's value is known, so redaction has to happen on
+        // the job thread -- `Message` derives `Debug`, and threading a
+        // secrets list through `SyncFinished` would make it a carrier of
+        // keychain material.
+        let project = bombadil_core::model::Project {
+            env: vec![bombadil_core::model::EnvVar {
+                key: "TOKEN".into(),
+                value: String::new(),
+                secret: true,
+            }],
+            ..project("api")
+        };
+        let config = Config {
+            projects: vec![project.clone()],
+            settings: fake_uv_settings(),
+            ..Config::default()
+        };
+        let store = bombadil_core::secrets::InMemorySecretStore::new();
+        bombadil_core::secrets::SecretStore::set(
+            &store,
+            &bombadil_core::secrets::SecretKey::ProjectEnv {
+                project_id: project.id,
+                key: "TOKEN".into(),
+            },
+            "s3cr3t-sync-value",
+        )
+        .unwrap();
+
+        let runner = FakeCommandRunner::new();
+        version_probe(&runner);
+        runner.expect(
+            "uv",
+            &["sync"],
+            bombadil_core::process::CommandOutcome {
+                status: Some(1),
+                stdout: String::new(),
+                stderr: "error: 401 for index (token: s3cr3t-sync-value)".into(),
+            },
+        );
+
+        let (success, lines) = run_sync(&project, &config, &store, &runner);
+        assert!(!success);
+
+        // Through the real `update` path, so this covers everything between
+        // the process output and what the drawer holds.
+        let mut app = App::new(config);
+        let _ = update(
+            &mut app,
+            Message::SyncFinished { success, lines },
+            unused_runner(),
+        );
+
+        assert!(
+            app.drawer
+                .lines
+                .iter()
+                .all(|l| !l.contains("s3cr3t-sync-value")),
+            "a keychain secret leaked into the drawer transcript: {:?}",
+            app.drawer.lines
+        );
+        assert!(
+            app.drawer.lines.iter().any(|l| l.contains("***")),
+            "the failing line must still be shown, redacted; got {:?}",
+            app.drawer.lines
+        );
+    }
+
+    #[test]
+    fn an_unresolvable_uv_reports_the_actionable_message() {
+        // The `bundled` closure's own message is the one the user can act on
+        // ("install uv on PATH"); a generic "could not resolve a uv binary"
+        // throws away the only sentence that helps.
+        let project = project("api");
+        let config = Config {
+            projects: vec![project.clone()],
+            settings: bombadil_core::model::Settings {
+                uv_source: bombadil_core::model::UvSource::Bundled,
+                ..Default::default()
+            },
+            ..Config::default()
+        };
+        let store = bombadil_core::secrets::InMemorySecretStore::new();
+        let runner = FakeCommandRunner::new();
+
+        let (success, lines) = run_sync(&project, &config, &store, &runner);
+
+        assert!(!success);
+        let joined = lines.join("\n");
+        assert!(
+            joined.contains("install uv on PATH"),
+            "the resolve error's own text must survive; got {joined}"
         );
     }
 
