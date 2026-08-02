@@ -38,6 +38,10 @@ pub fn entries(config: &Config) -> Vec<Entry> {
 /// lives in `entries`. `selected` is accepted for parity with the other
 /// `view` functions in this crate; highlighting the selected row is left to
 /// styling, not covered by a test.
+///
+/// Each row is wrapped in a `mouse_area` so a right-click opens the project's
+/// context menu (spec §8) without disturbing the left-click select behaviour
+/// the button already provides.
 pub fn view<'a>(entries: &[Entry], _selected: Option<usize>) -> iced::Element<'a, Message> {
     let mut list = iced::widget::column![].spacing(4);
     for (i, entry) in entries.iter().enumerate() {
@@ -50,11 +54,11 @@ pub fn view<'a>(entries: &[Entry], _selected: Option<usize>) -> iced::Element<'a
             Some(version) => format!("{marker} {} ({version})", entry.label),
             None => format!("{marker} {}", entry.label),
         };
-        list = list.push(
-            iced::widget::button(iced::widget::text(label))
-                .on_press(Message::ProjectSelected(i))
-                .width(iced::Length::Fill),
-        );
+        let row = iced::widget::button(iced::widget::text(label))
+            .on_press(Message::ProjectSelected(i))
+            .width(iced::Length::Fill);
+        list =
+            list.push(iced::widget::mouse_area(row).on_right_press(Message::ContextMenuOpened(i)));
     }
     list.into()
 }

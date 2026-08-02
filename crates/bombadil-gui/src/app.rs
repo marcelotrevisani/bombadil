@@ -1,16 +1,18 @@
 use crate::add_project;
 use crate::banner;
+use crate::context_menu;
 use crate::detail;
 use crate::drawer;
 use crate::interpreter;
 use crate::job;
 use crate::sidebar;
 use bombadil_core::envspec::{self, EnvInputs};
-use bombadil_core::model::{Config, Project};
+use bombadil_core::model::{Config, Project, TerminalChoice};
 use bombadil_core::process::CommandRunner;
 use bombadil_core::secrets::{KeyringSecretStore, SecretStore};
 use bombadil_core::store::Loaded;
 use bombadil_core::terminal::open::secret_values;
+use bombadil_core::terminal::{self, Os, TerminalKind};
 use bombadil_core::uv;
 use bombadil_core::uv::results::Interpreter;
 use bombadil_core::venv_path;
@@ -108,6 +110,11 @@ pub struct App {
     /// object, not a bare `Store`, so a test can substitute a fake -- see
     /// `ConfigPersist`.
     pub persist: Arc<dyn ConfigPersist>,
+    /// The open context menu (spec §8: right-click a project), if any.
+    /// `None` before the first right-click and after it closes -- there is
+    /// nothing else for the menu to show in either state, the same shape
+    /// `add_project` uses for its own dialog.
+    pub context_menu: Option<context_menu::ContextMenu>,
 }
 
 #[derive(Debug, Clone)]
@@ -165,6 +172,38 @@ pub enum Message {
         lines: Vec<String>,
         index: usize,
     },
+    /// A project was right-clicked: open the context menu for `projects[usize]`
+    /// and kick off terminal detection. Spec §8.
+    ContextMenuOpened(usize),
+    /// The context menu was dismissed without an action -- Close was pressed,
+    /// or an action that closes it as a side effect (Open terminal, Remove).
+    ContextMenuClosed,
+    /// Terminal detection finished for the open context menu. Criterion 1:
+    /// `terminal::detect::available` fires up to seven probes, run through
+    /// `job::run` (see `detect_terminals`) so none of them can hang the
+    /// window on a stale mount or a slow `open -Ra`.
+    ContextMenuTerminalsDetected(Vec<TerminalKind>),
+    /// "Open terminal" (or its Custom entry) was picked for `projects[usize]`.
+    /// Criterion 5: dispatched as background work, never run inline --
+    /// `open_terminal` wraps the call in `job::run`, and `terminal::open::open`
+    /// itself spawns the emulator via `CommandRunner::spawn`, not `run`, so
+    /// the window is never held hostage for the terminal's lifetime.
+    OpenTerminalRequested(usize, TerminalChoice),
+    /// The background open finished. `Ok(())` on a successful spawn; `Err`
+    /// carries text `terminal::open::open` has already redacted of any
+    /// secret the composed environment resolved.
+    OpenTerminalFinished(Result<(), String>),
+    /// "Remove from list" was picked for `projects[usize]`. Criterion 4:
+    /// removes the project from `config`/`projects`/`entries` in memory,
+    /// synchronously, and dispatches a background persist -- the same
+    /// in-memory-first shape `AddProjectConfirmed` uses. Never touches the
+    /// venv on disk: nothing in this path calls a `CommandRunner`, and
+    /// `bombadil-core` has no function that could delete one anyway.
+    RemoveProjectRequested(usize),
+    /// The background persist for a removal finished.
+    RemoveProjectFinished {
+        success: bool,
+    },
 }
 
 impl App {
@@ -185,6 +224,7 @@ impl App {
             syncing: None,
             add_project: None,
             persist: Arc::new(NullPersist),
+            context_menu: None,
         }
     }
 
@@ -419,6 +459,77 @@ pub fn update(app: &mut App, message: Message, runner: Arc<dyn CommandRunner>) -
                 return Task::perform(probe_venv(path), move |version| {
                     Message::VenvProbed(index, version)
                 });
+            }
+        }
+        // A stale index can arrive the same way `ProjectSelected`'s can.
+        Message::ContextMenuOpened(i) if i < app.projects.len() => {
+            app.context_menu = Some(context_menu::ContextMenu {
+                project_index: i,
+                terminals: Vec::new(),
+            });
+            return Task::perform(
+                detect_terminals(Os::host(), runner),
+                Message::ContextMenuTerminalsDetected,
+            );
+        }
+        Message::ContextMenuOpened(_) => {}
+        Message::ContextMenuClosed => {
+            app.context_menu = None;
+        }
+        // A stale detection result for a menu the user already closed.
+        Message::ContextMenuTerminalsDetected(terminals) => {
+            if let Some(menu) = &mut app.context_menu {
+                menu.terminals = terminals;
+            }
+        }
+        Message::OpenTerminalRequested(i, choice) if i < app.projects.len() => {
+            app.context_menu = None;
+            if let Some(project) = app.projects.get(i).cloned() {
+                let config = app.config.clone();
+                return Task::perform(
+                    open_terminal(choice, project, config, runner),
+                    Message::OpenTerminalFinished,
+                );
+            }
+        }
+        Message::OpenTerminalRequested(_, _) => {}
+        Message::OpenTerminalFinished(Ok(())) => {}
+        Message::OpenTerminalFinished(Err(message)) => {
+            // Redacted already, on the job thread inside `terminal::open::open`
+            // -- the composed environment never reaches this `Message`, the
+            // same discipline `SyncFinished` follows for `run_sync`.
+            drawer::push_line(&mut app.drawer, &message, &[]);
+            drawer::set_idle(&mut app.drawer, "open terminal failed".to_string());
+            if !app.drawer.lines.is_empty() {
+                app.drawer.expanded = true;
+            }
+        }
+        Message::RemoveProjectRequested(i) if i < app.projects.len() => {
+            // In-memory first, synchronously -- the same discipline
+            // `AddProjectConfirmed` uses, so the sidebar reflects the removal
+            // the instant `update` returns rather than only once the
+            // background persist lands.
+            app.config.projects.remove(i);
+            app.projects.remove(i);
+            app.entries.remove(i);
+            app.selected = match app.selected {
+                Some(s) if s == i => (!app.projects.is_empty())
+                    .then_some(i.min(app.projects.len().saturating_sub(1))),
+                Some(s) if s > i => Some(s - 1),
+                other => other,
+            };
+            app.context_menu = None;
+
+            let config = app.config.clone();
+            let persist = app.persist.clone();
+            return Task::perform(persist_removal(config, persist), |success| {
+                Message::RemoveProjectFinished { success }
+            });
+        }
+        Message::RemoveProjectRequested(_) => {}
+        Message::RemoveProjectFinished { success } => {
+            if !success {
+                drawer::set_idle(&mut app.drawer, "remove failed to persist".to_string());
             }
         }
     }
@@ -798,6 +909,114 @@ async fn confirm_add_project(
     }
 }
 
+/// Detects installed terminals off the render thread. Criterion 1:
+/// `terminal::detect::available` fires up to seven probes (`which`, `where`,
+/// `open -Ra`), any one of which can hang -- a `which` walking a stale
+/// network mount, a slow `open -Ra` waiting on LaunchServices -- exactly what
+/// `job::run`'s timeout exists for. Degrades to an empty list on a timeout or
+/// a panic, the same as every other probe in this file: offering nothing is
+/// safer than offering a terminal that turns out not to be there (spec §9).
+async fn detect_terminals(os: Os, runner: Arc<dyn CommandRunner>) -> Vec<TerminalKind> {
+    match job::run(
+        move || terminal::detect::available(os, runner.as_ref()),
+        VENV_PROBE_TIMEOUT,
+    )
+    .await
+    {
+        job::JobResult::Done(kinds) => kinds,
+        job::JobResult::TimedOut | job::JobResult::Failed => Vec::new(),
+    }
+}
+
+/// The blocking half of opening a terminal: resolves the venv path and hands
+/// off to `terminal::open::open`, which composes the environment and spawns
+/// the emulator via `CommandRunner::spawn` -- never `run`, which would hold
+/// the window hostage for the terminal's whole lifetime (criterion 5).
+///
+/// `KeyringSecretStore` is constructed by the caller, on the job thread, the
+/// same discipline `sync_project` uses -- it is the one piece of this path a
+/// test must never reach.
+///
+/// `shell` comes from `$SHELL` rather than being hardcoded: unset (as it
+/// commonly is on Windows) degrades to an unrecognised shell family, which
+/// `terminal::open::open` already handles by opening without the
+/// re-assertion rather than refusing to open at all.
+fn run_open_terminal(
+    choice: &TerminalChoice,
+    project: &Project,
+    config: &Config,
+    store: &dyn SecretStore,
+    runner: &dyn CommandRunner,
+) -> Result<(), String> {
+    let venv_path = venv_path::resolve(project, &config.settings).map_err(|e| e.to_string())?;
+    let inputs = EnvInputs {
+        parent: std::env::vars().collect(),
+        config: config.clone(),
+        project: project.clone(),
+        venv_path,
+    };
+    let shell = std::env::var("SHELL").unwrap_or_default();
+    // A Bombadil-owned scratch directory for the re-assertion init file
+    // `terminal::open::open` writes -- namespaced per-project underneath by
+    // `open` itself, so two concurrent opens for different projects cannot
+    // collide (see its own doc comment).
+    let scratch_dir = std::env::temp_dir().join("bombadil-terminal-init");
+    terminal::open::open(
+        choice,
+        Os::host(),
+        &inputs,
+        &shell,
+        store,
+        runner,
+        &scratch_dir,
+    )
+    .map_err(|err| err.to_string())
+}
+
+/// Runs off the render thread via `job::run` -- same shape as `sync_project`.
+async fn open_terminal(
+    choice: TerminalChoice,
+    project: Project,
+    config: Config,
+    runner: Arc<dyn CommandRunner>,
+) -> Result<(), String> {
+    match job::run(
+        move || {
+            run_open_terminal(
+                &choice,
+                &project,
+                &config,
+                &KeyringSecretStore::new(),
+                runner.as_ref(),
+            )
+        },
+        VENV_PROBE_TIMEOUT,
+    )
+    .await
+    {
+        job::JobResult::Done(result) => result,
+        job::JobResult::TimedOut => Err("opening the terminal timed out".to_string()),
+        job::JobResult::Failed => Err("opening the terminal failed unexpectedly".to_string()),
+    }
+}
+
+/// The blocking half of persisting a removal: just a save. Its own function,
+/// mirroring `run_confirm_add_project`, so a test can exercise it directly
+/// with a `FakeConfigPersist` instead of through `update`'s opaque `Task`.
+fn run_persist(config: &Config, persist: &dyn ConfigPersist) -> bool {
+    persist.save(config).is_ok()
+}
+
+/// Runs off the render thread via `job::run`: persisting the config after a
+/// removal is a blocking file write, same as every other `ConfigPersist` call
+/// in this file.
+async fn persist_removal(config: Config, persist: Arc<dyn ConfigPersist>) -> bool {
+    match job::run(move || run_persist(&config, persist.as_ref()), SYNC_TIMEOUT).await {
+        job::JobResult::Done(success) => success,
+        job::JobResult::TimedOut | job::JobResult::Failed => false,
+    }
+}
+
 pub fn view(app: &App) -> iced::Element<'_, Message> {
     let detail: iced::Element<'_, Message> = match app.selected_project() {
         // The probe answers from the already-probed `entries` cache rather
@@ -844,10 +1063,28 @@ pub fn view(app: &App) -> iced::Element<'_, Message> {
     // is what makes this never go stale after a config change. The load
     // problems are the exception: the load happened once, and an unreadable
     // file leaves no trace in the default `Config` it produced.
+    // Same freshness reasoning as `add_project_dialog`: the default terminal
+    // is read straight from `app.config` on every render rather than cached,
+    // so a settings change (plan 3c) would not need this to be re-derived.
+    let context_menu_view: iced::Element<'_, Message> = match &app.context_menu {
+        Some(menu) => {
+            let default = app.config.terminal_defaults.get(&Os::host());
+            context_menu::view(menu, default)
+        }
+        None => iced::widget::text("").into(),
+    };
+
     let mut problems = app.load_problems.clone();
     problems.extend(banner::problems(&app.config));
     let footer = iced::widget::text(crate::about::attribution()).size(11);
-    iced::widget::column![banner::view(&problems), body, add_project_dialog, footer].into()
+    iced::widget::column![
+        banner::view(&problems),
+        body,
+        add_project_dialog,
+        context_menu_view,
+        footer
+    ]
+    .into()
 }
 
 #[cfg(test)]
@@ -1687,6 +1924,411 @@ mod tests {
             1,
             "the config must still be persisted on adoption"
         );
+    }
+
+    /// Drive a future to completion on this thread, for tests that need the
+    /// result of one of this file's `async fn`s (`detect_terminals`,
+    /// `open_terminal`) without going through iced's opaque `Task`. Same
+    /// trick `job::run`'s own tests use: its future does its waiting on an
+    /// `mpsc` channel via `recv_timeout`, which blocks the polling thread
+    /// itself, so a trivial spin-poll executor is enough and avoids pulling
+    /// in a runtime.
+    fn block_on<F: std::future::Future>(mut f: F) -> F::Output {
+        use std::task::{Context, Poll, Waker};
+        let mut f = unsafe { std::pin::Pin::new_unchecked(&mut f) };
+        let waker = Waker::noop();
+        let mut cx = Context::from_waker(waker);
+        loop {
+            if let Poll::Ready(v) = f.as_mut().poll(&mut cx) {
+                return v;
+            }
+            std::thread::yield_now();
+        }
+    }
+
+    // --- Criterion 1: only detected terminals are offered ---
+
+    #[test]
+    fn opening_the_context_menu_dispatches_terminal_detection_without_blocking() {
+        // The dispatch-shape half of criterion 1: `available` fires up to
+        // seven probes, any of which can hang, so detection must never run
+        // synchronously inside `update` -- exactly the freeze `job::run`
+        // exists to prevent.
+        let mut app = App::new(Config {
+            projects: vec![project("api")],
+            ..Config::default()
+        });
+        let fake = Arc::new(FakeCommandRunner::new());
+
+        let task = update(&mut app, Message::ContextMenuOpened(0), fake.clone());
+
+        assert!(
+            fake.calls().is_empty(),
+            "runner.run must not be called synchronously inside update; got {:?}",
+            fake.calls()
+        );
+        assert!(
+            task.units() > 0,
+            "opening the context menu must dispatch the terminal probe"
+        );
+        assert_eq!(
+            app.context_menu.as_ref().map(|m| m.project_index),
+            Some(0),
+            "the menu must open for the right-clicked project immediately"
+        );
+    }
+
+    #[test]
+    fn context_menu_terminal_detection_only_offers_what_the_probe_finds() {
+        // The content half of criterion 1: exercises `detect_terminals`
+        // directly, the async function `job::run` wraps -- the same pattern
+        // `run_sync`'s own tests use for its blocking counterpart. Proves the
+        // GUI's wiring actually reaches `terminal::detect::available` rather
+        // than a hardcoded list of every kind for the OS.
+        let runner = FakeCommandRunner::new();
+        runner.expect(
+            "which",
+            &["kitty"],
+            bombadil_core::process::CommandOutcome {
+                status: Some(0),
+                stdout: "/usr/bin/kitty".into(),
+                stderr: String::new(),
+            },
+        );
+
+        let got = block_on(detect_terminals(
+            bombadil_core::terminal::Os::Linux,
+            Arc::new(runner),
+        ));
+
+        assert_eq!(
+            got,
+            vec![bombadil_core::terminal::TerminalKind::Kitty],
+            "only the terminal the probe actually found must be offered"
+        );
+    }
+
+    #[test]
+    fn a_stale_detection_result_after_the_menu_closed_is_dropped() {
+        let mut app = App::new(Config {
+            projects: vec![project("api")],
+            ..Config::default()
+        });
+        app.context_menu = None;
+
+        let _ = update(
+            &mut app,
+            Message::ContextMenuTerminalsDetected(vec![
+                bombadil_core::terminal::TerminalKind::Kitty,
+            ]),
+            unused_runner(),
+        );
+
+        assert!(app.context_menu.is_none());
+    }
+
+    // --- Criterion 2: the configured default appears first ---
+    // Pure ordering logic (`context_menu::ordered`) is covered in
+    // `context_menu.rs`'s own tests, the same file it lives in; this test
+    // covers the GUI wiring that carries `terminal_defaults` from `Config`
+    // into `view` -- see `context_menu_view` in `view`, which reads
+    // `app.config.terminal_defaults` fresh on every render.
+
+    #[test]
+    fn the_configured_default_is_read_from_config_for_the_hosts_os() {
+        let config = Config {
+            projects: vec![project("api")],
+            terminal_defaults: std::collections::BTreeMap::from([(
+                bombadil_core::terminal::Os::host(),
+                TerminalChoice::Detected(bombadil_core::terminal::TerminalKind::Kitty),
+            )]),
+            ..Config::default()
+        };
+        let app = App::new(config);
+        assert_eq!(
+            app.config
+                .terminal_defaults
+                .get(&bombadil_core::terminal::Os::host()),
+            Some(&TerminalChoice::Detected(
+                bombadil_core::terminal::TerminalKind::Kitty
+            )),
+            "the configured default for this OS must be reachable for view to order by"
+        );
+    }
+
+    // --- Criterion 4: Remove from list ---
+
+    #[test]
+    fn removing_a_project_deletes_it_from_the_in_memory_config_immediately() {
+        let config = Config {
+            projects: vec![project("api"), project("web")],
+            ..Config::default()
+        };
+        let mut app = App::new(config);
+
+        let task = update(
+            &mut app,
+            Message::RemoveProjectRequested(0),
+            unused_runner(),
+        );
+
+        assert_eq!(
+            app.config.projects.len(),
+            1,
+            "got {:?}",
+            app.config.projects
+        );
+        assert_eq!(app.config.projects[0].label, "web");
+        assert_eq!(app.projects.len(), 1);
+        assert_eq!(app.projects[0].label, "web");
+        assert_eq!(app.entries.len(), 1);
+        assert!(
+            task.units() > 0,
+            "removal must still dispatch a background persist"
+        );
+    }
+
+    #[test]
+    fn removing_a_project_persists_the_config_without_it() {
+        // Exercises `run_persist` directly, the same pattern
+        // `confirming_the_dialog_persists_the_appended_project_to_disk` uses
+        // for the add-project path.
+        let project_a = project("api");
+        let project_b = project("web");
+        let config = Config {
+            projects: vec![project_b.clone()],
+            ..Config::default()
+        };
+        let persist = FakeConfigPersist::default();
+
+        let success = run_persist(&config, &persist);
+
+        assert!(success);
+        let saved = persist.saved();
+        assert_eq!(saved.len(), 1, "persist.save must be called exactly once");
+        assert_eq!(
+            saved[0].projects,
+            vec![project_b],
+            "the removed project must be absent from what gets persisted"
+        );
+        assert!(!saved[0].projects.contains(&project_a));
+    }
+
+    #[test]
+    fn removing_the_last_remaining_project_leaves_nothing_selected() {
+        // The subtraction `projects.len() - 1` underflows once the removed
+        // project was the only one -- must clear the selection instead of
+        // panicking.
+        let mut app = App::new(Config {
+            projects: vec![project("api")],
+            ..Config::default()
+        });
+        app.selected = Some(0);
+
+        let _ = update(
+            &mut app,
+            Message::RemoveProjectRequested(0),
+            unused_runner(),
+        );
+
+        assert!(app.projects.is_empty());
+        assert!(app.selected.is_none());
+    }
+
+    #[test]
+    fn removing_a_project_never_touches_the_venv_on_disk() {
+        // bombadil-core has no function capable of deleting a venv at all --
+        // confirmed by inspection: the only `fs::remove_*` call in the whole
+        // crate lives inside `venv_path`'s own test fixture teardown, not in
+        // any code `update` can reach. So this proves the removal path we
+        // built calls no `CommandRunner` at all, which is everything there
+        // is to guard against today; there is no delete-venv primitive for a
+        // future regression to accidentally wire up removal into yet.
+        let mut app = App::new(Config {
+            projects: vec![project("api")],
+            ..Config::default()
+        });
+        let fake = Arc::new(FakeCommandRunner::new());
+
+        let _ = update(&mut app, Message::RemoveProjectRequested(0), fake.clone());
+
+        assert!(
+            fake.calls().is_empty(),
+            "removing a project must not run or spawn any process; got {:?}",
+            fake.calls()
+        );
+    }
+
+    #[test]
+    fn removing_an_out_of_range_project_is_ignored() {
+        let mut app = App::new(Config {
+            projects: vec![project("api")],
+            ..Config::default()
+        });
+
+        let task = update(
+            &mut app,
+            Message::RemoveProjectRequested(99),
+            unused_runner(),
+        );
+
+        assert_eq!(
+            app.projects.len(),
+            1,
+            "an invalid index must change nothing"
+        );
+        assert_eq!(task.units(), 0);
+    }
+
+    #[test]
+    fn removing_the_selected_project_clears_or_shifts_the_selection() {
+        let mut app = App::new(Config {
+            projects: vec![project("api"), project("web")],
+            ..Config::default()
+        });
+        app.selected = Some(0);
+
+        let _ = update(
+            &mut app,
+            Message::RemoveProjectRequested(0),
+            unused_runner(),
+        );
+
+        assert_eq!(
+            app.selected_project().map(|p| p.label.as_str()),
+            Some("web"),
+            "removing the selected project must not leave a dangling index"
+        );
+    }
+
+    // --- Criterion 5: opening a terminal dispatches through job::run ---
+
+    #[test]
+    fn opening_a_terminal_never_calls_the_runner_synchronously() {
+        let mut app = App::new(Config {
+            projects: vec![project("api")],
+            ..Config::default()
+        });
+        let fake = Arc::new(FakeCommandRunner::new());
+
+        let task = update(
+            &mut app,
+            Message::OpenTerminalRequested(
+                0,
+                TerminalChoice::Detected(bombadil_core::terminal::TerminalKind::Kitty),
+            ),
+            fake.clone(),
+        );
+
+        assert!(
+            fake.calls().is_empty(),
+            "runner.run/spawn must not be called synchronously inside update; got {:?}",
+            fake.calls()
+        );
+        assert!(
+            task.units() > 0,
+            "opening a terminal must dispatch real background work, not Task::none()"
+        );
+        assert!(
+            app.context_menu.is_none(),
+            "the menu should close once an action is taken from it"
+        );
+    }
+
+    #[test]
+    fn opening_a_terminal_for_an_out_of_range_project_dispatches_nothing() {
+        let mut app = App::new(Config {
+            projects: vec![project("api")],
+            ..Config::default()
+        });
+
+        let task = update(
+            &mut app,
+            Message::OpenTerminalRequested(
+                99,
+                TerminalChoice::Detected(bombadil_core::terminal::TerminalKind::Kitty),
+            ),
+            unused_runner(),
+        );
+
+        assert_eq!(task.units(), 0);
+    }
+
+    #[test]
+    fn opening_a_terminal_spawns_the_chosen_kind_with_the_composed_environment() {
+        // Exercises `run_open_terminal` directly, the blocking half
+        // `open_terminal` wraps in `job::run` -- the same pattern
+        // `run_sync`'s own tests use. Proves the GUI wiring reaches
+        // `terminal::open::open` with the right project/config, not just
+        // that *some* process gets run.
+        let project = bombadil_core::model::Project {
+            env: vec![bombadil_core::model::EnvVar {
+                key: "MARKER".into(),
+                value: "set".into(),
+                secret: false,
+            }],
+            ..project("api")
+        };
+        let config = Config {
+            projects: vec![project.clone()],
+            ..Config::default()
+        };
+        let store = bombadil_core::secrets::InMemorySecretStore::new();
+        let runner = FakeCommandRunner::new();
+        runner.expect(
+            "gnome-terminal",
+            &[],
+            bombadil_core::process::CommandOutcome {
+                status: Some(0),
+                stdout: String::new(),
+                stderr: String::new(),
+            },
+        );
+
+        let result = run_open_terminal(
+            &TerminalChoice::Detected(bombadil_core::terminal::TerminalKind::GnomeTerminal),
+            &project,
+            &config,
+            &store,
+            &runner,
+        );
+
+        assert!(result.is_ok(), "got {result:?}");
+        let calls = runner.calls();
+        assert_eq!(calls.len(), 1);
+        assert!(
+            calls[0].clear_env,
+            "the composition must be authoritative, not layered on the ambient environment"
+        );
+        assert_eq!(
+            calls[0].env.get("MARKER").map(String::as_str),
+            Some("set"),
+            "a project env var must reach the terminal; got {:?}",
+            calls[0].env.keys().collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn a_terminal_that_has_disappeared_reports_a_failure_not_a_panic() {
+        // No rule programmed -- the spawn itself fails, the "terminal has
+        // disappeared" case spec §9 names. `run_open_terminal` must surface
+        // it as an `Err`, not unwrap and take the window down.
+        let config = Config {
+            projects: vec![project("api")],
+            ..Config::default()
+        };
+        let store = bombadil_core::secrets::InMemorySecretStore::new();
+        let runner = FakeCommandRunner::new();
+
+        let result = run_open_terminal(
+            &TerminalChoice::Detected(bombadil_core::terminal::TerminalKind::Kitty),
+            &project("api"),
+            &config,
+            &store,
+            &runner,
+        );
+
+        assert!(result.is_err());
     }
 
     fn project(label: &str) -> bombadil_core::model::Project {
