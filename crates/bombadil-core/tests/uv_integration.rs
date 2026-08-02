@@ -6,7 +6,7 @@
 use bombadil_core::model::UvSource;
 use bombadil_core::process::{CommandRunner, CommandSpec, SystemCommandRunner};
 use bombadil_core::uv::command::{self, DependencyGroup, ProjectContext};
-use bombadil_core::uv::results::{parse_pip_list, parse_tree};
+use bombadil_core::uv::results::{InstalledPackage, parse_pip_list, parse_tree};
 use bombadil_core::uv::{ResolvedUv, UvVersion, locate_on_path, resolve};
 
 fn write_project(dir: &std::path::Path) {
@@ -181,14 +181,16 @@ fn workspace_member_selection_agrees_with_a_real_uv() {
         venv_path: tmp.path().join("env"),
     };
 
-    let installed = |ctx: &ProjectContext| -> Vec<String> {
+    // The one place that runs `pip list` and checks it succeeded, so every
+    // caller below gets uv's stderr on failure instead of a parse panic.
+    let list_packages = |ctx: &ProjectContext| -> Vec<InstalledPackage> {
         let outcome = runner.run(&command::pip_list(&uv, ctx)).unwrap();
         assert!(outcome.success(), "pip list failed: {}", outcome.stderr);
-        let mut names: Vec<String> = parse_pip_list(&outcome.stdout)
-            .expect("pip list JSON parses")
-            .into_iter()
-            .map(|p| p.name)
-            .collect();
+        parse_pip_list(&outcome.stdout).expect("pip list JSON parses")
+    };
+
+    let installed = |ctx: &ProjectContext| -> Vec<String> {
+        let mut names: Vec<String> = list_packages(ctx).into_iter().map(|p| p.name).collect();
         names.sort();
         names
     };
@@ -200,7 +202,11 @@ fn workspace_member_selection_agrees_with_a_real_uv() {
         "sync --all-packages failed: {}",
         outcome.stderr
     );
-    assert_eq!(installed(&ctx), vec!["alpha", "beta"]);
+    assert_eq!(
+        installed(&ctx),
+        vec!["alpha", "beta"],
+        "initial sync must install every member"
+    );
 
     // The behaviour this whole plan rests on: a smaller selection REMOVES the
     // rest, so deselection needs no manifest edit.
@@ -219,8 +225,7 @@ fn workspace_member_selection_agrees_with_a_real_uv() {
     );
 
     // And the survivor is genuinely editable, which is what "dev mode" means.
-    let outcome = runner.run(&command::pip_list(&uv, &ctx)).unwrap();
-    let packages = parse_pip_list(&outcome.stdout).unwrap();
+    let packages = list_packages(&ctx);
     let alpha = packages.iter().find(|p| p.name == "alpha").unwrap();
     assert!(
         alpha.is_editable(),
