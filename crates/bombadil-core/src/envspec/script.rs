@@ -181,6 +181,13 @@ mod tests {
     use crate::process::{CommandOutcome, FakeCommandRunner};
     use std::path::PathBuf;
 
+    /// The program `dump_command` builds on this platform. Hardcoding "sh"
+    /// made every one of these tests fail on Windows, where the spec names
+    /// `powershell` and nothing matched the programmed rule.
+    fn shell() -> &'static str {
+        if cfg!(windows) { "powershell" } else { "sh" }
+    }
+
     fn script(path: &str) -> Script {
         Script {
             path: PathBuf::from(path),
@@ -220,7 +227,7 @@ mod tests {
     fn an_exported_variable_is_added() {
         let runner = FakeCommandRunner::new();
         runner.expect(
-            "sh",
+            shell(),
             &[],
             CommandOutcome {
                 status: Some(0),
@@ -263,7 +270,7 @@ mod tests {
     fn a_changed_variable_takes_the_scripts_value() {
         let runner = FakeCommandRunner::new();
         runner.expect(
-            "sh",
+            shell(),
             &[],
             CommandOutcome {
                 status: Some(0),
@@ -283,7 +290,7 @@ mod tests {
         // from the dump, so a script can remove one and we must honour it.
         let runner = FakeCommandRunner::new();
         runner.expect(
-            "sh",
+            shell(),
             &[],
             CommandOutcome {
                 status: Some(0),
@@ -303,7 +310,7 @@ mod tests {
         // worse than none, so a non-zero exit stops the whole composition.
         let runner = FakeCommandRunner::new();
         runner.expect(
-            "sh",
+            shell(),
             &[],
             CommandOutcome {
                 status: Some(3),
@@ -328,7 +335,7 @@ mod tests {
         // credentials -- with nothing, and still return Ok.
         let runner = FakeCommandRunner::new();
         runner.expect(
-            "sh",
+            shell(),
             &[],
             CommandOutcome {
                 status: Some(0),
@@ -353,7 +360,7 @@ mod tests {
         // came after it.
         let runner = FakeCommandRunner::new();
         runner.expect(
-            "sh",
+            shell(),
             &[],
             CommandOutcome {
                 status: Some(0),
@@ -374,7 +381,7 @@ mod tests {
     fn the_sentinel_never_reaches_the_child_process() {
         let runner = FakeCommandRunner::new();
         runner.expect(
-            "sh",
+            shell(),
             &[],
             CommandOutcome {
                 status: Some(0),

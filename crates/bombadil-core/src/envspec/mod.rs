@@ -185,6 +185,13 @@ mod tests {
     use std::path::PathBuf;
     use uuid::Uuid;
 
+    /// The program `dump_command` builds on this platform. Hardcoding "sh"
+    /// made every one of these tests fail on Windows, where the spec names
+    /// `powershell` and nothing matched the programmed rule.
+    fn shell() -> &'static str {
+        if cfg!(windows) { "powershell" } else { "sh" }
+    }
+
     fn project() -> Project {
         Project {
             id: Uuid::from_u128(7),
@@ -344,7 +351,7 @@ mod tests {
         };
         let runner = FakeCommandRunner::new();
         runner.expect(
-            "sh",
+            shell(),
             &[],
             CommandOutcome {
                 status: Some(0),
@@ -551,7 +558,7 @@ mod tests {
         // VIRTUAL_ENV and UV_PROJECT_ENVIRONMENT -- which activation must
         // overwrite afterwards, since they name the same venv.
         runner.expect(
-            "sh",
+            shell(),
             &[],
             CommandOutcome {
                 status: Some(0),
