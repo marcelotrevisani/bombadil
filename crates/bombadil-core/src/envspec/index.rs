@@ -26,7 +26,11 @@ const TOKEN_USERNAME: &str = "__token__";
 /// If the parent shell already exports `UV_INDEX` or `UV_DEFAULT_INDEX` and
 /// `indexes` selects none of that kind, that ambient value is left untouched
 /// and survives into the composed environment -- deliberate inheritance, not
-/// a bug.
+/// a bug. The same is true, and more dangerous, of credential variables:
+/// `inject` never clears a `UV_INDEX_<NAME>_USERNAME`/`_PASSWORD` it did not
+/// itself write, so a user with e.g. `UV_INDEX_MY_INDEX_PASSWORD` exported in
+/// their shell has that password sent to whatever index named `my-index` the
+/// project points at, Bombadil-configured or not.
 ///
 /// Two index names that normalize to the same credential variable (uv
 /// uppercases the name and maps `-` to `_`, so `my-index` and `my_index`
@@ -41,10 +45,24 @@ pub fn inject(
     into: &mut BTreeMap<String, String>,
 ) -> Result<(), EnvError> {
     let mut extras = Vec::new();
-    // Which index last claimed a given password variable, so a second index
-    // normalizing to the same variable is caught before it overwrites the
-    // first rather than after.
-    let mut claimed_by: BTreeMap<String, String> = BTreeMap::new();
+
+    // Every index's name, grouped by the credential variable it would
+    // normalize to -- computed over the *whole* input, not just the indexes
+    // that go on to inject credentials below. An index with `IndexAuth::None`
+    // or no stored secret never writes a credential itself, but its
+    // `name=url` pair still lands in `UV_INDEX`/`UV_DEFAULT_INDEX`
+    // unconditionally, so uv still resolves *another* colliding index's
+    // credentials against it. Building this set only from indexes that reach
+    // the credential-writing code below would miss exactly that case.
+    let mut names_by_var: BTreeMap<String, Vec<&str>> = BTreeMap::new();
+    for index in indexes {
+        let entry = names_by_var
+            .entry(index_credential_var(&index.name, "PASSWORD"))
+            .or_default();
+        if !entry.contains(&index.name.as_str()) {
+            entry.push(&index.name);
+        }
+    }
 
     for index in indexes {
         let pair = format!("{}={}", index.name, index.url);
@@ -76,17 +94,16 @@ pub fn inject(
         };
 
         let password_var = index_credential_var(&index.name, "PASSWORD");
-        if let Some(first) = claimed_by
-            .get(&password_var)
-            .filter(|first| **first != index.name)
+        if let Some(other) = names_by_var[&password_var]
+            .iter()
+            .find(|name| **name != index.name)
         {
             return Err(EnvError::IndexCredentialCollision {
-                first: first.clone(),
+                first: (*other).to_string(),
                 second: index.name.clone(),
                 var: password_var,
             });
         }
-        claimed_by.insert(password_var.clone(), index.name.clone());
 
         into.insert(index_credential_var(&index.name, "USERNAME"), username);
         into.insert(password_var, secret);
@@ -367,6 +384,43 @@ mod tests {
 
         inject(&[&a, &b], &store, &mut env).unwrap();
 
-        assert!(env.contains_key("UV_INDEX"));
+        let uv_index = env.get("UV_INDEX").expect("UV_INDEX");
+        assert!(uv_index.contains("my-index"), "got {uv_index}");
+        assert!(uv_index.contains("my_index"), "got {uv_index}");
+    }
+
+    #[test]
+    fn a_colliding_index_with_no_auth_still_blocks_the_other_from_injecting() {
+        // The IndexAuth::None index never reaches the credential-writing code
+        // itself, but its name=url pair still lands in UV_INDEX
+        // unconditionally -- so uv still resolves credentials for an index
+        // named "my-index" through the same normalized variable "my_index"
+        // would claim. Building the collision set only from indexes that
+        // reach the credential-writing code would miss this and let
+        // "my_index"'s password be sent to "my-index"'s server.
+        let no_auth = index("my-index", IndexKind::Extra, IndexAuth::None);
+        let with_auth = index(
+            "my_index",
+            IndexKind::Extra,
+            IndexAuth::Basic {
+                username: "bob".into(),
+            },
+        );
+        let store = InMemorySecretStore::new();
+        store
+            .set(
+                &SecretKey::Index {
+                    name: "my_index".into(),
+                },
+                "bob-secret",
+            )
+            .unwrap();
+        let mut env = BTreeMap::new();
+
+        let err = inject(&[&no_auth, &with_auth], &store, &mut env).unwrap_err();
+
+        let rendered = err.to_string();
+        assert!(rendered.contains("my-index"), "got {rendered}");
+        assert!(rendered.contains("my_index"), "got {rendered}");
     }
 }
