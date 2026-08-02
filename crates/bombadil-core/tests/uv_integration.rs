@@ -6,6 +6,7 @@
 use bombadil_core::model::{Project, Script, UvSource, VenvLocation};
 use bombadil_core::process::{CommandRunner, CommandSpec, SystemCommandRunner};
 use bombadil_core::secrets::{InMemorySecretStore, KeyringSecretStore, SecretKey, SecretStore};
+use bombadil_core::terminal::activation::{InitFile, ShellFamily, init_file};
 use bombadil_core::uv::command::{self, DependencyGroup, ProjectContext};
 use bombadil_core::uv::results::{InstalledPackage, parse_pip_list, parse_tree};
 use bombadil_core::uv::{ResolvedUv, UvVersion, locate_on_path, resolve};
@@ -501,4 +502,97 @@ fn the_real_keychain_round_trips_where_one_exists() {
 
     assert_eq!(round_tripped.unwrap().as_deref(), Some("hunter2"));
     assert_eq!(after_delete.unwrap(), None, "the secret must be gone");
+}
+
+fn which_bash() -> Option<std::path::PathBuf> {
+    locate_on_path("bash")
+}
+
+fn which_zsh() -> Option<std::path::PathBuf> {
+    locate_on_path("zsh")
+}
+
+/// Write `file` under `tmp`, launch `shell` with the `InitFile`'s
+/// `shell_args`/`env` (substituting `{file}`/`{dir}` for the file actually
+/// written, exactly as a real caller must), and return the first entry of
+/// the resulting `PATH`.
+///
+/// The child inherits the ambient environment rather than a cleared one, and
+/// `HOME` is left untouched, so the shell really does read this machine's own
+/// rc files -- that is the whole point of this test file over the hermetic
+/// unit tests in `activation.rs`.
+fn first_path_entry_via_init_file(
+    shell: &std::path::Path,
+    tmp: &std::path::Path,
+    file: &InitFile,
+) -> String {
+    let path = tmp.join(&file.relative_path);
+    std::fs::write(&path, &file.contents).unwrap();
+    let dir = path.parent().unwrap().to_string_lossy().into_owned();
+    let file_str = path.to_string_lossy().into_owned();
+
+    let args: Vec<String> = file
+        .shell_args
+        .iter()
+        .map(|a| a.replace("{file}", &file_str))
+        .collect();
+
+    let mut spec = CommandSpec::new(shell);
+    spec.args = args;
+    spec.args.push("-c".into());
+    spec.args.push("printf '%s' \"$PATH\"".into());
+    for (key, value) in &file.env {
+        spec.env.insert(key.clone(), value.replace("{dir}", &dir));
+    }
+
+    let outcome = SystemCommandRunner.run(&spec).unwrap();
+    assert!(outcome.success(), "shell failed: {}", outcome.stderr);
+    outcome.stdout.split(':').next().unwrap_or_default().into()
+}
+
+#[test]
+fn the_generated_init_file_puts_the_venv_first_in_a_real_interactive_bash_shell() {
+    // Measured before this plan: without the init file an interactive bash
+    // leaves the venv at position 3, behind ~/.local/bin, because .bashrc
+    // prepends after us. This asserts the fix against a real bash.
+    let Some(bash) = which_bash() else {
+        eprintln!("no bash on this machine; skipping");
+        return;
+    };
+
+    let tmp = tempfile::tempdir().unwrap();
+    let venv_bin = tmp.path().join("envs/api/bin");
+    std::fs::create_dir_all(&venv_bin).unwrap();
+
+    let file = init_file(ShellFamily::Bash, &venv_bin).expect("bash is a known shell");
+
+    let first = first_path_entry_via_init_file(&bash, tmp.path(), &file);
+    assert_eq!(
+        first,
+        venv_bin.to_string_lossy(),
+        "the venv must be first after the user's rc has run; got {first}"
+    );
+}
+
+#[test]
+fn the_generated_init_file_puts_the_venv_first_in_a_real_interactive_zsh_shell() {
+    // Same measurement as the bash case, but through ZDOTDIR rather than an
+    // rcfile argument -- zsh has no --rcfile equivalent.
+    let Some(zsh) = which_zsh() else {
+        eprintln!("no zsh on this machine; skipping");
+        return;
+    };
+
+    let tmp = tempfile::tempdir().unwrap();
+    let venv_bin = tmp.path().join("envs/api/bin");
+    std::fs::create_dir_all(&venv_bin).unwrap();
+
+    let file = init_file(ShellFamily::Zsh, &venv_bin).expect("zsh is a known shell");
+
+    let first = first_path_entry_via_init_file(&zsh, tmp.path(), &file);
+    assert_eq!(
+        first,
+        venv_bin.to_string_lossy(),
+        "the venv must be first after the user's rc has run; got {first}"
+    );
 }
