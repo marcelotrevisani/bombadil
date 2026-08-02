@@ -166,6 +166,7 @@ mod tests {
             venv: VenvLocation::Alongside,
             env: vec![],
             scripts: vec![],
+            members: Default::default(),
         }
     }
 

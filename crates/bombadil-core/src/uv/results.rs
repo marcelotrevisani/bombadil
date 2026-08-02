@@ -1,5 +1,6 @@
 use crate::error::ResultsError;
 use serde::Deserialize;
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 /// The `uv tree --format json` schema version this code was written against.
@@ -10,6 +11,18 @@ pub const TESTED_TREE_SCHEMA: &str = "preview";
 pub struct InstalledPackage {
     pub name: String,
     pub version: String,
+    /// Present when uv installed this package in editable mode, naming the
+    /// directory it was installed from. Absent for ordinary dependencies.
+    #[serde(default)]
+    pub editable_project_location: Option<PathBuf>,
+}
+
+impl InstalledPackage {
+    /// Whether this package is a dev-mode install rather than an ordinary
+    /// dependency. Distinguishing the two is the point of the members list.
+    pub fn is_editable(&self) -> bool {
+        self.editable_project_location.is_some()
+    }
 }
 
 pub fn parse_pip_list(json: &str) -> Result<Vec<InstalledPackage>, ResultsError> {
@@ -44,15 +57,58 @@ pub fn parse_python_list(json: &str) -> Result<Vec<Interpreter>, ResultsError> {
     })
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-pub struct TreeRoot {
+/// One node in the resolved dependency graph.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TreePackage {
     pub id: String,
+    pub name: String,
+    pub version: String,
+    /// Ids of this package's direct dependencies. Look each up in
+    /// `DependencyGraph::packages`.
+    pub dependencies: Vec<String>,
+}
+
+/// A workspace member, as uv enumerates them — globs already expanded.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct TreeMember {
+    pub name: String,
+    pub path: PathBuf,
+    pub id: String,
+}
+
+/// The resolved graph: entry points plus every node, keyed by id.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DependencyGraph {
+    pub roots: Vec<String>,
+    pub members: Vec<TreeMember>,
+    pub packages: BTreeMap<String, TreePackage>,
+}
+
+impl DependencyGraph {
+    /// The direct dependencies of a package, resolved from ids to nodes.
+    /// Ids with no entry in `packages` are skipped rather than erroring —
+    /// uv's schema is `preview`, and a dangling id must not take out the view.
+    ///
+    /// One level deep and safe as it stands, but Python dependency graphs
+    /// contain cycles: a caller that recurses through this must carry its own
+    /// visited set to avoid looping forever.
+    pub fn dependencies_of(&self, id: &str) -> Vec<&TreePackage> {
+        self.packages
+            .get(id)
+            .map(|pkg| {
+                pkg.dependencies
+                    .iter()
+                    .filter_map(|dep_id| self.packages.get(dep_id))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
 }
 
 /// What came back from `uv tree`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TreeOutcome {
-    Parsed(Vec<TreeRoot>),
+    Parsed(DependencyGraph),
     /// uv produced a schema we have not been tested against. The caller shows
     /// direct dependencies only rather than guessing at an unknown shape.
     UnsupportedSchema {
@@ -70,11 +126,40 @@ struct RawSchema {
 }
 
 #[derive(Deserialize)]
+struct RawRootRef {
+    id: String,
+}
+
+#[derive(Deserialize)]
+struct RawDependencyRef {
+    id: String,
+}
+
+/// A `resolution` entry. `name`/`version` are optional because uv's
+/// `resolution` map also carries a non-package pseudo-entry for the
+/// workspace itself (`"kind": "workspace"`), which has neither. Such entries
+/// are dropped when building `DependencyGraph::packages` rather than failing
+/// the whole parse.
+#[derive(Deserialize)]
+struct RawPackage {
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    version: Option<String>,
+    #[serde(default)]
+    dependencies: Vec<RawDependencyRef>,
+}
+
+#[derive(Deserialize)]
 struct RawTree {
     #[serde(default)]
     schema: Option<RawSchema>,
     #[serde(default)]
-    roots: Vec<TreeRoot>,
+    roots: Vec<RawRootRef>,
+    #[serde(default)]
+    members: Vec<TreeMember>,
+    #[serde(default)]
+    resolution: BTreeMap<String, RawPackage>,
 }
 
 pub fn parse_tree(json: &str) -> Result<TreeOutcome, ResultsError> {
@@ -85,7 +170,30 @@ pub fn parse_tree(json: &str) -> Result<TreeOutcome, ResultsError> {
 
     match raw.schema {
         Some(schema) if schema.version.as_deref() == Some(TESTED_TREE_SCHEMA) => {
-            Ok(TreeOutcome::Parsed(raw.roots))
+            let packages = raw
+                .resolution
+                .into_iter()
+                .filter_map(|(id, pkg)| {
+                    let name = pkg.name?;
+                    let version = pkg.version?;
+                    let dependencies = pkg.dependencies.into_iter().map(|d| d.id).collect();
+                    Some((
+                        id.clone(),
+                        TreePackage {
+                            id,
+                            name,
+                            version,
+                            dependencies,
+                        },
+                    ))
+                })
+                .collect();
+
+            Ok(TreeOutcome::Parsed(DependencyGraph {
+                roots: raw.roots.into_iter().map(|r| r.id).collect(),
+                members: raw.members,
+                packages,
+            }))
         }
         Some(RawSchema { version: Some(v) }) => Ok(TreeOutcome::UnsupportedSchema { found: v }),
         Some(RawSchema { version: None }) => Ok(TreeOutcome::UnsupportedSchema {
@@ -108,9 +216,27 @@ mod tests {
     #[test]
     fn reads_installed_packages() {
         let got = parse_pip_list(PIP_LIST).unwrap();
-        assert_eq!(got.len(), 2);
+        assert_eq!(got.len(), 3);
         assert_eq!(got[0].name, "idna");
         assert_eq!(got[0].version, "3.18");
+    }
+
+    #[test]
+    fn an_editable_install_reports_where_it_came_from() {
+        // This is what distinguishes a dev-installed member from an ordinary
+        // dependency that happens to share its name.
+        let got = parse_pip_list(PIP_LIST).unwrap();
+
+        let ordinary = got.iter().find(|p| p.name == "idna").unwrap();
+        assert!(!ordinary.is_editable());
+        assert_eq!(ordinary.editable_project_location, None);
+
+        let editable = got.iter().find(|p| p.name == "beta").unwrap();
+        assert!(editable.is_editable());
+        assert_eq!(
+            editable.editable_project_location.as_deref(),
+            Some(std::path::Path::new("/work/repo/packages/beta"))
+        );
     }
 
     #[test]
@@ -143,15 +269,56 @@ mod tests {
         assert_eq!(got[1].implementation, "cpython");
     }
 
-    #[test]
-    fn reads_the_tree_when_the_schema_is_the_one_we_tested() {
+    fn parsed_graph() -> DependencyGraph {
         match parse_tree(TREE).unwrap() {
-            TreeOutcome::Parsed(roots) => {
-                assert_eq!(roots.len(), 2);
-                assert!(roots[0].id.starts_with("jsonprobe"));
-            }
+            TreeOutcome::Parsed(graph) => graph,
             other => panic!("expected Parsed, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn reads_the_tree_when_the_schema_is_the_one_we_tested() {
+        let graph = parsed_graph();
+        assert!(!graph.roots.is_empty());
+        assert!(!graph.packages.is_empty());
+    }
+
+    #[test]
+    fn dependencies_of_a_root_resolves_its_direct_dependencies_by_name() {
+        let graph = parsed_graph();
+        let root = &graph.roots[0];
+        let names: Vec<&str> = graph
+            .dependencies_of(root)
+            .iter()
+            .map(|p| p.name.as_str())
+            .collect();
+        assert_eq!(names, vec!["httpx"], "got {names:?}");
+    }
+
+    #[test]
+    fn a_transitive_chain_can_be_walked_two_levels() {
+        let graph = parsed_graph();
+        let httpx = graph
+            .packages
+            .values()
+            .find(|p| p.name == "httpx")
+            .expect("httpx is in the fixture");
+        let httpcore = graph
+            .dependencies_of(&httpx.id)
+            .into_iter()
+            .find(|p| p.name == "httpcore")
+            .expect("httpx depends on httpcore");
+        let h11_present = graph
+            .dependencies_of(&httpcore.id)
+            .iter()
+            .any(|p| p.name == "h11");
+        assert!(h11_present, "httpcore should depend on h11");
+    }
+
+    #[test]
+    fn dependencies_of_an_unknown_id_returns_empty_rather_than_panicking() {
+        let graph = parsed_graph();
+        assert!(graph.dependencies_of("does-not-exist@nowhere").is_empty());
     }
 
     #[test]

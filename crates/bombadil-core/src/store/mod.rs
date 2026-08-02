@@ -199,7 +199,8 @@ mod tests {
     use super::*;
     use crate::model::{
         CURRENT_SCHEMA_VERSION, Config, DefaultVenvLocation, EnvVar, Index, IndexAuth, IndexKind,
-        Project, Script, Settings, UvSource, VenvLocation,
+        MemberOrigin, MemberRef, MemberSelection, Project, Script, Settings, UvSource,
+        VenvLocation,
     };
     use std::path::PathBuf;
     use uuid::Uuid;
@@ -209,7 +210,8 @@ mod tests {
     /// serializer. Exercises every field of `Config`, including a `Central`
     /// default venv location, a `Custom` uv source, one `Default` and one
     /// `Extra` index, `Basic` and `None` auth, global and per-project env vars
-    /// and scripts, and a project with a `Custom` venv location.
+    /// and scripts, a project with a `Custom` venv location, and
+    /// `[projects.members]` with a `Discovered` entry and a named `Added` one.
     const GOLDEN_FIXTURE: &str = include_str!("../../tests/fixtures/full.toml");
 
     #[test]
@@ -272,6 +274,23 @@ mod tests {
                     args: vec![],
                     enabled: false,
                 }],
+                members: MemberSelection {
+                    all_discovered: false,
+                    entries: vec![
+                        MemberRef {
+                            path: PathBuf::from("packages/alpha"),
+                            origin: MemberOrigin::Discovered,
+                            selected: true,
+                            name: None,
+                        },
+                        MemberRef {
+                            path: PathBuf::from("/work/shared-lib"),
+                            origin: MemberOrigin::Added,
+                            selected: false,
+                            name: Some("shared-lib".into()),
+                        },
+                    ],
+                },
             }],
         };
 

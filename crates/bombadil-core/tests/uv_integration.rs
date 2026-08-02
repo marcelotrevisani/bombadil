@@ -6,7 +6,7 @@
 use bombadil_core::model::UvSource;
 use bombadil_core::process::{CommandRunner, CommandSpec, SystemCommandRunner};
 use bombadil_core::uv::command::{self, DependencyGroup, ProjectContext};
-use bombadil_core::uv::results::{parse_pip_list, parse_tree};
+use bombadil_core::uv::results::{InstalledPackage, parse_pip_list, parse_tree};
 use bombadil_core::uv::{ResolvedUv, UvVersion, locate_on_path, resolve};
 
 fn write_project(dir: &std::path::Path) {
@@ -137,5 +137,220 @@ fn an_unknown_subcommand_is_reported_as_a_failed_outcome() {
     assert!(
         !outcome.stderr.is_empty(),
         "uv must explain the failure on stderr"
+    );
+}
+
+/// Build a three-member uv workspace under `root`.
+fn write_workspace(root: &std::path::Path) {
+    std::fs::write(
+        root.join("pyproject.toml"),
+        "[project]\nname = \"wsroot\"\nversion = \"0.1.0\"\nrequires-python = \">=3.10\"\n\
+         dependencies = []\n\n[tool.uv.workspace]\nmembers = [\"packages/*\"]\n",
+    )
+    .unwrap();
+
+    for member in ["alpha", "beta", "gamma"] {
+        let dir = root.join("packages").join(member);
+        std::fs::create_dir_all(dir.join("src").join(member)).unwrap();
+        std::fs::write(
+            dir.join("pyproject.toml"),
+            format!(
+                "[project]\nname = \"{member}\"\nversion = \"0.1.0\"\n\
+                 requires-python = \">=3.10\"\ndependencies = []\n\n\
+                 [build-system]\nrequires = [\"hatchling\"]\n\
+                 build-backend = \"hatchling.build\"\n"
+            ),
+        )
+        .unwrap();
+        std::fs::write(dir.join("src").join(member).join("__init__.py"), "").unwrap();
+    }
+}
+
+#[test]
+fn workspace_member_selection_agrees_with_a_real_uv() {
+    let runner = SystemCommandRunner;
+    let uv = resolve_uv(&runner);
+
+    let tmp = tempfile::tempdir().unwrap();
+    let project_dir = tmp.path().join("repo");
+    std::fs::create_dir_all(&project_dir).unwrap();
+    write_workspace(&project_dir);
+
+    let ctx = ProjectContext {
+        project_dir: project_dir.clone(),
+        venv_path: tmp.path().join("env"),
+    };
+
+    // The one place that runs `pip list` and checks it succeeded, so every
+    // caller below gets uv's stderr on failure instead of a parse panic.
+    let list_packages = |ctx: &ProjectContext| -> Vec<InstalledPackage> {
+        let outcome = runner.run(&command::pip_list(&uv, ctx)).unwrap();
+        assert!(outcome.success(), "pip list failed: {}", outcome.stderr);
+        parse_pip_list(&outcome.stdout).expect("pip list JSON parses")
+    };
+
+    let installed = |ctx: &ProjectContext| -> Vec<String> {
+        let mut names: Vec<String> = list_packages(ctx).into_iter().map(|p| p.name).collect();
+        names.sort();
+        names
+    };
+
+    // Everything.
+    let outcome = runner.run(&command::sync_all_members(&uv, &ctx)).unwrap();
+    assert!(
+        outcome.success(),
+        "sync --all-packages failed: {}",
+        outcome.stderr
+    );
+    assert_eq!(
+        installed(&ctx),
+        vec!["alpha", "beta", "gamma"],
+        "initial sync must install every member"
+    );
+
+    // A selection of two proves the repeated `--package` flag actually works
+    // end to end, not just a single one.
+    let outcome = runner
+        .run(&command::sync_members(
+            &uv,
+            &ctx,
+            &["alpha".to_string(), "beta".to_string()],
+        ))
+        .unwrap();
+    assert!(
+        outcome.success(),
+        "sync --package alpha --package beta failed: {}",
+        outcome.stderr
+    );
+    assert_eq!(
+        installed(&ctx),
+        vec!["alpha", "beta"],
+        "re-syncing with a two-member selection must remove the third"
+    );
+
+    // The behaviour this whole plan rests on: narrowing to one further
+    // REMOVES the other, so deselection needs no manifest edit.
+    let outcome = runner
+        .run(&command::sync_members(&uv, &ctx, &["alpha".to_string()]))
+        .unwrap();
+    assert!(
+        outcome.success(),
+        "sync --package alpha failed: {}",
+        outcome.stderr
+    );
+    assert_eq!(
+        installed(&ctx),
+        vec!["alpha"],
+        "re-syncing with a smaller selection must remove the deselected members"
+    );
+
+    // And the survivor is genuinely editable, which is what "dev mode" means.
+    let packages = list_packages(&ctx);
+    let alpha = packages.iter().find(|p| p.name == "alpha").unwrap();
+    assert!(
+        alpha.is_editable(),
+        "workspace members must be installed editable; got {alpha:?}"
+    );
+}
+
+/// Build a loose (non-workspace) project directory named `itest-app`.
+fn write_loose_project(dir: &std::path::Path) {
+    std::fs::write(
+        dir.join("pyproject.toml"),
+        "[project]\nname = \"itest-app\"\nversion = \"0.1.0\"\n\
+         requires-python = \">=3.10\"\ndependencies = []\n",
+    )
+    .unwrap();
+}
+
+/// Build a sibling library with its own `pyproject.toml`, installable by uv.
+fn write_sibling_library(dir: &std::path::Path) {
+    std::fs::create_dir_all(dir.join("src").join("itest_lib")).unwrap();
+    std::fs::write(
+        dir.join("pyproject.toml"),
+        "[project]\nname = \"itest-lib\"\nversion = \"0.1.0\"\n\
+         requires-python = \">=3.10\"\ndependencies = []\n\n\
+         [build-system]\nrequires = [\"hatchling\"]\n\
+         build-backend = \"hatchling.build\"\n",
+    )
+    .unwrap();
+    std::fs::write(dir.join("src").join("itest_lib").join("__init__.py"), "").unwrap();
+}
+
+#[test]
+fn loose_package_editable_add_and_remove_agrees_with_a_real_uv() {
+    // Proves the other half of spec 5a: `uv add --editable <path>` /
+    // `uv remove` for a loose (non-workspace) project. Critically, this is
+    // also the only place `InstalledPackage::is_editable()` is proven for a
+    // package that entered the environment via `uv add --editable` rather
+    // than as a workspace member -- the two code paths that produce an
+    // editable install are not guaranteed to report themselves identically.
+    let runner = SystemCommandRunner;
+    let uv = resolve_uv(&runner);
+
+    let tmp = tempfile::tempdir().unwrap();
+    let project_dir = tmp.path().join("app");
+    let lib_dir = tmp.path().join("itest-lib");
+    std::fs::create_dir_all(&project_dir).unwrap();
+    std::fs::create_dir_all(&lib_dir).unwrap();
+    write_loose_project(&project_dir);
+    write_sibling_library(&lib_dir);
+
+    let ctx = ProjectContext {
+        project_dir: project_dir.clone(),
+        venv_path: tmp.path().join("env"),
+    };
+
+    let list_packages = || -> Vec<InstalledPackage> {
+        let outcome = runner.run(&command::pip_list(&uv, &ctx)).unwrap();
+        assert!(outcome.success(), "pip list failed: {}", outcome.stderr);
+        parse_pip_list(&outcome.stdout).expect("pip list JSON parses")
+    };
+
+    // Add the sibling as an editable dependency, using the same relative-path
+    // computation the real caller would use.
+    let relative = bombadil_core::members::path_for_manifest(&project_dir, &lib_dir);
+    let outcome = runner
+        .run(&command::add_editable(&uv, &ctx, &relative))
+        .unwrap();
+    assert!(
+        outcome.success(),
+        "add --editable failed: {}",
+        outcome.stderr
+    );
+
+    let outcome = runner.run(&command::sync(&uv, &ctx)).unwrap();
+    assert!(outcome.success(), "sync failed: {}", outcome.stderr);
+
+    let packages = list_packages();
+    let lib = packages
+        .iter()
+        .find(|p| p.name == "itest-lib")
+        .unwrap_or_else(|| panic!("itest-lib not installed; got {packages:?}"));
+    assert!(
+        lib.is_editable(),
+        "uv add --editable must produce an editable install; got {lib:?}"
+    );
+    assert_eq!(
+        lib.editable_project_location
+            .as_deref()
+            .and_then(|p| p.file_name()),
+        Some(std::ffi::OsStr::new("itest-lib")),
+        "editable_project_location must point at the sibling library; got {lib:?}"
+    );
+
+    // Now remove it and confirm it is gone -- the other half of the mapping.
+    let outcome = runner
+        .run(&command::remove_editable(&uv, &ctx, "itest-lib"))
+        .unwrap();
+    assert!(outcome.success(), "remove failed: {}", outcome.stderr);
+
+    let outcome = runner.run(&command::sync(&uv, &ctx)).unwrap();
+    assert!(outcome.success(), "sync failed: {}", outcome.stderr);
+
+    let packages = list_packages();
+    assert!(
+        !packages.iter().any(|p| p.name == "itest-lib"),
+        "itest-lib must be gone after remove_editable; got {packages:?}"
     );
 }

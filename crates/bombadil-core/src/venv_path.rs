@@ -79,6 +79,7 @@ mod tests {
             venv,
             env: vec![],
             scripts: vec![],
+            members: Default::default(),
         }
     }
 
