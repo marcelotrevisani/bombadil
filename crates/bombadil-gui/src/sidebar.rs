@@ -23,6 +23,14 @@ pub struct Entry {
 /// `venv_probe` is a parameter rather than a filesystem call so this runs
 /// without touching disk in tests; the caller supplies a real probe.
 ///
+/// **It is production-dead.** The only real caller (`app::App::new`) passes
+/// `|_| None`, so every entry starts hollow and the real versions arrive
+/// asynchronously through `Message::VenvProbed` -- probing inline here would
+/// block the render thread on a `pyvenv.cfg` read, which is exactly what
+/// `app::boot`'s background probes exist to avoid. Left in place because the
+/// tests below exercise the filled/hollow branches through it; do not mistake
+/// it for live wiring.
+///
 /// A project whose venv path cannot be resolved (`venv_path::resolve` fails
 /// on a `pyproject.toml` with no parent) is listed hollow rather than
 /// dropped -- dropping it would make it unrecoverable through the UI, since

@@ -7,6 +7,7 @@ use bombadil_core::envspec::{self, EnvInputs};
 use bombadil_core::model::{Config, Project};
 use bombadil_core::process::CommandRunner;
 use bombadil_core::secrets::{KeyringSecretStore, SecretStore};
+use bombadil_core::store::Loaded;
 use bombadil_core::terminal::open::secret_values;
 use bombadil_core::uv;
 use bombadil_core::venv_path;
@@ -47,6 +48,12 @@ pub struct App {
     /// streams a running sync's output and collapses to a status line once
     /// it finishes.
     pub drawer: drawer::Drawer,
+    /// Problems from *loading* the config, computed once at startup by
+    /// `boot`. Unlike `banner::problems`, which `view` recomputes from
+    /// `config` every render, the load happened once and cannot be
+    /// re-derived from the config it produced -- an unreadable file and an
+    /// empty one both leave a default `Config` behind.
+    pub load_problems: banner::Problems,
     /// The id of the project whose `uv sync` is in flight, if any.
     ///
     /// Spec line 121 requires at most one mutating uv command per project.
@@ -98,6 +105,7 @@ impl App {
             selected,
             entries,
             drawer: drawer::Drawer::default(),
+            load_problems: Vec::new(),
             syncing: None,
         }
     }
@@ -113,8 +121,13 @@ impl App {
 /// Wired through `job::run`, not called inline -- reading `pyvenv.cfg` can
 /// hang on a stale network mount, and doing that at startup on the render
 /// thread would freeze the window before it ever appears.
-pub fn boot(config: Config) -> (App, Task<Message>) {
-    let app = App::new(config);
+///
+/// Takes the whole `Loaded`, not just its `Config`: a corrupt or too-new
+/// file yields a *default* config, so dropping the variant here would leave
+/// the user staring at an empty project list with nothing to explain it.
+pub fn boot(loaded: Loaded) -> (App, Task<Message>) {
+    let mut app = App::new(loaded.config().clone());
+    app.load_problems = banner::load_problems(&loaded);
     let probes = app
         .projects
         .iter()
@@ -365,10 +378,14 @@ pub fn view(app: &App) -> iced::Element<'_, Message> {
         iced::widget::container(detail_and_drawer).padding(12),
     ];
 
-    // Recomputed from `app.config` on every call, not cached anywhere on
-    // `App` -- see `banner`'s module doc for why that is what makes this
-    // never go stale after a config change.
-    iced::widget::column![banner::view(&banner::problems(&app.config)), body].into()
+    // The config problems are recomputed from `app.config` on every call,
+    // not cached anywhere on `App` -- see `banner`'s module doc for why that
+    // is what makes this never go stale after a config change. The load
+    // problems are the exception: the load happened once, and an unreadable
+    // file leaves no trace in the default `Config` it produced.
+    let mut problems = app.load_problems.clone();
+    problems.extend(banner::problems(&app.config));
+    iced::widget::column![banner::view(&problems), body].into()
 }
 
 #[cfg(test)]
@@ -487,6 +504,28 @@ mod tests {
         assert!(
             task.units() > 0,
             "Sync must still dispatch work for a project with no venv"
+        );
+    }
+
+    #[test]
+    fn a_corrupt_config_boots_with_a_banner_rather_than_a_silently_empty_list() {
+        // `banner::load_problems` is only useful if it is actually wired: a
+        // user whose config is corrupt gets a default `Config`, so without
+        // this the window opens on zero projects and says nothing, and the
+        // reasonable conclusion is that their data is gone. No projects means
+        // `boot` starts no probe tasks, so this touches no filesystem.
+        let (app, _task) = boot(Loaded::Unreadable {
+            config: Config::default(),
+            message: "expected `=` at line 4".into(),
+        });
+
+        assert!(app.projects.is_empty());
+        assert!(
+            app.load_problems
+                .iter()
+                .any(|p| p.message.contains("could not be read")),
+            "the load failure must reach the banner; got {:?}",
+            app.load_problems
         );
     }
 

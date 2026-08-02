@@ -20,10 +20,41 @@
 //! catching a live bug -- see the task report for the fuller reasoning.
 
 use bombadil_core::model::Config;
+use bombadil_core::store::Loaded;
 use bombadil_core::validate::{self, Problem};
 
 /// The problems found in the current config. An empty list means no banner.
 pub type Problems = Vec<Problem>;
+
+/// Problems from *loading* the config file, as opposed to problems *in* a
+/// config that loaded cleanly.
+///
+/// `Loaded::Unreadable` and `Loaded::ReadOnly` both hand back a default
+/// `Config`, so a user whose file is corrupt or was written by a newer build
+/// sees an empty project list. Discarding the variant makes that
+/// indistinguishable from having registered no projects at all, and the
+/// reasonable conclusion for the user to draw is that their data is gone.
+///
+/// Unlike [`problems`] this cannot be recomputed per render -- the load
+/// happened once at startup -- so `App` carries the result instead.
+pub fn load_problems(loaded: &Loaded) -> Problems {
+    match loaded {
+        Loaded::Ok(_) | Loaded::Fresh(_) => Vec::new(),
+        Loaded::ReadOnly { found, .. } => vec![Problem {
+            message: format!(
+                "the config file uses schema version {found}, which this build of \
+                 Bombadil does not understand; it is shown read-only and will not \
+                 be written back"
+            ),
+        }],
+        Loaded::Unreadable { message, .. } => vec![Problem {
+            message: format!(
+                "the config file could not be read, so no projects are shown; \
+                 the file has been left untouched: {message}"
+            ),
+        }],
+    }
+}
 
 /// Recomputes every problem in `config` from scratch. Thin wrapper over
 /// [`validate::validate`] -- kept as its own function so `app::view` has a
@@ -129,6 +160,49 @@ mod tests {
             after.iter().any(|p| p.message.contains("ftp://")),
             "the newly introduced URL problem must appear; got {after:?}"
         );
+    }
+
+    #[test]
+    fn an_unreadable_config_is_reported_rather_than_looking_empty() {
+        // Both non-clean variants hand back a default Config, so without a
+        // banner the user sees zero projects and no explanation -- and would
+        // reasonably conclude their data is gone.
+        let found = load_problems(&Loaded::Unreadable {
+            config: Config::default(),
+            message: "expected `=` at line 4".into(),
+        });
+        let joined = messages(&found);
+        assert!(
+            joined.contains("could not be read"),
+            "the banner must say the config could not be read; got {found:?}"
+        );
+        assert!(
+            joined.contains("expected `=` at line 4"),
+            "the banner must carry the underlying cause; got {found:?}"
+        );
+    }
+
+    #[test]
+    fn a_too_new_config_is_reported_with_the_version_it_declares() {
+        let found = load_problems(&Loaded::ReadOnly {
+            config: Config::default(),
+            found: 99,
+        });
+        let joined = messages(&found);
+        assert!(
+            joined.contains("99"),
+            "the banner must name the schema version found; got {found:?}"
+        );
+        assert!(
+            joined.contains("read-only"),
+            "the banner must say the file will not be written back; got {found:?}"
+        );
+    }
+
+    #[test]
+    fn a_cleanly_loaded_config_produces_no_load_banner() {
+        assert!(load_problems(&Loaded::Ok(Config::default())).is_empty());
+        assert!(load_problems(&Loaded::Fresh(Config::default())).is_empty());
     }
 
     #[test]
