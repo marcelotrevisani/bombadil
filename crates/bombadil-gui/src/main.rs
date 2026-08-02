@@ -9,6 +9,7 @@ mod drawer;
 mod env_editor;
 mod interpreter;
 mod job;
+mod scripts_editor;
 mod sidebar;
 
 use bombadil_core::model::Config;

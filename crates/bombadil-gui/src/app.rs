@@ -7,6 +7,7 @@ use crate::drawer;
 use crate::env_editor;
 use crate::interpreter;
 use crate::job;
+use crate::scripts_editor;
 use crate::sidebar;
 use bombadil_core::envspec::{self, EnvInputs};
 use bombadil_core::model::{Config, Project, Settings, TerminalChoice};
@@ -308,6 +309,30 @@ pub enum Message {
     /// The background half of an env var edit finished: a plain edit's
     /// persist, or a secret toggle's keychain write/delete plus persist.
     EnvVarPersistFinished {
+        success: bool,
+    },
+    /// The Scripts tab's "Add script" button was pressed for `scope` (spec
+    /// §6, Task 3): open the async file picker for the script to run.
+    /// Dispatches `pick_script` through `Task::perform` rather than adding a
+    /// row synchronously -- there is no path to add until the picker
+    /// resolves, and `rfd::AsyncFileDialog` never blocks `update`.
+    ScriptAddRequested(scripts_editor::ScriptScope),
+    /// The script picker finished. `None` when the user cancelled it.
+    ScriptFilePicked(scripts_editor::ScriptScope, Option<PathBuf>),
+    /// A row's "remove" button was pressed.
+    ScriptRemoved(scripts_editor::ScriptScope, usize),
+    /// A row's "enabled" checkbox was toggled (criterion 2): flips the flag
+    /// in place, never removes the row.
+    ScriptEnabledToggled(scripts_editor::ScriptScope, usize),
+    /// A row's "up" button was pressed: move it one position earlier within
+    /// its own scope (criterion 1). Never crosses the global/project
+    /// boundary -- see `scripts_editor`'s module doc for why that would be
+    /// meaningless against `envspec::compose`'s own ordering.
+    ScriptMovedUp(scripts_editor::ScriptScope, usize),
+    /// A row's "down" button was pressed: the mirror of `ScriptMovedUp`.
+    ScriptMovedDown(scripts_editor::ScriptScope, usize),
+    /// The background half of a script edit finished: persisting the config.
+    ScriptPersistFinished {
         success: bool,
     },
 }
@@ -969,6 +994,51 @@ pub fn update(app: &mut App, message: Message, runner: Arc<dyn CommandRunner>) -
                 );
             }
         }
+        Message::ScriptAddRequested(scope) => {
+            return Task::perform(pick_script(), move |path| {
+                Message::ScriptFilePicked(scope, path)
+            });
+        }
+        // Cancelled -- nothing chosen, nothing to add.
+        Message::ScriptFilePicked(_, None) => {}
+        Message::ScriptFilePicked(scope, Some(path)) => {
+            if let Some(scripts) = scripts_editor::scripts_mut(&mut app.config, scope) {
+                scripts_editor::add_script(scripts, path);
+            }
+            return persist_script_edit(app);
+        }
+        Message::ScriptRemoved(scope, index) => {
+            if let Some(scripts) = scripts_editor::scripts_mut(&mut app.config, scope) {
+                scripts_editor::remove_script(scripts, index);
+            }
+            return persist_script_edit(app);
+        }
+        Message::ScriptEnabledToggled(scope, index) => {
+            if let Some(scripts) = scripts_editor::scripts_mut(&mut app.config, scope) {
+                scripts_editor::toggle_enabled(scripts, index);
+            }
+            return persist_script_edit(app);
+        }
+        Message::ScriptMovedUp(scope, index) => {
+            if let Some(scripts) = scripts_editor::scripts_mut(&mut app.config, scope) {
+                scripts_editor::move_up(scripts, index);
+            }
+            return persist_script_edit(app);
+        }
+        Message::ScriptMovedDown(scope, index) => {
+            if let Some(scripts) = scripts_editor::scripts_mut(&mut app.config, scope) {
+                scripts_editor::move_down(scripts, index);
+            }
+            return persist_script_edit(app);
+        }
+        Message::ScriptPersistFinished { success } => {
+            if !success {
+                drawer::set_idle(
+                    &mut app.drawer,
+                    "script change failed to persist".to_string(),
+                );
+            }
+        }
     }
     Task::none()
 }
@@ -1022,6 +1092,17 @@ async fn pick_pyproject() -> Option<PathBuf> {
 async fn pick_folder() -> Option<PathBuf> {
     rfd::AsyncFileDialog::new()
         .pick_folder()
+        .await
+        .map(|handle| handle.path().to_path_buf())
+}
+
+/// Opens the async file picker for a pre-activate script (criterion 3). Same
+/// reasoning as `pick_pyproject`: the blocking `rfd::FileDialog` must never
+/// be used, since a modal dialog on the render thread would freeze the
+/// window for as long as the user takes to answer it.
+async fn pick_script() -> Option<PathBuf> {
+    rfd::AsyncFileDialog::new()
+        .pick_file()
         .await
         .map(|handle| handle.path().to_path_buf())
 }
@@ -1644,6 +1725,18 @@ fn persist_env_edit(app: &App) -> Task<Message> {
     })
 }
 
+/// Dispatches a background persist of `app.config` as it stands right now,
+/// for a script edit (add, remove, toggle enabled, reorder). Mirrors
+/// `persist_env_edit` exactly -- none of these edits touch the keychain, so a
+/// plain `persist_config` is the whole job.
+fn persist_script_edit(app: &App) -> Task<Message> {
+    let config = app.config.clone();
+    let persist = app.persist.clone();
+    Task::perform(persist_config(config, persist), |success| {
+        Message::ScriptPersistFinished { success }
+    })
+}
+
 /// Runs off the render thread via `job::run`: persisting the config is a
 /// blocking file write, same as every other `ConfigPersist` call in this
 /// file.
@@ -1768,8 +1861,18 @@ pub fn view(app: &App) -> iced::Element<'_, Message> {
     // needs to know which project's `env` to show alongside them.
     let env_vars_tab = env_editor::view(&app.config, app.selected);
 
-    let detail_and_drawer =
-        iced::widget::column![detail, deps_tab, env_vars_tab, drawer::view(&app.drawer)].spacing(8);
+    // Same shape as `env_vars_tab`: global scripts always shown, the
+    // project's own scripts once one is selected.
+    let scripts_tab = scripts_editor::view(&app.config, app.selected);
+
+    let detail_and_drawer = iced::widget::column![
+        detail,
+        deps_tab,
+        env_vars_tab,
+        scripts_tab,
+        drawer::view(&app.drawer)
+    ]
+    .spacing(8);
 
     let add_project_button = iced::widget::button(iced::widget::text("Add project"))
         .on_press(Message::AddProjectPickManifestRequested);
@@ -4223,6 +4326,205 @@ mod tests {
             persist.saved().last().unwrap().global_env[0].value,
             "http://new",
             "the persisted config must carry the retyped value"
+        );
+    }
+
+    // --- Task 3: the Scripts tab ---
+    //
+    // Reordering (criterion 1) and disable-not-delete (criterion 2) as pure
+    // logic are covered by `scripts_editor`'s own tests -- `move_up`/
+    // `move_down`/`toggle_enabled`/`execution_order` are pure functions, and
+    // testing them directly there is a stronger proof than re-deriving the
+    // same claim by driving `update`'s opaque `Task`. What belongs here is
+    // the wiring: that the messages a real button press sends actually reach
+    // those functions and actually persist.
+
+    fn script(path: &str, enabled: bool) -> bombadil_core::model::Script {
+        bombadil_core::model::Script {
+            path: std::path::PathBuf::from(path),
+            args: Vec::new(),
+            enabled,
+        }
+    }
+
+    #[test]
+    fn requesting_to_add_a_script_dispatches_work_without_touching_config_synchronously() {
+        // Criterion 3: the whole point of going through `pick_script`
+        // (`rfd::AsyncFileDialog`) instead of adding a row inline is that
+        // nothing about the new script is known -- there is no path -- until
+        // the async picker resolves. A synchronous add here would mean the
+        // handler bypassed the picker entirely, the exact freeze criterion 3
+        // exists to prevent (a modal `rfd::FileDialog` on this same thread
+        // would look identical from `update`'s side: config unchanged until
+        // the call returns).
+        let mut app = App::new(Config::default());
+
+        let task = update(
+            &mut app,
+            Message::ScriptAddRequested(scripts_editor::ScriptScope::Global),
+            unused_runner(),
+        );
+
+        assert!(
+            task.units() > 0,
+            "requesting to add a script must dispatch background work"
+        );
+        assert!(
+            app.config.global_scripts.is_empty(),
+            "nothing may be added to the config before the picker has answered; got {:?}",
+            app.config.global_scripts
+        );
+    }
+
+    #[test]
+    fn a_picked_script_is_appended_and_persisted() {
+        let mut app = App::new(Config::default());
+        let persist = Arc::new(FakeConfigPersist::default());
+        app.persist = persist.clone();
+
+        let task = update(
+            &mut app,
+            Message::ScriptFilePicked(
+                scripts_editor::ScriptScope::Global,
+                Some(std::path::PathBuf::from("/etc/bombadil/pre.sh")),
+            ),
+            unused_runner(),
+        );
+
+        assert_eq!(app.config.global_scripts.len(), 1);
+        assert_eq!(
+            app.config.global_scripts[0].path,
+            std::path::PathBuf::from("/etc/bombadil/pre.sh")
+        );
+        assert!(
+            task.units() > 0,
+            "the add must dispatch a background persist"
+        );
+        assert!(
+            persist.saved().is_empty(),
+            "persist.save must not be called synchronously inside update"
+        );
+
+        let success = block_on(persist_config(app.config.clone(), persist.clone()));
+        assert!(success);
+        assert_eq!(persist.saved().last().unwrap().global_scripts.len(), 1);
+    }
+
+    #[test]
+    fn cancelling_the_script_picker_adds_nothing() {
+        let mut app = App::new(Config::default());
+        let _ = update(
+            &mut app,
+            Message::ScriptFilePicked(scripts_editor::ScriptScope::Global, None),
+            unused_runner(),
+        );
+        assert!(app.config.global_scripts.is_empty());
+    }
+
+    #[test]
+    fn disabling_a_script_through_update_leaves_it_in_the_config() {
+        // Criterion 2, at the wiring level: the message a real checkbox press
+        // sends must land on `toggle_enabled`, not on `remove_script`.
+        let mut app = App::new(Config {
+            global_scripts: vec![script("/etc/pre.sh", true)],
+            ..Config::default()
+        });
+
+        let _ = update(
+            &mut app,
+            Message::ScriptEnabledToggled(scripts_editor::ScriptScope::Global, 0),
+            unused_runner(),
+        );
+
+        assert_eq!(
+            app.config.global_scripts.len(),
+            1,
+            "a disabled script must still be in the config, not removed"
+        );
+        assert!(!app.config.global_scripts[0].enabled);
+    }
+
+    #[test]
+    fn removing_a_script_through_update_actually_drops_it() {
+        // The opposite mistake from the previous test: `ScriptRemoved` must
+        // still really remove, so disable-not-delete is not proven by a
+        // handler that never deletes anything at all.
+        let mut app = App::new(Config {
+            global_scripts: vec![script("/etc/pre.sh", true)],
+            ..Config::default()
+        });
+
+        let _ = update(
+            &mut app,
+            Message::ScriptRemoved(scripts_editor::ScriptScope::Global, 0),
+            unused_runner(),
+        );
+
+        assert!(app.config.global_scripts.is_empty());
+    }
+
+    #[test]
+    fn moving_a_script_down_through_update_persists_the_new_order() {
+        // Criterion 1, at the wiring level.
+        let mut app = App::new(Config {
+            global_scripts: vec![script("/a.sh", true), script("/b.sh", true)],
+            ..Config::default()
+        });
+        let persist = Arc::new(FakeConfigPersist::default());
+        app.persist = persist.clone();
+
+        let task = update(
+            &mut app,
+            Message::ScriptMovedDown(scripts_editor::ScriptScope::Global, 0),
+            unused_runner(),
+        );
+
+        assert_eq!(
+            app.config.global_scripts[0].path,
+            std::path::PathBuf::from("/b.sh"),
+            "the order must change the instant update returns; got {:?}",
+            app.config.global_scripts
+        );
+        assert!(task.units() > 0);
+
+        let success = block_on(persist_config(app.config.clone(), persist.clone()));
+        assert!(success);
+        assert_eq!(
+            persist.saved().last().unwrap().global_scripts[0].path,
+            std::path::PathBuf::from("/b.sh"),
+            "the persisted config must carry the new order, or it reverts on restart"
+        );
+    }
+
+    #[test]
+    fn moving_a_project_scripts_row_never_touches_global_scripts() {
+        // The reordering scoping the module doc argues for: a `Project`
+        // scope's move must resolve to that project's own list, the same
+        // guarantee `project_scope_addresses_that_projects_own_list_not_global`
+        // proves for `scripts_mut` directly -- this is the same claim through
+        // `update`'s real message.
+        let mut proj = project("api");
+        proj.scripts = vec![script("/p-a.sh", true), script("/p-b.sh", true)];
+        let mut app = App::new(Config {
+            global_scripts: vec![script("/g.sh", true)],
+            projects: vec![proj],
+            ..Config::default()
+        });
+
+        let _ = update(
+            &mut app,
+            Message::ScriptMovedDown(scripts_editor::ScriptScope::Project(0), 0),
+            unused_runner(),
+        );
+
+        assert_eq!(
+            app.config.global_scripts,
+            vec![script("/g.sh", true)],
+            "a project-scope reorder must never touch global_scripts"
+        );
+        assert_eq!(
+            app.config.projects[0].scripts[0].path,
+            PathBuf::from("/p-b.sh")
         );
     }
 
