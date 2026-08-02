@@ -150,6 +150,38 @@ mod tests {
     }
 
     #[test]
+    fn a_project_written_before_the_optional_tables_existed_still_loads() {
+        // The claim behind "no schema bump": a config written by an older build,
+        // carrying none of the optional per-project tables, must still parse and
+        // fill in defaults. Proving this on a bare MemberSelection would only
+        // show the field type has a default, which is a weaker claim.
+        let text = r#"
+schema_version = 1
+
+[[projects]]
+id = "00000000-0000-0000-0000-000000000000"
+label = "legacy"
+pyproject_path = "/proj/legacy/pyproject.toml"
+
+[projects.venv]
+kind = "alongside"
+"#;
+
+        let config: Config = toml::from_str(text).expect("a pre-feature project must still parse");
+        let project = &config.projects[0];
+
+        assert_eq!(project.label, "legacy");
+        assert_eq!(project.members, MemberSelection::default());
+        assert!(
+            project.members.all_discovered,
+            "default selection takes everything"
+        );
+        assert!(project.index_names.is_empty());
+        assert!(project.env.is_empty());
+        assert!(project.scripts.is_empty());
+    }
+
+    #[test]
     fn a_secret_env_var_persists_an_empty_value() {
         // Struct-update syntax rather than `let mut c = Config::default(); c.x = ..`:
         // clippy's field_reassign_with_default rejects the latter, and CI denies warnings.
