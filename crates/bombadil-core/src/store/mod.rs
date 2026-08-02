@@ -199,7 +199,8 @@ mod tests {
     use super::*;
     use crate::model::{
         CURRENT_SCHEMA_VERSION, Config, DefaultVenvLocation, EnvVar, Index, IndexAuth, IndexKind,
-        Project, Script, Settings, UvSource, VenvLocation,
+        MemberOrigin, MemberRef, MemberSelection, Project, Script, Settings, UvSource,
+        VenvLocation,
     };
     use std::path::PathBuf;
     use uuid::Uuid;
@@ -272,6 +273,21 @@ mod tests {
                     args: vec![],
                     enabled: false,
                 }],
+                members: MemberSelection {
+                    all_discovered: false,
+                    entries: vec![
+                        MemberRef {
+                            path: PathBuf::from("packages/alpha"),
+                            origin: MemberOrigin::Discovered,
+                            selected: true,
+                        },
+                        MemberRef {
+                            path: PathBuf::from("/work/shared-lib"),
+                            origin: MemberOrigin::Added,
+                            selected: false,
+                        },
+                    ],
+                },
             }],
         };
 

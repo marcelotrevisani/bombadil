@@ -1,11 +1,13 @@
 mod env_var;
 mod index;
+mod member;
 mod project;
 mod script;
 mod settings;
 
 pub use env_var::EnvVar;
 pub use index::{Index, IndexAuth, IndexKind};
+pub use member::{MemberOrigin, MemberRef, MemberSelection};
 pub use project::{Project, VenvLocation};
 pub use script::Script;
 pub use settings::{DefaultVenvLocation, Settings, UvSource};
@@ -120,6 +122,7 @@ mod tests {
                     args: vec![],
                     enabled: false,
                 }],
+                members: MemberSelection::default(),
             }],
         }
     }

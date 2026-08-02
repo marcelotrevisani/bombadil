@@ -71,3 +71,16 @@ secret = true
 path = "./scripts/decrypt.sh"
 args = []
 enabled = false
+
+[projects.members]
+all_discovered = false
+
+[[projects.members.entries]]
+path = "packages/alpha"
+origin = "discovered"
+selected = true
+
+[[projects.members.entries]]
+path = "/work/shared-lib"
+origin = "added"
+selected = false

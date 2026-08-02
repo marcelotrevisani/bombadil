@@ -1,4 +1,4 @@
-use super::{EnvVar, Script};
+use super::{EnvVar, MemberSelection, Script};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use uuid::Uuid;
@@ -30,4 +30,6 @@ pub struct Project {
     pub env: Vec<EnvVar>,
     #[serde(default)]
     pub scripts: Vec<Script>,
+    #[serde(default)]
+    pub members: MemberSelection,
 }
