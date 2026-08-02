@@ -1,3 +1,4 @@
+use crate::banner;
 use crate::detail;
 use crate::drawer;
 use crate::job;
@@ -26,12 +27,13 @@ const SYNC_TIMEOUT: Duration = Duration::from_secs(300);
 /// Everything the window shows. Deliberately plain data: `update` is the only
 /// place it changes, which is what makes the logic testable without a display.
 pub struct App {
-    // Not read yet outside `boot`: `projects`, `selected` and `entries` are
-    // what `view` and `update` need this task. Kept whole rather than
-    // trimmed to just the projects, because settings/index/save features in
-    // later tasks need the rest of the config and re-deriving `App` then
-    // would be needless churn.
-    #[allow(dead_code)]
+    // `projects`, `selected` and `entries` are what most of `view` and
+    // `update` need; `config` as a whole is also read directly by `view`,
+    // which recomputes `banner::problems(&app.config)` on every render
+    // rather than caching it on this struct -- see `banner`'s module doc.
+    // Kept whole rather than trimmed to just the projects, because
+    // settings/index/save features in later tasks need the rest of the
+    // config and re-deriving `App` then would be needless churn.
     pub config: Config,
     pub projects: Vec<Project>,
     pub selected: Option<usize>,
@@ -259,11 +261,15 @@ pub fn view(app: &App) -> iced::Element<'_, Message> {
 
     let detail_and_drawer = iced::widget::column![detail, drawer::view(&app.drawer)].spacing(8);
 
-    iced::widget::row![
+    let body = iced::widget::row![
         iced::widget::container(sidebar::view(&app.entries, app.selected)).width(240),
         iced::widget::container(detail_and_drawer).padding(12),
-    ]
-    .into()
+    ];
+
+    // Recomputed from `app.config` on every call, not cached anywhere on
+    // `App` -- see `banner`'s module doc for why that is what makes this
+    // never go stale after a config change.
+    iced::widget::column![banner::view(&banner::problems(&app.config)), body].into()
 }
 
 #[cfg(test)]

@@ -1,4 +1,5 @@
 mod app;
+mod banner;
 mod detail;
 mod drawer;
 mod job;
