@@ -139,3 +139,91 @@ fn an_unknown_subcommand_is_reported_as_a_failed_outcome() {
         "uv must explain the failure on stderr"
     );
 }
+
+/// Build a two-member uv workspace under `root`.
+fn write_workspace(root: &std::path::Path) {
+    std::fs::write(
+        root.join("pyproject.toml"),
+        "[project]\nname = \"wsroot\"\nversion = \"0.1.0\"\nrequires-python = \">=3.10\"\n\
+         dependencies = []\n\n[tool.uv.workspace]\nmembers = [\"packages/*\"]\n",
+    )
+    .unwrap();
+
+    for member in ["alpha", "beta"] {
+        let dir = root.join("packages").join(member);
+        std::fs::create_dir_all(dir.join("src").join(member)).unwrap();
+        std::fs::write(
+            dir.join("pyproject.toml"),
+            format!(
+                "[project]\nname = \"{member}\"\nversion = \"0.1.0\"\n\
+                 requires-python = \">=3.10\"\ndependencies = []\n\n\
+                 [build-system]\nrequires = [\"hatchling\"]\n\
+                 build-backend = \"hatchling.build\"\n"
+            ),
+        )
+        .unwrap();
+        std::fs::write(dir.join("src").join(member).join("__init__.py"), "").unwrap();
+    }
+}
+
+#[test]
+fn workspace_member_selection_agrees_with_a_real_uv() {
+    let runner = SystemCommandRunner;
+    let uv = resolve_uv(&runner);
+
+    let tmp = tempfile::tempdir().unwrap();
+    let project_dir = tmp.path().join("repo");
+    std::fs::create_dir_all(&project_dir).unwrap();
+    write_workspace(&project_dir);
+
+    let ctx = ProjectContext {
+        project_dir: project_dir.clone(),
+        venv_path: tmp.path().join("env"),
+    };
+
+    let installed = |ctx: &ProjectContext| -> Vec<String> {
+        let outcome = runner.run(&command::pip_list(&uv, ctx)).unwrap();
+        assert!(outcome.success(), "pip list failed: {}", outcome.stderr);
+        let mut names: Vec<String> = parse_pip_list(&outcome.stdout)
+            .expect("pip list JSON parses")
+            .into_iter()
+            .map(|p| p.name)
+            .collect();
+        names.sort();
+        names
+    };
+
+    // Everything.
+    let outcome = runner.run(&command::sync_all_members(&uv, &ctx)).unwrap();
+    assert!(
+        outcome.success(),
+        "sync --all-packages failed: {}",
+        outcome.stderr
+    );
+    assert_eq!(installed(&ctx), vec!["alpha", "beta"]);
+
+    // The behaviour this whole plan rests on: a smaller selection REMOVES the
+    // rest, so deselection needs no manifest edit.
+    let outcome = runner
+        .run(&command::sync_members(&uv, &ctx, &["alpha".to_string()]))
+        .unwrap();
+    assert!(
+        outcome.success(),
+        "sync --package alpha failed: {}",
+        outcome.stderr
+    );
+    assert_eq!(
+        installed(&ctx),
+        vec!["alpha"],
+        "re-syncing with a smaller selection must remove the deselected members"
+    );
+
+    // And the survivor is genuinely editable, which is what "dev mode" means.
+    let outcome = runner.run(&command::pip_list(&uv, &ctx)).unwrap();
+    let packages = parse_pip_list(&outcome.stdout).unwrap();
+    let alpha = packages.iter().find(|p| p.name == "alpha").unwrap();
+    assert!(
+        alpha.is_editable(),
+        "workspace members must be installed editable; got {alpha:?}"
+    );
+}
