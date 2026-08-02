@@ -56,16 +56,18 @@ impl SecretStore for KeyringSecretStore {
 
     /// Probe by asking for a namespaced account that is never written.
     ///
-    /// A `NoEntry` answer proves the backend responded, which is what we care
-    /// about; only a hard error means unusable. Headless Linux and WSL often
-    /// have no Secret Service, and the caller offers session-only entry
-    /// instead of failing later at spawn time with something cryptic.
+    /// Available means the backend *answered*: either it returned a value, or
+    /// it said `NoEntry`, which is a real answer. Every other error — an
+    /// unreachable D-Bus session, a locked or missing store, an unsupported
+    /// backend — means unusable.
+    ///
+    /// This is deliberately the conservative direction. Reporting a broken
+    /// keychain as available makes the app fail later at spawn time with
+    /// something cryptic; reporting a working one as unavailable only offers
+    /// session-only entry, which is recoverable and visible.
     fn is_available(&self) -> bool {
         match keyring::Entry::new(SERVICE, SECRET_PROBE_ACCOUNT) {
-            Ok(entry) => !matches!(
-                entry.get_password(),
-                Err(keyring::Error::PlatformFailure(_))
-            ),
+            Ok(entry) => matches!(entry.get_password(), Ok(_) | Err(keyring::Error::NoEntry)),
             Err(_) => false,
         }
     }
