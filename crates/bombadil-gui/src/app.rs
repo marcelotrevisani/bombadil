@@ -1253,8 +1253,15 @@ pub fn update(app: &mut App, message: Message, runner: Arc<dyn CommandRunner>) -
             {
                 row.active = row.location == location;
             }
+            // Selecting the project too. Pressing one of its environments is
+            // a statement about *that* project, and leaving the selection
+            // where it was meant the detail header, the tabs and the refresh
+            // below all went on describing a different one -- so the press
+            // appeared to do nothing at all.
+            app.selected = Some(i);
             // The tabs describe the active environment, so they are re-read
-            // for the same reason a finished sync re-reads them.
+            // for the same reason a finished sync re-reads them -- and now
+            // for the project that was actually pressed.
             return Task::batch([persist_env_edit(app), refresh_after_sync(app, runner)]);
         }
         Message::SyncRequested(i) => {
@@ -5771,6 +5778,50 @@ mod tests {
                 .count(),
             1,
             "one active environment, never two"
+        );
+    }
+
+    #[test]
+    fn activating_an_environment_selects_its_project_too() {
+        // Reported as clicking between environments "not changing the
+        // project, and dependencies and everything else". Pressing one of a
+        // project's environments is a statement about that project; leaving
+        // the selection where it was meant the header, the tabs and the
+        // re-read all described a different one, so the press looked inert.
+        let target = VenvLocation::Custom {
+            path: std::path::PathBuf::from("/envs/web"),
+        };
+        let mut app = App::new(Config {
+            projects: vec![
+                project("api"),
+                Project {
+                    id: uuid::Uuid::from_u128(2),
+                    environments: vec![bombadil_core::model::Environment {
+                        location: target.clone(),
+                        python: PythonPin::Unpinned,
+                    }],
+                    active: target.clone(),
+                    ..project("web")
+                },
+            ],
+            ..Config::default()
+        });
+        app.selected = Some(0);
+
+        let task = update(
+            &mut app,
+            Message::EnvironmentActivated(1, target),
+            unused_runner(),
+        );
+
+        assert_eq!(
+            app.selected,
+            Some(1),
+            "the pressed environment's project must become the selected one"
+        );
+        assert!(
+            task.units() > 0,
+            "and its dependencies and members must be re-read"
         );
     }
 
