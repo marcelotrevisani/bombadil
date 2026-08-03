@@ -156,7 +156,7 @@ pub fn delete(project: &Project, settings: &Settings, path: &Path) -> Result<(),
 mod tests {
     use super::{central_dir_name, delete, probe, resolve};
     use crate::error::VenvDeleteError;
-    use crate::model::{DefaultVenvLocation, Project, Settings, UvSource, VenvLocation};
+    use crate::model::{DefaultVenvLocation, Project, PythonPin, Settings, UvSource, VenvLocation};
     use std::path::{Path, PathBuf};
 
     fn project(venv: VenvLocation) -> Project {
@@ -172,6 +172,7 @@ mod tests {
         Settings {
             uv_source: UvSource::Auto,
             default_venv_location,
+            python: PythonPin::default(),
         }
     }
 

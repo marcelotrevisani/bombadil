@@ -199,9 +199,10 @@ mod tests {
     use super::*;
     use crate::model::{
         CURRENT_SCHEMA_VERSION, Config, DefaultVenvLocation, EnvVar, Index, IndexAuth, IndexKind,
-        MemberOrigin, MemberRef, MemberSelection, Project, Script, Settings, UvSource,
-        VenvLocation,
+        MemberOrigin, MemberRef, MemberSelection, Override, Project, PythonPin, Script, Settings,
+        TerminalChoice, UvSource, VenvLocation,
     };
+    use std::collections::BTreeMap;
     use std::path::PathBuf;
 
     /// Hand-authored, not serde-generated (see the file's own header comment):
@@ -226,6 +227,7 @@ mod tests {
                 default_venv_location: DefaultVenvLocation::Central {
                     path: PathBuf::from("/home/t/.venvs"),
                 },
+                python: PythonPin::Version("3.12.13".into()),
             },
             indexes: vec![
                 Index {
@@ -293,6 +295,12 @@ mod tests {
                 // `model::tests`. A `..Project::default()` tail would let a
                 // field added later slip past this round-trip.
                 id: uuid::Uuid::nil(),
+                python: Override::Set(PythonPin::Version("3.11".into())),
+                uv_source: Override::Set(UvSource::FromPath),
+                terminals: BTreeMap::from([(
+                    crate::terminal::Os::Linux,
+                    TerminalChoice::Detected(crate::terminal::TerminalKind::Konsole),
+                )]),
             }],
             terminal_defaults: std::collections::BTreeMap::new(),
         };
@@ -312,6 +320,64 @@ mod tests {
 
     fn temp_config_path(dir: &tempfile::TempDir) -> PathBuf {
         paths::config_file_in(dir.path())
+    }
+
+    #[test]
+    fn a_config_written_before_the_override_fields_existed_still_loads() {
+        // The safety property of adding them: every one is
+        // `#[serde(default)]`, so a config from an older build must load, and
+        // must load as "follow the global" -- never as an override of
+        // something the user never set. Getting this wrong does not fail
+        // loudly; it silently gives a project settings nobody chose.
+        //
+        // The fixture with the new tables stripped out, which is exactly what
+        // an older build wrote.
+        let older: String = GOLDEN_FIXTURE
+            .split("\n\n")
+            // `contains`, not `starts_with`: every table in the fixture is
+            // introduced by a comment, so the block starts with the comment.
+            .filter(|block| {
+                ![
+                    "[settings.python]",
+                    "[projects.python]",
+                    "[projects.python.value]",
+                    "[projects.uv_source]",
+                    "[projects.uv_source.value]",
+                    "[projects.terminals.",
+                ]
+                .iter()
+                .any(|header| block.contains(header))
+            })
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        for header in [
+            "[settings.python]",
+            "[projects.python]",
+            "[projects.uv_source]",
+            "[projects.terminals.",
+        ] {
+            assert!(
+                !older.contains(header),
+                "the stripped fixture still carries {header}, so this test would \
+                 prove nothing about a config that lacks it"
+            );
+        }
+
+        let got: Config = toml::from_str(&older).expect("an older config must still parse");
+
+        assert_eq!(got.settings.python, PythonPin::Unpinned);
+        let project = &got.projects[0];
+        assert_eq!(project.python, Override::Inherit);
+        assert_eq!(project.uv_source, Override::Inherit);
+        assert!(project.terminals.is_empty());
+        // And nothing else moved: the rest of the config is byte-identical to
+        // what the full fixture produces, so this proves the new fields
+        // default without proving it by ignoring everything else.
+        let full: Config = toml::from_str(GOLDEN_FIXTURE).unwrap();
+        assert_eq!(got.indexes, full.indexes);
+        assert_eq!(got.global_env, full.global_env);
+        assert_eq!(got.projects[0].env, full.projects[0].env);
+        assert_eq!(got.projects[0].members, full.projects[0].members);
     }
 
     #[test]

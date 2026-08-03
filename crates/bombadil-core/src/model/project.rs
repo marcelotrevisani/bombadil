@@ -1,5 +1,6 @@
 use super::{EnvVar, MemberSelection, Script};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use uuid::Uuid;
 
@@ -42,4 +43,19 @@ pub struct Project {
     pub scripts: Vec<Script>,
     #[serde(default)]
     pub members: MemberSelection,
+    /// This project's interpreter pin, or the global one.
+    #[serde(default)]
+    pub python: super::Override<super::PythonPin>,
+    /// Which uv runs this project, or the global choice. A project that has
+    /// to stay on an older uv is the case this exists for.
+    #[serde(default)]
+    pub uv_source: super::Override<super::UvSource>,
+    /// Which terminal this project opens in, per OS. Empty means "follow
+    /// `Config::terminal_defaults`".
+    ///
+    /// A map rather than an `Override<TerminalChoice>`, mirroring the global
+    /// field: the terminals that exist differ per platform, so a project
+    /// override of iTerm2 must not make the project unopenable on Linux.
+    #[serde(default)]
+    pub terminals: BTreeMap<crate::terminal::Os, super::TerminalChoice>,
 }

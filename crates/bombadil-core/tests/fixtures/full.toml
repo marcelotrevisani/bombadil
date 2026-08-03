@@ -19,6 +19,12 @@ path = "/opt/uv/bin/uv"
 kind = "central"
 path = "/home/t/.venvs"
 
+# The global interpreter pin. `unpinned` is the other shape, and is what a
+# config written before this field existed loads as.
+[settings.python]
+kind = "version"
+value = "3.12.13"
+
 # A "default" index (maps to UV_DEFAULT_INDEX) with Basic auth.
 [[indexes]]
 name = "priv"
@@ -85,3 +91,25 @@ path = "/work/shared-lib"
 origin = "added"
 selected = false
 name = "shared-lib"
+
+# Per-project overrides. `kind = "inherit"` is the other shape of each, and
+# is what an absent field loads as -- which is what keeps a config written
+# before these existed loading unchanged.
+[projects.python]
+kind = "set"
+
+[projects.python.value]
+kind = "version"
+value = "3.11"
+
+[projects.uv_source]
+kind = "set"
+
+[projects.uv_source.value]
+kind = "from_path"
+
+# Keyed by OS, mirroring [terminal_defaults]: the terminals that exist differ
+# per platform, so an override for one must not speak for another.
+[projects.terminals.linux]
+kind = "detected"
+value = "konsole"

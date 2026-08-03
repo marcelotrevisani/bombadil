@@ -40,4 +40,9 @@ pub struct Settings {
     pub uv_source: UvSource,
     #[serde(default)]
     pub default_venv_location: DefaultVenvLocation,
+    /// The interpreter new environments are built with, and the one Sync
+    /// asserts. `Unpinned` leaves the choice to uv and the manifest's
+    /// `requires-python`, which is what happened before this existed.
+    #[serde(default)]
+    pub python: super::PythonPin,
 }
