@@ -87,3 +87,17 @@ tree:
     @cargo tree --workspace --depth 1
     @printf 'crates in tree: '
     @cargo tree --prefix none | awk '{print $1}' | sort -u | wc -l
+
+# Regenerate every image asset from the SVGs in assets/. Needs `pip install cairosvg`.
+icon:
+    python3 scripts/render_assets.py
+
+# Install the desktop entry and themed icons into ~/.local/share.
+# Needed on GNOME/Wayland, which takes a window's icon from the .desktop file
+# rather than from the window itself.
+install-desktop:
+    ./scripts/install-desktop.sh
+
+# Remove what install-desktop wrote.
+uninstall-desktop:
+    ./scripts/install-desktop.sh --uninstall
