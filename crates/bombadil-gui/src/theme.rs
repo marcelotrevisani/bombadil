@@ -59,11 +59,12 @@
 //! in `SLATE`, `JACKET`, `PARCHMENT`, `BODY`, `DATA`, `SPACE_1`, `SPACE_2`,
 //! `SIDEBAR_WIDTH`, `FONT_DATA`, `FONT_PROSE_SEMIBOLD` and [`state_glyph`]
 //! itself. Task 3 (the detail header and tab bar) pulled in `DISPLAY`,
-//! `TITLE`, `SPACE_3`, `SPACE_4` and `TAB_UNDERLINE`. What remains genuinely
-//! unused -- `BARK` and `LABEL` -- carries its own narrow
-//! `#[allow(dead_code)]` naming the task that consumes it, so this list
-//! shrinks item by item as tasks 4 and 5 land instead of vanishing all at
-//! once.
+//! `TITLE`, `SPACE_3`, `SPACE_4` and `TAB_UNDERLINE`. Task 4 (the data
+//! panes) pulled in `BARK` (every dependency/member/index row is a raised
+//! surface over the pane's `INK` ground), `LABEL` (the "main"/"group: x"/
+//! "extra: x" section headings), `GLYPH_COLUMN_WIDTH`,
+//! `DEP_NAME_COLUMN_WIDTH` and `DEP_CONSTRAINT_COLUMN_WIDTH`. Nothing in
+//! this module remains unused as of Task 4.
 
 use iced::font::Weight;
 use iced::{Color, Font, Theme, color};
@@ -75,7 +76,6 @@ use iced::{Color, Font, Theme, color};
 /// Ground: near-black with a green cast, not neutral grey.
 pub const INK: Color = color!(0x1B1D1A);
 /// Raised surfaces -- sidebar, drawer, rows.
-#[allow(dead_code, reason = "consumed by task 5 (drawer surface)")]
 pub const BARK: Color = color!(0x242723);
 /// Primary text on [`INK`]; warm, never pure white.
 pub const PARCHMENT: Color = color!(0xE8E4D9);
@@ -115,7 +115,6 @@ pub fn theme() -> Theme {
 // ---------------------------------------------------------------------------
 
 /// Secondary text, disabled labels.
-#[allow(dead_code, reason = "consumed by tasks 4-5 (data panes, editors)")]
 pub const LABEL: f32 = 11.0;
 /// All Plex-set data: versions, constraints, paths, keys, URLs.
 pub const DATA: f32 = 12.0;
@@ -154,6 +153,18 @@ pub const SIDEBAR_WIDTH: f32 = 240.0;
 /// only indicator (no boxes, no pills, no background fill), so the state
 /// glyph column stays the application's one symbolic vocabulary.
 pub const TAB_UNDERLINE: f32 = 2.0;
+/// Width of the state glyph column, fixed at the left of every row in every
+/// pane (sidebar, dependency rows, member rows, index rows) so the label
+/// that follows starts at the same x regardless of which glyph rendered.
+pub const GLYPH_COLUMN_WIDTH: f32 = 20.0;
+/// Package name column width in the Dependencies tab, so the constraint and
+/// version that follow stack in a fixed vertical column across every group
+/// (main, groups, extras) rather than only within one.
+pub const DEP_NAME_COLUMN_WIDTH: f32 = 200.0;
+/// Declared-constraint column width in the Dependencies tab, immediately
+/// after the name column -- the version that follows is what a user
+/// compares character by character, and this is what keeps it aligned.
+pub const DEP_CONSTRAINT_COLUMN_WIDTH: f32 = 100.0;
 
 // ---------------------------------------------------------------------------
 // Fonts

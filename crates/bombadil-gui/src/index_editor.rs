@@ -78,6 +78,7 @@
 //! other half: nothing that flows through `Message` can print it either.
 
 use crate::app::Message;
+use crate::theme;
 use bombadil_core::model::{Config, Index, IndexAuth, IndexKind};
 use bombadil_core::secrets::SecretKey;
 use bombadil_core::validate;
@@ -276,6 +277,19 @@ pub fn selected_are_subset(project_index_names: &[String], indexes: &[Index]) ->
         .all(|name| indexes.iter().any(|index| &index.name == name))
 }
 
+/// Maps one index's row, in a project's own selection checklist, to the
+/// glyph state it should render: [`theme::State::Present`] when the project
+/// has selected it, [`theme::State::Absent`] otherwise. Only two states
+/// apply here -- an index is either opted into or not, with nothing
+/// analogous to "installed but outside the constraint" to give a third.
+pub fn state(project_index_names: &[String], name: &str) -> theme::State {
+    if project_index_names.iter().any(|n| n == name) {
+        theme::State::Present
+    } else {
+        theme::State::Absent
+    }
+}
+
 /// Renders one auth-choice button, disabled (via `on_press_maybe(None)`) when
 /// it already names the row's current choice -- the same "no press needed,
 /// no press possible" treatment `scripts_editor`'s move buttons give the
@@ -302,11 +316,16 @@ fn index_row<'a>(
 ) -> iced::Element<'a, Message> {
     // Enter commits, the same as the row's save button below: typing itself
     // neither persists nor moves the keychain credential -- see
-    // `app::commit_index_edit`.
+    // `app::commit_index_edit`. Both fields are data -- a name and a URL
+    // are compared character by character -- so both render in Plex.
     let name_input = iced::widget::text_input("name", &index.name)
+        .font(theme::FONT_DATA)
+        .size(theme::DATA)
         .on_input(move |v| Message::IndexNameChanged(i, v))
         .on_submit(Message::IndexEditCommitted(i));
     let url_input = iced::widget::text_input("https://...", &index.url)
+        .font(theme::FONT_DATA)
+        .size(theme::DATA)
         .on_input(move |v| Message::IndexUrlChanged(i, v))
         .on_submit(Message::IndexEditCommitted(i));
 
@@ -336,7 +355,7 @@ fn index_row<'a>(
         auth_button("basic", AuthChoice::Basic, current_choice, i),
         auth_button("token", AuthChoice::Token, current_choice, i),
     ]
-    .spacing(4);
+    .spacing(theme::SPACE_1);
 
     let mut row = iced::widget::row![
         name_input,
@@ -345,10 +364,12 @@ fn index_row<'a>(
         default_toggle,
         auth_buttons
     ]
-    .spacing(6);
+    .spacing(theme::SPACE_2);
 
     if let IndexAuth::Basic { username } = &index.auth {
         let username_input = iced::widget::text_input("username", username)
+            .font(theme::FONT_DATA)
+            .size(theme::DATA)
             .on_input(move |v| Message::IndexUsernameChanged(i, v))
             .on_submit(Message::IndexEditCommitted(i));
         row = row.push(username_input);
@@ -361,6 +382,8 @@ fn index_row<'a>(
         // back from the keychain, and rendered `.secure(true)` so even the
         // in-flight text is masked on screen.
         let credential_input = iced::widget::text_input(CREDENTIAL_PLACEHOLDER, draft)
+            .font(theme::FONT_DATA)
+            .size(theme::DATA)
             .secure(true)
             .on_input(move |v| Message::IndexCredentialChanged(i, CredentialInput(v)));
         let can_save = collision.is_none() && !draft.is_empty();
@@ -377,9 +400,13 @@ fn index_row<'a>(
         iced::widget::button(iced::widget::text("remove")).on_press(Message::IndexRemoved(i));
     row = row.push(save).push(remove);
 
-    let mut column = iced::widget::column![row].spacing(2);
+    let mut column = iced::widget::column![row].spacing(theme::SPACE_1);
     if let Some(message) = collision {
-        column = column.push(iced::widget::text(message));
+        // Not one of `BOOT`'s two rationed cases (the drifted glyph, a
+        // destructive confirm) -- this is a save-blocking validation
+        // message, not a third glyph state, so it stays in the default text
+        // colour rather than borrowing the rationed one.
+        column = column.push(iced::widget::text(message).size(theme::BODY));
     }
     column.into()
 }
@@ -392,7 +419,12 @@ pub fn view<'a>(
     selected_project: Option<usize>,
     credential_drafts: &[String],
 ) -> iced::Element<'a, Message> {
-    let mut column = iced::widget::column![iced::widget::text("Indexes").size(16)].spacing(8);
+    let mut column = iced::widget::column![
+        iced::widget::text("Indexes")
+            .font(theme::FONT_PROSE_SEMIBOLD)
+            .size(theme::TITLE)
+    ]
+    .spacing(theme::SPACE_3);
 
     for (i, index) in config.indexes.iter().enumerate() {
         let draft = credential_drafts.get(i).map(String::as_str).unwrap_or("");
@@ -405,14 +437,38 @@ pub fn view<'a>(
     if let Some(i) = selected_project
         && let Some(project) = config.projects.get(i)
     {
-        column = column.push(iced::widget::text("Project indexes").size(14));
+        column = column.push(
+            iced::widget::text("Project indexes")
+                .font(theme::FONT_PROSE)
+                .size(theme::LABEL)
+                .color(theme::SLATE),
+        );
         for index in &config.indexes {
+            let glyph = theme::state_glyph(state(&project.index_names, &index.name));
             let selected = project.index_names.contains(&index.name);
             let name = index.name.clone();
+            // The index name is the checkbox label -- data, the same as any
+            // other name compared character by character, so it renders in
+            // Plex rather than the checkbox's default prose font.
             let checkbox = iced::widget::checkbox(selected)
                 .label(index.name.clone())
+                .font(theme::FONT_DATA)
+                .text_size(theme::DATA)
                 .on_toggle(move |_| Message::ProjectIndexToggled(i, name.clone()));
-            column = column.push(checkbox);
+            let line = iced::widget::row![
+                iced::widget::text(glyph.glyph.to_string())
+                    .size(theme::BODY)
+                    .color(glyph.colour)
+                    .width(theme::GLYPH_COLUMN_WIDTH),
+                checkbox,
+            ]
+            .spacing(theme::SPACE_1);
+            column = column.push(iced::widget::container(line).padding(theme::SPACE_1).style(
+                |_theme| iced::widget::container::Style {
+                    background: Some(iced::Background::Color(theme::BARK)),
+                    ..iced::widget::container::Style::default()
+                },
+            ));
         }
         // Criterion 3's invariant, stated rather than only silently relied
         // on: `banner::view` already reports a stale reference by name
@@ -421,9 +477,10 @@ pub fn view<'a>(
         // directly-testable guard this tab's own selection state has to
         // keep satisfying, not a second copy of that user-facing message.
         if !selected_are_subset(&project.index_names, &config.indexes) {
-            column = column.push(iced::widget::text(
-                "this project selects an index that no longer exists",
-            ));
+            column = column.push(
+                iced::widget::text("this project selects an index that no longer exists")
+                    .size(theme::BODY),
+            );
         }
     }
 
@@ -717,5 +774,20 @@ mod tests {
         // something that looks like it discloses a stored value.
         assert!(!CREDENTIAL_PLACEHOLDER.is_empty());
         assert!(!CREDENTIAL_PLACEHOLDER.to_lowercase().contains("hunter"));
+    }
+
+    // --- state: the glyph mapping for one index's row in a project's
+    // selection. Only two states apply here -- see the module doc's
+    // criterion 3: a project's selection is a subset of `Config::indexes`,
+    // never an installed/drifted distinction. ---
+
+    #[test]
+    fn a_selected_index_is_present() {
+        assert_eq!(state(&["priv".to_string()], "priv"), theme::State::Present);
+    }
+
+    #[test]
+    fn an_unselected_index_is_absent() {
+        assert_eq!(state(&["public".to_string()], "priv"), theme::State::Absent);
     }
 }

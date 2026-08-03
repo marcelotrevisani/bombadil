@@ -15,6 +15,9 @@ use bombadil_core::pyproject::{GroupEntry, PyProject};
 use bombadil_core::uv::results::{DependencyGraph, InstalledPackage, TreeOutcome, TreePackage};
 use std::collections::BTreeSet;
 
+use crate::interpreter;
+use crate::theme;
+
 /// Which bucket a row belongs to. `Main` is `[project.dependencies]`; `Group`
 /// is a PEP 735 entry under `[dependency-groups]`; `Extra` is an entry under
 /// `[project.optional-dependencies]`. Kept distinct rather than flattened --
@@ -304,12 +307,125 @@ pub fn unavailable_message(cause: &str) -> String {
     format!("could not read this project's environment: {cause}")
 }
 
+/// Maps one dependency row to the glyph state it should render.
+///
+/// - Not installed: [`theme::State::Absent`] -- declared, not installed
+///   (criterion 1's exact "needs a `uv sync`" row), and equally a leftover
+///   with no constraint to violate in the first place has nothing to be
+///   absent *from*, so this only ever fires for a genuinely uninstalled
+///   package.
+/// - Installed, and the installed version satisfies the declared
+///   constraint (or there is no constraint to check, e.g. an undeclared
+///   leftover or a bare `"typer"` requirement): [`theme::State::Present`].
+/// - Installed, but outside the declared constraint:
+///   [`theme::State::Drifted`] -- a package installed at a version the
+///   manifest forbids is a different problem from one that is missing, and
+///   this is the state that says so.
+///
+/// Reuses `interpreter::version_satisfies` rather than a second comparator.
+/// A dependency constraint (`">=0.27"`, `"~=1.2"`, ...) is the same PEP 440
+/// specifier grammar `requires-python` uses, so the same parser applies
+/// directly -- no forked rule, no second parser. That includes its fallback
+/// direction: a constraint this parser cannot read (PEP 440's `<`, `<=`,
+/// `!=`, `===`, an epoch, a local version) is treated as satisfied, not as a
+/// mismatch, so a working package is never marked drifted just because its
+/// constraint used syntax outside the subset that parser handles.
+pub fn state(row: &DepRow) -> theme::State {
+    match &row.version {
+        None => theme::State::Absent,
+        Some(version) => {
+            if interpreter::version_satisfies(version, row.constraint.as_deref()) {
+                theme::State::Present
+            } else {
+                theme::State::Drifted
+            }
+        }
+    }
+}
+
+/// Renders one dependency row: the state glyph, then name, constraint and
+/// version in fixed-width columns so the mono-set constraints and versions
+/// stack vertically across the whole tab, not just within one group --
+/// `theme::DEP_NAME_COLUMN_WIDTH`/`DEP_CONSTRAINT_COLUMN_WIDTH` are the grid
+/// every row in every group shares. The row itself sits on a `bark` raised
+/// surface over the pane's `ink` ground, the same treatment every row in
+/// every pane gets.
+///
+/// Package names are data too (the plan's own instruction: a user compares
+/// them character by character), so the name column is Plex like the
+/// constraint and version columns. Only the placeholder words a real value
+/// is missing -- `"not installed"`, `"(not declared)"` -- switch to the
+/// prose face, the same exception `sidebar::view` already makes for
+/// `"no env"`.
+fn dep_row<'a>(row: &DepRow) -> iced::Element<'a, crate::app::Message> {
+    let glyph = theme::state_glyph(state(row));
+
+    let name = iced::widget::text(row.name.clone())
+        .font(theme::FONT_DATA)
+        .size(theme::DATA)
+        .width(theme::DEP_NAME_COLUMN_WIDTH);
+
+    let constraint: iced::Element<'_, crate::app::Message> = match &row.constraint {
+        Some(constraint) => iced::widget::text(constraint.clone())
+            .font(theme::FONT_DATA)
+            .size(theme::DATA)
+            .color(theme::SLATE)
+            .into(),
+        None => iced::widget::text("-")
+            .font(theme::FONT_PROSE)
+            .size(theme::DATA)
+            .color(theme::SLATE)
+            .into(),
+    };
+    let constraint = iced::widget::container(constraint).width(theme::DEP_CONSTRAINT_COLUMN_WIDTH);
+
+    let version: iced::Element<'_, crate::app::Message> = match &row.version {
+        Some(version) => iced::widget::text(version.clone())
+            .font(theme::FONT_DATA)
+            .size(theme::DATA)
+            .into(),
+        None => iced::widget::text("not installed")
+            .font(theme::FONT_PROSE)
+            .size(theme::DATA)
+            .color(theme::SLATE)
+            .into(),
+    };
+
+    let mut line = iced::widget::row![
+        iced::widget::text(glyph.glyph.to_string())
+            .size(theme::BODY)
+            .color(glyph.colour)
+            .width(theme::GLYPH_COLUMN_WIDTH),
+        name,
+        constraint,
+        version,
+    ]
+    .spacing(theme::SPACE_1);
+
+    if !row.declared {
+        line = line.push(
+            iced::widget::text("(not declared)")
+                .font(theme::FONT_PROSE)
+                .size(theme::DATA)
+                .color(theme::SLATE),
+        );
+    }
+
+    iced::widget::container(line)
+        .padding(theme::SPACE_1)
+        .style(|_theme| iced::widget::container::Style {
+            background: Some(iced::Background::Color(theme::BARK)),
+            ..iced::widget::container::Style::default()
+        })
+        .into()
+}
+
 /// Renders the tab, or -- for a fetch that failed -- [`unavailable_message`]
 /// alone, with no rows at all: a row claiming a version, or the absence of
 /// one, would be a claim this fetch is in no position to make.
 ///
 /// Deliberately dumb, like every other `view` in this crate: all the logic
-/// worth testing lives in `build`, `unavailable_message`,
+/// worth testing lives in `build`, `state`, `unavailable_message`,
 /// `transitive_dependencies` and `find_id_by_name`. A direct dependency's
 /// transitive tree, when `tab.graph` has one, is shown beneath it
 /// unconditionally rather than behind a click -- `App` carries no per-row
@@ -318,12 +434,25 @@ pub fn unavailable_message(cause: &str) -> String {
 pub fn view<'a>(fetched: &Result<DepsTab, String>) -> iced::Element<'a, crate::app::Message> {
     let tab = match fetched {
         Ok(tab) => tab,
-        Err(cause) => return iced::widget::text(unavailable_message(cause)).into(),
+        Err(cause) => {
+            return iced::widget::text(unavailable_message(cause))
+                .size(theme::BODY)
+                .into();
+        }
     };
-    let mut column = iced::widget::column![].spacing(12);
+    let mut column = iced::widget::column![].spacing(theme::SPACE_3);
 
     if let Some(note) = &tab.tree_note {
-        column = column.push(iced::widget::text(note.clone()));
+        // Not one of `BOOT`'s rationed cases (a missing venv, a declared but
+        // uninstalled dependency, a member syncing will remove, a
+        // destructive confirm) -- an unreadable tree still shows every
+        // direct dependency's row above, so this is informational, not an
+        // alarm.
+        column = column.push(
+            iced::widget::text(note.clone())
+                .size(theme::BODY)
+                .color(theme::SLATE),
+        );
     }
 
     for group in &tab.groups {
@@ -332,23 +461,34 @@ pub fn view<'a>(fetched: &Result<DepsTab, String>) -> iced::Element<'a, crate::a
             GroupKind::Group(name) => format!("group: {name}"),
             GroupKind::Extra(name) => format!("extra: {name}"),
         };
-        let mut rows = iced::widget::column![iced::widget::text(title).size(16)].spacing(2);
+        let mut rows = iced::widget::column![
+            iced::widget::text(title)
+                .font(theme::FONT_PROSE)
+                .size(theme::LABEL)
+                .color(theme::SLATE)
+        ]
+        .spacing(theme::SPACE_1);
         for row in &group.rows {
-            let constraint = row.constraint.as_deref().unwrap_or("-");
-            let version = row.version.as_deref().unwrap_or("(not installed)");
-            let suffix = if row.declared { "" } else { " (not declared)" };
-            rows = rows.push(iced::widget::text(format!(
-                "{}  {constraint}  {version}{suffix}",
-                row.name
-            )));
+            rows = rows.push(dep_row(row));
 
             if let Some(graph) = &tab.graph
                 && let Some(id) = find_id_by_name(graph, &row.name)
             {
                 for dep in transitive_dependencies(graph, id) {
                     rows = rows.push(
-                        iced::widget::text(format!("    \u{2514} {} {}", dep.name, dep.version))
-                            .size(13),
+                        iced::widget::row![
+                            iced::widget::Space::new().width(theme::GLYPH_COLUMN_WIDTH),
+                            iced::widget::text(format!("\u{2514} {}", dep.name))
+                                .font(theme::FONT_DATA)
+                                .size(theme::LABEL)
+                                .color(theme::SLATE)
+                                .width(theme::DEP_NAME_COLUMN_WIDTH),
+                            iced::widget::text(dep.version.clone())
+                                .font(theme::FONT_DATA)
+                                .size(theme::LABEL)
+                                .color(theme::SLATE),
+                        ]
+                        .spacing(theme::SPACE_1),
                     );
                 }
             }
@@ -785,5 +925,58 @@ mod tests {
         let graph = graph_with_chain();
         assert_eq!(find_id_by_name(&graph, "HTTPX"), Some("httpx"));
         assert_eq!(find_id_by_name(&graph, "nonexistent"), None);
+    }
+
+    // --- state: the glyph mapping for one dependency row ---
+
+    fn row(constraint: Option<&str>, version: Option<&str>) -> DepRow {
+        DepRow {
+            name: "httpx".to_string(),
+            constraint: constraint.map(String::from),
+            version: version.map(String::from),
+            declared: true,
+        }
+    }
+
+    #[test]
+    fn a_declared_and_installed_package_satisfying_its_constraint_is_present() {
+        assert_eq!(
+            state(&row(Some(">=0.27"), Some("0.27.2"))),
+            theme::State::Present
+        );
+    }
+
+    #[test]
+    fn a_declared_but_uninstalled_package_is_absent() {
+        assert_eq!(state(&row(Some(">=0.27"), None)), theme::State::Absent);
+    }
+
+    #[test]
+    fn an_installed_package_outside_its_declared_constraint_is_drifted() {
+        // The bug this glyph exists to catch: installed at a version the
+        // manifest forbids is a different problem from missing entirely.
+        assert_eq!(
+            state(&row(Some(">=0.27"), Some("0.26.0"))),
+            theme::State::Drifted
+        );
+    }
+
+    #[test]
+    fn an_installed_package_with_no_declared_constraint_is_present() {
+        // A leftover -- installed but not declared anywhere -- has nothing
+        // to violate, so it reads as agreeing rather than drifted.
+        assert_eq!(state(&row(None, Some("4.14.2"))), theme::State::Present);
+    }
+
+    #[test]
+    fn an_unparseable_constraint_falls_back_to_present_not_drifted() {
+        // Same fallback direction as `interpreter::version_satisfies` and
+        // `sidebar::state`: a constraint this parser cannot read must never
+        // read as "does not satisfy". Marking a working package drifted on a
+        // parse failure would be a false alarm.
+        assert_eq!(
+            state(&row(Some("<3.13"), Some("3.9.18"))),
+            theme::State::Present
+        );
     }
 }
