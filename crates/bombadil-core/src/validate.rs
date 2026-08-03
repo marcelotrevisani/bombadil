@@ -149,7 +149,9 @@ pub fn validate(config: &Config) -> Vec<Problem> {
 #[cfg(test)]
 mod tests {
     use super::{index_credential_var, validate};
-    use crate::model::{Config, EnvVar, Index, IndexAuth, IndexKind, Project, VenvLocation};
+    use crate::model::{
+        Config, EnvVar, Environment, Index, IndexAuth, IndexKind, Project, VenvLocation,
+    };
     use std::path::PathBuf;
 
     fn index(name: &str, kind: IndexKind) -> Index {
@@ -167,7 +169,11 @@ mod tests {
             label: "p".into(),
             pyproject_path: PathBuf::from("/p/pyproject.toml"),
             index_names,
-            venv: VenvLocation::Alongside,
+            environments: vec![Environment {
+                location: VenvLocation::Alongside,
+                ..Environment::default()
+            }],
+            active: VenvLocation::Alongside,
             ..Project::default()
         }
     }

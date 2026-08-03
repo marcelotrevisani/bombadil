@@ -315,7 +315,8 @@ fn environments_panel<'a>(config: &Config, project_index: usize) -> iced::Elemen
     // Recomputed every render from the choice above, the same "recompute,
     // don't cache" trick the add-project dialog uses, so it tracks a change
     // the instant it lands rather than at the next open.
-    let resolved = bombadil_core::venv_path::resolve(project, &config.settings)
+    let environment = project.active_environment().cloned().unwrap_or_default();
+    let resolved = bombadil_core::venv_path::resolve(project, &environment, &config.settings)
         .map(|path| path.display().to_string())
         .unwrap_or_else(|err| err.to_string());
 
@@ -326,17 +327,17 @@ fn environments_panel<'a>(config: &Config, project_index: usize) -> iced::Elemen
         iced::widget::row![
             choice(
                 "Follow the global default",
-                project.venv == VenvLocation::Default,
+                project.active == VenvLocation::Default,
                 Message::PreferencesProjectVenvSelected(id, VenvLocation::Default),
             ),
             choice(
                 "Alongside the manifest",
-                project.venv == VenvLocation::Alongside,
+                project.active == VenvLocation::Alongside,
                 Message::PreferencesProjectVenvSelected(id, VenvLocation::Alongside),
             ),
             choice(
                 "Chosen folder...",
-                matches!(project.venv, VenvLocation::Custom { .. }),
+                matches!(project.active, VenvLocation::Custom { .. }),
                 Message::PreferencesProjectVenvPickFolderRequested(id),
             ),
         ]
@@ -382,9 +383,11 @@ fn python_panel<'a>(
     project_index: Option<usize>,
 ) -> iced::Element<'a, Message> {
     let project = project_index.and_then(|i| config.projects.get(i));
-    let inheriting = project.is_some_and(|p| p.python == bombadil_core::model::Override::Inherit);
-    let effective = match project {
-        Some(project) => project.python.resolve(&config.settings.python).clone(),
+    // The pin lives on the active environment now. Task 5 turns this panel
+    // into a per-environment editor; until then it edits the active one.
+    let inheriting = false;
+    let effective = match project.and_then(|p| p.active_environment()) {
+        Some(environment) => environment.python.clone(),
         None => config.settings.python.clone(),
     };
     let current = match &effective {

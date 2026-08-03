@@ -118,14 +118,24 @@ pub fn resolved_default_venv_paths(
     projects: &[Project],
     settings: &Settings,
 ) -> Vec<(String, Result<PathBuf, String>)> {
+    // Every environment that follows the global default, not just one per
+    // project: a project can now have several, and only some of them may be
+    // on `Default`. Naming the project alone would say a change affects it
+    // wholesale when it moves one of its environments.
     projects
         .iter()
-        .filter(|p| matches!(p.venv, VenvLocation::Default))
-        .map(|p| {
-            (
-                p.label.clone(),
-                venv_path::resolve(p, settings).map_err(|e| e.to_string()),
-            )
+        .flat_map(|project| {
+            project
+                .environments
+                .iter()
+                .filter(|environment| matches!(environment.location, VenvLocation::Default))
+                .map(move |environment| {
+                    (
+                        project.label.clone(),
+                        venv_path::resolve(project, environment, settings)
+                            .map_err(|e| e.to_string()),
+                    )
+                })
         })
         .collect()
 }
@@ -273,6 +283,7 @@ pub fn global_view<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bombadil_core::model::{Environment, PythonPin};
     use std::path::PathBuf;
     use uuid::Uuid;
 
@@ -281,7 +292,11 @@ mod tests {
             id: Uuid::from_u128(1),
             label: label.into(),
             pyproject_path: PathBuf::from(dir).join("pyproject.toml"),
-            venv,
+            environments: vec![Environment {
+                location: venv.clone(),
+                python: PythonPin::Unpinned,
+            }],
+            active: venv,
             ..Project::default()
         }
     }

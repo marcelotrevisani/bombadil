@@ -9,7 +9,7 @@
 # `src/store/mod.rs`, which asserts the resulting `Config` equals an
 # independently hand-built expected value.
 
-schema_version = 1
+schema_version = 2
 
 [settings.uv_source]
 kind = "custom"
@@ -63,9 +63,32 @@ pyproject_path = "/proj/my-api/pyproject.toml"
 index_names = ["priv", "extra"]
 
 # A project-level venv override, distinct from the global Central setting above.
-[projects.venv]
+# Two environments, because that is the shape version 2 exists to carry: a
+# fixture with one could not catch a serialiser that only ever wrote the
+# first. `active` names one of them by location -- never by index, since this
+# list is edited while the application runs.
+expanded = false
+
+[[projects.environments]]
+
+[projects.environments.location]
 kind = "custom"
 path = "/mnt/envs/my-api"
+
+[projects.environments.python]
+kind = "version"
+value = "3.11"
+
+[[projects.environments]]
+
+[projects.environments.location]
+kind = "alongside"
+
+[projects.environments.python]
+kind = "unpinned"
+
+[projects.active]
+kind = "alongside"
 
 # A secret var: value must be empty on disk, the real value lives in the keychain.
 [[projects.env]]
@@ -92,16 +115,10 @@ origin = "added"
 selected = false
 name = "shared-lib"
 
-# Per-project overrides. `kind = "inherit"` is the other shape of each, and
-# is what an absent field loads as -- which is what keeps a config written
-# before these existed loading unchanged.
-[projects.python]
-kind = "set"
-
-[projects.python.value]
-kind = "version"
-value = "3.11"
-
+# Per-project overrides. `kind = "inherit"` is the other shape, and is what an
+# absent field loads as -- which is what keeps a config written before these
+# existed loading unchanged. The interpreter pin is NOT here in version 2: it
+# lives on each environment above.
 [projects.uv_source]
 kind = "set"
 

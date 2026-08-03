@@ -793,7 +793,8 @@ fn probe_every_venv(app: &App) -> Task<Message> {
             .iter()
             .enumerate()
             .filter_map(|(i, project)| {
-                let path = venv_path::resolve(project, &app.config.settings).ok()?;
+                let environment = project.active_environment()?;
+                let path = venv_path::resolve(project, environment, &app.config.settings).ok()?;
                 let pyproject_path = project.pyproject_path.clone();
                 Some(Task::perform(
                     probe_venv_and_requirement(path, pyproject_path),
@@ -878,7 +879,8 @@ fn deps_command_context(project: &Project, config: &Config) -> Option<uv::comman
         .pyproject_path
         .parent()
         .filter(|p| !p.as_os_str().is_empty())?;
-    let venv_path = venv_path::resolve(project, &config.settings).ok()?;
+    let venv_path =
+        venv_path::resolve(project, project.active_environment()?, &config.settings).ok()?;
     Some(uv::command::ProjectContext {
         project_dir: project_dir.to_path_buf(),
         venv_path,
@@ -1172,7 +1174,9 @@ pub fn update(app: &mut App, message: Message, runner: Arc<dyn CommandRunner>) -
                 if sync_would_delete(&pin, venv_version.as_deref())
                     && let PythonPin::Version(to) = &pin
                     && let Some(from) = &venv_version
-                    && let Ok(venv_path) = venv_path::resolve(&project, &app.config.settings)
+                    && let Some(environment) = project.active_environment()
+                    && let Ok(venv_path) =
+                        venv_path::resolve(&project, environment, &app.config.settings)
                 {
                     app.confirm_pin_change = Some(context_menu::ConfirmPinChange {
                         project_id: project.id,
@@ -1333,7 +1337,7 @@ pub fn update(app: &mut App, message: Message, runner: Arc<dyn CommandRunner>) -
         }
         Message::AddProjectConfirmed => {
             if let Some(draft) = app.add_project.take() {
-                let project = add_project::to_project(&draft);
+                let project = add_project::to_project(&draft, &app.config.settings);
                 let python_version = interpreter::preselect(
                     draft.interpreters.available(),
                     draft.requires_python.as_deref(),
@@ -1416,7 +1420,8 @@ pub fn update(app: &mut App, message: Message, runner: Arc<dyn CommandRunner>) -
             // other project's venv status, rather than trusting `success` to
             // imply a venv now exists.
             if let Some(project) = app.config.projects.get(index).cloned()
-                && let Ok(path) = venv_path::resolve(&project, &app.config.settings)
+                && let Some(environment) = project.active_environment()
+                && let Ok(path) = venv_path::resolve(&project, environment, &app.config.settings)
             {
                 let pyproject_path = project.pyproject_path.clone();
                 return Task::perform(
@@ -1570,7 +1575,9 @@ pub fn update(app: &mut App, message: Message, runner: Arc<dyn CommandRunner>) -
         Message::RecreateVenvRequested(i) => {
             app.context_menu = None;
             if let Some(project) = app.config.projects.get(i)
-                && let Ok(venv_path) = venv_path::resolve(project, &app.config.settings)
+                && let Some(environment) = project.active_environment()
+                && let Ok(venv_path) =
+                    venv_path::resolve(project, environment, &app.config.settings)
             {
                 app.confirm_recreate = Some(context_menu::ConfirmRecreate {
                     project_id: project.id,
@@ -1717,10 +1724,25 @@ pub fn update(app: &mut App, message: Message, runner: Arc<dyn CommandRunner>) -
             match scope {
                 preferences::Scope::Global => app.config.settings.python = pin,
                 preferences::Scope::Project(id) => {
+                    // Onto the active environment, which is where the pin
+                    // lives now. A project no longer has one of its own.
                     let Some(project) = app.config.projects.iter_mut().find(|p| p.id == id) else {
                         return Task::none();
                     };
-                    project.python = Override::Set(pin);
+                    let active = project.active.clone();
+                    let index = project
+                        .environments
+                        .iter()
+                        .position(|environment| environment.location == active)
+                        .or(if project.environments.is_empty() {
+                            None
+                        } else {
+                            Some(0)
+                        });
+                    let Some(index) = index else {
+                        return Task::none();
+                    };
+                    project.environments[index].python = pin;
                 }
             }
             return persist_env_edit(app);
@@ -1758,7 +1780,21 @@ pub fn update(app: &mut App, message: Message, runner: Arc<dyn CommandRunner>) -
             let Some(project) = app.config.projects.iter_mut().find(|p| p.id == id) else {
                 return Task::none();
             };
-            project.venv = location;
+            project.active = location.clone();
+            if let Some(environment) = project
+                .environments
+                .iter_mut()
+                .find(|environment| environment.location == location)
+            {
+                let _ = environment;
+            } else {
+                project
+                    .environments
+                    .push(bombadil_core::model::Environment {
+                        location,
+                        python: PythonPin::Unpinned,
+                    });
+            }
             // Re-probed, not just persisted: the sidebar's venv status
             // describes wherever each project resolved when it was last
             // probed, and this just moved that. The same reasoning the global
@@ -1776,7 +1812,20 @@ pub fn update(app: &mut App, message: Message, runner: Arc<dyn CommandRunner>) -
             let Some(project) = app.config.projects.iter_mut().find(|p| p.id == id) else {
                 return Task::none();
             };
-            project.venv = VenvLocation::Custom { path };
+            let location = VenvLocation::Custom { path };
+            project.active = location.clone();
+            if !project
+                .environments
+                .iter()
+                .any(|environment| environment.location == location)
+            {
+                project
+                    .environments
+                    .push(bombadil_core::model::Environment {
+                        location,
+                        python: PythonPin::Unpinned,
+                    });
+            }
             return Task::batch([persist_env_edit(app), probe_every_venv(app)]);
         }
         Message::PreferencesInheritToggled(scope, section) => {
@@ -1794,7 +1843,10 @@ pub fn update(app: &mut App, message: Message, runner: Arc<dyn CommandRunner>) -
                 return Task::none();
             };
             match section {
-                preferences::Section::Python => project.python = Override::Inherit,
+                // The pin is per environment now, and an environment either
+                // has one or does not -- there is nothing above it to inherit
+                // from. Task 5 replaces this control for the Python section.
+                preferences::Section::Python => return Task::none(),
                 preferences::Section::Uv => project.uv_source = Override::Inherit,
                 preferences::Section::Terminal => {
                     project.terminals.remove(&Os::host());
@@ -2783,7 +2835,10 @@ fn run_sync(
     // `match`, not `let ... else`: the error names the offending path, and
     // "could not resolve a virtual environment path" tells the user nothing
     // they can act on.
-    let venv_path = match venv_path::resolve(project, &config.settings) {
+    let Some(environment) = project.active_environment().cloned() else {
+        return (false, vec!["this project has no environment".to_string()]);
+    };
+    let venv_path = match venv_path::resolve(project, &environment, &config.settings) {
         Ok(path) => path,
         Err(err) => return (false, vec![err.to_string()]),
     };
@@ -2848,7 +2903,10 @@ fn run_members_sync(
     else {
         return (false, vec!["no project directory to run uv in".to_string()]);
     };
-    let venv_path = match venv_path::resolve(project, &config.settings) {
+    let Some(environment) = project.active_environment().cloned() else {
+        return (false, vec!["this project has no environment".to_string()]);
+    };
+    let venv_path = match venv_path::resolve(project, &environment, &config.settings) {
         Ok(path) => path,
         Err(err) => return (false, vec![err.to_string()]),
     };
@@ -2921,7 +2979,10 @@ fn run_recreate_venv(
     on_line: &mut dyn FnMut(String),
     delete: impl Fn(&Path) -> Result<(), String>,
 ) -> (bool, Vec<String>) {
-    let venv_path = match venv_path::resolve(project, &config.settings) {
+    let Some(environment) = project.active_environment().cloned() else {
+        return (false, vec!["this project has no environment".to_string()]);
+    };
+    let venv_path = match venv_path::resolve(project, &environment, &config.settings) {
         Ok(path) => path,
         Err(err) => return (false, vec![err.to_string()]),
     };
@@ -2959,7 +3020,11 @@ fn recreate_venv(
                 &KeyringSecretStore::new(),
                 runner.as_ref(),
                 on_line,
-                |path| venv_path::delete(target, &settings, path).map_err(|err| err.to_string()),
+                |path| {
+                    let environment = target.active_environment().cloned().unwrap_or_default();
+                    venv_path::delete(target, &environment, &settings, path)
+                        .map_err(|e| e.to_string())
+                },
             )
         },
         "recreating the environment timed out",
@@ -2989,7 +3054,10 @@ fn run_confirm_add_project(
         return (false, vec![err]);
     }
 
-    let venv_path = match venv_path::resolve(project, &config.settings) {
+    let Some(environment) = project.active_environment().cloned() else {
+        return (false, vec!["this project has no environment".to_string()]);
+    };
+    let venv_path = match venv_path::resolve(project, &environment, &config.settings) {
         Ok(path) => path,
         Err(err) => return (false, vec![err.to_string()]),
     };
@@ -3189,7 +3257,12 @@ fn run_open_terminal(
     runner: &dyn CommandRunner,
     scratch_dir: &Path,
 ) -> Result<(), String> {
-    let venv_path = venv_path::resolve(project, &config.settings).map_err(|e| e.to_string())?;
+    let environment = project
+        .active_environment()
+        .cloned()
+        .ok_or_else(|| "this project has no environment".to_string())?;
+    let venv_path =
+        venv_path::resolve(project, &environment, &config.settings).map_err(|e| e.to_string())?;
     let inputs = EnvInputs {
         parent: std::env::vars().collect(),
         config: config.clone(),
@@ -4661,7 +4734,11 @@ mod tests {
     #[test]
     fn a_pinned_project_syncs_with_that_interpreter() {
         let project = Project {
-            python: bombadil_core::model::Override::Set(PythonPin::Version("3.12".into())),
+            environments: vec![bombadil_core::model::Environment {
+                location: VenvLocation::Alongside,
+                python: PythonPin::Version("3.12".into()),
+            }],
+            active: VenvLocation::Alongside,
             ..project("api")
         };
         let config = Config {
@@ -4774,7 +4851,11 @@ mod tests {
         // The whole point of the task: the press opens a confirmation instead
         // of dispatching, and dispatches nothing at all until it is answered.
         let project = Project {
-            python: bombadil_core::model::Override::Set(PythonPin::Version("3.12".into())),
+            environments: vec![bombadil_core::model::Environment {
+                location: VenvLocation::Alongside,
+                python: PythonPin::Version("3.12".into()),
+            }],
+            active: VenvLocation::Alongside,
             ..project("api")
         };
         let mut app = App::new(Config {
@@ -4803,7 +4884,11 @@ mod tests {
         // The other half: the guard must not stand in front of an ordinary
         // sync. A confirmation on every press is one the user stops reading.
         let project = Project {
-            python: bombadil_core::model::Override::Set(PythonPin::Version("3.12".into())),
+            environments: vec![bombadil_core::model::Environment {
+                location: VenvLocation::Alongside,
+                python: PythonPin::Version("3.12".into()),
+            }],
+            active: VenvLocation::Alongside,
             ..project("api")
         };
         let mut app = App::new(Config {
@@ -6767,10 +6852,16 @@ mod tests {
         // along. Deriving it keeps the whole path asserted -- the message has
         // to name which environment is gone, and a central-store venv is a
         // hashed directory the user has never seen.
-        let expected = venv_path::resolve(&project, &config.settings)
-            .expect("this project's venv path must resolve")
-            .display()
-            .to_string();
+        let expected = venv_path::resolve(
+            &project,
+            project
+                .active_environment()
+                .expect("this project has an environment"),
+            &config.settings,
+        )
+        .expect("this project's venv path must resolve")
+        .display()
+        .to_string();
         assert!(
             joined.contains(&expected) && joined.contains("deleted"),
             "the user must be told the environment was deleted and not rebuilt; \
@@ -7010,47 +7101,15 @@ mod tests {
         );
 
         assert_eq!(
-            app.config.projects[0].python,
-            Override::Set(PythonPin::Version("3.11".into()))
+            app.config.projects[0]
+                .active_environment()
+                .map(|e| e.python.clone()),
+            Some(PythonPin::Version("3.11".into()))
         );
         assert_eq!(
             app.config.settings.python,
             PythonPin::Version("3.12".into()),
             "a project override must not write into the global value"
-        );
-    }
-
-    #[test]
-    fn toggling_inherit_back_on_discards_the_override_not_the_global() {
-        let mut app = App::new(Config {
-            projects: vec![project("api")],
-            settings: Settings {
-                python: PythonPin::Version("3.12".into()),
-                ..Settings::default()
-            },
-            ..Config::default()
-        });
-        let id = app.config.projects[0].id;
-        app.config.projects[0].python = Override::Set(PythonPin::Version("3.11".into()));
-
-        let _ = update(
-            &mut app,
-            Message::PreferencesSectionOpened(preferences::Section::default()),
-            unused_runner(),
-        );
-        let _ = update(
-            &mut app,
-            Message::PreferencesInheritToggled(
-                preferences::Scope::Project(id),
-                preferences::Section::Python,
-            ),
-            unused_runner(),
-        );
-
-        assert_eq!(app.config.projects[0].python, Override::Inherit);
-        assert_eq!(
-            app.config.settings.python,
-            PythonPin::Version("3.12".into())
         );
     }
 
@@ -7077,7 +7136,12 @@ mod tests {
             unused_runner(),
         );
 
-        assert_eq!(app.config.projects[0].python, Override::Inherit);
+        assert_eq!(
+            app.config.projects[0]
+                .active_environment()
+                .map(|e| e.python.clone()),
+            Some(PythonPin::Unpinned)
+        );
         assert_eq!(app.config.settings.python, PythonPin::Unpinned);
     }
 
@@ -7104,7 +7168,7 @@ mod tests {
         );
 
         assert_eq!(
-            app.config.projects[0].venv,
+            app.config.projects[0].active,
             VenvLocation::Custom {
                 path: std::path::PathBuf::from("/envs/api")
             }
@@ -7122,7 +7186,11 @@ mod tests {
         // to an empty path.
         let mut app = App::new(Config {
             projects: vec![Project {
-                venv: VenvLocation::Alongside,
+                environments: vec![bombadil_core::model::Environment {
+                    location: VenvLocation::Alongside,
+                    python: PythonPin::Unpinned,
+                }],
+                active: VenvLocation::Alongside,
                 ..project("api")
             }],
             ..Config::default()
@@ -7135,7 +7203,7 @@ mod tests {
             unused_runner(),
         );
 
-        assert_eq!(app.config.projects[0].venv, VenvLocation::Alongside);
+        assert_eq!(app.config.projects[0].active, VenvLocation::Alongside);
         assert_eq!(task.units(), 0, "cancelling must change nothing");
     }
 
@@ -7149,7 +7217,7 @@ mod tests {
         // Captured rather than hardcoded: the `project` helper picks a
         // location of its own, and asserting a literal here tests the helper
         // instead of the behaviour.
-        let before = app.config.projects[0].venv.clone();
+        let before = app.config.projects[0].active.clone();
         let task = update(
             &mut app,
             Message::PreferencesProjectVenvSelected(
@@ -7161,7 +7229,7 @@ mod tests {
             unused_runner(),
         );
 
-        assert_eq!(app.config.projects[0].venv, before);
+        assert_eq!(app.config.projects[0].active, before);
         assert_eq!(task.units(), 0);
     }
 
@@ -9149,7 +9217,11 @@ mod tests {
     #[test]
     fn changing_the_default_venv_location_changes_the_resolved_path_for_a_default_project() {
         let project_at = |dir: &Path| Project {
-            venv: bombadil_core::model::VenvLocation::Default,
+            environments: vec![bombadil_core::model::Environment {
+                location: bombadil_core::model::VenvLocation::Default,
+                python: PythonPin::Unpinned,
+            }],
+            active: bombadil_core::model::VenvLocation::Default,
             pyproject_path: dir.join("pyproject.toml"),
             ..project("api")
         };
@@ -9162,7 +9234,14 @@ mod tests {
             },
             ..Config::default()
         });
-        let before = venv_path::resolve(&app.config.projects[0], &app.config.settings).unwrap();
+        let before = venv_path::resolve(
+            &app.config.projects[0],
+            app.config.projects[0]
+                .active_environment()
+                .expect("this project has an environment"),
+            &app.config.settings,
+        )
+        .unwrap();
         assert_eq!(before, dir.path().join(".venv"));
 
         let central = tempfile::tempdir().unwrap();
@@ -9178,7 +9257,14 @@ mod tests {
                 path: central.path().to_path_buf()
             }
         );
-        let after = venv_path::resolve(&app.config.projects[0], &app.config.settings).unwrap();
+        let after = venv_path::resolve(
+            &app.config.projects[0],
+            app.config.projects[0]
+                .active_environment()
+                .expect("this project has an environment"),
+            &app.config.settings,
+        )
+        .unwrap();
         assert_ne!(
             after, before,
             "the resolved path for a Default project must change with the setting"
@@ -9201,7 +9287,11 @@ mod tests {
         // `AddProjectConfirmFinished` already re-dispatches for exactly this
         // reason.
         let default_project = |label: &str| Project {
-            venv: bombadil_core::model::VenvLocation::Default,
+            environments: vec![bombadil_core::model::Environment {
+                location: bombadil_core::model::VenvLocation::Default,
+                python: PythonPin::Unpinned,
+            }],
+            active: bombadil_core::model::VenvLocation::Default,
             ..project(label)
         };
         let mut app = App::new(Config {
@@ -9257,7 +9347,11 @@ mod tests {
 
         let mut app = App::new(Config {
             projects: vec![Project {
-                venv: bombadil_core::model::VenvLocation::Default,
+                environments: vec![bombadil_core::model::Environment {
+                    location: bombadil_core::model::VenvLocation::Default,
+                    python: PythonPin::Unpinned,
+                }],
+                active: bombadil_core::model::VenvLocation::Default,
                 pyproject_path: dir.path().join("pyproject.toml"),
                 ..project("api")
             }],
@@ -9276,7 +9370,14 @@ mod tests {
             fake.clone(),
         );
 
-        let new_path = venv_path::resolve(&app.config.projects[0], &app.config.settings).unwrap();
+        let new_path = venv_path::resolve(
+            &app.config.projects[0],
+            app.config.projects[0]
+                .active_environment()
+                .expect("this project has an environment"),
+            &app.config.settings,
+        )
+        .unwrap();
         assert!(
             old_venv.exists() && old_venv.join("pyvenv.cfg").exists(),
             "the venv at the OLD resolved location must survive the settings change untouched"
@@ -9320,7 +9421,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut app = App::new(Config {
             projects: vec![Project {
-                venv: bombadil_core::model::VenvLocation::Default,
+                environments: vec![bombadil_core::model::Environment {
+                    location: bombadil_core::model::VenvLocation::Default,
+                    python: PythonPin::Unpinned,
+                }],
+                active: bombadil_core::model::VenvLocation::Default,
                 pyproject_path: dir.path().join("pyproject.toml"),
                 ..project("api")
             }],
@@ -9376,7 +9481,11 @@ mod tests {
             id: uuid::Uuid::new_v4(),
             label: label.into(),
             pyproject_path: std::path::PathBuf::from(format!("/p/{label}/pyproject.toml")),
-            venv: bombadil_core::model::VenvLocation::Alongside,
+            environments: vec![bombadil_core::model::Environment {
+                location: bombadil_core::model::VenvLocation::Alongside,
+                python: PythonPin::Unpinned,
+            }],
+            active: bombadil_core::model::VenvLocation::Alongside,
             ..bombadil_core::model::Project::default()
         }
     }

@@ -35,7 +35,13 @@ pub struct Effective {
 /// silently answer about a different project when the two disagree.
 pub fn effective(config: &Config, project: &Project, os: Os) -> Effective {
     Effective {
-        python: project.python.resolve(&config.settings.python).clone(),
+        // From the active environment now that the pin lives there. Task 2
+        // removes this field from `Effective` entirely; the callers that read
+        // it move to asking the environment directly.
+        python: project
+            .active_environment()
+            .map(|environment| environment.python.clone())
+            .unwrap_or_else(|| config.settings.python.clone()),
         uv_source: project
             .uv_source
             .resolve(&config.settings.uv_source)
@@ -54,7 +60,7 @@ pub fn effective(config: &Config, project: &Project, os: Os) -> Effective {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{Override, Settings};
+    use crate::model::{Environment, Override, Settings, VenvLocation};
     use crate::terminal::TerminalKind;
     use std::collections::BTreeMap;
 
@@ -97,7 +103,11 @@ mod tests {
             ..Settings::default()
         };
         let project = Project {
-            python: Override::Set(PythonPin::Version("3.11".into())),
+            environments: vec![Environment {
+                location: VenvLocation::Alongside,
+                python: PythonPin::Version("3.11".into()),
+            }],
+            active: VenvLocation::Alongside,
             uv_source: Override::Set(UvSource::FromPath),
             ..Project::default()
         };
@@ -118,7 +128,11 @@ mod tests {
             ..Settings::default()
         };
         let project = Project {
-            python: Override::Set(PythonPin::Unpinned),
+            environments: vec![Environment {
+                location: VenvLocation::Alongside,
+                python: PythonPin::Unpinned,
+            }],
+            active: VenvLocation::Alongside,
             ..Project::default()
         };
         let config = config_with(settings, project.clone());

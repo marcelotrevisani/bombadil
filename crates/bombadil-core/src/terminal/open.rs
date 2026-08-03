@@ -210,7 +210,7 @@ mod tests {
     use super::*;
 
     use crate::envspec::EnvInputs;
-    use crate::model::{Config, EnvVar, Project, VenvLocation};
+    use crate::model::{Config, EnvVar, Environment, Project, VenvLocation};
     use crate::process::FakeCommandRunner;
     use crate::secrets::InMemorySecretStore;
     use crate::terminal::TerminalKind;
@@ -231,7 +231,11 @@ mod tests {
             id: Uuid::from_u128(7),
             label: "my-api".into(),
             pyproject_path: PathBuf::from("/proj/my-api/pyproject.toml"),
-            venv: VenvLocation::Alongside,
+            environments: vec![Environment {
+                location: VenvLocation::Alongside,
+                ..Environment::default()
+            }],
+            active: VenvLocation::Alongside,
             ..Project::default()
         }
     }

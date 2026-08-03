@@ -606,7 +606,11 @@ mod tests {
             label: "api".into(),
             pyproject_path: PathBuf::from("/p/api/pyproject.toml"),
             index_names,
-            venv: bombadil_core::model::VenvLocation::Alongside,
+            environments: vec![bombadil_core::model::Environment {
+                location: bombadil_core::model::VenvLocation::Alongside,
+                python: bombadil_core::model::PythonPin::Unpinned,
+            }],
+            active: bombadil_core::model::VenvLocation::Alongside,
             ..Project::default()
         }
     }

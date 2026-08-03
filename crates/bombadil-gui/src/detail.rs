@@ -204,7 +204,11 @@ mod tests {
             id: uuid::Uuid::new_v4(),
             label: label.into(),
             pyproject_path: std::path::PathBuf::from(format!("/p/{label}/pyproject.toml")),
-            venv: bombadil_core::model::VenvLocation::Alongside,
+            environments: vec![bombadil_core::model::Environment {
+                location: bombadil_core::model::VenvLocation::Alongside,
+                python: bombadil_core::model::PythonPin::Unpinned,
+            }],
+            active: bombadil_core::model::VenvLocation::Alongside,
             ..bombadil_core::model::Project::default()
         }
     }

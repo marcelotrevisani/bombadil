@@ -2,7 +2,7 @@ pub mod atomic;
 pub mod paths;
 
 use crate::error::StoreError;
-use crate::model::{CURRENT_SCHEMA_VERSION, Config};
+use crate::model::{CURRENT_SCHEMA_VERSION, Config, Environment};
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
 
@@ -115,13 +115,20 @@ impl Store {
         };
 
         match toml::from_str::<Config>(&text) {
+            // Not migrated: a config from the future is opened read-only and
+            // handed back exactly as it was found. Migrating it would mean
+            // guessing at a schema this build does not know.
             Ok(config) if found > CURRENT_SCHEMA_VERSION => {
                 let store = Self::new(path, Writability::TooNew { found });
                 (store, Loaded::ReadOnly { config, found })
             }
+            // Every readable config goes through `migrate`, including one
+            // already at the current version -- it is idempotent, and running
+            // it unconditionally is what keeps "did this file need migrating"
+            // from becoming a question anyone has to answer.
             Ok(config) => {
                 let store = Self::new(path, Writability::Writable);
-                (store, Loaded::Ok(config))
+                (store, Loaded::Ok(migrate(config)))
             }
             // Too new to parse at all. The version already explains the
             // situation better than the parse error would, so it is discarded —
@@ -194,13 +201,49 @@ impl Store {
     }
 }
 
+/// Brings a config forward to [`CURRENT_SCHEMA_VERSION`].
+///
+/// Version 1 held one environment per project, in `Project::venv`, with the
+/// interpreter pin on the project. Version 2 holds a list, with the pin on
+/// each environment.
+///
+/// The two version-1 fields are read through `Project::legacy_venv` and
+/// `legacy_python`, which are `skip_serializing`: they come in from an old
+/// file, are read once here, and are never written again. Leaving them live
+/// would mean two places a location could be set and two answers to which
+/// environment is current.
+///
+/// Idempotent, because [`Store::open`] runs it on every load including files
+/// it wrote itself: a project that already has environments is left alone.
+pub fn migrate(mut config: Config) -> Config {
+    for project in &mut config.projects {
+        if project.environments.is_empty() {
+            let location = project.legacy_venv.take().unwrap_or_default();
+            let python = project
+                .legacy_python
+                .take()
+                .and_then(|pin| pin.as_set().cloned())
+                .unwrap_or_default();
+            project.active = location.clone();
+            project.environments.push(Environment { location, python });
+        }
+        // Dropped whether or not they were used: a version-2 config carries
+        // neither, and keeping one around would make it a second source of
+        // truth the next reader has to reconcile.
+        project.legacy_venv = None;
+        project.legacy_python = None;
+    }
+    config.schema_version = CURRENT_SCHEMA_VERSION;
+    config
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::model::{
-        CURRENT_SCHEMA_VERSION, Config, DefaultVenvLocation, EnvVar, Index, IndexAuth, IndexKind,
-        MemberOrigin, MemberRef, MemberSelection, Override, Project, PythonPin, Script, Settings,
-        TerminalChoice, UvSource, VenvLocation,
+        CURRENT_SCHEMA_VERSION, Config, DefaultVenvLocation, EnvVar, Environment, Index, IndexAuth,
+        IndexKind, MemberOrigin, MemberRef, MemberSelection, Override, Project, PythonPin, Script,
+        Settings, TerminalChoice, UvSource, VenvLocation,
     };
     use std::collections::BTreeMap;
     use std::path::PathBuf;
@@ -214,12 +257,93 @@ mod tests {
     /// `[projects.members]` with a `Discovered` entry and a named `Added` one.
     const GOLDEN_FIXTURE: &str = include_str!("../../tests/fixtures/full.toml");
 
+    /// A real version-1 config, from before environments were a list.
+    const GOLDEN_V1: &str = include_str!("../../tests/fixtures/full-v1.toml");
+
+    #[test]
+    fn a_version_1_config_migrates_to_the_environment_it_already_had() {
+        // The whole risk of this change, in one test. A migration that drops
+        // an environment drops the user's account of where their packages
+        // are, and they would find out at the next Sync by watching uv build
+        // a new one somewhere else.
+        //
+        // Against a real file rather than a hand-built `Config`: a hand-built
+        // one cannot catch a field that fails to deserialise, which is the
+        // failure mode that would actually bite.
+        let loaded: Config = toml::from_str(GOLDEN_V1).expect("a v1 config must parse");
+        let migrated = migrate(loaded);
+
+        let project = &migrated.projects[0];
+        assert_eq!(
+            project.environments.len(),
+            1,
+            "exactly the one environment it had, no more and no fewer"
+        );
+        assert_eq!(
+            project.environments[0].location,
+            VenvLocation::Custom {
+                path: PathBuf::from("/mnt/envs/my-api")
+            },
+            "the location must survive verbatim"
+        );
+        assert_eq!(
+            project.active, project.environments[0].location,
+            "the one environment it has must be the active one"
+        );
+        assert_eq!(migrated.schema_version, CURRENT_SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn a_version_1_project_pin_becomes_its_environments_pin() {
+        // `Project::python` is removed by this change. Dropping it silently
+        // would unpin an environment the user had pinned, and the next Sync
+        // would rebuild it on whatever uv chose -- deleting the old one on
+        // the way, since that is what `uv sync -p` does when the version
+        // differs.
+        let loaded: Config = toml::from_str(GOLDEN_V1).expect("a v1 config must parse");
+        let migrated = migrate(loaded);
+
+        assert_eq!(
+            migrated.projects[0].environments[0].python,
+            PythonPin::Version("3.11".into()),
+            "the project's pin must move onto its environment, not vanish"
+        );
+    }
+
+    #[test]
+    fn a_version_2_config_is_left_alone() {
+        // Migration must be idempotent: `Store::open` runs it on every load,
+        // including on files it wrote itself.
+        let already: Config = toml::from_str(GOLDEN_FIXTURE).expect("v2 parses");
+        assert_eq!(migrate(already.clone()), already);
+    }
+
+    #[test]
+    fn a_migrated_project_starts_expanded() {
+        // After migration every project has exactly one environment, and a
+        // collapsed default would hide the thing the tree exists to show.
+        let loaded: Config = toml::from_str(GOLDEN_V1).unwrap();
+        assert!(migrate(loaded).projects[0].expanded);
+    }
+
+    #[test]
+    fn migration_never_leaves_a_legacy_field_behind() {
+        // They are `skip_serializing`, so a surviving one could not be
+        // written -- but it could be *read* by the next thing to touch the
+        // in-memory config, which is exactly the second source of truth this
+        // change exists to remove.
+        let loaded: Config = toml::from_str(GOLDEN_V1).unwrap();
+        let migrated = migrate(loaded);
+        assert_eq!(migrated.projects[0].legacy_venv, None);
+        assert_eq!(migrated.projects[0].legacy_python, None);
+    }
+
     #[test]
     fn deserializes_the_golden_fixture_field_by_field() {
         let got: Config = toml::from_str(GOLDEN_FIXTURE).expect("golden fixture must parse");
 
         let expected = Config {
-            schema_version: 1,
+            schema_version: CURRENT_SCHEMA_VERSION,
             settings: Settings {
                 uv_source: UvSource::Custom {
                     path: PathBuf::from("/opt/uv/bin/uv"),
@@ -261,9 +385,29 @@ mod tests {
                 label: "my-api".into(),
                 pyproject_path: PathBuf::from("/proj/my-api/pyproject.toml"),
                 index_names: vec!["priv".into(), "extra".into()],
-                venv: VenvLocation::Custom {
-                    path: PathBuf::from("/mnt/envs/my-api"),
-                },
+                // Two environments, because that is the shape this
+                // schema exists to carry, and a fixture with one could not
+                // catch a serialiser that only ever wrote the first.
+                environments: vec![
+                    Environment {
+                        location: VenvLocation::Custom {
+                            path: PathBuf::from("/mnt/envs/my-api"),
+                        },
+                        python: PythonPin::Version("3.11".into()),
+                    },
+                    Environment {
+                        location: VenvLocation::Alongside,
+                        python: PythonPin::Unpinned,
+                    },
+                ],
+                active: VenvLocation::Alongside,
+                expanded: false,
+                // Never present in a version-2 config: they are
+                // `skip_serializing`, read once by the migration and dropped.
+                // Named here because this fixture names every field on
+                // purpose -- that is how a field added later gets caught.
+                legacy_venv: None,
+                legacy_python: None,
                 env: vec![EnvVar {
                     key: "DATABASE_PASSWORD".into(),
                     value: String::new(),
@@ -295,7 +439,6 @@ mod tests {
                 // `model::tests`. A `..Project::default()` tail would let a
                 // field added later slip past this round-trip.
                 id: uuid::Uuid::nil(),
-                python: Override::Set(PythonPin::Version("3.11".into())),
                 uv_source: Override::Set(UvSource::FromPath),
                 terminals: BTreeMap::from([(
                     crate::terminal::Os::Linux,
@@ -343,9 +486,8 @@ mod tests {
         // The same shape of mistake this crate's GUI docs already warn about
         // for `display()`ed paths: a platform assumption hiding in a test
         // rather than in the code, invisible on Linux and macOS.
-        const STRIPPED: [&str; 4] = [
+        const STRIPPED: [&str; 3] = [
             "[settings.python]",
-            "[projects.python",
             "[projects.uv_source",
             "[projects.terminals.",
         ];
@@ -381,7 +523,6 @@ mod tests {
 
         assert_eq!(got.settings.python, PythonPin::Unpinned);
         let project = &got.projects[0];
-        assert_eq!(project.python, Override::Inherit);
         assert_eq!(project.uv_source, Override::Inherit);
         assert!(project.terminals.is_empty());
         // And nothing else moved: the rest of the config is byte-identical to
@@ -443,15 +584,43 @@ mod tests {
         let (store, loaded) = Store::open(path.clone());
         assert_eq!(
             loaded.config().schema_version,
-            stale,
-            "precondition: an older version should load as-is and stay writable"
+            CURRENT_SCHEMA_VERSION,
+            "an older config is migrated at load, not carried at its old version"
         );
 
-        let config = loaded.config().clone();
+        // Stamped back down *in memory only*, which is what keeps this test
+        // able to tell a `save` that stamps the version from one that echoes
+        // whatever it was handed. Since migration now runs at load, a config
+        // straight from `open` is already current and could not distinguish
+        // the two.
+        let mut config = loaded.config().clone();
+        config.schema_version = stale;
         store.save(&config).unwrap();
 
         let (_, reloaded) = Store::open(path);
         assert_eq!(reloaded.config().schema_version, CURRENT_SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn opening_a_version_1_file_migrates_it_rather_than_reporting_it_stale() {
+        // `migrate`'s own tests call it directly. This is the one that says
+        // `Store::open` actually calls it -- without which a v1 config would
+        // load with no environments at all and every project would look like
+        // it had never been set up.
+        let dir = tempfile::tempdir().unwrap();
+        let path = temp_config_path(&dir);
+        std::fs::write(&path, GOLDEN_V1).unwrap();
+
+        let (store, loaded) = Store::open(path);
+
+        assert!(store.is_writable(), "an old config is not read-only");
+        let config = loaded.config();
+        assert_eq!(config.schema_version, CURRENT_SCHEMA_VERSION);
+        assert_eq!(
+            config.projects[0].environments.len(),
+            1,
+            "the environment it had must survive the trip through `open`"
+        );
     }
 
     #[test]

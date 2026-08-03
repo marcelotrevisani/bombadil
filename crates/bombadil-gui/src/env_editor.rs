@@ -573,7 +573,11 @@ mod tests {
             id: Uuid::from_u128(1),
             label: "api".into(),
             pyproject_path: PathBuf::from("/p/api/pyproject.toml"),
-            venv: bombadil_core::model::VenvLocation::Alongside,
+            environments: vec![bombadil_core::model::Environment {
+                location: bombadil_core::model::VenvLocation::Alongside,
+                python: bombadil_core::model::PythonPin::Unpinned,
+            }],
+            active: bombadil_core::model::VenvLocation::Alongside,
             env,
             ..Project::default()
         }

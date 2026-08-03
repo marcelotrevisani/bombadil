@@ -385,7 +385,13 @@ fn a_composed_environment_activates_a_real_venv() {
         id: uuid::Uuid::from_u128(1),
         label: "envtest".into(),
         pyproject_path: project_dir.join("pyproject.toml"),
-        venv: VenvLocation::Custom {
+        environments: vec![bombadil_core::model::Environment {
+            location: VenvLocation::Custom {
+                path: venv_path.clone(),
+            },
+            python: bombadil_core::model::PythonPin::Unpinned,
+        }],
+        active: VenvLocation::Custom {
             path: venv_path.clone(),
         },
         ..Project::default()

@@ -181,7 +181,12 @@ fn fallback_label(pyproject_path: &Path) -> String {
 /// dialog, where the id must be real and unique -- one function rather than
 /// two, since generating a `Uuid::new_v4()` for a display-only resolve costs
 /// nothing.
-pub fn to_project(draft: &Draft) -> Project {
+pub fn to_project(draft: &Draft, settings: &Settings) -> Project {
+    let location = match &draft.venv_choice {
+        VenvChoice::SettingsDefault => VenvLocation::Default,
+        VenvChoice::Alongside => VenvLocation::Alongside,
+        VenvChoice::Chosen(path) => VenvLocation::Custom { path: path.clone() },
+    };
     Project {
         id: Uuid::new_v4(),
         label: draft
@@ -189,11 +194,15 @@ pub fn to_project(draft: &Draft) -> Project {
             .clone()
             .unwrap_or_else(|| fallback_label(&draft.pyproject_path)),
         pyproject_path: draft.pyproject_path.clone(),
-        venv: match &draft.venv_choice {
-            VenvChoice::SettingsDefault => VenvLocation::Default,
-            VenvChoice::Alongside => VenvLocation::Alongside,
-            VenvChoice::Chosen(path) => VenvLocation::Custom { path: path.clone() },
-        },
+        // One environment to begin with, which is what the dialog offers a
+        // choice of. More are added from Preferences.
+        environments: vec![bombadil_core::model::Environment {
+            location: location.clone(),
+            // Seeded from the global pin, the meaning `Settings::python` has
+            // now that the pin lives on the environment.
+            python: settings.python.clone(),
+        }],
+        active: location,
         ..Project::default()
     }
 }
@@ -206,7 +215,9 @@ pub fn to_project(draft: &Draft) -> Project {
 /// `app::view`) is what makes this track `venv_choice` as the user changes
 /// it, the same trick `banner::problems` uses to stay live.
 pub fn resolved_venv_path(draft: &Draft, settings: &Settings) -> Result<PathBuf, VenvPathError> {
-    venv_path::resolve(&to_project(draft), settings)
+    let project = to_project(draft, settings);
+    let environment = project.active_environment().cloned().unwrap_or_default();
+    venv_path::resolve(&project, &environment, settings)
 }
 
 /// Formats the resolved path for display, or the reason it could not be
@@ -672,7 +683,7 @@ requires-python = ">=3.11"
             "[tool.uv.workspace]\nmembers = []\n",
         );
 
-        let project = to_project(&draft);
+        let project = to_project(&draft, &Settings::default());
 
         assert_eq!(project.label, "monorepo-root");
     }
@@ -682,7 +693,7 @@ requires-python = ">=3.11"
         // The fallback must not start overriding what the manifest says --
         // a project whose name differs from its folder is entirely normal.
         let draft = draft_from(Path::new("/p/some-folder/pyproject.toml"), MANIFEST);
-        assert_eq!(to_project(&draft).label, "my-api");
+        assert_eq!(to_project(&draft, &Settings::default()).label, "my-api");
     }
 
     #[test]
@@ -744,8 +755,8 @@ requires-python = ">=3.11"
         // `resolved_venv_path` test and still be wrong for the config the
         // project is about to be appended to.
         let draft = draft_from(Path::new("/p/my-api/pyproject.toml"), MANIFEST);
-        let a = to_project(&draft);
-        let b = to_project(&draft);
+        let a = to_project(&draft, &Settings::default());
+        let b = to_project(&draft, &Settings::default());
         assert_ne!(a.id, Uuid::nil());
         assert_ne!(
             a.id, b.id,
