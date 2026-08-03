@@ -114,14 +114,33 @@ pub fn draft_from(path: &Path, text: &str) -> Draft {
 /// prompt the user to install something. `interpreter::preselect` answers
 /// `None` for the first three alike, which is why the distinction has to
 /// live in [`Interpreters`] rather than be inferred from an empty list.
-fn interpreter_status(draft: &Draft) -> String {
+///
+/// An enum rather than one pre-formatted string, because the four cases are
+/// not the same kind of thing on screen: a version is a value the user
+/// compares character by character and belongs in the data face, while the
+/// other three are sentences and belong in prose. The old single string
+/// forced all four into one `text` and prefixed each with `"python: "`,
+/// which is a label pretending to be part of a sentence.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InterpreterLine {
+    /// uv has not answered yet.
+    Pending,
+    /// uv could not be run at all; carries its own reason.
+    Failed(String),
+    /// uv answered and nothing it reported satisfies `requires-python`.
+    NoneCompatible,
+    /// The interpreter a new environment would be built with.
+    Version(String),
+}
+
+fn interpreter_line(draft: &Draft) -> InterpreterLine {
     match &draft.interpreters {
-        Interpreters::Pending => "python: (checking available interpreters...)".to_string(),
-        Interpreters::Failed(why) => format!("python: could not list interpreters -- {why}"),
+        Interpreters::Pending => InterpreterLine::Pending,
+        Interpreters::Failed(why) => InterpreterLine::Failed(why.clone()),
         Interpreters::Loaded(interpreters) => {
             match interpreter::preselect(interpreters, draft.requires_python.as_deref()) {
-                Some(interpreter) => format!("python: {}", interpreter.version),
-                None => "python: no compatible interpreter found".to_string(),
+                Some(interpreter) => InterpreterLine::Version(interpreter.version.clone()),
+                None => InterpreterLine::NoneCompatible,
             }
         }
     }
@@ -266,60 +285,159 @@ pub fn view<'a>(draft: &Draft, resolved: &str) -> iced::Element<'a, Message> {
         .clone()
         .unwrap_or_else(|| "(none)".to_string());
 
-    let venv_row = iced::widget::row![
-        iced::widget::button(iced::widget::text("Settings default")).on_press(
-            Message::AddProjectVenvChoiceSelected(VenvChoice::SettingsDefault)
-        ),
-        iced::widget::button(iced::widget::text("Alongside manifest"))
-            .on_press(Message::AddProjectVenvChoiceSelected(VenvChoice::Alongside)),
-        iced::widget::button(iced::widget::text("Choose folder..."))
-            .on_press(Message::AddProjectPickVenvFolderRequested),
-    ]
-    .spacing(theme::SPACE_2);
-
-    let mut column = iced::widget::column![
-        iced::widget::text("Add project")
-            .font(theme::FONT_PROSE_SEMIBOLD)
-            .size(theme::TITLE),
+    // --- Manifest: what was picked, and what it says ---------------------
+    let manifest = iced::widget::column![
         iced::widget::text(draft.pyproject_path.display().to_string())
             .font(theme::FONT_DATA)
             .size(theme::DATA)
             .color(theme::SLATE),
-        theme::labeled_value("name:", name),
-        theme::labeled_value("requires-python:", requires_python),
-        iced::widget::text(interpreter_status(draft))
-            .size(theme::BODY)
-            .color(theme::SLATE),
+        theme::labeled_value("name", name),
+        theme::labeled_value("requires-python", requires_python),
     ]
     .spacing(theme::SPACE_1);
 
+    // --- Interpreter: which python a new environment would be built with --
+    let mut interpreter_section = iced::widget::column![].spacing(theme::SPACE_2);
+    match interpreter_line(draft) {
+        InterpreterLine::Version(version) => {
+            interpreter_section = interpreter_section.push(
+                iced::widget::text(version)
+                    .font(theme::FONT_DATA)
+                    .size(theme::BODY),
+            );
+        }
+        InterpreterLine::Pending => {
+            interpreter_section = interpreter_section.push(
+                iced::widget::text("Checking which interpreters are available...")
+                    .size(theme::BODY)
+                    .color(theme::SLATE),
+            );
+        }
+        InterpreterLine::Failed(why) => {
+            interpreter_section = interpreter_section.push(
+                iced::widget::text(format!("Could not list interpreters: {why}"))
+                    .size(theme::BODY)
+                    .color(theme::SLATE),
+            );
+        }
+        InterpreterLine::NoneCompatible => {
+            interpreter_section = interpreter_section.push(
+                iced::widget::text("No installed interpreter satisfies requires-python.")
+                    .size(theme::BODY)
+                    .color(theme::SLATE),
+            );
+        }
+    }
     if needs_install_offer(draft) {
-        column = column.push(
-            iced::widget::button(iced::widget::text("Install compatible interpreter"))
-                .on_press(Message::AddProjectInstallInterpreterRequested),
+        interpreter_section = interpreter_section.push(
+            iced::widget::button(
+                iced::widget::text("Install a compatible interpreter").size(theme::BODY),
+            )
+            .on_press(Message::AddProjectInstallInterpreterRequested)
+            .padding([theme::SPACE_1, theme::SPACE_3])
+            .style(theme::button_quiet),
         );
     }
 
-    let actions = iced::widget::row![
-        iced::widget::button(iced::widget::text("Add project"))
-            .on_press(Message::AddProjectConfirmed),
-        iced::widget::button(iced::widget::text("Cancel")).on_press(Message::AddProjectCancelled),
+    // --- Environment: where it goes, and what happens there ---------------
+    //
+    // A segmented choice, not three loose buttons. Every one of them used to
+    // paint itself the theme's primary colour, so all three read as "press
+    // me" and none read as "this is the current one" -- three actions where
+    // there is one setting with three values.
+    let choice = |label: &'static str, selected: bool, message: Message| {
+        iced::widget::button(iced::widget::text(label).size(theme::BODY))
+            .on_press(message)
+            .padding([theme::SPACE_1, theme::SPACE_3])
+            .style(theme::button_choice(selected))
+    };
+    let venv_row = iced::widget::row![
+        choice(
+            "Settings default",
+            draft.venv_choice == VenvChoice::SettingsDefault,
+            Message::AddProjectVenvChoiceSelected(VenvChoice::SettingsDefault),
+        ),
+        choice(
+            "Alongside manifest",
+            draft.venv_choice == VenvChoice::Alongside,
+            Message::AddProjectVenvChoiceSelected(VenvChoice::Alongside),
+        ),
+        // Both a state and an action: selected when a folder has been picked,
+        // and pressing it re-opens the picker either way.
+        choice(
+            "Chosen folder...",
+            matches!(draft.venv_choice, VenvChoice::Chosen(_)),
+            Message::AddProjectPickVenvFolderRequested,
+        ),
+    ]
+    .spacing(theme::SPACE_1);
+
+    let mut environment = iced::widget::column![
+        venv_row,
+        iced::widget::text(resolved.to_string())
+            .font(theme::FONT_DATA)
+            .size(theme::DATA)
+            .color(theme::SLATE),
     ]
     .spacing(theme::SPACE_2);
-
-    column = column
-        .push(venv_row)
-        .push(theme::labeled_value("venv:", resolved.to_string()));
-
     if let Some(outcome) = venv_outcome_status(draft) {
-        column = column.push(
+        environment = environment.push(
             iced::widget::text(outcome)
                 .size(theme::BODY)
                 .color(theme::SLATE),
         );
     }
 
-    column.push(actions).into()
+    // Cancel is not a primary action, and both buttons being the same colour
+    // is what made this dialog read as a row of equal choices.
+    let actions = iced::widget::row![
+        iced::widget::Space::new().width(iced::Length::Fill),
+        iced::widget::button(iced::widget::text("Cancel").size(theme::BODY))
+            .on_press(Message::AddProjectCancelled)
+            .padding([theme::SPACE_1, theme::SPACE_3])
+            .style(theme::button_quiet),
+        iced::widget::button(iced::widget::text("Add project").size(theme::BODY))
+            .on_press(Message::AddProjectConfirmed)
+            .padding([theme::SPACE_1, theme::SPACE_3])
+            .style(theme::button_primary),
+    ]
+    .spacing(theme::SPACE_2);
+
+    iced::widget::column![
+        iced::widget::text("Add project")
+            .font(theme::FONT_PROSE_SEMIBOLD)
+            .size(theme::DISPLAY),
+        theme::hairline_row(),
+        section("Manifest", manifest.into()),
+        section("Interpreter", interpreter_section.into()),
+        section("Virtual environment", environment.into()),
+        theme::hairline_row(),
+        actions,
+    ]
+    .spacing(theme::SPACE_3)
+    .into()
+}
+
+/// A titled block of the dialog.
+///
+/// The dialog used to be one flat column of nine lines and six buttons with
+/// nothing saying which line belonged to which decision -- so the three
+/// location buttons looked like actions on the manifest above them, and the
+/// sentence about adopting an existing environment referred to "the
+/// interpreter selected above" with nothing on screen that looked selected.
+fn section<'a>(
+    title: &'static str,
+    content: iced::Element<'a, Message>,
+) -> iced::Element<'a, Message> {
+    iced::widget::column![
+        iced::widget::text(title)
+            .font(theme::FONT_PROSE_SEMIBOLD)
+            .size(theme::LABEL)
+            .color(theme::SLATE),
+        content,
+    ]
+    .spacing(theme::SPACE_2)
+    .into()
 }
 
 #[cfg(test)]
@@ -460,7 +578,7 @@ requires-python = ">=3.11"
         // interpreter_status must not conflate "still looking" with "none
         // found," which would show the install offer prematurely.
         let draft = draft_from(Path::new("/p/my-api/pyproject.toml"), MANIFEST);
-        assert!(interpreter_status(&draft).contains("checking"));
+        assert_eq!(interpreter_line(&draft), InterpreterLine::Pending);
         assert!(!needs_install_offer(&draft));
     }
 
@@ -475,11 +593,15 @@ requires-python = ">=3.11"
         draft.interpreters =
             Interpreters::Failed("no uv binary is available at /nope/uv".to_string());
 
-        let status = interpreter_status(&draft);
-        assert!(
-            !status.contains("checking"),
-            "a failed fetch must not keep claiming to be in progress; got {status}"
+        let line = interpreter_line(&draft);
+        assert_ne!(
+            line,
+            InterpreterLine::Pending,
+            "a failed fetch must not keep claiming to be in progress"
         );
+        let InterpreterLine::Failed(status) = &line else {
+            panic!("a failed fetch must read as failed; got {line:?}");
+        };
         assert!(
             status.contains("/nope/uv"),
             "the failure's own text must survive to the dialog; got {status}"
@@ -494,7 +616,10 @@ requires-python = ">=3.11"
     fn a_satisfying_interpreter_is_named_in_the_status_line() {
         let mut draft = draft_from(Path::new("/p/my-api/pyproject.toml"), MANIFEST);
         draft.interpreters = Interpreters::Loaded(vec![interp("3.10.13"), interp("3.11.9")]);
-        assert_eq!(interpreter_status(&draft), "python: 3.11.9");
+        assert_eq!(
+            interpreter_line(&draft),
+            InterpreterLine::Version("3.11.9".to_string())
+        );
         assert!(!needs_install_offer(&draft));
     }
 
@@ -502,10 +627,7 @@ requires-python = ">=3.11"
     fn nothing_satisfying_offers_to_install_instead_of_naming_the_wrong_one() {
         let mut draft = draft_from(Path::new("/p/my-api/pyproject.toml"), MANIFEST);
         draft.interpreters = Interpreters::Loaded(vec![interp("3.9.18")]);
-        assert_eq!(
-            interpreter_status(&draft),
-            "python: no compatible interpreter found"
-        );
+        assert_eq!(interpreter_line(&draft), InterpreterLine::NoneCompatible);
         assert!(needs_install_offer(&draft));
     }
 
