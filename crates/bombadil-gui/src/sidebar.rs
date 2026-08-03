@@ -138,6 +138,22 @@ pub fn rolled_up(rows: &[EnvironmentRow], requires_python: Option<&str>) -> Stat
     }
 }
 
+/// The message an environment row sends when pressed.
+///
+/// Returns a `Message`, not an `Option<Message>`, and that is the point: it
+/// used to be `on_press_maybe((!active).then_some(...))`, so the row that was
+/// already the project's default had no press handler. A project with one
+/// environment has it default always, so its row was permanently dead -- and
+/// because this press is also what *selects the project*, that project could
+/// not be reached by clicking its environment at all.
+///
+/// A type that cannot express "not pressable" is a better guarantee than a
+/// test, and this bug had no test: it lived entirely in `view`, which this
+/// crate does not test by convention.
+pub fn environment_press(project: usize, row: &EnvironmentRow) -> Message {
+    Message::EnvironmentActivated(project, row.location.clone())
+}
+
 /// The glyph for one environment row.
 pub fn row_state(row: &EnvironmentRow, requires_python: Option<&str>) -> State {
     match &row.python_version {
@@ -349,6 +365,10 @@ fn environment_row<'a>(
         None => "not created".to_string(),
     };
     let active = row.active;
+    // "default" rather than "active", which is the user's own word for it:
+    // the environment a project uses when you select it. The model calls it
+    // `active`; nothing on screen has to.
+    let suffix = if active { "  default" } else { "" };
 
     // The active marker: a `jacket` bar down the leading edge, the same shape
     // a selected project uses. It replaced a full outline around the row,
@@ -372,7 +392,7 @@ fn environment_row<'a>(
             .color(glyph.colour)
             .width(theme::GLYPH_COLUMN_WIDTH),
         iced::widget::column![
-            iced::widget::text(name)
+            iced::widget::text(format!("{name}{suffix}"))
                 .font(theme::FONT_DATA)
                 .size(theme::DATA),
             iced::widget::text(version)
@@ -396,9 +416,7 @@ fn environment_row<'a>(
             .width(theme::DISCLOSURE_WIDTH + theme::SPACE_2)
             .height(theme::TREE_ROW_HEIGHT),
         iced::widget::button(content)
-            .on_press_maybe(
-                (!active).then_some(Message::EnvironmentActivated(project, row.location.clone())),
-            )
+            .on_press(environment_press(project, row))
             .width(iced::Length::Fill)
             .height(theme::TREE_ROW_HEIGHT)
             .padding(theme::SPACE_1)
@@ -505,6 +523,35 @@ mod tests {
                 ..row("/p/api/.venv")
             }],
             ..entry(Some(python_version), None)
+        }
+    }
+
+    #[test]
+    fn every_environment_row_is_pressable_including_the_default_one() {
+        // The press does two things -- makes this environment the default,
+        // and selects its project -- and only the first is a no-op when it is
+        // already the default. Gating on that made a one-environment
+        // project's row dead, and with it the only way to reach that project
+        // by clicking its environment.
+        //
+        // `environment_press` returns a `Message` rather than an `Option`, so
+        // this is really asserting the type still says so.
+        let default_row = EnvironmentRow {
+            active: true,
+            ..row("/p/api/.venv")
+        };
+        let other = EnvironmentRow {
+            active: false,
+            ..row("/p/api/.venv-311")
+        };
+
+        for row in [&default_row, &other] {
+            let message = environment_press(0, row);
+            assert!(
+                matches!(message, Message::EnvironmentActivated(0, ref location)
+                    if *location == row.location),
+                "every row must send its own activation; got {message:?}"
+            );
         }
     }
 

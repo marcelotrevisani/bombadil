@@ -5782,6 +5782,52 @@ mod tests {
     }
 
     #[test]
+    fn pressing_the_environment_a_project_already_uses_still_selects_it() {
+        // Reported as: clicking an environment in one project then one in
+        // another "is not changing (maybe because the second project only has
+        // one virtual environment)". Exactly that. The row was pressable only
+        // when it was *not* already the default, so a project with one
+        // environment had a permanently dead row -- and since the press is
+        // also what selects the project, that project could never be reached
+        // by clicking its environment at all.
+        let only = VenvLocation::Custom {
+            path: std::path::PathBuf::from("/envs/web"),
+        };
+        let mut app = App::new(Config {
+            projects: vec![
+                project("api"),
+                Project {
+                    id: uuid::Uuid::from_u128(2),
+                    environments: vec![bombadil_core::model::Environment {
+                        location: only.clone(),
+                        python: PythonPin::Unpinned,
+                    }],
+                    active: only.clone(),
+                    ..project("web")
+                },
+            ],
+            ..Config::default()
+        });
+        app.selected = Some(0);
+
+        // The environment is already this project's default -- the press is
+        // a no-op for `active` and the whole point for `selected`.
+        let task = update(
+            &mut app,
+            Message::EnvironmentActivated(1, only.clone()),
+            unused_runner(),
+        );
+
+        assert_eq!(
+            app.selected,
+            Some(1),
+            "pressing a project's only environment must still reach that project"
+        );
+        assert_eq!(app.config.projects[1].active, only);
+        assert!(task.units() > 0, "and re-read its dependencies");
+    }
+
+    #[test]
     fn activating_an_environment_selects_its_project_too() {
         // Reported as clicking between environments "not changing the
         // project, and dependencies and everything else". Pressing one of a

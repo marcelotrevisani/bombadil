@@ -309,7 +309,8 @@ fn environments_panel<'a>(config: &Config, project_index: usize) -> iced::Elemen
     let mut column = iced::widget::column![
         iced::widget::text(
             "Every virtual environment this project has. Sync, Open terminal and Recreate \
-             act on the active one; the sidebar shows them all."
+             act on the default one, and selecting the project shows it; the sidebar lists \
+             them all."
         )
         .size(theme::BODY)
         .color(theme::SLATE),
@@ -330,8 +331,14 @@ fn environments_panel<'a>(config: &Config, project_index: usize) -> iced::Elemen
         let mut card = iced::widget::column![
             iced::widget::row![
                 iced::widget::button(
-                    iced::widget::text(if active { "active" } else { "make active" })
-                        .size(theme::BODY)
+                    // The user's word: this is the environment the project
+                    // uses when you select it.
+                    iced::widget::text(if active {
+                        "default for this project"
+                    } else {
+                        "make default"
+                    })
+                    .size(theme::BODY)
                 )
                 .on_press_maybe((!active).then_some(Message::EnvironmentActivated(
                     project_index,
@@ -374,7 +381,7 @@ fn environments_panel<'a>(config: &Config, project_index: usize) -> iced::Elemen
                     .color(theme::SLATE)
                     .width(theme::INDEX_LABEL_WIDTH),
                 place(
-                    "global default",
+                    "follow global location",
                     VenvLocation::Default,
                     environment.location == VenvLocation::Default
                 ),
