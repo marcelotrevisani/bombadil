@@ -26,6 +26,7 @@ use bombadil_core::terminal::{self, Os, TerminalKind};
 use bombadil_core::uv;
 use bombadil_core::uv::results::{InstalledPackage, Interpreter, TreeOutcome};
 use bombadil_core::venv_path;
+use futures::StreamExt;
 use iced::Task;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -306,11 +307,23 @@ pub enum Message {
     /// `uv sync` -- which prunes packages absent from the target's lockfile
     /// -- against an environment the user never named.
     SyncRequested(usize),
-    /// A background sync finished. `success` is true only on a zero exit;
-    /// `lines` is the transcript to hand to the output drawer -- uv's stdout
-    /// and stderr on a real run, or a single line describing a failed
-    /// resolve, a timeout, or a panicking job when there is no process
-    /// output to show instead.
+    /// One line of a running uv command's output, already redacted on the job
+    /// thread. Spec §8: the drawer streams live output, so these arrive one
+    /// at a time while the command runs rather than in a batch after it
+    /// exits.
+    ///
+    /// Redacted *before* the message is constructed, never after: `Message`
+    /// derives `Debug`, so a raw line here would put keychain material into
+    /// every rendering of it. The composed environment -- the only place the
+    /// set of secret values exists -- lives on the job thread, which is why
+    /// the redaction has to happen there.
+    SyncLine(String),
+    /// A background sync finished. `success` is true only on a zero exit.
+    ///
+    /// `lines` is whatever the drawer has *not* already been given as
+    /// `SyncLine`: a failed resolve, a timeout, a panicking job, or the note
+    /// a recreate appends when the environment could not be rebuilt. A real
+    /// run's uv output arrives as `SyncLine` and is not repeated here.
     SyncFinished {
         success: bool,
         lines: Vec<String>,
@@ -1080,10 +1093,18 @@ pub fn update(app: &mut App, message: Message, runner: Arc<dyn CommandRunner>) -
                     status: format!("syncing {}...", project.label),
                     ..drawer::Drawer::default()
                 };
-                return Task::perform(sync_project(project, config, runner), |(success, lines)| {
-                    Message::SyncFinished { success, lines }
-                });
+                return Task::stream(sync_project(project, config, runner));
             }
+        }
+        Message::SyncLine(line) => {
+            // Already redacted on the job thread, where the composed
+            // environment (and therefore the set of secret values) exists --
+            // see `Message::SyncLine`. `push_line` redacts again with an
+            // empty set, a no-op kept so nothing reaching the drawer by some
+            // other route can skip redaction, and it also re-expands the
+            // drawer: output arriving is exactly what "a command is running"
+            // means.
+            drawer::push_line(&mut app.drawer, &line, &[]);
         }
         Message::SyncFinished { success, lines } => {
             app.syncing = None;
@@ -1411,16 +1432,14 @@ pub fn update(app: &mut App, message: Message, runner: Arc<dyn CommandRunner>) -
                     status: format!("recreating {}...", project.label),
                     ..drawer::Drawer::default()
                 };
-                // Reuses `SyncFinished`: a recreate ends in the same `uv sync`
-                // with the same single-slot release, the same transcript and
-                // the same expand-on-failure. What it does NOT reuse is the
-                // status text's meaning -- `run_recreate_venv` appends a line
-                // saying the environment was deleted and not rebuilt, which
-                // is the part "sync failed" cannot express on its own.
-                return Task::perform(
-                    recreate_venv(project, config, runner),
-                    |(success, lines)| Message::SyncFinished { success, lines },
-                );
+                // Reuses `SyncLine`/`SyncFinished`: a recreate ends in the
+                // same `uv sync` with the same single-slot release, the same
+                // transcript and the same expand-on-failure. What it does NOT
+                // reuse is the status text's meaning -- `run_recreate_venv`
+                // appends a line saying the environment was deleted and not
+                // rebuilt, which is the part "sync failed" cannot express on
+                // its own.
+                return Task::stream(recreate_venv(project, config, runner));
             }
         }
         Message::OpenFolderRequested(i) => {
@@ -2080,13 +2099,10 @@ fn dispatch_members_sync(
         status: format!("syncing members for {}...", project.label),
         ..drawer::Drawer::default()
     };
-    // Reuses `SyncFinished`: this is still an ordinary `uv sync` under the
-    // hood, with the same single-slot release, transcript handling and
-    // expand-on-failure.
-    Task::perform(
-        members_sync(project, config, kind, discovered, runner),
-        |(success, lines)| Message::SyncFinished { success, lines },
-    )
+    // Reuses `SyncLine`/`SyncFinished`: this is still an ordinary `uv sync`
+    // under the hood, with the same single-slot release, transcript handling
+    // and expand-on-failure.
+    Task::stream(members_sync(project, config, kind, discovered, runner))
 }
 
 /// Dispatches the adopt-or-create probe for wherever the draft's venv choice
@@ -2174,36 +2190,70 @@ async fn load_manifest_draft(path: PathBuf) -> add_project::Draft {
     add_project::draft_from(&path, &text)
 }
 
-/// Runs off the render thread via `job::run` -- resolving uv and running
-/// `uv sync` both spawn a process, and `CommandRunner::run` blocks until it
-/// exits.
+/// Turns the blocking half of a uv command into the stream of messages the
+/// drawer consumes: one `SyncLine` per line of output as uv prints it, then
+/// one terminal `SyncFinished`.
+///
+/// Shared by every sync-shaped action -- a plain sync, a members-aware sync,
+/// a recreate -- because all three are a `uv sync` with the same transcript
+/// handling and the same single in-flight slot. Only the wording of a timeout
+/// differs, which is what `timed_out` and `failed` are for.
+///
+/// `job::stream` off the render thread for the same reason `job::run` was
+/// there before: `CommandRunner::stream` still blocks its caller until the
+/// child exits. What changed is that it no longer blocks the *output*.
+fn sync_stream<F>(
+    work: F,
+    timed_out: &'static str,
+    failed: &'static str,
+) -> impl futures::Stream<Item = Message>
+where
+    F: FnOnce(&mut dyn FnMut(String)) -> (bool, Vec<String>) + Send + 'static,
+{
+    job::stream(
+        move |emit| {
+            let (success, lines) = work(&mut |line| emit(Message::SyncLine(line)));
+            emit(Message::SyncFinished { success, lines });
+        },
+        SYNC_TIMEOUT,
+    )
+    .map(move |result| match result {
+        job::JobResult::Done(message) => message,
+        job::JobResult::TimedOut => Message::SyncFinished {
+            success: false,
+            lines: vec![timed_out.to_string()],
+        },
+        job::JobResult::Failed => Message::SyncFinished {
+            success: false,
+            lines: vec![failed.to_string()],
+        },
+    })
+}
+
+/// Streams a plain `uv sync` off the render thread.
 ///
 /// `KeyringSecretStore` is constructed here, on the job thread, rather than
 /// taken as a parameter of `update`: it is the one piece of this path a test
 /// must never reach, so it lives at the boundary and `run_sync` below takes
 /// the store abstractly.
-async fn sync_project(
+fn sync_project(
     project: Project,
     config: Config,
     runner: Arc<dyn CommandRunner>,
-) -> (bool, Vec<String>) {
-    match job::run(
-        move || {
+) -> impl futures::Stream<Item = Message> {
+    sync_stream(
+        move |on_line| {
             run_sync(
                 &project,
                 &config,
                 &KeyringSecretStore::new(),
                 runner.as_ref(),
+                on_line,
             )
         },
-        SYNC_TIMEOUT,
+        "sync timed out",
+        "sync failed unexpectedly",
     )
-    .await
-    {
-        job::JobResult::Done(result) => result,
-        job::JobResult::TimedOut => (false, vec!["sync timed out".to_string()]),
-        job::JobResult::Failed => (false, vec!["sync failed unexpectedly".to_string()]),
-    }
 }
 
 /// Resolves which uv binary to run, given `config.settings.uv_source`.
@@ -2342,6 +2392,7 @@ fn run_sync(
     config: &Config,
     store: &dyn SecretStore,
     runner: &dyn CommandRunner,
+    on_line: &mut dyn FnMut(String),
 ) -> (bool, Vec<String>) {
     let Some(project_dir) = project
         .pyproject_path
@@ -2368,7 +2419,7 @@ fn run_sync(
         venv_path: venv_path.clone(),
     };
     let spec = uv::command::sync(&resolved_uv, &ctx);
-    compose_and_run(spec, project, config, &venv_path, store, runner)
+    compose_and_stream(spec, project, config, &venv_path, store, runner, on_line)
 }
 
 /// The blocking half of a members-aware sync (spec §5a, Task 5, criterion
@@ -2386,6 +2437,7 @@ fn run_members_sync(
     discovered: &[bombadil_core::members::DiscoveredMember],
     store: &dyn SecretStore,
     runner: &dyn CommandRunner,
+    on_line: &mut dyn FnMut(String),
 ) -> (bool, Vec<String>) {
     let Some(project_dir) = project
         .pyproject_path
@@ -2414,21 +2466,21 @@ fn run_members_sync(
             uv::command::sync_members(&resolved_uv, &ctx, &names)
         }
     };
-    compose_and_run(spec, project, config, &venv_path, store, runner)
+    compose_and_stream(spec, project, config, &venv_path, store, runner, on_line)
 }
 
-/// Runs a members-aware sync off the render thread -- same shape as
+/// Streams a members-aware sync off the render thread -- same shape as
 /// `sync_project`, including `SYNC_TIMEOUT`, since this is also a real `uv
 /// sync` under the hood.
-async fn members_sync(
+fn members_sync(
     project: Project,
     config: Config,
     kind: bombadil_core::members::WorkspaceKind,
     discovered: Vec<bombadil_core::members::DiscoveredMember>,
     runner: Arc<dyn CommandRunner>,
-) -> (bool, Vec<String>) {
-    match job::run(
-        move || {
+) -> impl futures::Stream<Item = Message> {
+    sync_stream(
+        move |on_line| {
             run_members_sync(
                 &project,
                 &config,
@@ -2436,16 +2488,12 @@ async fn members_sync(
                 &discovered,
                 &KeyringSecretStore::new(),
                 runner.as_ref(),
+                on_line,
             )
         },
-        SYNC_TIMEOUT,
+        "sync timed out",
+        "sync failed unexpectedly",
     )
-    .await
-    {
-        job::JobResult::Done(result) => result,
-        job::JobResult::TimedOut => (false, vec!["sync timed out".to_string()]),
-        job::JobResult::Failed => (false, vec!["sync failed unexpectedly".to_string()]),
-    }
 }
 
 /// The blocking half of a recreate: delete the project's environment, then
@@ -2468,6 +2516,7 @@ fn run_recreate_venv(
     config: &Config,
     store: &dyn SecretStore,
     runner: &dyn CommandRunner,
+    on_line: &mut dyn FnMut(String),
     delete: impl Fn(&Path) -> Result<(), String>,
 ) -> (bool, Vec<String>) {
     let venv_path = match venv_path::resolve(project, &config.settings) {
@@ -2479,7 +2528,7 @@ fn run_recreate_venv(
         return (false, vec![err, "nothing was deleted".to_string()]);
     }
 
-    let (success, mut lines) = run_sync(project, config, store, runner);
+    let (success, mut lines) = run_sync(project, config, store, runner, on_line);
     if !success {
         // The outcome the confirmation warned about. "sync failed" on its own
         // leaves the user unaware that the environment they had is gone.
@@ -2491,15 +2540,15 @@ fn run_recreate_venv(
     (success, lines)
 }
 
-/// Runs a recreate off the render thread -- same shape as `sync_project`,
+/// Streams a recreate off the render thread -- same shape as `sync_project`,
 /// including `SYNC_TIMEOUT`, since the rebuild half *is* a `uv sync`.
-async fn recreate_venv(
+fn recreate_venv(
     project: Project,
     config: Config,
     runner: Arc<dyn CommandRunner>,
-) -> (bool, Vec<String>) {
-    match job::run(
-        move || {
+) -> impl futures::Stream<Item = Message> {
+    sync_stream(
+        move |on_line| {
             let settings = config.settings.clone();
             let target = &project;
             run_recreate_venv(
@@ -2507,23 +2556,13 @@ async fn recreate_venv(
                 &config,
                 &KeyringSecretStore::new(),
                 runner.as_ref(),
+                on_line,
                 |path| venv_path::delete(target, &settings, path).map_err(|err| err.to_string()),
             )
         },
-        SYNC_TIMEOUT,
+        "recreating the environment timed out",
+        "recreating the environment failed unexpectedly",
     )
-    .await
-    {
-        job::JobResult::Done(result) => result,
-        job::JobResult::TimedOut => (
-            false,
-            vec!["recreating the environment timed out".to_string()],
-        ),
-        job::JobResult::Failed => (
-            false,
-            vec!["recreating the environment failed unexpectedly".to_string()],
-        ),
-    }
 }
 
 /// The blocking half of confirming the add-project dialog: persist the
@@ -2585,7 +2624,14 @@ fn run_confirm_add_project(
         Some(python) => uv::command::sync_with_python(&resolved_uv, &ctx, python),
         None => uv::command::sync(&resolved_uv, &ctx),
     };
-    compose_and_run(spec, project, config, &venv_path, store, runner)
+    // Collected, not streamed: this path ends in `AddProjectConfirmFinished`,
+    // which carries the dialog's outcome and the index of the project it
+    // created -- there is no per-line message shaped like it, and inventing
+    // one is a separate feature. The command still runs through
+    // `CommandRunner::stream`; only the delivery is batched.
+    collect_lines(|on_line| {
+        compose_and_stream(spec, project, config, &venv_path, store, runner, on_line)
+    })
 }
 
 /// Shared by `run_sync` and `run_confirm_add_project`: compose the
@@ -2600,14 +2646,22 @@ fn run_confirm_add_project(
 ///
 /// Redaction happens *here*, not in `update`: this is the only place the
 /// composed environment exists, and `Message` derives `Debug`, so a secrets
-/// list must never be threaded through one.
-fn compose_and_run(
+/// list must never be threaded through one. Every line goes through it on
+/// the way to `on_line`, so a secret cannot reach the drawer even one line
+/// at a time.
+///
+/// `CommandRunner::stream`, not `run`: the process output goes to `on_line`
+/// as uv prints it. Which is why the returned `Vec` holds only what
+/// `on_line` never saw -- the errors that happen *instead* of a run, so a
+/// caller that shows both does not show uv's output twice.
+fn compose_and_stream(
     mut spec: bombadil_core::process::CommandSpec,
     project: &Project,
     config: &Config,
     venv_path: &Path,
     store: &dyn SecretStore,
     runner: &dyn CommandRunner,
+    on_line: &mut dyn FnMut(String),
 ) -> (bool, Vec<String>) {
     let inputs = EnvInputs {
         parent: std::env::vars().collect(),
@@ -2628,18 +2682,27 @@ fn compose_and_run(
     // whatever launched Bombadil.
     spec.clear_env = true;
 
-    match runner.run(&spec) {
-        Ok(outcome) => {
-            let mut lines: Vec<String> = outcome.stdout.lines().map(str::to_string).collect();
-            lines.extend(outcome.stderr.lines().map(str::to_string));
-            let lines = lines
-                .into_iter()
-                .map(|line| envspec::redact(line, &secrets))
-                .collect();
-            (outcome.success(), lines)
-        }
+    match runner.stream(&spec, &mut |line| {
+        on_line(envspec::redact(line.text().to_string(), &secrets))
+    }) {
+        // Nothing to return: every line uv printed has already gone to
+        // `on_line`, and handing the same transcript back would show it twice.
+        Ok(outcome) => (outcome.success(), Vec::new()),
         Err(err) => (false, vec![envspec::redact(err.to_string(), &secrets)]),
     }
+}
+
+/// Run one of the streaming halves above and gather what it streamed, for the
+/// callers that still want the whole transcript in one piece -- the
+/// add-project dialog, whose outcome is a single result, and the tests that
+/// assert on what a sync produced.
+fn collect_lines(
+    work: impl FnOnce(&mut dyn FnMut(String)) -> (bool, Vec<String>),
+) -> (bool, Vec<String>) {
+    let mut lines = Vec::new();
+    let (success, rest) = work(&mut |line| lines.push(line));
+    lines.extend(rest);
+    (success, lines)
 }
 
 /// Runs off the render thread via `job::run` -- persisting the config,
@@ -3979,7 +4042,8 @@ mod tests {
             },
         );
 
-        let (success, _lines) = run_sync(&project, &config, &store, &runner);
+        let (success, _lines) =
+            collect_lines(|on_line| run_sync(&project, &config, &store, &runner, on_line));
         assert!(success);
 
         let calls = runner.calls();
@@ -4047,7 +4111,8 @@ mod tests {
             },
         );
 
-        let (success, lines) = run_sync(&project, &config, &store, &runner);
+        let (success, lines) =
+            collect_lines(|on_line| run_sync(&project, &config, &store, &runner, on_line));
         assert!(!success);
 
         // Through the real `update` path, so this covers everything between
@@ -4072,6 +4137,216 @@ mod tests {
             "the failing line must still be shown, redacted; got {:?}",
             app.drawer.lines
         );
+    }
+
+    #[test]
+    fn a_sync_runs_its_uv_command_through_stream_not_run() {
+        // Spec §8 asks the drawer to stream live output. `CommandRunner::run`
+        // calls `Command::output()`, which waits for the child to exit and
+        // hands back one batch -- so a sync that used it could not stream
+        // whatever the drawer did with the result.
+        //
+        // Asserted on the fake's stream counter, not on `Task::units()`:
+        // several tests here use `units() > 0` to mean "a job was
+        // dispatched", and that cannot tell which seam the job went through.
+        let project = project("api");
+        let config = Config {
+            projects: vec![project.clone()],
+            settings: fake_uv_settings(),
+            ..Config::default()
+        };
+        let store = bombadil_core::secrets::InMemorySecretStore::new();
+        let runner = FakeCommandRunner::new();
+        version_probe(&runner);
+        runner.expect(
+            "uv",
+            &["sync"],
+            bombadil_core::process::CommandOutcome {
+                status: Some(0),
+                stdout: "Installed 3 packages".into(),
+                stderr: String::new(),
+            },
+        );
+
+        let (success, _lines) =
+            collect_lines(|on_line| run_sync(&project, &config, &store, &runner, on_line));
+
+        assert!(success);
+        assert_eq!(
+            runner.streaming_calls(),
+            1,
+            "the `uv sync` itself must go through `stream`; got {:?}",
+            runner.calls()
+        );
+    }
+
+    #[test]
+    fn the_sync_stream_emits_one_message_per_line_then_a_terminal_one() {
+        // The shape `update` depends on: lines arrive one at a time while the
+        // command runs, and exactly one `SyncFinished` closes the run. A
+        // wrapper that gathered the lines and sent them with the terminal
+        // message would leave the drawer blank for the whole sync, which is
+        // the bug this plan exists to fix.
+        let got: Vec<Message> = futures::executor::block_on(
+            sync_stream(
+                |on_line| {
+                    on_line("Resolved 3 packages".to_string());
+                    on_line("Installed 3 packages".to_string());
+                    (true, Vec::new())
+                },
+                "timed out",
+                "failed",
+            )
+            .collect(),
+        );
+
+        let rendered: Vec<String> = got.iter().map(|m| format!("{m:?}")).collect();
+        assert_eq!(got.len(), 3, "got {rendered:?}");
+        assert!(
+            matches!(&got[0], Message::SyncLine(line) if line == "Resolved 3 packages"),
+            "got {rendered:?}"
+        );
+        assert!(
+            matches!(&got[1], Message::SyncLine(line) if line == "Installed 3 packages"),
+            "got {rendered:?}"
+        );
+        assert!(
+            matches!(
+                &got[2],
+                Message::SyncFinished { success: true, lines } if lines.is_empty()
+            ),
+            "the terminal message must not repeat the lines already streamed; got {rendered:?}"
+        );
+    }
+
+    #[test]
+    fn a_streamed_line_is_redacted_before_it_becomes_a_message() {
+        // Not "the drawer holds no secret" -- that is the test above, and it
+        // would still pass if redaction happened at the end. `Message` derives
+        // `Debug`, so a secret must never be in the string a `SyncLine` is
+        // built from: this asserts on the line as `compose_and_stream` hands
+        // it over, which is the moment before the message exists.
+        let project = bombadil_core::model::Project {
+            env: vec![bombadil_core::model::EnvVar {
+                key: "TOKEN".into(),
+                value: String::new(),
+                secret: true,
+            }],
+            ..project("api")
+        };
+        let config = Config {
+            projects: vec![project.clone()],
+            settings: fake_uv_settings(),
+            ..Config::default()
+        };
+        let store = bombadil_core::secrets::InMemorySecretStore::new();
+        bombadil_core::secrets::SecretStore::set(
+            &store,
+            &bombadil_core::secrets::SecretKey::ProjectEnv {
+                project_id: project.id,
+                key: "TOKEN".into(),
+            },
+            "s3cr3t-streamed-value",
+        )
+        .unwrap();
+
+        let runner = FakeCommandRunner::new();
+        version_probe(&runner);
+        runner.expect(
+            "uv",
+            &["sync"],
+            bombadil_core::process::CommandOutcome {
+                status: Some(1),
+                stdout: String::new(),
+                stderr: "error: 401 for index (token: s3cr3t-streamed-value)".into(),
+            },
+        );
+
+        let mut streamed = Vec::new();
+        let (success, _lines) = run_sync(&project, &config, &store, &runner, &mut |line| {
+            streamed.push(line)
+        });
+
+        assert!(!success);
+        assert!(
+            !streamed.is_empty(),
+            "the failing line must reach the drawer, not be swallowed"
+        );
+        assert!(
+            streamed
+                .iter()
+                .all(|l| !l.contains("s3cr3t-streamed-value")),
+            "a keychain secret reached the callback unredacted: {streamed:?}"
+        );
+        assert!(
+            streamed.iter().any(|l| l.contains("***")),
+            "the line must still be shown, redacted; got {streamed:?}"
+        );
+    }
+
+    #[test]
+    fn a_failed_sync_keeps_a_streamed_transcript_visible() {
+        // The streaming counterpart of
+        // `a_failed_sync_keeps_the_transcript_visible`. That one hands the
+        // transcript to `SyncFinished`; a streamed run's `SyncFinished`
+        // carries no lines at all, because they arrived as `SyncLine` while
+        // uv was running. The expand-on-failure check reads
+        // `app.drawer.lines`, not the message -- if it had read the message,
+        // streaming would have silently undone plan 3a's fix and every failed
+        // sync would show "sync failed" with nothing under it.
+        let mut app = App::new(Config {
+            projects: vec![project("api")],
+            ..Config::default()
+        });
+
+        for message in [
+            Message::SyncLine("Resolved 12 packages".to_string()),
+            Message::SyncLine("error: no solution found".to_string()),
+            Message::SyncFinished {
+                success: false,
+                lines: Vec::new(),
+            },
+        ] {
+            let _ = update(&mut app, message, unused_runner());
+        }
+
+        assert!(
+            app.drawer.expanded,
+            "a failed sync must leave the streamed transcript on screen; \
+             drawer was collapsed showing only {:?}",
+            app.drawer.status
+        );
+        assert_eq!(
+            app.drawer.lines,
+            vec!["Resolved 12 packages", "error: no solution found"],
+            "the streamed lines must be kept, in arrival order"
+        );
+        assert_eq!(app.drawer.status, "sync failed");
+    }
+
+    #[test]
+    fn a_line_arriving_mid_sync_is_shown_immediately() {
+        // The drawer must not wait for `SyncFinished` to show anything: for
+        // the length of a sync, what `SyncLine` has put there is all the user
+        // has. (The cap and the drop-the-oldest rule are `push_line`'s, and
+        // `drawer`'s own tests cover them -- this only proves `update` routes
+        // through it.)
+        let mut app = App::new(Config {
+            projects: vec![project("api")],
+            ..Config::default()
+        });
+
+        let _ = update(
+            &mut app,
+            Message::SyncLine("Resolved 12 packages".to_string()),
+            unused_runner(),
+        );
+
+        assert!(
+            app.drawer.expanded,
+            "output arriving means a command is running; the drawer must be open"
+        );
+        assert_eq!(app.drawer.lines, vec!["Resolved 12 packages"]);
     }
 
     #[test]
@@ -4125,7 +4400,8 @@ mod tests {
             },
         );
 
-        let (success, lines) = run_sync(&target, &app.config, &store, &runner);
+        let (success, lines) =
+            collect_lines(|on_line| run_sync(&target, &app.config, &store, &runner, on_line));
         assert!(success, "got {lines:?}");
 
         let calls = runner.calls();
@@ -4167,7 +4443,8 @@ mod tests {
         let store = bombadil_core::secrets::InMemorySecretStore::new();
         let runner = FakeCommandRunner::new();
 
-        let (success, lines) = run_sync(&project, &config, &store, &runner);
+        let (success, lines) =
+            collect_lines(|on_line| run_sync(&project, &config, &store, &runner, on_line));
 
         assert!(!success);
         let joined = lines.join("\n");
@@ -5470,13 +5747,16 @@ mod tests {
         );
         let deleted = std::sync::Mutex::new(Vec::new());
 
-        let (success, _lines) = run_recreate_venv(
-            &project,
-            &config,
-            &store,
-            &runner,
-            recording_delete(&deleted, Ok(())),
-        );
+        let (success, _lines) = collect_lines(|on_line| {
+            run_recreate_venv(
+                &project,
+                &config,
+                &store,
+                &runner,
+                on_line,
+                recording_delete(&deleted, Ok(())),
+            )
+        });
 
         assert!(success);
         assert_eq!(
@@ -5520,16 +5800,19 @@ mod tests {
         );
         let deleted = std::sync::Mutex::new(Vec::new());
 
-        let (success, lines) = run_recreate_venv(
-            &project,
-            &config,
-            &store,
-            &runner,
-            recording_delete(
-                &deleted,
-                Err("/p/api/.venv holds no pyvenv.cfg".to_string()),
-            ),
-        );
+        let (success, lines) = collect_lines(|on_line| {
+            run_recreate_venv(
+                &project,
+                &config,
+                &store,
+                &runner,
+                on_line,
+                recording_delete(
+                    &deleted,
+                    Err("/p/api/.venv holds no pyvenv.cfg".to_string()),
+                ),
+            )
+        });
 
         assert!(!success);
         assert!(
@@ -5569,13 +5852,16 @@ mod tests {
         );
         let deleted = std::sync::Mutex::new(Vec::new());
 
-        let (success, lines) = run_recreate_venv(
-            &project,
-            &config,
-            &store,
-            &runner,
-            recording_delete(&deleted, Ok(())),
-        );
+        let (success, lines) = collect_lines(|on_line| {
+            run_recreate_venv(
+                &project,
+                &config,
+                &store,
+                &runner,
+                on_line,
+                recording_delete(&deleted, Ok(())),
+            )
+        });
 
         assert!(!success);
         let joined = lines.join("\n");
@@ -7120,8 +7406,17 @@ mod tests {
             },
         );
 
-        let (success, lines) =
-            run_members_sync(&target, &app.config, &kind, &discovered, &store, &runner);
+        let (success, lines) = collect_lines(|on_line| {
+            run_members_sync(
+                &target,
+                &app.config,
+                &kind,
+                &discovered,
+                &store,
+                &runner,
+                on_line,
+            )
+        });
         assert!(success, "got {lines:?}");
 
         let calls = runner.calls();
@@ -7176,7 +7471,8 @@ mod tests {
             "a project whose plan is Plain must take the plain path, argv and \
              status line included"
         );
-        let (success, lines) = run_sync(&target, &app.config, &store, &runner);
+        let (success, lines) =
+            collect_lines(|on_line| run_sync(&target, &app.config, &store, &runner, on_line));
         assert!(success, "got {lines:?}");
 
         let calls = runner.calls();

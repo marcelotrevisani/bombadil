@@ -4,7 +4,7 @@
 #![cfg(feature = "uv-integration")]
 
 use bombadil_core::model::{Project, Script, UvSource, VenvLocation};
-use bombadil_core::process::{CommandRunner, CommandSpec, SystemCommandRunner};
+use bombadil_core::process::{CommandRunner, CommandSpec, OutputLine, SystemCommandRunner};
 use bombadil_core::secrets::{InMemorySecretStore, KeyringSecretStore, SecretKey, SecretStore};
 use bombadil_core::terminal::activation::{InitFile, ShellFamily, init_file};
 use bombadil_core::uv::command::{self, DependencyGroup, ProjectContext};
@@ -530,6 +530,157 @@ fn spawn_returns_before_the_child_exits() {
     assert!(
         elapsed < std::time::Duration::from_secs(5),
         "spawn waited for the child ({elapsed:?}); under `run` this would take 30s"
+    );
+}
+
+/// A child that prints, waits, then prints again -- the only shape that can
+/// tell streaming apart from buffering.
+///
+/// Not `sleep` on Windows, and deliberately not `timeout`: `timeout` refuses
+/// to run at all when stdin is not a console, which is exactly how `stream`
+/// launches its child. `ping` against the loopback address is the classic
+/// `cmd` sleep that works without one.
+fn print_sleep_print() -> CommandSpec {
+    #[cfg(unix)]
+    {
+        CommandSpec::new("sh")
+            .arg("-c")
+            .arg("echo first; sleep 2; echo second")
+    }
+    #[cfg(windows)]
+    {
+        CommandSpec::new("cmd")
+            .arg("/C")
+            .arg("echo first& ping -n 3 127.0.0.1 >nul& echo second")
+    }
+}
+
+#[test]
+fn streaming_delivers_a_line_before_the_child_exits() {
+    // The whole point of `stream`. A test asserting only that both lines
+    // eventually arrive would pass against `run`, which buffers everything
+    // until the process exits -- so the assertion is on *when* the first line
+    // landed, not on what landed.
+    let started = std::time::Instant::now();
+    let mut first_line_at = None;
+
+    let outcome = SystemCommandRunner
+        .stream(&print_sleep_print(), &mut |_| {
+            first_line_at.get_or_insert_with(|| started.elapsed());
+        })
+        .expect("the child must run");
+
+    let total = started.elapsed();
+    let first = first_line_at.expect("no line ever reached the callback");
+
+    assert_eq!(outcome.status, Some(0), "the exit status still comes back");
+    assert!(
+        total >= std::time::Duration::from_secs(2),
+        "the child was meant to take about two seconds; it took {total:?}, \
+         so this test cannot tell streaming from buffering"
+    );
+    assert!(
+        first + std::time::Duration::from_secs(1) < total,
+        "the first line arrived at {first:?} of a {total:?} run: that is the \
+         end, which is what `run` already did"
+    );
+}
+
+#[test]
+fn streaming_delivers_both_pipes_tagged() {
+    // uv writes its progress to stderr and its results to stdout. A `stream`
+    // that read only stdout would show an empty drawer for most of a sync.
+    #[cfg(unix)]
+    let spec = CommandSpec::new("sh")
+        .arg("-c")
+        .arg("echo to-stdout; echo to-stderr 1>&2");
+    #[cfg(windows)]
+    let spec = CommandSpec::new("cmd")
+        .arg("/C")
+        .arg("echo to-stdout& echo to-stderr 1>&2");
+
+    let mut seen = Vec::new();
+    let outcome = SystemCommandRunner
+        .stream(&spec, &mut |line| seen.push(line))
+        .expect("the child must run");
+
+    assert!(
+        seen.iter().any(|line| matches!(
+            line,
+            OutputLine::Stdout(text) if text.trim() == "to-stdout"
+        )),
+        "stdout never reached the callback; got {seen:?}"
+    );
+    assert!(
+        seen.iter().any(|line| matches!(
+            line,
+            OutputLine::Stderr(text) if text.trim() == "to-stderr"
+        )),
+        "stderr never reached the callback; got {seen:?}"
+    );
+    assert_eq!(outcome.status, Some(0));
+}
+
+#[test]
+fn a_real_uv_sync_streams_its_output_before_it_finishes() {
+    // Task 3: everything above proves the wiring; this is the only test that
+    // shows the feature works against the tool it exists for.
+    let runner = SystemCommandRunner;
+    let uv = resolve_uv(&runner);
+
+    let tmp = tempfile::tempdir().unwrap();
+    let project_dir = tmp.path().join("proj");
+    std::fs::create_dir_all(&project_dir).unwrap();
+    // Real dependencies, not the empty list `write_project` writes: a sync
+    // with nothing to resolve and nothing to install prints its two lines at
+    // the very end, and no timing assertion could then tell streaming from
+    // buffering. These are small, pure-Python and dependency-free.
+    std::fs::write(
+        project_dir.join("pyproject.toml"),
+        "[project]\nname = \"itest\"\nversion = \"0.1.0\"\nrequires-python = \">=3.10\"\n\
+         dependencies = [\"iniconfig\", \"packaging\"]\n",
+    )
+    .unwrap();
+
+    let ctx = ProjectContext {
+        project_dir: project_dir.clone(),
+        venv_path: project_dir.join(".venv"),
+    };
+    // A cache of its own, so the download actually happens rather than being
+    // served from a warm shared cache in a few milliseconds.
+    let spec = command::sync(&uv, &ctx).env(
+        "UV_CACHE_DIR",
+        tmp.path().join("cache").to_string_lossy().into_owned(),
+    );
+
+    let started = std::time::Instant::now();
+    let mut lines = Vec::new();
+
+    let outcome = runner
+        .stream(&spec, &mut |line| {
+            lines.push((started.elapsed(), line));
+        })
+        .expect("uv sync must run");
+
+    let total = started.elapsed();
+    assert!(outcome.success(), "uv sync failed: {outcome:?}");
+    let first = lines.first().expect("uv sync produced no output at all").0;
+    let last = lines.last().unwrap().0;
+
+    // The assertion is on the *spread*, not on when the first line landed
+    // relative to the end. A trivial sync takes a few hundred milliseconds
+    // whatever the machine, so "the first line came well before the last
+    // line" would be a coin toss -- but under `run` every line is handed over
+    // in one tight loop after the process has already exited, so the spread
+    // collapses to microseconds. Under `stream` it is at least the time uv
+    // spends between resolving and installing.
+    assert!(
+        last - first >= std::time::Duration::from_millis(5),
+        "the {} lines of a {total:?} sync all arrived within {:?} of each \
+         other, which is what a buffer being replayed after the process \
+         exited looks like -- not incremental delivery. Lines: {lines:?}",
+        lines.len(),
+        last - first,
     );
 }
 
