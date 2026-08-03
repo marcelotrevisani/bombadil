@@ -52,22 +52,18 @@
 //! A 4pt base ([`SPACE_BASE`]). Every spacing constant is a whole multiple
 //! of it, so nothing in the layout sits off the grid by a stray pixel.
 //!
-//! # Why so much of this module looks unused right now
+//! # Why parts of this module still look unused
 //!
-//! This task only builds the module and wires the fonts and base theme into
-//! `main.rs`; nothing in `view` reads `BARK`, `SLATE`, the type scale, the
-//! spacing scale, `FONT_DATA`, `FONT_PROSE_SEMIBOLD` or the state glyph yet
-//! -- that lands with the plan's later tasks (sidebar, detail header, data
-//! panes, editors), each of which is required to pull its values from here
-//! rather than hardcode them. `bombadil-gui` is a binary crate, so unused
-//! `pub` items are flagged as dead code with no external crate to excuse
-//! them; the allow below is scoped to this transitional state, not a
-//! blanket suppression of the lint.
-
-#![allow(
-    dead_code,
-    reason = "consumed incrementally by later tasks in the visual identity plan; see module docs"
-)]
+//! `bombadil-gui` is a binary crate, so an unused `pub` item is flagged as
+//! dead code with no external crate to excuse it. Task 2 (the sidebar) has
+//! now pulled in `SLATE`, `JACKET`, `PARCHMENT`, `BODY`, `DATA`, `SPACE_1`,
+//! `SPACE_2`, `SIDEBAR_WIDTH`, `FONT_DATA`, `FONT_PROSE_SEMIBOLD` and
+//! [`state_glyph`] itself, so the blanket allow Task 1 left on the whole
+//! module is gone. What remains genuinely unused -- `BARK`, `LABEL`,
+//! `TITLE`, `DISPLAY`, `SPACE_3`, `SPACE_4` -- carries its own narrow
+//! `#[allow(dead_code)]` naming the task that consumes it, so this list
+//! shrinks item by item as tasks 3 through 5 land instead of vanishing all
+//! at once.
 
 use iced::font::Weight;
 use iced::{Color, Font, Theme, color};
@@ -79,6 +75,7 @@ use iced::{Color, Font, Theme, color};
 /// Ground: near-black with a green cast, not neutral grey.
 pub const INK: Color = color!(0x1B1D1A);
 /// Raised surfaces -- sidebar, drawer, rows.
+#[allow(dead_code, reason = "consumed by task 5 (drawer surface)")]
 pub const BARK: Color = color!(0x242723);
 /// Primary text on [`INK`]; warm, never pure white.
 pub const PARCHMENT: Color = color!(0xE8E4D9);
@@ -117,15 +114,21 @@ pub fn theme() -> Theme {
 // Type scale (points)
 // ---------------------------------------------------------------------------
 
-/// Sidebar secondary text, disabled labels.
+/// Secondary text, disabled labels.
+#[allow(dead_code, reason = "consumed by tasks 4-5 (data panes, editors)")]
 pub const LABEL: f32 = 11.0;
 /// All Plex-set data: versions, constraints, paths, keys, URLs.
 pub const DATA: f32 = 12.0;
 /// Default prose size.
 pub const BODY: f32 = 13.0;
 /// Section and pane titles.
+#[allow(
+    dead_code,
+    reason = "consumed by task 3 (tab bar, detail header titles)"
+)]
 pub const TITLE: f32 = 17.0;
 /// The project label in the detail header -- the largest thing on screen.
+#[allow(dead_code, reason = "consumed by task 3 (detail header)")]
 pub const DISPLAY: f32 = 22.0;
 
 // ---------------------------------------------------------------------------
@@ -139,9 +142,22 @@ pub const SPACE_1: f32 = SPACE_BASE;
 /// Between related rows.
 pub const SPACE_2: f32 = SPACE_BASE * 2.0;
 /// Between unrelated groups within a pane.
+#[allow(
+    dead_code,
+    reason = "consumed by tasks 3-5 (panes with multiple groups)"
+)]
 pub const SPACE_3: f32 = SPACE_BASE * 4.0;
 /// Between panes and major sections.
+#[allow(dead_code, reason = "consumed by tasks 3-5 (pane and section layout)")]
 pub const SPACE_4: f32 = SPACE_BASE * 6.0;
+
+// ---------------------------------------------------------------------------
+// Layout
+// ---------------------------------------------------------------------------
+
+/// Fixed sidebar width, so the dependency table keeps the full remaining
+/// width instead of the sidebar's own content deciding the split.
+pub const SIDEBAR_WIDTH: f32 = 240.0;
 
 // ---------------------------------------------------------------------------
 // Fonts

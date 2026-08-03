@@ -12,6 +12,7 @@ use crate::members_editor;
 use crate::scripts_editor;
 use crate::settings_editor;
 use crate::sidebar;
+use crate::theme;
 use bombadil_core::envspec::{self, EnvInputs};
 use bombadil_core::model::{
     Config, DefaultVenvLocation, Project, Settings, TerminalChoice, UvSource,
@@ -271,10 +272,19 @@ pub enum Message {
     ProjectSelected(usize),
     /// A tab in the detail area's selector was pressed (spec §8).
     TabSelected(Tab),
-    /// A background venv probe finished for `projects[usize]`. Carries the
+    /// A background venv probe finished for `projects[index]`. Carries the
     /// Python version on success; `None` covers "no venv", a probe that
     /// timed out, and a probe that failed -- all three degrade to hollow.
-    VenvProbed(usize, Option<String>),
+    /// Also carries `requires-python`, re-read from the manifest alongside
+    /// the venv probe (see `probe_venv_and_requirement`) so the sidebar can
+    /// tell a healthy venv from a drifted one via `sidebar::state`; `None`
+    /// there covers both "no requirement" and "could not be read", the same
+    /// permissive fallback `interpreter::version_satisfies` already applies.
+    VenvProbed {
+        index: usize,
+        python_version: Option<String>,
+        requires_python: Option<String>,
+    },
     /// The background fetch for the Dependencies tab finished for
     /// `projects[usize]` -- criterion 5: dispatched through `job::run`,
     /// never run inline, because `uv tree` on a large project is slow.
@@ -695,9 +705,15 @@ fn probe_every_venv(app: &App) -> Task<Message> {
             .enumerate()
             .filter_map(|(i, project)| {
                 let path = venv_path::resolve(project, &app.config.settings).ok()?;
-                Some(Task::perform(probe_venv(path), move |version| {
-                    Message::VenvProbed(i, version)
-                }))
+                let pyproject_path = project.pyproject_path.clone();
+                Some(Task::perform(
+                    probe_venv_and_requirement(path, pyproject_path),
+                    move |(python_version, requires_python)| Message::VenvProbed {
+                        index: i,
+                        python_version,
+                        requires_python,
+                    },
+                ))
             })
             .collect::<Vec<_>>(),
     )
@@ -710,6 +726,38 @@ async fn probe_venv(path: PathBuf) -> Option<String> {
     match job::run(move || venv_path::probe(&path), VENV_PROBE_TIMEOUT).await {
         job::JobResult::Done(version) => version,
         job::JobResult::TimedOut | job::JobResult::Failed => None,
+    }
+}
+
+/// Runs the venv probe and a `requires-python` re-read together, off the
+/// render thread, for the sidebar's drift check (`sidebar::state`). Not
+/// folded into `probe_venv` itself: that function is also reused by the
+/// add-project dialog's adopt-or-create probe (`probe_venv_outcome`), which
+/// has no project manifest in play at all, so bundling a pyproject read into
+/// it would give that call site a read it never asked for.
+///
+/// One `job::run` call rather than two: both reads are the same shape of
+/// small local file `VENV_PROBE_TIMEOUT` already covers -- see that
+/// constant's own doc. A read failure on either side (missing file,
+/// unparseable manifest) degrades to `None`, same as `probe_venv`.
+async fn probe_venv_and_requirement(
+    venv_path: PathBuf,
+    pyproject_path: PathBuf,
+) -> (Option<String>, Option<String>) {
+    match job::run(
+        move || {
+            let python_version = venv_path::probe(&venv_path);
+            let requires_python = bombadil_core::pyproject::load(&pyproject_path)
+                .ok()
+                .and_then(|p| p.requires_python);
+            (python_version, requires_python)
+        },
+        VENV_PROBE_TIMEOUT,
+    )
+    .await
+    {
+        job::JobResult::Done(result) => result,
+        job::JobResult::TimedOut | job::JobResult::Failed => (None, None),
     }
 }
 
@@ -969,12 +1017,17 @@ pub fn update(app: &mut App, message: Message, runner: Arc<dyn CommandRunner>) -
         Message::TabSelected(tab) => {
             app.tab = tab;
         }
-        Message::VenvProbed(i, version) if i < app.entries.len() => {
-            app.entries[i].venv_exists = version.is_some();
-            app.entries[i].python_version = version;
+        Message::VenvProbed {
+            index,
+            python_version,
+            requires_python,
+        } if index < app.entries.len() => {
+            app.entries[index].venv_exists = python_version.is_some();
+            app.entries[index].python_version = python_version;
+            app.entries[index].requires_python = requires_python;
         }
         // A stale probe result for a project that no longer exists.
-        Message::VenvProbed(_, _) => {}
+        Message::VenvProbed { .. } => {}
         Message::DepsLoaded(i, fetch) if i < app.config.projects.len() => {
             // The failure is kept, not flattened into an empty tab: `deps::view`
             // renders it as the reason it is, which is the one thing an empty
@@ -1164,6 +1217,11 @@ pub fn update(app: &mut App, message: Message, runner: Arc<dyn CommandRunner>) -
                     label: project.label.clone(),
                     venv_exists: false,
                     python_version: None,
+                    // Free: the dialog already parsed the manifest into
+                    // `draft`, so there is no read to wait on here the way
+                    // `probe_every_venv` needs one for a project loaded from
+                    // config with no draft behind it.
+                    requires_python: draft.requires_python.clone(),
                 });
                 let index = app.config.projects.len() - 1;
                 app.selected = Some(index);
@@ -1217,9 +1275,15 @@ pub fn update(app: &mut App, message: Message, runner: Arc<dyn CommandRunner>) -
             if let Some(project) = app.config.projects.get(index).cloned()
                 && let Ok(path) = venv_path::resolve(&project, &app.config.settings)
             {
-                return Task::perform(probe_venv(path), move |version| {
-                    Message::VenvProbed(index, version)
-                });
+                let pyproject_path = project.pyproject_path.clone();
+                return Task::perform(
+                    probe_venv_and_requirement(path, pyproject_path),
+                    move |(python_version, requires_python)| Message::VenvProbed {
+                        index,
+                        python_version,
+                        requires_python,
+                    },
+                );
             }
         }
         // A stale index can arrive the same way `ProjectSelected`'s can.
@@ -3066,7 +3130,7 @@ pub fn view(app: &App) -> iced::Element<'_, Message> {
     .spacing(8);
 
     let body = iced::widget::row![
-        iced::widget::container(sidebar_and_controls).width(240),
+        iced::widget::container(sidebar_and_controls).width(theme::SIDEBAR_WIDTH),
         iced::widget::container(detail_and_drawer).padding(12),
     ];
 
