@@ -67,6 +67,12 @@ pub fn validate(config: &Config) -> Vec<Problem> {
     // way uv normalizes them (uppercased, '-' mapped to '_').
     let mut seen: HashMap<String, &str> = HashMap::new();
     for index in &config.indexes {
+        // A row the user has added and not filled in yet is not a
+        // misconfiguration. See `Index::is_blank` for why that is both fields
+        // and not either.
+        if index.is_blank() {
+            continue;
+        }
         if !is_valid_index_name(&index.name) {
             problems.push(Problem::new(format!(
                 "index name {:?} must contain only letters, digits, '_' or '-'",
@@ -184,6 +190,72 @@ mod tests {
     #[test]
     fn a_default_config_is_valid() {
         assert!(validate(&Config::default()).is_empty());
+    }
+
+    #[test]
+    fn an_index_that_has_not_been_filled_in_yet_reports_nothing() {
+        // Pressing "Add index" creates a row to type into, and that row is
+        // empty. Reporting it as two configuration errors before a character
+        // has been typed trains the user to ignore the banner -- which is
+        // also how a real misconfiguration is reported, so that habit is
+        // expensive.
+        let config = Config {
+            indexes: vec![Index {
+                name: String::new(),
+                url: String::new(),
+                kind: IndexKind::Extra,
+                default_for_new_projects: false,
+                auth: IndexAuth::None,
+            }],
+            ..Config::default()
+        };
+
+        let problems = validate(&config);
+
+        assert!(
+            problems.is_empty(),
+            "an untouched row is not a problem; got {problems:?}"
+        );
+    }
+
+    #[test]
+    fn a_half_filled_index_is_still_reported() {
+        // The other half, and the reason `is_blank` requires *both* fields
+        // empty. A name with no URL would break a sync, and silence about it
+        // would be worse than the noise this fix removes.
+        let named_only = Config {
+            indexes: vec![Index {
+                name: "internal".into(),
+                url: String::new(),
+                kind: IndexKind::Extra,
+                default_for_new_projects: false,
+                auth: IndexAuth::None,
+            }],
+            ..Config::default()
+        };
+        let problems = validate(&named_only);
+        assert!(
+            problems.iter().any(|p| p.message.contains("only http://")),
+            "a named index with no URL must still be reported; got {problems:?}"
+        );
+
+        let url_only = Config {
+            indexes: vec![Index {
+                name: String::new(),
+                url: "https://nexus.example/simple".into(),
+                kind: IndexKind::Extra,
+                default_for_new_projects: false,
+                auth: IndexAuth::None,
+            }],
+            ..Config::default()
+        };
+        let problems = validate(&url_only);
+        assert!(
+            problems
+                .iter()
+                .any(|p| p.message.contains("must contain only letters")),
+            "a URL with no name must still be reported; got {problems:?}"
+        );
     }
 
     #[test]
