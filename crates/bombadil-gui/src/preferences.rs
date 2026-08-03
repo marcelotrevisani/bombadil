@@ -304,54 +304,141 @@ fn environments_panel<'a>(config: &Config, project_index: usize) -> iced::Elemen
         return iced::widget::text("").into();
     };
     let id = project.id;
+    let removable = project.environments.len() > 1;
 
-    let choice = |label: &'static str, selected: bool, message: Message| {
-        iced::widget::button(iced::widget::text(label).size(theme::BODY))
-            .on_press(message)
-            .padding([theme::SPACE_1, theme::SPACE_3])
-            .style(theme::button_choice(selected))
-    };
-
-    // Recomputed every render from the choice above, the same "recompute,
-    // don't cache" trick the add-project dialog uses, so it tracks a change
-    // the instant it lands rather than at the next open.
-    let environment = project.active_environment().cloned().unwrap_or_default();
-    let resolved = bombadil_core::venv_path::resolve(project, &environment, &config.settings)
-        .map(|path| path.display().to_string())
-        .unwrap_or_else(|err| err.to_string());
-
-    iced::widget::column![
-        iced::widget::text("Where this project's virtual environment lives.")
-            .size(theme::BODY)
-            .color(theme::SLATE),
-        iced::widget::row![
-            choice(
-                "Follow the global default",
-                project.active == VenvLocation::Default,
-                Message::PreferencesProjectVenvSelected(id, VenvLocation::Default),
-            ),
-            choice(
-                "Alongside the manifest",
-                project.active == VenvLocation::Alongside,
-                Message::PreferencesProjectVenvSelected(id, VenvLocation::Alongside),
-            ),
-            choice(
-                "Chosen folder...",
-                matches!(project.active, VenvLocation::Custom { .. }),
-                Message::PreferencesProjectVenvPickFolderRequested(id),
-            ),
-        ]
-        .spacing(theme::SPACE_1),
-        theme::labeled_value("resolves to", resolved),
+    let mut column = iced::widget::column![
         iced::widget::text(
-            "Moving this does not move the environment already on disk. Sync builds a new \
-             one at the new location, and the old one is left where it is."
+            "Every virtual environment this project has. Sync, Open terminal and Recreate \
+             act on the active one; the sidebar shows them all."
         )
-        .size(theme::LABEL)
+        .size(theme::BODY)
         .color(theme::SLATE),
     ]
-    .spacing(theme::SPACE_3)
-    .into()
+    .spacing(theme::SPACE_3);
+
+    for environment in &project.environments {
+        let location = environment.location.clone();
+        let active = environment.location == project.active;
+        let resolved = bombadil_core::venv_path::resolve(project, environment, &config.settings)
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|err| err.to_string());
+        let pin = match &environment.python {
+            PythonPin::Version(version) => version.clone(),
+            PythonPin::Unpinned => String::new(),
+        };
+
+        let mut card = iced::widget::column![
+            iced::widget::row![
+                iced::widget::button(
+                    iced::widget::text(if active { "active" } else { "make active" })
+                        .size(theme::BODY)
+                )
+                .on_press_maybe((!active).then_some(Message::EnvironmentActivated(
+                    project_index,
+                    location.clone()
+                )))
+                .padding([theme::SPACE_1, theme::SPACE_3])
+                .style(theme::button_choice(active)),
+                iced::widget::Space::new().width(iced::Length::Fill),
+                // Never offered for the last one: a project with no
+                // environments has nothing to sync, and the state is only
+                // reachable by removing them all one at a time.
+                iced::widget::button(iced::widget::text("Remove").size(theme::BODY))
+                    .on_press_maybe(
+                        removable
+                            .then_some(Message::EnvironmentRemoveRequested(id, location.clone()))
+                    )
+                    .padding([theme::SPACE_1, theme::SPACE_3])
+                    .style(theme::button_quiet),
+            ]
+            .align_y(iced::Alignment::Center),
+            theme::labeled_value("path", resolved),
+        ]
+        .spacing(theme::SPACE_2);
+
+        // Where it lives. `Default` follows the global setting, which is what
+        // that variant has always meant -- now per environment rather than
+        // per project.
+        let place = |label: &'static str, to: VenvLocation, current: bool| {
+            let from = location.clone();
+            iced::widget::button(iced::widget::text(label).size(theme::BODY))
+                .on_press(Message::EnvironmentLocationSelected(id, from, to))
+                .padding([theme::SPACE_1, theme::SPACE_2])
+                .style(theme::button_choice(current))
+        };
+        let for_picker = location.clone();
+        card = card.push(
+            iced::widget::row![
+                iced::widget::text("where")
+                    .size(theme::LABEL)
+                    .color(theme::SLATE)
+                    .width(theme::INDEX_LABEL_WIDTH),
+                place(
+                    "global default",
+                    VenvLocation::Default,
+                    environment.location == VenvLocation::Default
+                ),
+                place(
+                    "alongside",
+                    VenvLocation::Alongside,
+                    environment.location == VenvLocation::Alongside
+                ),
+                iced::widget::button(iced::widget::text("folder...").size(theme::BODY))
+                    .on_press(Message::EnvironmentPickFolderRequested(id, for_picker))
+                    .padding([theme::SPACE_1, theme::SPACE_2])
+                    .style(theme::button_choice(matches!(
+                        environment.location,
+                        VenvLocation::Custom { .. }
+                    ))),
+            ]
+            .spacing(theme::SPACE_1)
+            .align_y(iced::Alignment::Center),
+        );
+
+        let for_input = location.clone();
+        card = card.push(
+            iced::widget::row![
+                iced::widget::text("python")
+                    .size(theme::LABEL)
+                    .color(theme::SLATE)
+                    .width(theme::INDEX_LABEL_WIDTH),
+                iced::widget::text_input("3.12, or empty to let uv choose", &pin)
+                    .on_input(move |version| Message::EnvironmentPinChanged(
+                        id,
+                        for_input.clone(),
+                        version
+                    ))
+                    .font(theme::FONT_DATA)
+                    .size(theme::DATA)
+                    .padding(theme::SPACE_1),
+            ]
+            .spacing(theme::SPACE_2)
+            .align_y(iced::Alignment::Center),
+        );
+
+        column = column.push(
+            iced::widget::container(card)
+                .padding(theme::SPACE_3)
+                .style(theme::panel),
+        );
+    }
+
+    column
+        .push(
+            iced::widget::button(iced::widget::text("Add environment").size(theme::BODY))
+                .on_press(Message::EnvironmentAdded(id))
+                .padding([theme::SPACE_1, theme::SPACE_3])
+                .style(theme::button_quiet),
+        )
+        .push(
+            iced::widget::text(
+                "Changing an environment's python deletes and rebuilds it on the next Sync, \
+                 which asks first. Removing one here leaves the directory on disk.",
+            )
+            .size(theme::LABEL)
+            .color(theme::SLATE),
+        )
+        .into()
 }
 
 /// The Scripts section. Global only: a project's own pre-activate hooks stay
