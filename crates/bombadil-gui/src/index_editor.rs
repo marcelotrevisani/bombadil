@@ -300,50 +300,72 @@ fn auth_button<'a>(
     current: AuthChoice,
     i: usize,
 ) -> iced::Element<'a, Message> {
-    iced::widget::button(iced::widget::text(label))
+    iced::widget::button(iced::widget::text(label).size(theme::BODY))
         .on_press_maybe((choice != current).then_some(Message::IndexAuthChoiceChanged(i, choice)))
+        .padding([theme::SPACE_1, theme::SPACE_2])
+        .style(theme::button_choice(choice == current))
         .into()
 }
 
-/// Renders one index's row plus, if its current name collides with
-/// another's credential variable, the message criterion 2 requires --
-/// naming both -- directly under it.
+/// One labelled field of an index card: the label in a fixed column, the
+/// control beside it.
+///
+/// The fixed column is what makes the fields line up down the card, and the
+/// labels are why they are readable at all: this used to be one horizontal
+/// strip of five unlabelled controls, and inside the Preferences panel every
+/// text input in it was squeezed to nothing. The name and URL boxes were not
+/// merely small, they had no width left to render.
+fn field<'a>(
+    label: &'static str,
+    control: iced::Element<'a, Message>,
+) -> iced::Element<'a, Message> {
+    iced::widget::row![
+        iced::widget::text(label)
+            .size(theme::LABEL)
+            .color(theme::SLATE)
+            .width(theme::INDEX_LABEL_WIDTH),
+        control,
+    ]
+    .spacing(theme::SPACE_2)
+    .align_y(iced::Alignment::Center)
+    .into()
+}
+
+/// Renders one index as a card of labelled fields, plus -- if its name
+/// collides with another's credential variable -- the message criterion 2
+/// requires, naming both, directly under it.
 fn index_row<'a>(
     i: usize,
     index: &Index,
     config: &Config,
     draft: &str,
 ) -> iced::Element<'a, Message> {
-    // Enter commits, the same as the row's save button below: typing itself
+    // Enter commits, the same as the card's save button below: typing itself
     // neither persists nor moves the keychain credential -- see
-    // `app::commit_index_edit`. Both fields are data -- a name and a URL
-    // are compared character by character -- so both render in Plex.
-    let name_input = iced::widget::text_input("name", &index.name)
+    // `app::commit_index_edit`. Both fields are data -- a name and a URL are
+    // compared character by character -- so both render in Plex.
+    let name_input = iced::widget::text_input("internal", &index.name)
         .font(theme::FONT_DATA)
         .size(theme::DATA)
+        .padding(theme::SPACE_1)
         .on_input(move |v| Message::IndexNameChanged(i, v))
         .on_submit(Message::IndexEditCommitted(i));
-    let url_input = iced::widget::text_input("https://...", &index.url)
+    let url_input = iced::widget::text_input("https://nexus.example/simple", &index.url)
         .font(theme::FONT_DATA)
         .size(theme::DATA)
+        .padding(theme::SPACE_1)
         .on_input(move |v| Message::IndexUrlChanged(i, v))
         .on_submit(Message::IndexEditCommitted(i));
 
-    let kind_button = iced::widget::button(iced::widget::text(match index.kind {
-        IndexKind::Default => "default index (replaces PyPI) -- click for extra",
-        IndexKind::Extra => "extra index (supplements PyPI) -- click for default",
-    }))
-    .on_press(Message::IndexKindChanged(
-        i,
-        match index.kind {
-            IndexKind::Default => IndexKind::Extra,
-            IndexKind::Extra => IndexKind::Default,
-        },
-    ));
-
-    let default_toggle = iced::widget::checkbox(index.default_for_new_projects)
-        .label("default for new projects")
-        .on_toggle(move |_| Message::IndexDefaultToggled(i));
+    // Two options shown as two, not one button whose label explains what the
+    // *other* press would do. "default index (replaces PyPI) -- click for
+    // extra" was 47 characters of control, and it was the single widest thing
+    // in the row.
+    let kind_choice = iced::widget::row![
+        kind_button("replaces PyPI", IndexKind::Default, index.kind, i),
+        kind_button("supplements PyPI", IndexKind::Extra, index.kind, i),
+    ]
+    .spacing(theme::SPACE_1);
 
     let current_choice = match &index.auth {
         IndexAuth::None => AuthChoice::None,
@@ -351,31 +373,42 @@ fn index_row<'a>(
         IndexAuth::Token => AuthChoice::Token,
     };
     let auth_buttons = iced::widget::row![
-        auth_button("no auth", AuthChoice::None, current_choice, i),
+        auth_button("none", AuthChoice::None, current_choice, i),
         auth_button("basic", AuthChoice::Basic, current_choice, i),
         auth_button("token", AuthChoice::Token, current_choice, i),
     ]
     .spacing(theme::SPACE_1);
 
-    let mut row = iced::widget::row![
-        name_input,
-        url_input,
-        kind_button,
-        default_toggle,
-        auth_buttons
+    let collision = collision_message(config, &index.name);
+
+    let mut card = iced::widget::column![
+        field("name", name_input.into()),
+        field("url", url_input.into()),
+        field("kind", kind_choice.into()),
+        field(
+            "",
+            iced::widget::checkbox(index.default_for_new_projects)
+                .label("use for new projects")
+                .text_size(theme::BODY)
+                .on_toggle(move |_| Message::IndexDefaultToggled(i))
+                .into()
+        ),
+        field("auth", auth_buttons.into()),
     ]
     .spacing(theme::SPACE_2);
 
     if let IndexAuth::Basic { username } = &index.auth {
-        let username_input = iced::widget::text_input("username", username)
-            .font(theme::FONT_DATA)
-            .size(theme::DATA)
-            .on_input(move |v| Message::IndexUsernameChanged(i, v))
-            .on_submit(Message::IndexEditCommitted(i));
-        row = row.push(username_input);
+        card = card.push(field(
+            "username",
+            iced::widget::text_input("alice", username)
+                .font(theme::FONT_DATA)
+                .size(theme::DATA)
+                .padding(theme::SPACE_1)
+                .on_input(move |v| Message::IndexUsernameChanged(i, v))
+                .on_submit(Message::IndexEditCommitted(i))
+                .into(),
+        ));
     }
-
-    let collision = collision_message(config, &index.name);
 
     if !matches!(index.auth, IndexAuth::None) {
         // Criterion 4: bound to the ephemeral draft, never to anything read
@@ -384,36 +417,73 @@ fn index_row<'a>(
         let credential_input = iced::widget::text_input(CREDENTIAL_PLACEHOLDER, draft)
             .font(theme::FONT_DATA)
             .size(theme::DATA)
+            .padding(theme::SPACE_1)
             .secure(true)
             .on_input(move |v| Message::IndexCredentialChanged(i, CredentialInput(v)));
         let can_save = collision.is_none() && !draft.is_empty();
-        let save_button = iced::widget::button(iced::widget::text("save credential"))
-            .on_press_maybe(can_save.then_some(Message::IndexCredentialSaveRequested(i)));
-        row = row.push(credential_input).push(save_button);
+        card = card.push(field(
+            match index.auth {
+                IndexAuth::Token => "token",
+                _ => "password",
+            },
+            iced::widget::row![
+                credential_input,
+                iced::widget::button(iced::widget::text("save to keychain").size(theme::BODY))
+                    .on_press_maybe(can_save.then_some(Message::IndexCredentialSaveRequested(i)))
+                    .padding([theme::SPACE_1, theme::SPACE_2])
+                    .style(theme::button_quiet),
+            ]
+            .spacing(theme::SPACE_2)
+            .into(),
+        ));
+    }
+
+    if let Some(message) = collision {
+        // Not one of `BOOT`'s two rationed cases (the drifted glyph, a
+        // destructive confirm) -- this is a save-blocking validation message,
+        // not a third glyph state, so it stays in the default text colour
+        // rather than borrowing the rationed one.
+        card = card.push(iced::widget::text(message).size(theme::BODY));
     }
 
     // The typed fields (name, URL, username) reach `config.toml` through this
     // press or through Enter, never per keystroke.
-    let save =
-        iced::widget::button(iced::widget::text("save")).on_press(Message::IndexEditCommitted(i));
-    let remove =
-        iced::widget::button(iced::widget::text("remove")).on_press(Message::IndexRemoved(i));
-    row = row.push(save).push(remove);
+    card = card.push(
+        iced::widget::row![
+            iced::widget::Space::new().width(iced::Length::Fill),
+            iced::widget::button(iced::widget::text("save").size(theme::BODY))
+                .on_press(Message::IndexEditCommitted(i))
+                .padding([theme::SPACE_1, theme::SPACE_3])
+                .style(theme::button_primary),
+            iced::widget::button(iced::widget::text("remove").size(theme::BODY))
+                .on_press(Message::IndexRemoved(i))
+                .padding([theme::SPACE_1, theme::SPACE_3])
+                .style(theme::button_quiet),
+        ]
+        .spacing(theme::SPACE_2),
+    );
 
-    let mut column = iced::widget::column![row].spacing(theme::SPACE_1);
-    if let Some(message) = collision {
-        // Not one of `BOOT`'s two rationed cases (the drifted glyph, a
-        // destructive confirm) -- this is a save-blocking validation
-        // message, not a third glyph state, so it stays in the default text
-        // colour rather than borrowing the rationed one.
-        column = column.push(iced::widget::text(message).size(theme::BODY));
-    }
-    column.into()
+    iced::widget::container(card)
+        .padding(theme::SPACE_3)
+        .style(theme::panel)
+        .into()
 }
 
-/// Renders the whole tab: every configured index, then -- once a project is
-/// selected -- a checkbox per index for that project's own selection
-/// (criterion 3).
+/// One of the two index kinds, shown as a choice rather than as a toggle
+/// whose label describes the press you are not making.
+fn kind_button<'a>(
+    label: &'static str,
+    kind: IndexKind,
+    current: IndexKind,
+    i: usize,
+) -> iced::Element<'a, Message> {
+    iced::widget::button(iced::widget::text(label).size(theme::BODY))
+        .on_press_maybe((kind != current).then_some(Message::IndexKindChanged(i, kind)))
+        .padding([theme::SPACE_1, theme::SPACE_2])
+        .style(theme::button_choice(kind == current))
+        .into()
+}
+
 /// Every configured index: name, URL, kind, auth. Defined once, globally --
 /// so one index means one keychain credential, whichever projects use it.
 ///

@@ -209,6 +209,9 @@ pub const OVERLAY_MAX_HEIGHT: f32 = 560.0;
 /// transcript scrolls: a thousand-line resolution must not push the
 /// application off the top of the window.
 pub const DRAWER_MAX_HEIGHT: f32 = 220.0;
+/// Width of the label column in an index card, so `name`, `url`, `kind` and
+/// `auth` line up down the left of it.
+pub const INDEX_LABEL_WIDTH: f32 = 72.0;
 /// Width of the Preferences card. Wider than a modal: it carries a scope
 /// switch, a section list and a panel of fields side by side.
 pub const PREFS_WIDTH: f32 = 860.0;
