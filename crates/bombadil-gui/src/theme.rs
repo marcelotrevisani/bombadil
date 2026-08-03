@@ -225,6 +225,9 @@ pub const PREFS_SECTION_WIDTH: f32 = 150.0;
 pub const CONTEXT_MENU_WIDTH: f32 = 320.0;
 /// Width of the drop-down panel the Help menu opens.
 pub const MENU_WIDTH: f32 = 220.0;
+/// Width of the sidebar's disclosure triangle, so every project's glyph and
+/// label start at the same x whether it is open or closed.
+pub const DISCLOSURE_WIDTH: f32 = 16.0;
 /// Width of the state glyph column, fixed at the left of every row in every
 /// pane (sidebar, dependency rows, member rows, index rows) so the label
 /// that follows starts at the same x regardless of which glyph rendered.
