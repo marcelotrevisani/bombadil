@@ -1919,6 +1919,7 @@ pub fn update(app: &mut App, message: Message, runner: Arc<dyn CommandRunner>) -
                     // which is the meaning it has now that the pin lives here.
                     python: seed,
                 });
+            rebuild_entries(app);
             return Task::batch([persist_env_edit(app), probe_every_venv(app)]);
         }
         Message::EnvironmentPinChanged(id, location, version) => {
@@ -1934,6 +1935,8 @@ pub fn update(app: &mut App, message: Message, runner: Arc<dyn CommandRunner>) -
                 return Task::none();
             };
             environment.python = pin;
+            // The row shows its own pin, and drift is judged against it.
+            rebuild_entries(app);
             return persist_env_edit(app);
         }
         Message::EnvironmentRemoveRequested(id, location) => {
@@ -1988,6 +1991,7 @@ pub fn update(app: &mut App, message: Message, runner: Arc<dyn CommandRunner>) -
                     .map(|environment| environment.location.clone())
                     .unwrap_or_default();
             }
+            rebuild_entries(app);
             return Task::batch([persist_env_edit(app), probe_every_venv(app)]);
         }
         Message::EnvironmentLocationSelected(id, from, to) => {
@@ -2020,6 +2024,7 @@ pub fn update(app: &mut App, message: Message, runner: Arc<dyn CommandRunner>) -
             }
             // Re-probed: the sidebar's glyph describes wherever an
             // environment last resolved, and this moved that.
+            rebuild_entries(app);
             return Task::batch([persist_env_edit(app), probe_every_venv(app)]);
         }
         Message::EnvironmentPickFolderRequested(id, from) => {
@@ -2476,6 +2481,58 @@ pub fn update(app: &mut App, message: Message, runner: Arc<dyn CommandRunner>) -
         }
     }
     Task::none()
+}
+
+/// Rebuilds `app.entries` from `app.config`, keeping what has already been
+/// probed.
+///
+/// `entries` is what the sidebar renders; `config` is what is persisted.
+/// Anything that changes a project's environments has to update both, and
+/// writing only the second is a bug this project has already been bitten by
+/// once -- `App::projects` was a stale clone, the file on disk stayed
+/// correct, and restarting "fixed" it, which is precisely why manual testing
+/// missed it. It came back here as "the add environment button is not
+/// working": the environment was added and persisted, and the tree went on
+/// showing the old list.
+///
+/// Probed versions are carried across by location rather than dropped. A
+/// rebuild that dropped them would blank every row to "not created" on each
+/// add, until the probes landed again.
+fn rebuild_entries(app: &mut App) {
+    /// What a rebuild has to carry across: a project's `requires-python` and
+    /// each environment's probed version, keyed by the location that
+    /// identifies it.
+    type Probed = (
+        Option<String>,
+        Vec<(bombadil_core::model::VenvLocation, Option<String>)>,
+    );
+
+    let probed: Vec<Probed> = app
+        .entries
+        .iter()
+        .map(|entry| {
+            (
+                entry.requires_python.clone(),
+                entry
+                    .environments
+                    .iter()
+                    .map(|row| (row.location.clone(), row.python_version.clone()))
+                    .collect(),
+            )
+        })
+        .collect();
+
+    app.entries = sidebar::entries(&app.config);
+
+    for (entry, (requires_python, rows)) in app.entries.iter_mut().zip(probed) {
+        entry.requires_python = requires_python;
+        for row in &mut entry.environments {
+            if let Some((_, version)) = rows.iter().find(|(location, _)| *location == row.location)
+            {
+                row.python_version = version.clone();
+            }
+        }
+    }
 }
 
 /// Re-read everything a finished sync has just invalidated.
@@ -5135,6 +5192,105 @@ mod tests {
             5,
             "Dependencies, Members, Env vars, Scripts, Indexes -- and Settings \
              deliberately not, since it has no per-project half"
+        );
+    }
+
+    #[test]
+    fn an_added_environment_appears_in_the_sidebar_at_once() {
+        // `app.entries` is what the tree renders; `app.config` is what is
+        // persisted. Writing only the second is the bug the whole-branch
+        // review already caught once, in `App::projects`: the file on disk is
+        // right, the screen is wrong, and restarting "fixes" it -- which is
+        // exactly why manual testing misses it.
+        //
+        // Reported as "the add environment button is not working".
+        let mut app = App::new(Config {
+            projects: vec![project("api")],
+            ..Config::default()
+        });
+        let id = app.config.projects[0].id;
+        let before = app.entries[0].environments.len();
+
+        let _ = update(&mut app, Message::EnvironmentAdded(id), unused_runner());
+
+        assert_eq!(
+            app.config.projects[0].environments.len(),
+            before + 1,
+            "the config must carry it"
+        );
+        assert_eq!(
+            app.entries[0].environments.len(),
+            before + 1,
+            "and the sidebar must show it without waiting for a restart"
+        );
+    }
+
+    #[test]
+    fn a_removed_environment_leaves_the_sidebar_at_once() {
+        let spare = VenvLocation::Custom {
+            path: std::path::PathBuf::from("/envs/spare"),
+        };
+        let mut app = App::new(Config {
+            projects: vec![Project {
+                environments: vec![
+                    bombadil_core::model::Environment {
+                        location: VenvLocation::Alongside,
+                        python: PythonPin::Unpinned,
+                    },
+                    bombadil_core::model::Environment {
+                        location: spare.clone(),
+                        python: PythonPin::Unpinned,
+                    },
+                ],
+                active: VenvLocation::Alongside,
+                ..project("api")
+            }],
+            ..Config::default()
+        });
+        let id = app.config.projects[0].id;
+
+        let _ = update(
+            &mut app,
+            Message::EnvironmentRemoveRequested(id, spare.clone()),
+            unused_runner(),
+        );
+        let _ = update(
+            &mut app,
+            Message::EnvironmentRemovalConfirmed,
+            unused_runner(),
+        );
+
+        assert_eq!(app.entries[0].environments.len(), 1);
+        assert!(
+            app.entries[0]
+                .environments
+                .iter()
+                .all(|row| row.location != spare),
+            "the removed environment must be gone from the tree too"
+        );
+    }
+
+    #[test]
+    fn rebuilding_the_sidebar_keeps_versions_already_probed() {
+        // A rebuild that dropped them would blank every row to "not created"
+        // on each add, and they would only come back when the probes landed.
+        let mut app = App::new(Config {
+            projects: vec![project("api")],
+            ..Config::default()
+        });
+        let id = app.config.projects[0].id;
+        set_probed_version(&mut app, 0, "3.12.13");
+
+        let _ = update(&mut app, Message::EnvironmentAdded(id), unused_runner());
+
+        assert_eq!(
+            app.entries[0]
+                .environments
+                .iter()
+                .find(|row| row.active)
+                .and_then(|row| row.python_version.clone()),
+            Some("3.12.13".to_string()),
+            "an environment already probed must not blank on an unrelated add"
         );
     }
 
