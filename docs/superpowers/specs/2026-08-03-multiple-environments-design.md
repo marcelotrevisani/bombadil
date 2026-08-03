@@ -109,9 +109,12 @@ Projects                    [Add]
     ○ .venv        no environment yet
 ```
 
-- Expand state lives on `App`, not in the config: which rows a user has open is
-  not a setting worth persisting, and a config field nothing else reads is a
-  field nothing else tests.
+- **Expand state persists**, as `Project::expanded`. A project you collapse
+  stays collapsed across a restart. It defaults to *expanded*, not collapsed:
+  after migration every project has exactly one environment, and a collapsed
+  default would hide the thing this feature exists to show. `#[serde(default)]`
+  on a `bool` gives `false`, so this needs an explicit
+  `#[serde(default = "expanded_by_default")]`.
 - Clicking a project selects it. Clicking an environment makes it active — a
   single click, because it is not destructive: nothing is deleted, the next
   Sync simply builds against a different directory.
