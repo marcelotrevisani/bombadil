@@ -166,11 +166,27 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - name: Create the GitHub release
+      # A release for this tag very often exists already, because publishing
+      # one from the GitHub UI is what creates the tag, and creating the tag is
+      # what starts this run. Treating that as a failure marks a release red
+      # after every crate has already been uploaded -- which is exactly what
+      # happened to v0.1.0.
+      #
+      # An existing release is left completely alone. Its notes may have been
+      # written by hand, and `gh release edit --notes` replaces the body rather
+      # than appending to it: overwriting someone's release notes to add one
+      # cosmetic line about crates.io is a bad trade.
+      - name: Create the GitHub release, unless there already is one
         env:
           GH_TOKEN: ${{ github.token }}
           VERSION: ${{ needs.version.outputs.version }}
         run: |
+          set -euo pipefail
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            echo "a release for $GITHUB_REF_NAME already exists -- leaving its notes untouched"
+            echo "published to crates.io: bombadil-core, bombadil-uv-bin, bombadil-gui $VERSION"
+            exit 0
+          fi
           gh release create "$GITHUB_REF_NAME" \
             --title "Bombadil $GITHUB_REF_NAME" \
             --generate-notes \
