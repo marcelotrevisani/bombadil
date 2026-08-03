@@ -203,7 +203,6 @@ mod tests {
         VenvLocation,
     };
     use std::path::PathBuf;
-    use uuid::Uuid;
 
     /// Hand-authored, not serde-generated (see the file's own header comment):
     /// a generated fixture would just re-encode whatever bug is already in the
@@ -257,7 +256,6 @@ mod tests {
                 enabled: true,
             }],
             projects: vec![Project {
-                id: Uuid::nil(),
                 label: "my-api".into(),
                 pyproject_path: PathBuf::from("/proj/my-api/pyproject.toml"),
                 index_names: vec!["priv".into(), "extra".into()],
@@ -291,6 +289,10 @@ mod tests {
                         },
                     ],
                 },
+                // Every field named on purpose -- see the twin fixture in
+                // `model::tests`. A `..Project::default()` tail would let a
+                // field added later slip past this round-trip.
+                id: uuid::Uuid::nil(),
             }],
             terminal_defaults: std::collections::BTreeMap::new(),
         };

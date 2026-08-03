@@ -276,11 +276,8 @@ mod tests {
             id: Uuid::from_u128(1),
             label: label.into(),
             pyproject_path: PathBuf::from(dir).join("pyproject.toml"),
-            index_names: vec![],
             venv,
-            env: vec![],
-            scripts: vec![],
-            members: Default::default(),
+            ..Project::default()
         }
     }
 

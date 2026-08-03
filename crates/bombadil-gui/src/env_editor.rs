@@ -519,11 +519,9 @@ mod tests {
             id: Uuid::from_u128(1),
             label: "api".into(),
             pyproject_path: PathBuf::from("/p/api/pyproject.toml"),
-            index_names: vec![],
             venv: bombadil_core::model::VenvLocation::Alongside,
             env,
-            scripts: vec![],
-            members: Default::default(),
+            ..Project::default()
         }
     }
 

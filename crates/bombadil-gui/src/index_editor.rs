@@ -518,9 +518,7 @@ mod tests {
             pyproject_path: PathBuf::from("/p/api/pyproject.toml"),
             index_names,
             venv: bombadil_core::model::VenvLocation::Alongside,
-            env: vec![],
-            scripts: vec![],
-            members: Default::default(),
+            ..Project::default()
         }
     }
 

@@ -84,7 +84,6 @@ impl Default for Config {
 mod tests {
     use super::*;
     use std::path::PathBuf;
-    use uuid::Uuid;
 
     fn fully_populated() -> Config {
         Config {
@@ -126,7 +125,6 @@ mod tests {
                 enabled: true,
             }],
             projects: vec![Project {
-                id: Uuid::nil(),
                 label: "my-api".into(),
                 pyproject_path: PathBuf::from("/proj/my-api/pyproject.toml"),
                 index_names: vec!["priv".into(), "extra".into()],
@@ -143,6 +141,11 @@ mod tests {
                     args: vec![],
                     enabled: false,
                 }],
+                // Every field named on purpose: this fixture exists to prove
+                // a whole `Config` round-trips through TOML, and a
+                // `..Project::default()` tail would let a field added later
+                // slip past the very test that would have caught it.
+                id: uuid::Uuid::nil(),
                 members: MemberSelection::default(),
             }],
             terminal_defaults: BTreeMap::from([

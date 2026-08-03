@@ -145,7 +145,6 @@ mod tests {
     use super::{index_credential_var, validate};
     use crate::model::{Config, EnvVar, Index, IndexAuth, IndexKind, Project, VenvLocation};
     use std::path::PathBuf;
-    use uuid::Uuid;
 
     fn index(name: &str, kind: IndexKind) -> Index {
         Index {
@@ -159,14 +158,11 @@ mod tests {
 
     fn project(index_names: Vec<String>) -> Project {
         Project {
-            id: Uuid::nil(),
             label: "p".into(),
             pyproject_path: PathBuf::from("/p/pyproject.toml"),
             index_names,
             venv: VenvLocation::Alongside,
-            env: vec![],
-            scripts: vec![],
-            members: Default::default(),
+            ..Project::default()
         }
     }
 
