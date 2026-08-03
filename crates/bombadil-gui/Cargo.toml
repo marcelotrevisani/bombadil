@@ -10,6 +10,9 @@ bombadil-core = { path = "../bombadil-core", version = "0.1.0" }
 bombadil-uv-bin = { path = "../bombadil-uv-bin", version = "0.1.0" }
 iced = "0.14"
 rfd = "0.17"
+# Already in Cargo.lock via iced; declared here for `Task::stream`, which
+# takes a `futures::Stream`. Not a new entry in Cargo.lock.
+futures = "0.3"
 # Already a workspace dependency (bombadil-core depends on it); promoted from
 # dev-dependencies here because `add_project::to_project` builds a throwaway
 # `Project`, whose `id` field is a `Uuid`, for display-only calls into

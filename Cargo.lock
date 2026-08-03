@@ -399,6 +399,7 @@ version = "0.1.0"
 dependencies = [
  "bombadil-core",
  "bombadil-uv-bin",
+ "futures",
  "iced",
  "rfd",
  "tempfile",

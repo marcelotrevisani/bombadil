@@ -13,8 +13,13 @@
 //! executor thread is a deliberate tradeoff, not an oversight: this
 //! application only ever has a handful of jobs in flight at once (startup
 //! probes, a uv command), so parking a thread per job is cheap and avoids
-//! pulling in an async runtime (no `tokio`, no `futures`) for what an
-//! `mpsc` channel already does.
+//! pulling in an async runtime (no `tokio`) for what an `mpsc` channel
+//! already does.
+//!
+//! [`stream`] is the same deal for work that produces output as it runs: the
+//! thread and the channel are unchanged, and `futures::stream::unfold` only
+//! turns the receiver into the `Stream` `iced::Task::stream` wants. `futures`
+//! is not a runtime and was already in the lockfile via iced.
 
 use std::sync::mpsc;
 use std::time::Duration;
@@ -63,9 +68,53 @@ where
     }
 }
 
+/// Run blocking work that produces items as it goes, off the render thread,
+/// and deliver each one as it is produced.
+///
+/// The streaming counterpart of [`run`], for `CommandRunner::stream`: `run`
+/// can only report a job's single final value, so a `uv sync` behind it stays
+/// invisible until it exits.
+///
+/// `timeout` bounds the wait for *each* item rather than the whole job, which
+/// is the only bound that still means anything here. A large `uv sync` can
+/// legitimately outlast any total budget, but one that has printed nothing
+/// for `timeout` has stopped making progress -- and unlike [`run`]'s deadline,
+/// this one cannot fire on a job that is plainly still working.
+///
+/// The stream ends when `work` returns. A `work` that panics ends it with
+/// [`JobResult::Failed`]: the thread dies without sending its end marker, and
+/// the channel disconnecting is how that arrives here.
+pub fn stream<T, F>(work: F, timeout: Duration) -> impl futures::Stream<Item = JobResult<T>>
+where
+    T: Send + 'static,
+    F: FnOnce(&mut dyn FnMut(T)) + Send + 'static,
+{
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let emitter = tx.clone();
+        work(&mut move |item| {
+            let _ = emitter.send(Some(item));
+        });
+        // The end marker. Its absence is what tells the reader a panic
+        // happened rather than a normal finish.
+        let _ = tx.send(None);
+    });
+
+    futures::stream::unfold(Some(rx), move |state| async move {
+        let rx = state?;
+        match rx.recv_timeout(timeout) {
+            Ok(Some(item)) => Some((JobResult::Done(item), Some(rx))),
+            Ok(None) => None,
+            Err(mpsc::RecvTimeoutError::Timeout) => Some((JobResult::TimedOut, None)),
+            Err(mpsc::RecvTimeoutError::Disconnected) => Some((JobResult::Failed, None)),
+        }
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use futures::StreamExt;
     use std::time::Duration;
 
     #[test]
@@ -105,6 +154,122 @@ mod tests {
             "returned after {:?}; the timeout did not bound the wait",
             started.elapsed()
         );
+    }
+
+    // --- stream ---------------------------------------------------------
+
+    #[test]
+    fn every_item_arrives_in_order_and_the_stream_then_ends() {
+        let got: Vec<_> = futures::executor::block_on(
+            stream(
+                |emit| {
+                    for i in 0..3 {
+                        emit(i);
+                    }
+                },
+                Duration::from_secs(5),
+            )
+            .collect(),
+        );
+
+        assert_eq!(
+            got,
+            vec![JobResult::Done(0), JobResult::Done(1), JobResult::Done(2)],
+            "the stream must end when the work returns, with nothing after it"
+        );
+    }
+
+    #[test]
+    fn an_item_reaches_the_consumer_before_the_work_has_finished() {
+        // The whole reason this exists next to `run`. A version that gathered
+        // everything and handed it over at the end would satisfy the ordering
+        // test above and still leave the drawer blank for the length of a
+        // `uv sync`, so the assertion is on *when* the first item arrived.
+        let started = std::time::Instant::now();
+        let mut arrivals = Vec::new();
+
+        futures::executor::block_on(
+            stream(
+                |emit| {
+                    emit(());
+                    std::thread::sleep(Duration::from_millis(300));
+                    emit(());
+                },
+                Duration::from_secs(5),
+            )
+            .for_each(|_| {
+                arrivals.push(started.elapsed());
+                std::future::ready(())
+            }),
+        );
+
+        assert_eq!(arrivals.len(), 2);
+        assert!(
+            arrivals[0] + Duration::from_millis(100) < arrivals[1],
+            "both items arrived at once ({arrivals:?}); that is the buffered \
+             behaviour `run` already had"
+        );
+    }
+
+    #[test]
+    fn work_that_goes_silent_times_out_rather_than_hanging_the_stream() {
+        // The bound is per item, not on the whole job: the first item arrives
+        // and is delivered, and only the silence after it is a timeout.
+        let got: Vec<_> = futures::executor::block_on(
+            stream(
+                |emit| {
+                    emit(1);
+                    std::thread::sleep(Duration::from_secs(30));
+                },
+                Duration::from_millis(50),
+            )
+            .collect(),
+        );
+
+        assert_eq!(got, vec![JobResult::Done(1), JobResult::TimedOut]);
+    }
+
+    #[test]
+    fn work_that_keeps_producing_is_not_timed_out() {
+        // The other half of "per item, not per job": a long `uv sync` that is
+        // still printing must not be declared dead. A total-budget timeout
+        // would cut this off at 50ms.
+        let got: Vec<_> = futures::executor::block_on(
+            stream(
+                |emit| {
+                    for i in 0..5 {
+                        std::thread::sleep(Duration::from_millis(30));
+                        emit(i);
+                    }
+                },
+                Duration::from_millis(200),
+            )
+            .collect(),
+        );
+
+        assert_eq!(got.len(), 5, "got {got:?}");
+        assert!(
+            got.iter().all(|item| matches!(item, JobResult::Done(_))),
+            "a job that kept producing was cut off: {got:?}"
+        );
+    }
+
+    #[test]
+    fn work_that_panics_ends_the_stream_as_a_failure() {
+        // Same contract as `run`: a panicking job is reported, never
+        // propagated, and never leaves the stream open forever.
+        let got: Vec<_> = futures::executor::block_on(
+            stream(
+                |emit| {
+                    emit(1);
+                    panic!("boom");
+                },
+                Duration::from_secs(5),
+            )
+            .collect(),
+        );
+
+        assert_eq!(got, vec![JobResult::Done(1), JobResult::Failed]);
     }
 
     /// Drive a future to completion on this thread. `job::run`'s future does
