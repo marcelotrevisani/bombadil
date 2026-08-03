@@ -42,6 +42,7 @@ pub enum Section {
     Python,
     Uv,
     Terminal,
+    Scripts,
     EnvVars,
     Indexes,
 }
@@ -49,14 +50,30 @@ pub enum Section {
 impl Section {
     /// Every section, in the order the list renders them: the four that decide
     /// how an environment is built and opened first, then the two lists.
-    pub const ALL: [Section; 6] = [
+    pub const ALL: [Section; 7] = [
         Section::Environments,
         Section::Python,
         Section::Uv,
         Section::Terminal,
+        Section::Scripts,
         Section::EnvVars,
         Section::Indexes,
     ];
+
+    /// The Settings menu's wording, which has room to name the thing a user
+    /// is actually looking for. The section list inside Preferences uses the
+    /// shorter [`label`](Self::label).
+    pub fn menu_label(self) -> &'static str {
+        match self {
+            Section::Environments => "Virtual environments",
+            Section::Python => "Python version",
+            Section::Uv => "uv",
+            Section::Terminal => "Terminal",
+            Section::Scripts => "Scripts",
+            Section::EnvVars => "Environment variables",
+            Section::Indexes => "Package indexes and auth",
+        }
+    }
 
     pub fn label(self) -> &'static str {
         match self {
@@ -64,6 +81,7 @@ impl Section {
             Section::Python => "Python",
             Section::Uv => "uv",
             Section::Terminal => "Terminal",
+            Section::Scripts => "Scripts",
             Section::EnvVars => "Env vars",
             Section::Indexes => "Indexes",
         }
@@ -147,7 +165,9 @@ pub fn inherited_label(section: Section, config: &Config, os: Os) -> String {
         },
         // These merge rather than override, so "what you would inherit" is
         // not a single value and the panel says so in prose instead.
-        Section::Environments | Section::EnvVars | Section::Indexes => String::new(),
+        Section::Environments | Section::Scripts | Section::EnvVars | Section::Indexes => {
+            String::new()
+        }
     }
 }
 
@@ -224,6 +244,7 @@ pub fn view<'a>(
             uv_custom_validation,
         ),
         (Section::Uv, Some(i)) => uv_panel(config, scope, i),
+        (Section::Scripts, _) => settings_scripts_panel(config, selected_project),
         (Section::Python, _) => python_panel(config, scope, selected_project),
         (Section::Terminal, _) => terminal_panel(config, scope, selected_project),
     };
@@ -268,6 +289,28 @@ pub fn view<'a>(
         });
 
     iced::widget::opaque(iced::widget::mouse_area(positioner).on_press(Message::PreferencesClosed))
+}
+
+/// The Scripts section. Global only: a project's own pre-activate hooks stay
+/// in its Scripts tab, because they are that project's behaviour rather than
+/// a setting, and the user asked for the tab to stay.
+fn settings_scripts_panel<'a>(
+    config: &Config,
+    project_index: Option<usize>,
+) -> iced::Element<'a, Message> {
+    if project_index.is_some() {
+        return iced::widget::column![
+            iced::widget::text(
+                "A project's own pre-activate scripts live in its Scripts tab, next to \
+                 Dependencies and Members -- they are that project's behaviour rather than \
+                 a setting. Switch scope to Global to edit the scripts every project runs."
+            )
+            .size(theme::BODY)
+            .color(theme::SLATE),
+        ]
+        .into();
+    }
+    crate::scripts_editor::global_view(config)
 }
 
 /// The Python section: the pin, and what changing it costs.

@@ -150,8 +150,12 @@ pub struct App {
     /// `Message::PinChangeConfirmed` is the only message that reaches a
     /// pinned sync against an environment on another version.
     pub confirm_pin_change: Option<context_menu::ConfirmPinChange>,
-    /// Whether the top bar's Help menu is open.
-    pub menu_open: bool,
+    /// Which top-bar menu is open, if any.
+    ///
+    /// One field rather than a `bool` per menu: two menus open at once is a
+    /// state neither of them wants, and a `bool` each makes that
+    /// representable and then someone has to remember to close the other.
+    pub open_menu: Option<shell::TopMenu>,
     /// Which modal is open over the application, if any.
     ///
     /// This is what reaches the bundled licence text Apache-2.0 section 4 and
@@ -460,10 +464,10 @@ pub enum Message {
     /// The background open finished. `Err` carries the spawn failure --
     /// nothing composed reaches this path, so there is nothing to redact.
     OpenFolderFinished(Result<(), String>),
-    /// The top bar's Help button was pressed: open the menu, or close it if
-    /// it is already open. A press that did nothing would read as a broken
+    /// A top-bar menu button was pressed: open that menu, or close it if it
+    /// is already open. A press that did nothing would read as a broken
     /// control.
-    MenuToggled,
+    MenuToggled(shell::TopMenu),
     /// A press landed outside the open menu: close it without choosing.
     MenuDismissed,
     /// A menu entry was chosen. Opening a modal always closes the menu --
@@ -472,8 +476,9 @@ pub enum Message {
     ModalOpened(shell::Modal),
     /// The modal's Close button, or a press on its scrim.
     ModalClosed,
-    /// Help > Preferences.
-    PreferencesOpened,
+    /// A Settings-menu entry: open Preferences straight onto that section, in
+    /// Global scope.
+    PreferencesSectionOpened(preferences::Section),
     /// Its Close button, or a press on its scrim. Not an undo: every control
     /// in there has already written through to `Config` and persisted.
     PreferencesClosed,
@@ -717,7 +722,7 @@ impl App {
             context_menu: None,
             confirm_recreate: None,
             confirm_pin_change: None,
-            menu_open: false,
+            open_menu: None,
             modal: None,
             preferences: None,
             deps: None,
@@ -1626,25 +1631,36 @@ pub fn update(app: &mut App, message: Message, runner: Arc<dyn CommandRunner>) -
                 app.drawer.expanded = true;
             }
         }
-        Message::MenuToggled => {
-            app.menu_open = !app.menu_open;
+        Message::MenuToggled(menu) => {
+            app.open_menu = if app.open_menu == Some(menu) {
+                None
+            } else {
+                Some(menu)
+            };
         }
         Message::MenuDismissed => {
-            app.menu_open = false;
+            app.open_menu = None;
         }
         Message::ModalOpened(modal) => {
             app.modal = Some(modal);
-            app.menu_open = false;
+            app.open_menu = None;
         }
         Message::ModalClosed => {
             app.modal = None;
         }
-        Message::PreferencesOpened => {
-            app.preferences = Some(preferences::State::default());
+        Message::PreferencesSectionOpened(section) => {
+            // Straight to the section the user named, always in Global scope.
+            // The Settings menu exists so the settings are *visible* without
+            // opening anything first -- landing on a different section than
+            // the one pressed would undo that.
+            app.preferences = Some(preferences::State {
+                scope: preferences::Scope::Global,
+                section,
+            });
             // The menu closes behind what it opened, the same as
             // `ModalOpened`: two layers claiming the pointer at once is how a
             // press both dismisses and activates.
-            app.menu_open = false;
+            app.open_menu = None;
         }
         Message::PreferencesClosed => {
             // No undo: every control in there has already written through to
@@ -1736,6 +1752,7 @@ pub fn update(app: &mut App, message: Message, runner: Arc<dyn CommandRunner>) -
                 // The list sections merge rather than override, so there is
                 // nothing here to hand back. See `preferences`'s module doc.
                 preferences::Section::Environments
+                | preferences::Section::Scripts
                 | preferences::Section::EnvVars
                 | preferences::Section::Indexes => return Task::none(),
             }
@@ -3673,7 +3690,7 @@ pub fn view(app: &App) -> iced::Element<'_, Message> {
     // a hairline above: a running command's transcript is the one thing that
     // must not move when the pane above it scrolls.
     let frame = iced::widget::column![
-        shell::topbar(app.menu_open),
+        shell::topbar(app.open_menu),
         banner::view(&problems),
         body,
         theme::hairline_row(),
@@ -3714,8 +3731,8 @@ pub fn view(app: &App) -> iced::Element<'_, Message> {
     if app.confirm_member_sync.is_some() {
         layers = layers.push(shell::overlay_layer(confirm_member_sync_view));
     }
-    if app.menu_open {
-        layers = layers.push(shell::menu_layer());
+    if let Some(menu) = app.open_menu {
+        layers = layers.push(shell::menu_layer(menu));
     }
     if let Some(state) = app.preferences {
         // `resolve_scope` here, at render, rather than stored: recomputing it
@@ -6751,7 +6768,11 @@ mod tests {
         let persist = Arc::new(FakeConfigPersist::default());
         app.persist = persist.clone();
 
-        let _ = update(&mut app, Message::PreferencesOpened, unused_runner());
+        let _ = update(
+            &mut app,
+            Message::PreferencesSectionOpened(preferences::Section::default()),
+            unused_runner(),
+        );
         let _ = update(
             &mut app,
             Message::PreferencesPythonPinChanged(preferences::Scope::Global, "3.12".into()),
@@ -6782,7 +6803,11 @@ mod tests {
         // error about an interpreter nobody asked for.
         let mut app = App::new(Config::default());
 
-        let _ = update(&mut app, Message::PreferencesOpened, unused_runner());
+        let _ = update(
+            &mut app,
+            Message::PreferencesSectionOpened(preferences::Section::default()),
+            unused_runner(),
+        );
         let _ = update(
             &mut app,
             Message::PreferencesPythonPinChanged(preferences::Scope::Global, "3.12".into()),
@@ -6809,7 +6834,11 @@ mod tests {
         });
         let id = app.config.projects[0].id;
 
-        let _ = update(&mut app, Message::PreferencesOpened, unused_runner());
+        let _ = update(
+            &mut app,
+            Message::PreferencesSectionOpened(preferences::Section::default()),
+            unused_runner(),
+        );
         let _ = update(
             &mut app,
             Message::PreferencesPythonPinChanged(preferences::Scope::Project(id), "3.11".into()),
@@ -6840,7 +6869,11 @@ mod tests {
         let id = app.config.projects[0].id;
         app.config.projects[0].python = Override::Set(PythonPin::Version("3.11".into()));
 
-        let _ = update(&mut app, Message::PreferencesOpened, unused_runner());
+        let _ = update(
+            &mut app,
+            Message::PreferencesSectionOpened(preferences::Section::default()),
+            unused_runner(),
+        );
         let _ = update(
             &mut app,
             Message::PreferencesInheritToggled(
@@ -6869,7 +6902,11 @@ mod tests {
         });
         let gone = uuid::Uuid::from_u128(99);
 
-        let _ = update(&mut app, Message::PreferencesOpened, unused_runner());
+        let _ = update(
+            &mut app,
+            Message::PreferencesSectionOpened(preferences::Section::default()),
+            unused_runner(),
+        );
         let _ = update(
             &mut app,
             Message::PreferencesPythonPinChanged(preferences::Scope::Project(gone), "3.11".into()),
@@ -6892,7 +6929,11 @@ mod tests {
         });
         let id = app.config.projects[0].id;
 
-        let _ = update(&mut app, Message::PreferencesOpened, unused_runner());
+        let _ = update(
+            &mut app,
+            Message::PreferencesSectionOpened(preferences::Section::default()),
+            unused_runner(),
+        );
         let _ = update(
             &mut app,
             Message::PreferencesUvSourceOverridden(
@@ -6923,7 +6964,11 @@ mod tests {
             _ => Os::Linux,
         };
 
-        let _ = update(&mut app, Message::PreferencesOpened, unused_runner());
+        let _ = update(
+            &mut app,
+            Message::PreferencesSectionOpened(preferences::Section::default()),
+            unused_runner(),
+        );
         let _ = update(
             &mut app,
             Message::PreferencesTerminalOverridden(
@@ -6957,7 +7002,11 @@ mod tests {
         let id = app.config.projects[0].id;
         app.entries[0].python_version = Some("3.13.14".to_string());
 
-        let _ = update(&mut app, Message::PreferencesOpened, unused_runner());
+        let _ = update(
+            &mut app,
+            Message::PreferencesSectionOpened(preferences::Section::default()),
+            unused_runner(),
+        );
         let _ = update(
             &mut app,
             Message::PreferencesPythonPinChanged(preferences::Scope::Project(id), "3.12".into()),
@@ -6975,20 +7024,29 @@ mod tests {
     }
 
     #[test]
-    fn the_help_menu_opens_preferences_on_global() {
+    fn preferences_opens_on_global_and_closes_the_menu() {
         let mut app = App::new(Config {
             projects: vec![project("api")],
             ..Config::default()
         });
 
-        let _ = update(&mut app, Message::MenuToggled, unused_runner());
-        let _ = update(&mut app, Message::PreferencesOpened, unused_runner());
+        let _ = update(
+            &mut app,
+            Message::MenuToggled(shell::TopMenu::Help),
+            unused_runner(),
+        );
+        let _ = update(
+            &mut app,
+            Message::PreferencesSectionOpened(preferences::Section::default()),
+            unused_runner(),
+        );
 
         let state = app.preferences.expect("Preferences must open");
         assert_eq!(state.scope, preferences::Scope::Global);
         assert!(
-            !app.menu_open,
-            "the menu must close behind what it opened, as `ModalOpened` does"
+            app.open_menu.is_none(),
+            "an open Help menu must close behind it -- two layers claiming the \
+             pointer at once is how a press both dismisses and activates"
         );
     }
 
@@ -7004,7 +7062,11 @@ mod tests {
         });
         let id = app.config.projects[0].id;
 
-        let _ = update(&mut app, Message::PreferencesOpened, unused_runner());
+        let _ = update(
+            &mut app,
+            Message::PreferencesSectionOpened(preferences::Section::default()),
+            unused_runner(),
+        );
         let _ = update(
             &mut app,
             Message::PreferencesSectionSelected(preferences::Section::Python),
@@ -7031,7 +7093,11 @@ mod tests {
             ..Config::default()
         });
 
-        let _ = update(&mut app, Message::PreferencesOpened, unused_runner());
+        let _ = update(
+            &mut app,
+            Message::PreferencesSectionOpened(preferences::Section::default()),
+            unused_runner(),
+        );
         let _ = update(
             &mut app,
             Message::SettingsUvSourceChoiceChanged(settings_editor::UvSourceChoice::Bundled),
@@ -7054,8 +7120,16 @@ mod tests {
         let mut app = App::new(Config::default());
         assert_eq!(app.modal, None, "no modal is open on start");
 
-        let _ = update(&mut app, Message::MenuToggled, unused_runner());
-        assert!(app.menu_open, "the Help menu must open");
+        let _ = update(
+            &mut app,
+            Message::MenuToggled(shell::TopMenu::Help),
+            unused_runner(),
+        );
+        assert_eq!(
+            app.open_menu,
+            Some(shell::TopMenu::Help),
+            "the Help menu must open"
+        );
 
         let _ = update(
             &mut app,
@@ -7064,7 +7138,7 @@ mod tests {
         );
         assert_eq!(app.modal, Some(shell::Modal::Licences));
         assert!(
-            !app.menu_open,
+            app.open_menu.is_none(),
             "the menu must close behind the modal it opened; two layers \
              claiming the pointer at once is how a press both dismisses and \
              activates"
@@ -7080,14 +7154,29 @@ mod tests {
         // it must close it, and so must a press anywhere else.
         let mut app = App::new(Config::default());
 
-        let _ = update(&mut app, Message::MenuToggled, unused_runner());
-        let _ = update(&mut app, Message::MenuToggled, unused_runner());
-        assert!(!app.menu_open, "the Help button must toggle, not only open");
+        let _ = update(
+            &mut app,
+            Message::MenuToggled(shell::TopMenu::Help),
+            unused_runner(),
+        );
+        let _ = update(
+            &mut app,
+            Message::MenuToggled(shell::TopMenu::Help),
+            unused_runner(),
+        );
+        assert!(
+            app.open_menu.is_none(),
+            "the Help button must toggle, not only open"
+        );
         assert_eq!(app.modal, None, "dismissing must not open anything");
 
-        let _ = update(&mut app, Message::MenuToggled, unused_runner());
+        let _ = update(
+            &mut app,
+            Message::MenuToggled(shell::TopMenu::Help),
+            unused_runner(),
+        );
         let _ = update(&mut app, Message::MenuDismissed, unused_runner());
-        assert!(!app.menu_open);
+        assert!(app.open_menu.is_none());
         assert_eq!(app.modal, None);
     }
 

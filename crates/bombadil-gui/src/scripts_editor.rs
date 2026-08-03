@@ -156,6 +156,25 @@ fn rows<'a>(scope: ScriptScope, scripts: &[Script]) -> iced::Element<'a, Message
 
 /// Renders the whole tab: global scripts (which run first), then -- once a
 /// project is selected -- that project's own scripts, which run after them.
+/// The global scripts alone, for the Preferences Scripts section. The
+/// per-project half stays in the Scripts tab, which the user asked to keep:
+/// a pre-activate hook is a project's own behaviour, and only the global list
+/// is a setting.
+pub fn global_view<'a>(config: &Config) -> iced::Element<'a, Message> {
+    iced::widget::column![
+        iced::widget::text(ORDER_NOTE)
+            .size(theme::BODY)
+            .color(theme::SLATE),
+        rows(ScriptScope::Global, &config.global_scripts),
+        iced::widget::button(iced::widget::text("Add global script").size(theme::BODY))
+            .on_press(Message::ScriptAddRequested(ScriptScope::Global))
+            .padding([theme::SPACE_1, theme::SPACE_3])
+            .style(theme::button_quiet),
+    ]
+    .spacing(theme::SPACE_3)
+    .into()
+}
+
 pub fn view<'a>(config: &Config, selected_project: Option<usize>) -> iced::Element<'a, Message> {
     let mut column = iced::widget::column![
         iced::widget::text("Scripts")

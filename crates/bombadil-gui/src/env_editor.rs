@@ -477,6 +477,54 @@ pub fn project_view<'a>(
     ]
     .spacing(theme::SPACE_3);
 
+    // Every global variable, shown here too. Environment variables *merge*:
+    // a project's environment is the global set with its own layered over it,
+    // so a project scope that showed only its own rows would be hiding most
+    // of what its commands actually run with. That is what "the environment
+    // variable set is not showing" meant -- splitting the old combined pane
+    // by scope quietly dropped this half.
+    //
+    // Read-only, because editing a global belongs in the Global scope: two
+    // editable copies of one variable is two places for it to disagree.
+    let shadowed: Vec<String> = overrides(&config.global_env, &project.env)
+        .into_iter()
+        .map(|over| over.key)
+        .collect();
+    if !config.global_env.is_empty() {
+        column = column.push(
+            iced::widget::text("Inherited from global")
+                .font(theme::FONT_PROSE_SEMIBOLD)
+                .size(theme::LABEL)
+                .color(theme::SLATE),
+        );
+        for var in &config.global_env {
+            let overridden = shadowed.contains(&var.key);
+            let mut line = iced::widget::row![
+                iced::widget::text(var.key.clone())
+                    .font(theme::FONT_DATA)
+                    .size(theme::DATA)
+                    .color(theme::SLATE),
+                iced::widget::text(display_value(var))
+                    .font(theme::FONT_DATA)
+                    .size(theme::DATA)
+                    .color(theme::SLATE),
+            ]
+            .spacing(theme::SPACE_2);
+            if overridden {
+                line = line.push(
+                    iced::widget::text("(overridden above)")
+                        .size(theme::LABEL)
+                        .color(theme::SLATE),
+                );
+            }
+            column = column.push(
+                iced::widget::container(line)
+                    .padding(theme::SPACE_1)
+                    .style(theme::surface),
+            );
+        }
+    }
+
     for over in overrides(&config.global_env, &project.env) {
         // Key and the global's own value are both data; the sentence around
         // them is prose. Kept as separate `text` widgets rather than one
