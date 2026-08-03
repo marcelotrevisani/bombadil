@@ -537,8 +537,17 @@ pub enum Message {
     EnvironmentPickFolderRequested(uuid::Uuid, VenvLocation),
     /// That picker finished. `None` when cancelled, which leaves it alone.
     EnvironmentFolderPicked(uuid::Uuid, VenvLocation, Option<PathBuf>),
-    /// Add an environment to `Uuid`, seeded from the global pin.
+    /// Add an environment to `Uuid`: opens a folder picker.
+    ///
+    /// A picker rather than a generated name. The first version invented
+    /// `.venv-1` and added it silently, which told the user nothing about
+    /// where it was -- and an environment is its directory, so choosing that
+    /// directory *is* creating it. It also has to be a picker for the case
+    /// this exists for: pointing at an environment that already exists on
+    /// disk, including one another project uses.
     EnvironmentAdded(uuid::Uuid),
+    /// The picker finished. `None` when cancelled, which adds nothing.
+    EnvironmentAddFolderPicked(uuid::Uuid, Option<PathBuf>),
     /// Set one environment's own interpreter pin.
     EnvironmentPinChanged(uuid::Uuid, VenvLocation, String),
     /// Remove one. Opens a confirmation rather than removing: an environment
@@ -1885,38 +1894,36 @@ pub fn update(app: &mut App, message: Message, runner: Arc<dyn CommandRunner>) -
             return persist_env_edit(app);
         }
         Message::EnvironmentAdded(id) => {
+            return Task::perform(pick_folder(), move |path| {
+                Message::EnvironmentAddFolderPicked(id, path)
+            });
+        }
+        // Cancelled -- nothing is added.
+        Message::EnvironmentAddFolderPicked(_, None) => {}
+        Message::EnvironmentAddFolderPicked(id, Some(path)) => {
             let seed = app.config.settings.python.clone();
             let Some(project) = app.config.projects.iter_mut().find(|p| p.id == id) else {
                 return Task::none();
             };
-            // Alongside is the one location that always resolves and never
-            // collides with an existing central-store directory. The user
-            // moves it from the card once it is there.
-            let mut location = VenvLocation::Alongside;
-            let mut suffix = 1;
-            while project
+            let location = VenvLocation::Custom { path };
+            // Two environments cannot share a directory -- that is what
+            // identifies them -- so choosing one this project already has is
+            // a no-op rather than a duplicate row.
+            if project
                 .environments
                 .iter()
                 .any(|environment| environment.location == location)
             {
-                // Two environments cannot share a directory -- that is what
-                // identifies them -- so a name that is taken gets the next
-                // free one rather than silently replacing it.
-                location = VenvLocation::Custom {
-                    path: project
-                        .pyproject_path
-                        .parent()
-                        .unwrap_or_else(|| std::path::Path::new(""))
-                        .join(format!(".venv-{suffix}")),
-                };
-                suffix += 1;
+                return Task::none();
             }
             project
                 .environments
                 .push(bombadil_core::model::Environment {
                     location,
                     // `Settings::python` is the pin a new environment starts with,
-                    // which is the meaning it has now that the pin lives here.
+                    // which is the meaning it has now that the pin lives here. A
+                    // folder that already holds an environment reports its real
+                    // version once the probe lands, whatever this says.
                     python: seed,
                 });
             rebuild_entries(app);
@@ -5196,6 +5203,125 @@ mod tests {
     }
 
     #[test]
+    fn adding_an_environment_creates_nothing_until_a_folder_is_picked() {
+        // Reported as: pressing add "simply appearing a new env that I don't
+        // know how it was created". An environment *is* its directory, so
+        // choosing that directory is the act of creating it -- inventing a
+        // name and adding it silently tells the user nothing about where it
+        // went, and cannot express the case this exists for: pointing at an
+        // environment already on disk.
+        //
+        // What this proves is that the press creates nothing on its own;
+        // `EnvironmentAddFolderPicked` is the only arm that adds. That *the
+        // dispatched task is a folder picker* is not provable here -- a
+        // `Task` is opaque, and dispatching an invented path would look
+        // identical -- so it is confirmed by hand instead. Named for the
+        // claim it actually carries rather than the one I wanted it to.
+        let mut app = App::new(Config {
+            projects: vec![project("api")],
+            ..Config::default()
+        });
+        let id = app.config.projects[0].id;
+        let before = app.config.projects[0].environments.len();
+
+        let task = update(&mut app, Message::EnvironmentAdded(id), unused_runner());
+
+        assert!(task.units() > 0, "the press must dispatch something");
+        assert_eq!(
+            app.config.projects[0].environments.len(),
+            before,
+            "nothing may be created before the user has said where"
+        );
+        assert!(
+            app.entries[0].environments.len() == before,
+            "and nothing may appear in the tree either"
+        );
+    }
+
+    #[test]
+    fn cancelling_the_folder_picker_adds_nothing() {
+        let mut app = App::new(Config {
+            projects: vec![project("api")],
+            ..Config::default()
+        });
+        let id = app.config.projects[0].id;
+        let before = app.config.projects[0].environments.len();
+
+        let task = update(
+            &mut app,
+            Message::EnvironmentAddFolderPicked(id, None),
+            unused_runner(),
+        );
+
+        assert_eq!(app.config.projects[0].environments.len(), before);
+        assert_eq!(task.units(), 0);
+    }
+
+    #[test]
+    fn the_chosen_folder_is_where_the_environment_goes() {
+        let chosen = std::path::PathBuf::from("/home/me/envs/shared");
+        let mut app = App::new(Config {
+            projects: vec![project("api")],
+            ..Config::default()
+        });
+        let id = app.config.projects[0].id;
+
+        let _ = update(
+            &mut app,
+            Message::EnvironmentAddFolderPicked(id, Some(chosen.clone())),
+            unused_runner(),
+        );
+
+        assert_eq!(
+            app.config.projects[0].environments.last().unwrap().location,
+            VenvLocation::Custom {
+                path: chosen.clone()
+            },
+            "the environment must live exactly where the user pointed"
+        );
+        assert!(
+            app.entries[0]
+                .environments
+                .iter()
+                .any(|row| row.path == chosen),
+            "and the tree must show that directory"
+        );
+    }
+
+    #[test]
+    fn choosing_a_folder_this_project_already_uses_adds_nothing() {
+        // Two environments cannot share a directory -- that is what
+        // identifies them -- so this is a no-op rather than a duplicate row
+        // the user would then have to work out how to remove.
+        let chosen = std::path::PathBuf::from("/home/me/envs/shared");
+        let mut app = App::new(Config {
+            projects: vec![Project {
+                environments: vec![bombadil_core::model::Environment {
+                    location: VenvLocation::Custom {
+                        path: chosen.clone(),
+                    },
+                    python: PythonPin::Unpinned,
+                }],
+                active: VenvLocation::Custom {
+                    path: chosen.clone(),
+                },
+                ..project("api")
+            }],
+            ..Config::default()
+        });
+        let id = app.config.projects[0].id;
+
+        let task = update(
+            &mut app,
+            Message::EnvironmentAddFolderPicked(id, Some(chosen)),
+            unused_runner(),
+        );
+
+        assert_eq!(app.config.projects[0].environments.len(), 1);
+        assert_eq!(task.units(), 0);
+    }
+
+    #[test]
     fn an_added_environment_appears_in_the_sidebar_at_once() {
         // `app.entries` is what the tree renders; `app.config` is what is
         // persisted. Writing only the second is the bug the whole-branch
@@ -5211,7 +5337,11 @@ mod tests {
         let id = app.config.projects[0].id;
         let before = app.entries[0].environments.len();
 
-        let _ = update(&mut app, Message::EnvironmentAdded(id), unused_runner());
+        let _ = update(
+            &mut app,
+            Message::EnvironmentAddFolderPicked(id, Some(std::path::PathBuf::from("/envs/new"))),
+            unused_runner(),
+        );
 
         assert_eq!(
             app.config.projects[0].environments.len(),
@@ -5281,7 +5411,11 @@ mod tests {
         let id = app.config.projects[0].id;
         set_probed_version(&mut app, 0, "3.12.13");
 
-        let _ = update(&mut app, Message::EnvironmentAdded(id), unused_runner());
+        let _ = update(
+            &mut app,
+            Message::EnvironmentAddFolderPicked(id, Some(std::path::PathBuf::from("/envs/new"))),
+            unused_runner(),
+        );
 
         assert_eq!(
             app.entries[0]
@@ -5310,7 +5444,11 @@ mod tests {
         let id = app.config.projects[0].id;
         let before = app.config.projects[0].environments.len();
 
-        let _ = update(&mut app, Message::EnvironmentAdded(id), unused_runner());
+        let _ = update(
+            &mut app,
+            Message::EnvironmentAddFolderPicked(id, Some(std::path::PathBuf::from("/envs/new"))),
+            unused_runner(),
+        );
 
         assert_eq!(app.config.projects[0].environments.len(), before + 1);
         assert_eq!(
@@ -5330,8 +5468,15 @@ mod tests {
         });
         let id = app.config.projects[0].id;
 
-        for _ in 0..3 {
-            let _ = update(&mut app, Message::EnvironmentAdded(id), unused_runner());
+        for n in 0..3 {
+            let _ = update(
+                &mut app,
+                Message::EnvironmentAddFolderPicked(
+                    id,
+                    Some(std::path::PathBuf::from(format!("/envs/api-{n}"))),
+                ),
+                unused_runner(),
+            );
         }
 
         let locations: Vec<_> = app.config.projects[0]
