@@ -143,7 +143,11 @@ pub fn view<'a>(drawer: &Drawer) -> iced::Element<'a, Message> {
             iced::widget::text(drawer.status.clone())
                 .size(theme::BODY)
                 .color(status_colour),
-            iced::widget::scrollable(list),
+            // Bounded: a large resolution prints thousands of lines, and an
+            // unbounded transcript would push the whole application off the
+            // top of the window. `push_line` already caps how many are kept;
+            // this caps how much of the window they may occupy.
+            iced::widget::scrollable(list).height(theme::DRAWER_MAX_HEIGHT),
         ]
         .spacing(theme::SPACE_1)
         .into()
@@ -154,12 +158,13 @@ pub fn view<'a>(drawer: &Drawer) -> iced::Element<'a, Message> {
             .into()
     };
 
+    // Full width, not sized to its own content: the drawer is the base of the
+    // window, and a status line shrunk to the word "idle" read as a stray
+    // chip floating in the middle of the canvas.
     iced::widget::container(content)
-        .padding(theme::SPACE_2)
-        .style(|_theme| iced::widget::container::Style {
-            background: Some(iced::Background::Color(theme::BARK)),
-            ..iced::widget::container::Style::default()
-        })
+        .width(iced::Length::Fill)
+        .padding([theme::SPACE_2, theme::SPACE_3])
+        .style(theme::surface)
         .into()
 }
 

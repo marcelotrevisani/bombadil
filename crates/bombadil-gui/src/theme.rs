@@ -91,19 +91,31 @@ use iced::{Color, Font, Theme, color};
 
 /// Ground: near-black with a green cast, not neutral grey.
 pub const INK: Color = color!(0x1B1D1A);
-/// Raised surfaces -- sidebar, drawer, rows.
+/// Raised surfaces -- sidebar, drawer, top bar, rows.
 pub const BARK: Color = color!(0x242723);
 /// Primary text on [`INK`]; warm, never pure white.
 pub const PARCHMENT: Color = color!(0xE8E4D9);
 /// Secondary text, labels, disabled.
-pub const SLATE: Color = color!(0x7C8279);
+pub const SLATE: Color = color!(0x8B9187);
 /// Interactive: selection, focus, links, primary action.
-pub const JACKET: Color = color!(0x4A82C4);
+pub const JACKET: Color = color!(0x5E94D6);
+/// [`JACKET`] under the pointer. Only ever a hover or pressed state -- never
+/// a resting colour, so it carries no meaning of its own.
+pub const JACKET_HOVER: Color = color!(0x7CA9E0);
 /// Attention only: drift, absent, a destructive confirm. Rationed -- see the
 /// module docs.
 pub const BOOT: Color = color!(0xE3B23C);
 /// Confirmation: installed, present, success.
-pub const MOSS: Color = color!(0x4E7A57);
+pub const MOSS: Color = color!(0x5F9169);
+/// The hairline that separates one region from the next -- see
+/// [`hairline_row`] and this module's "Every region has an edge" docs.
+pub const EDGE: Color = color!(0x3A3E37);
+/// The scrim behind a modal: [`INK`] at four-fifths, so the application stays
+/// legible underneath while reading as unavailable.
+pub const SCRIM: Color = Color {
+    a: 0.8,
+    ..color!(0x11120F)
+};
 
 /// Builds the application's [`Theme`] from the palette above via
 /// [`Theme::custom`], the mechanism iced 0.14 provides for exactly this.
@@ -169,6 +181,36 @@ pub const SIDEBAR_WIDTH: f32 = 240.0;
 /// only indicator (no boxes, no pills, no background fill), so the state
 /// glyph column stays the application's one symbolic vocabulary.
 pub const TAB_UNDERLINE: f32 = 2.0;
+/// Height of the application's top bar: its name on the left, the Help menu
+/// on the right. 44pt is the smallest comfortable pointer target, and the
+/// menu button is the one control in it.
+pub const TOPBAR_HEIGHT: f32 = 44.0;
+/// Every hairline in the application is exactly this thick. One value, so a
+/// divider can never be a different weight in two places.
+pub const HAIRLINE: f32 = 1.0;
+/// Corner radius. Near-square on purpose: the shell is built from edged
+/// panels, and a rounded control inside one reads as a different system.
+pub const RADIUS: f32 = 2.0;
+/// Width of the marker on the selected sidebar row. Thicker than a
+/// [`HAIRLINE`] because it is an indicator, not a boundary -- the same
+/// distinction [`TAB_UNDERLINE`] makes in the tab bar.
+pub const SELECTED_MARKER: f32 = 3.0;
+/// Width of a modal card. Wide enough for a licence's 80-column paragraphs
+/// without becoming a second window.
+pub const MODAL_WIDTH: f32 = 680.0;
+/// Height of a modal's scrollable body, so a long licence scrolls inside the
+/// card instead of growing it past the window.
+pub const MODAL_BODY_HEIGHT: f32 = 420.0;
+/// Tallest an overlaid dialog card may grow before its own body scrolls
+/// instead. Without a bound, the add-project form on a small window grew past
+/// the bottom of the screen with its buttons below the edge.
+pub const OVERLAY_MAX_HEIGHT: f32 = 560.0;
+/// Tallest the output drawer may grow when expanded. Beyond this its
+/// transcript scrolls: a thousand-line resolution must not push the
+/// application off the top of the window.
+pub const DRAWER_MAX_HEIGHT: f32 = 220.0;
+/// Width of the drop-down panel the Help menu opens.
+pub const MENU_WIDTH: f32 = 220.0;
 /// Width of the state glyph column, fixed at the left of every row in every
 /// pane (sidebar, dependency rows, member rows, index rows) so the label
 /// that follows starts at the same x regardless of which glyph rendered.
@@ -204,6 +246,215 @@ pub const ATKINSON_REGULAR: &[u8] = include_bytes!("../fonts/AtkinsonHyperlegibl
 pub const ATKINSON_SEMIBOLD: &[u8] =
     include_bytes!("../fonts/AtkinsonHyperlegibleNext-SemiBold.ttf");
 pub const PLEX_MONO_REGULAR: &[u8] = include_bytes!("../fonts/IBMPlexMono-Regular.ttf");
+
+// ---------------------------------------------------------------------------
+// Surfaces and edges
+// ---------------------------------------------------------------------------
+
+/// A [`BARK`] surface: the sidebar, the top bar, the drawer, a row, a modal
+/// card. Pass to `container.style(...)`.
+pub fn surface(_theme: &Theme) -> iced::widget::container::Style {
+    iced::widget::container::Style {
+        background: Some(iced::Background::Color(BARK)),
+        ..iced::widget::container::Style::default()
+    }
+}
+
+/// A [`BARK`] surface with an [`EDGE`] outline: a modal card or a menu panel,
+/// which float over the application and need a boundary of their own rather
+/// than only a fill.
+pub fn panel(_theme: &Theme) -> iced::widget::container::Style {
+    iced::widget::container::Style {
+        background: Some(iced::Background::Color(BARK)),
+        border: iced::Border {
+            color: EDGE,
+            width: HAIRLINE,
+            radius: RADIUS.into(),
+        },
+        ..iced::widget::container::Style::default()
+    }
+}
+
+/// A full-width [`HAIRLINE`] in [`EDGE`]: the boundary between two stacked
+/// regions.
+///
+/// A filled `container` rather than iced's `Rule`, matching the tab bar's
+/// underline, so every line in the application is drawn one way.
+pub fn hairline_row<'a, Message: 'a>() -> iced::Element<'a, Message> {
+    iced::widget::container(
+        iced::widget::Space::new()
+            .width(iced::Length::Fill)
+            .height(HAIRLINE),
+    )
+    .width(iced::Length::Fill)
+    .style(|_theme| iced::widget::container::Style {
+        background: Some(iced::Background::Color(EDGE)),
+        ..iced::widget::container::Style::default()
+    })
+    .into()
+}
+
+/// [`hairline_row`]'s vertical twin: the boundary between two side-by-side
+/// regions, such as the sidebar and the detail pane.
+pub fn hairline_column<'a, Message: 'a>() -> iced::Element<'a, Message> {
+    iced::widget::container(
+        iced::widget::Space::new()
+            .width(HAIRLINE)
+            .height(iced::Length::Fill),
+    )
+    .height(iced::Length::Fill)
+    .style(|_theme| iced::widget::container::Style {
+        background: Some(iced::Background::Color(EDGE)),
+        ..iced::widget::container::Style::default()
+    })
+    .into()
+}
+
+// ---------------------------------------------------------------------------
+// Buttons
+// ---------------------------------------------------------------------------
+
+use iced::widget::button;
+
+/// The primary action: a [`JACKET`] fill with [`INK`] text.
+///
+/// [`INK`] rather than [`PARCHMENT`] on that fill, and the reason is measured
+/// rather than felt: parchment on jacket is 3.1:1, which fails WCAG AA for
+/// text at every size this application uses. Ink on jacket is 5.4:1. See
+/// [`contrast_ratio`] and the test that holds every pairing to it.
+pub fn button_primary(_theme: &Theme, status: button::Status) -> button::Style {
+    let fill = match status {
+        button::Status::Hovered | button::Status::Pressed => JACKET_HOVER,
+        button::Status::Disabled => BARK,
+        button::Status::Active => JACKET,
+    };
+    button::Style {
+        background: Some(iced::Background::Color(fill)),
+        text_color: if status == button::Status::Disabled {
+            SLATE
+        } else {
+            INK
+        },
+        border: iced::Border {
+            radius: RADIUS.into(),
+            ..iced::Border::default()
+        },
+        ..button::Style::default()
+    }
+}
+
+/// A secondary action: no fill, an [`EDGE`] outline, [`PARCHMENT`] text.
+///
+/// Most of the application's buttons are these. Only one control in any given
+/// view should be [`button_primary`] -- a screen where everything is primary
+/// has no primary.
+pub fn button_quiet(_theme: &Theme, status: button::Status) -> button::Style {
+    button::Style {
+        background: match status {
+            button::Status::Hovered | button::Status::Pressed => {
+                Some(iced::Background::Color(BARK))
+            }
+            _ => None,
+        },
+        text_color: match status {
+            button::Status::Disabled => SLATE,
+            _ => PARCHMENT,
+        },
+        border: iced::Border {
+            color: EDGE,
+            width: HAIRLINE,
+            radius: RADIUS.into(),
+        },
+        ..button::Style::default()
+    }
+}
+
+/// A destructive confirm: the [`BOOT`] fill this palette rations. Never use
+/// for anything else -- see the module docs on what that ration protects.
+pub fn button_danger(_theme: &Theme, status: button::Status) -> button::Style {
+    button::Style {
+        background: Some(iced::Background::Color(match status {
+            button::Status::Disabled => BARK,
+            _ => BOOT,
+        })),
+        text_color: if status == button::Status::Disabled {
+            SLATE
+        } else {
+            INK
+        },
+        border: iced::Border {
+            radius: RADIUS.into(),
+            ..iced::Border::default()
+        },
+        ..button::Style::default()
+    }
+}
+
+/// Bare text that responds to the pointer: a menu entry, a tab. No fill and
+/// no border at rest, so the region it sits in keeps its own shape.
+///
+/// `resting` is the colour when nothing is happening -- [`PARCHMENT`] for a
+/// menu entry, [`SLATE`] for an unselected tab -- because those two differ in
+/// weight but not in behaviour.
+pub fn button_bare(resting: Color) -> impl Fn(&Theme, button::Status) -> button::Style {
+    move |_theme, status| button::Style {
+        background: match status {
+            button::Status::Hovered | button::Status::Pressed => {
+                Some(iced::Background::Color(BARK))
+            }
+            _ => None,
+        },
+        text_color: match status {
+            button::Status::Hovered | button::Status::Pressed => PARCHMENT,
+            button::Status::Disabled => resting,
+            button::Status::Active => resting,
+        },
+        border: iced::Border {
+            radius: RADIUS.into(),
+            ..iced::Border::default()
+        },
+        ..button::Style::default()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Contrast
+// ---------------------------------------------------------------------------
+
+/// WCAG 2.1 relative luminance of `colour`, ignoring alpha.
+#[cfg(test)]
+fn relative_luminance(colour: Color) -> f32 {
+    fn channel(c: f32) -> f32 {
+        if c <= 0.03928 {
+            c / 12.92
+        } else {
+            ((c + 0.055) / 1.055).powf(2.4)
+        }
+    }
+    0.2126 * channel(colour.r) + 0.7152 * channel(colour.g) + 0.0722 * channel(colour.b)
+}
+
+/// The WCAG 2.1 contrast ratio between two colours, from 1.0 (identical) to
+/// 21.0 (black on white).
+///
+/// Here rather than in a comment because "is this legible" is a question with
+/// an answer, and the test below holds every pairing this application
+/// actually renders to it. The palette's first draft failed on its most-used
+/// colour -- `SLATE` carries nearly every path, version and label in the
+/// interface and sat at 4.3:1 against the ground.
+///
+/// `cfg(test)`: nothing in a running frame asks this question, because the
+/// answer is fixed at compile time. It exists so the palette is held to a
+/// number rather than to somebody's eye, and the tests below are where that
+/// happens.
+#[cfg(test)]
+pub fn contrast_ratio(a: Color, b: Color) -> f32 {
+    let (light, dark) = {
+        let (la, lb) = (relative_luminance(a), relative_luminance(b));
+        if la > lb { (la, lb) } else { (lb, la) }
+    };
+    (light + 0.05) / (dark + 0.05)
+}
 
 // ---------------------------------------------------------------------------
 // Typographic compounds
@@ -340,6 +591,82 @@ mod tests {
                 pair[0],
                 pair[1]
             );
+        }
+    }
+
+    #[test]
+    fn every_text_colour_is_legible_on_every_ground_it_is_rendered_on() {
+        // The user's report was "things are difficult to see", and this is the
+        // measurable half of it. `INK` is the application ground and `BARK`
+        // every raised surface, so a text colour has to clear WCAG AA (4.5:1)
+        // on both -- there is no third ground.
+        //
+        // The first draft of this palette failed here on the colour it uses
+        // most: `SLATE` sets nearly every path, version, label and secondary
+        // line in the interface, and sat at 4.3:1 against `INK`.
+        for (name, colour) in [
+            ("PARCHMENT", PARCHMENT),
+            ("SLATE", SLATE),
+            ("JACKET", JACKET),
+            ("BOOT", BOOT),
+        ] {
+            for (ground_name, ground) in [("INK", INK), ("BARK", BARK)] {
+                let ratio = contrast_ratio(colour, ground);
+                assert!(
+                    ratio >= 4.5,
+                    "{name} on {ground_name} is {ratio:.2}:1, below WCAG AA for text (4.5:1)"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn text_on_a_filled_button_is_legible() {
+        // `PARCHMENT` on `JACKET` is the obvious choice and it is 3.1:1 --
+        // which is why `button_primary` paints its text `INK` instead. The
+        // same holds for the rationed `BOOT` fill of a destructive confirm.
+        assert!(
+            contrast_ratio(INK, JACKET) >= 4.5,
+            "the primary button's text is {:.2}:1 on its own fill",
+            contrast_ratio(INK, JACKET)
+        );
+        assert!(
+            contrast_ratio(INK, BOOT) >= 4.5,
+            "the destructive button's text is {:.2}:1 on its own fill",
+            contrast_ratio(INK, BOOT)
+        );
+        assert!(
+            contrast_ratio(PARCHMENT, JACKET) < 4.5,
+            "if parchment on jacket ever clears AA, `button_primary`'s ink \
+             text is no longer the reason it exists -- revisit it rather than \
+             leaving this comment lying"
+        );
+    }
+
+    #[test]
+    fn a_state_glyph_is_legible_as_a_graphic_on_both_grounds() {
+        // A glyph is a non-text graphic: WCAG asks 3:1 of it, not 4.5:1. It
+        // still has to clear that, or the one symbolic vocabulary this
+        // application has is unreadable on the surfaces it renders on.
+        for state in [State::Present, State::Absent, State::Drifted] {
+            for (ground_name, ground) in [("INK", INK), ("BARK", BARK)] {
+                let ratio = contrast_ratio(state_glyph(state).colour, ground);
+                assert!(
+                    ratio >= 3.0,
+                    "the {state:?} glyph is {ratio:.2}:1 on {ground_name}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_hairline_is_visible_against_both_grounds() {
+        // A divider nobody can see is not a divider. It is a boundary, not
+        // text, so the bar is lower -- but it is not zero, and an `EDGE`
+        // picked by eye against `INK` alone would vanish on `BARK`.
+        for (name, ground) in [("INK", INK), ("BARK", BARK)] {
+            let ratio = contrast_ratio(EDGE, ground);
+            assert!(ratio >= 1.2, "the hairline is {ratio:.2}:1 on {name}");
         }
     }
 

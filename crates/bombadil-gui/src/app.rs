@@ -11,6 +11,7 @@ use crate::job;
 use crate::members_editor;
 use crate::scripts_editor;
 use crate::settings_editor;
+use crate::shell;
 use crate::sidebar;
 use crate::theme;
 use bombadil_core::envspec::{self, EnvInputs};
@@ -144,12 +145,16 @@ pub struct App {
     /// fills this in -- `RecreateVenvConfirmed` is the only message that
     /// reaches `venv_path::delete`.
     pub confirm_recreate: Option<context_menu::ConfirmRecreate>,
-    /// Whether the footer is showing the bundled uv licence in full.
-    /// Apache-2.0 section 4 obliges the text to be reachable, and
-    /// `bombadil_uv_bin::UV_LICENSE` is compiled in -- this is what reaches
-    /// it. Collapsed by default: it is thousands of words of boilerplate,
-    /// and the obligation is that the user *can* read it.
-    pub about_expanded: bool,
+    /// Whether the top bar's Help menu is open.
+    pub menu_open: bool,
+    /// Which modal is open over the application, if any.
+    ///
+    /// This is what reaches the bundled licence text Apache-2.0 section 4 and
+    /// OFL 1.1 oblige a distributed build to carry: `Modal::Licences` renders
+    /// all three in full. It used to be an expandable footer taking up the
+    /// bottom of every frame -- the obligation is that the user *can* read
+    /// thousands of words of boilerplate, not that they always are.
+    pub modal: Option<shell::Modal>,
     /// The Dependencies tab (spec §8) for whichever project it was last
     /// fetched for, paired with that project's index so a result that
     /// arrives after the selection has moved on is never shown against the
@@ -432,10 +437,18 @@ pub enum Message {
     /// The background open finished. `Err` carries the spawn failure --
     /// nothing composed reaches this path, so there is nothing to redact.
     OpenFolderFinished(Result<(), String>),
-    /// The footer's licence control was pressed: show or hide the bundled uv
-    /// licence text. Apache-2.0 section 4 obliges the text to be reachable,
-    /// and this is what reaches it.
-    AboutLicenseToggled,
+    /// The top bar's Help button was pressed: open the menu, or close it if
+    /// it is already open. A press that did nothing would read as a broken
+    /// control.
+    MenuToggled,
+    /// A press landed outside the open menu: close it without choosing.
+    MenuDismissed,
+    /// A menu entry was chosen. Opening a modal always closes the menu --
+    /// leaving it hanging over the modal it opened would be two layers
+    /// claiming focus at once.
+    ModalOpened(shell::Modal),
+    /// The modal's Close button, or a press on its scrim.
+    ModalClosed,
     /// The Env vars tab's "Add variable" button was pressed for `scope`
     /// (spec §5, Task 2).
     EnvVarAdded(env_editor::EnvScope),
@@ -660,7 +673,8 @@ impl App {
             persist: Arc::new(NullPersist),
             context_menu: None,
             confirm_recreate: None,
-            about_expanded: false,
+            menu_open: false,
+            modal: None,
             deps: None,
             index_credential_drafts,
             index_credential_names,
@@ -1459,8 +1473,18 @@ pub fn update(app: &mut App, message: Message, runner: Arc<dyn CommandRunner>) -
                 app.drawer.expanded = true;
             }
         }
-        Message::AboutLicenseToggled => {
-            app.about_expanded = !app.about_expanded;
+        Message::MenuToggled => {
+            app.menu_open = !app.menu_open;
+        }
+        Message::MenuDismissed => {
+            app.menu_open = false;
+        }
+        Message::ModalOpened(modal) => {
+            app.modal = Some(modal);
+            app.menu_open = false;
+        }
+        Message::ModalClosed => {
+            app.modal = None;
         }
         Message::EnvVarAdded(scope) => {
             if let Some(vars) = env_editor::vars_mut(&mut app.config, scope) {
@@ -3208,11 +3232,8 @@ pub fn view(app: &App) -> iced::Element<'_, Message> {
 
         let label = iced::widget::button(iced::widget::text(tab.label()).size(theme::TITLE))
             .on_press_maybe((!is_selected).then_some(Message::TabSelected(tab)))
-            .style(move |_theme, _status| iced::widget::button::Style {
-                background: None,
-                text_color,
-                ..iced::widget::button::Style::default()
-            });
+            .padding([theme::SPACE_1, theme::SPACE_2])
+            .style(theme::button_bare(text_color));
 
         let underline = iced::widget::container(
             iced::widget::Space::new()
@@ -3235,21 +3256,80 @@ pub fn view(app: &App) -> iced::Element<'_, Message> {
         );
     }
 
-    let detail_and_drawer = iced::widget::column![detail, tab_bar, pane, drawer::view(&app.drawer)]
-        .spacing(theme::SPACE_4);
+    // Nothing selected means the tab bar names panes for a project that is
+    // not there, and the detail header is an empty line where the largest
+    // type on screen should be. Both are suppressed, and with no projects at
+    // all the whole detail area becomes the one screen whose only content is
+    // the action that gets the user out of it.
+    let detail_area: iced::Element<'_, Message> = if app.config.projects.is_empty() {
+        shell::empty_state()
+    } else if selected.is_none() {
+        iced::widget::center(
+            iced::widget::text("Select a project")
+                .size(theme::BODY)
+                .color(theme::SLATE),
+        )
+        .into()
+    } else {
+        iced::widget::column![
+            detail,
+            theme::hairline_row(),
+            tab_bar,
+            iced::widget::scrollable(pane)
+                .width(iced::Length::Fill)
+                .height(iced::Length::Fill),
+        ]
+        .spacing(theme::SPACE_3)
+        .into()
+    };
 
-    let add_project_button = iced::widget::button(iced::widget::text("Add project"))
-        .on_press(Message::AddProjectPickManifestRequested);
-    let sidebar_and_controls = iced::widget::column![
-        add_project_button,
-        sidebar::view(&app.entries, app.selected)
+    // The sidebar is a `bark` surface with its own hairline against the
+    // detail ground beside it: it used to be the same `ink` as the pane it
+    // sat next to, with nothing between them, so the two regions read as one
+    // undivided canvas.
+    let sidebar_header = iced::widget::row![
+        iced::widget::text("Projects")
+            .font(theme::FONT_PROSE_SEMIBOLD)
+            .size(theme::LABEL)
+            .color(theme::SLATE),
+        iced::widget::Space::new().width(iced::Length::Fill),
+        // Labelled "Add", not a bare `+`: an icon-only control with no icon
+        // set behind it is a glyph the user has to guess at.
+        iced::widget::button(iced::widget::text("Add").size(theme::LABEL))
+            .on_press(Message::AddProjectPickManifestRequested)
+            .padding([theme::SPACE_1, theme::SPACE_2])
+            .style(theme::button_quiet),
     ]
-    .spacing(theme::SPACE_2);
+    .align_y(iced::Alignment::Center);
+
+    let sidebar_body: iced::Element<'_, Message> = if app.entries.is_empty() {
+        iced::widget::text("None yet")
+            .size(theme::DATA)
+            .color(theme::SLATE)
+            .into()
+    } else {
+        iced::widget::scrollable(sidebar::view(&app.entries, app.selected))
+            .height(iced::Length::Fill)
+            .into()
+    };
+
+    let sidebar_panel = iced::widget::container(
+        iced::widget::column![sidebar_header, sidebar_body].spacing(theme::SPACE_2),
+    )
+    .width(theme::SIDEBAR_WIDTH)
+    .height(iced::Length::Fill)
+    .padding(theme::SPACE_2)
+    .style(theme::surface);
 
     let body = iced::widget::row![
-        iced::widget::container(sidebar_and_controls).width(theme::SIDEBAR_WIDTH),
-        iced::widget::container(detail_and_drawer).padding(theme::SPACE_3),
-    ];
+        sidebar_panel,
+        theme::hairline_column(),
+        iced::widget::container(detail_area)
+            .width(iced::Length::Fill)
+            .height(iced::Length::Fill)
+            .padding(theme::SPACE_3),
+    ]
+    .height(iced::Length::Fill);
 
     // Recomputed fresh on every render from `app.add_project`'s current
     // `venv_choice`, the same trick `banner::problems` uses to stay live --
@@ -3298,26 +3378,51 @@ pub fn view(app: &App) -> iced::Element<'_, Message> {
 
     let mut problems = app.load_problems.clone();
     problems.extend(banner::problems(&app.config));
-    let footer = crate::about::view(app.about_expanded);
-    // The dialog, the context menu and both confirmations sit *above* the
-    // scrollable, not inside it. Nothing here is modal, so a confirmation
-    // rendered after the body is a confirmation the user has to scroll to --
-    // and with a real dependency tree that meant thousands of pixels below
-    // the viewport, in a column that did not scroll at all. Each is an empty
-    // `text("")` when closed, so they cost nothing when there is nothing to
-    // answer.
-    iced::widget::column![
+
+    // The drawer is pinned below the body rather than stacked inside it, with
+    // a hairline above: a running command's transcript is the one thing that
+    // must not move when the pane above it scrolls.
+    let frame = iced::widget::column![
+        shell::topbar(app.menu_open),
         banner::view(&problems),
-        add_project_dialog,
-        context_menu_view,
-        confirm_recreate_view,
-        confirm_member_sync_view,
-        iced::widget::scrollable(body)
-            .width(iced::Length::Fill)
-            .height(iced::Length::Fill),
-        footer
+        body,
+        theme::hairline_row(),
+        drawer::view(&app.drawer),
     ]
-    .into()
+    .height(iced::Length::Fill);
+
+    // Layered, not appended. Every one of these used to be a row in this
+    // column, so opening any of them shoved the whole application down the
+    // window -- and with a real dependency tree behind it, a confirmation
+    // could land thousands of pixels below the viewport in a column that did
+    // not scroll. Each layer is opaque, so a press reaches the top one only:
+    // without that, one click could both dismiss a popup and activate
+    // whatever happened to be under it.
+    //
+    // At most one of the four dialogs is open at a time -- `update` never
+    // opens a second over a first -- but they are pushed unconditionally in a
+    // fixed order so that if that ever stops being true the result is a
+    // predictable stack rather than whichever `match` arm ran last.
+    let mut layers = iced::widget::stack![frame];
+    if app.add_project.is_some() {
+        layers = layers.push(shell::overlay_layer(add_project_dialog));
+    }
+    if app.context_menu.is_some() {
+        layers = layers.push(shell::overlay_layer(context_menu_view));
+    }
+    if app.confirm_recreate.is_some() {
+        layers = layers.push(shell::overlay_layer(confirm_recreate_view));
+    }
+    if app.confirm_member_sync.is_some() {
+        layers = layers.push(shell::overlay_layer(confirm_member_sync_view));
+    }
+    if app.menu_open {
+        layers = layers.push(shell::menu_layer());
+    }
+    if let Some(modal) = app.modal {
+        layers = layers.push(shell::modal_layer(modal));
+    }
+    layers.into()
 }
 
 #[cfg(test)]
@@ -6034,19 +6139,51 @@ mod tests {
     }
 
     #[test]
-    fn the_bundled_licence_can_be_shown_and_hidden_again() {
-        // Apache-2.0 section 4 obliges the text to be reachable. It is
-        // compiled into the executable (`bombadil_uv_bin::UV_LICENSE`) and
-        // had no consumer at all; this flag is what `view` renders it from,
-        // so a toggle that never flips leaves the obligation unmet.
+    fn the_bundled_licence_is_reachable_through_the_help_menu() {
+        // Apache-2.0 section 4 and OFL 1.1 oblige the text to be reachable.
+        // It is compiled into the executable and had no consumer at all until
+        // the footer existed; moving that footer into a modal keeps the
+        // obligation met only if this route actually opens. `shell`'s own
+        // test holds the menu to still offering the entry; this holds the
+        // press to still opening it.
         let mut app = App::new(Config::default());
-        assert!(!app.about_expanded, "the licence starts collapsed");
+        assert_eq!(app.modal, None, "no modal is open on start");
 
-        let _ = update(&mut app, Message::AboutLicenseToggled, unused_runner());
-        assert!(app.about_expanded);
+        let _ = update(&mut app, Message::MenuToggled, unused_runner());
+        assert!(app.menu_open, "the Help menu must open");
 
-        let _ = update(&mut app, Message::AboutLicenseToggled, unused_runner());
-        assert!(!app.about_expanded);
+        let _ = update(
+            &mut app,
+            Message::ModalOpened(shell::Modal::Licences),
+            unused_runner(),
+        );
+        assert_eq!(app.modal, Some(shell::Modal::Licences));
+        assert!(
+            !app.menu_open,
+            "the menu must close behind the modal it opened; two layers \
+             claiming the pointer at once is how a press both dismisses and \
+             activates"
+        );
+
+        let _ = update(&mut app, Message::ModalClosed, unused_runner());
+        assert_eq!(app.modal, None);
+    }
+
+    #[test]
+    fn the_help_menu_closes_without_choosing_anything() {
+        // A menu with no way out but choosing is a trap: the press that opened
+        // it must close it, and so must a press anywhere else.
+        let mut app = App::new(Config::default());
+
+        let _ = update(&mut app, Message::MenuToggled, unused_runner());
+        let _ = update(&mut app, Message::MenuToggled, unused_runner());
+        assert!(!app.menu_open, "the Help button must toggle, not only open");
+        assert_eq!(app.modal, None, "dismissing must not open anything");
+
+        let _ = update(&mut app, Message::MenuToggled, unused_runner());
+        let _ = update(&mut app, Message::MenuDismissed, unused_runner());
+        assert!(!app.menu_open);
+        assert_eq!(app.modal, None);
     }
 
     // --- Task 2: the Env vars tab ---

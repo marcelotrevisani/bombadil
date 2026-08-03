@@ -1,14 +1,18 @@
-//! The attribution surface Apache-2.0 section 4 obliges: `bombadil-uv-bin`
+//! The attribution texts Apache-2.0 section 4 obliges: `bombadil-uv-bin`
 //! embeds a real uv binary, so a distributed build of Bombadil must carry
 //! uv's name, licence and version somewhere reachable in the UI -- and the
 //! licence *text* with it.
+//!
+//! This module owns the *text*; `shell` owns where it appears. It used to be
+//! an expandable footer at the bottom of every frame; it is now Help >
+//! Bundled licences, which satisfies the same obligation -- reachable, not
+//! unavoidable -- without spending the base of the window on boilerplate.
 //!
 //! The text is `bombadil_uv_bin::UV_LICENSE`, compiled into the executable by
 //! `include_str!`. That is the copy that always ships: `UV-LICENSE-APACHE`
 //! exists in the source tree but is not distributed next to the binary, so a
 //! footer telling the user to go read that file pointed at nothing. An
-//! expandable region here is the whole of the fix -- the obligation is that
-//! the text is reachable, not that it is beautiful.
+//! obligation is that the text is reachable, not that it is beautiful.
 //!
 //! # The two bundled fonts
 //!
@@ -18,14 +22,11 @@
 //! accompany the font it covers. Shipping the font without it is the same
 //! class of problem as shipping uv without its notice, so this module
 //! carries both OFL texts the same way it carries uv's: compiled in with
-//! `include_str!`, reachable from the same expandable footer.
-
-use crate::app::Message;
-use crate::theme;
+//! `include_str!`, reachable from the same menu entry.
 
 /// A short notice naming uv, its licence and the exact version bundled in
-/// this build. Rendered as a footer line by [`view`], above the control that
-/// reveals the full text.
+/// this build. Rendered in the About modal, above the control that opens the
+/// full text.
 ///
 /// `bombadil_uv_bin::BUNDLED_VERSION` is only known at `bombadil-uv-bin`'s own
 /// build time (its build script sets the env var `env!` reads), so it cannot
@@ -46,7 +47,7 @@ pub fn attribution() -> &'static str {
 ///
 /// A function rather than a re-exported `const` so this module is the single
 /// place the UI asks for the licence, and so the test below is testing the
-/// thing `view` actually renders.
+/// thing the Licences modal actually renders.
 pub fn license() -> &'static str {
     bombadil_uv_bin::UV_LICENSE
 }
@@ -68,42 +69,6 @@ pub fn atkinson_license() -> &'static str {
 /// same file `theme.rs` ships the font bytes alongside.
 pub fn plex_license() -> &'static str {
     include_str!("../fonts/OFL-IBMPlexMono.txt")
-}
-
-/// The footer: the attribution line, a control to reveal the bundled
-/// licence, and the licence itself while `expanded`.
-///
-/// Deliberately dumb, like every other `view` in this crate: the state lives
-/// on `App` and the toggle is a message, so what is worth testing (that the
-/// text is reachable at all, and that the toggle flips) is tested without a
-/// window.
-pub fn view<'a>(expanded: bool) -> iced::Element<'a, Message> {
-    let label = if expanded {
-        "Hide bundled licences"
-    } else {
-        "Bundled licences (uv, Apache-2.0 · fonts, OFL-1.1)"
-    };
-    let mut column = iced::widget::column![
-        iced::widget::text(attribution()).size(theme::LABEL),
-        iced::widget::text(font_attribution()).size(theme::LABEL),
-        iced::widget::button(iced::widget::text(label).size(theme::LABEL))
-            .on_press(Message::AboutLicenseToggled),
-    ]
-    .spacing(theme::SPACE_1);
-
-    if expanded {
-        column = column.push(iced::widget::scrollable(
-            iced::widget::text(atkinson_license()).size(theme::LABEL),
-        ));
-        column = column.push(iced::widget::scrollable(
-            iced::widget::text(plex_license()).size(theme::LABEL),
-        ));
-        column = column.push(iced::widget::scrollable(
-            iced::widget::text(license()).size(theme::LABEL),
-        ));
-    }
-
-    column.into()
 }
 
 #[cfg(test)]
@@ -148,8 +113,8 @@ mod tests {
     #[test]
     fn the_full_licence_text_is_reachable_from_the_ui() {
         // The point of the fix: `bombadil_uv_bin::UV_LICENSE` was compiled
-        // into the executable with no consumer at all. `view` renders exactly
-        // what this returns.
+        // into the executable with no consumer at all. `shell::modal_layer`
+        // renders exactly what this returns.
         let text = license();
         assert!(text.contains("Apache License"), "got {text}");
         assert!(
@@ -174,10 +139,10 @@ mod tests {
 
     #[test]
     fn both_font_licence_texts_are_reachable_from_the_ui() {
-        // Mirrors `the_full_licence_text_is_reachable_from_the_ui`: `view`
-        // renders exactly what these return, so a font shipped without a
-        // consumer for its licence text would be caught the same way uv's
-        // was.
+        // Mirrors `the_full_licence_text_is_reachable_from_the_ui`: the
+        // Licences modal renders exactly what these return, so a font shipped
+        // without a consumer for its licence text would be caught the same
+        // way uv's was.
         let atkinson = atkinson_license();
         assert!(atkinson.contains("SIL OPEN FONT LICENSE"), "got {atkinson}");
         assert!(atkinson.contains("Version 1.1"), "got {atkinson}");

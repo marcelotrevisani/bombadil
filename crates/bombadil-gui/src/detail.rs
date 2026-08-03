@@ -81,11 +81,10 @@ fn project_dir(project: &Project) -> PathBuf {
 /// character, so both are Plex at `DATA` in `slate` -- the same rule
 /// `sidebar` already applies to a project's path and version, held here too.
 ///
-/// Sync gets no explicit style: an unstyled button already renders with
-/// `theme::JACKET` as its background, because `theme::theme` builds the
-/// application's palette with `primary: JACKET` and iced's default button
-/// style paints from the theme's primary colour. That is what makes Sync
-/// "the primary action in jacket" -- there is nothing here to style.
+/// Sync is `theme::button_primary` -- the one filled control in this view,
+/// and the reason the tokens live in `theme` rather than here: an unstyled
+/// iced button also paints from the palette's primary, but it puts parchment
+/// on it, which measures 3.1:1. `button_primary` uses ink text for 5.4:1.
 ///
 /// `index` is the project's position in `App::config.projects`, carried into
 /// `Message::SyncRequested` so one message shape serves this button and the
@@ -114,13 +113,17 @@ pub fn view<'a>(header: &Header, index: usize) -> iced::Element<'a, Message> {
     };
 
     let title_row = iced::widget::row![
-        iced::widget::text(header.label.clone()).size(theme::DISPLAY),
+        iced::widget::text(header.label.clone())
+            .font(theme::FONT_PROSE_SEMIBOLD)
+            .size(theme::DISPLAY),
         iced::widget::Space::new().width(iced::Length::Fill),
         version,
     ];
 
-    let sync =
-        iced::widget::button(iced::widget::text("Sync")).on_press(Message::SyncRequested(index));
+    let sync = iced::widget::button(iced::widget::text("Sync").size(theme::BODY))
+        .on_press(Message::SyncRequested(index))
+        .padding([theme::SPACE_1, theme::SPACE_3])
+        .style(theme::button_primary);
 
     let path_row = iced::widget::row![
         iced::widget::text(header.path.display().to_string())
