@@ -5,6 +5,7 @@
 //! `requires-python`, and must offer to install a suitable interpreter
 //! through uv when none is available.
 
+use bombadil_core::model::PythonPin;
 use bombadil_core::uv::results::Interpreter;
 use std::cmp::Ordering;
 
@@ -226,6 +227,34 @@ pub fn preselect<'a>(
         })
 }
 
+/// Whether a venv's recorded Python `version` satisfies `pin`.
+///
+/// Compares only the release segments **both** versions carry, and that is
+/// not a convenience. `pyvenv.cfg` records what was *requested*, so a venv
+/// built with `uv sync -p 3.12` records `version_info = 3.12` while one built
+/// from a system interpreter records `3.13.14` -- verified against uv 0.12.1.
+/// A pin of `3.12.13` against a recorded `3.12` is a match that string
+/// equality calls a mismatch.
+///
+/// The cost of getting that wrong is not a wrong glyph. Sync asserts the pin
+/// by passing `-p`, and uv *deletes and recreates* an environment whose
+/// version differs, so a false mismatch destroys a working environment on
+/// every press -- a destructive loop out of a string comparison.
+///
+/// An unparseable version satisfies nothing: a venv this cannot read is not
+/// one it can vouch for.
+pub fn satisfies_pin(version: &str, pin: &PythonPin) -> bool {
+    let PythonPin::Version(pinned) = pin else {
+        return true;
+    };
+    let (recorded, wanted) = (release_segments(version), release_segments(pinned));
+    if recorded.is_empty() || wanted.is_empty() {
+        return false;
+    }
+    let shared = recorded.len().min(wanted.len());
+    recorded[..shared] == wanted[..shared]
+}
+
 /// Whether `version` names a pre-release: an alpha, a beta, a release
 /// candidate, anything that is not a plain dotted number.
 ///
@@ -420,6 +449,59 @@ mod tests {
     fn an_empty_interpreter_list_preselects_nothing() {
         assert_eq!(preselect(&[], Some(">=3.11")), None);
         assert_eq!(preselect(&[], None), None);
+    }
+
+    #[test]
+    fn a_pin_is_satisfied_by_a_version_that_only_records_fewer_segments() {
+        // `pyvenv.cfg` records what was *requested*: `uv sync -p 3.12` writes
+        // `version_info = 3.12`, not `3.12.13`. Verified against uv 0.12.1.
+        //
+        // String equality here is not a cosmetic bug. It would mark this venv
+        // drifted forever, and every Sync would delete and recreate a working
+        // environment -- a destructive loop out of a string comparison.
+        assert!(satisfies_pin(
+            "3.12",
+            &PythonPin::Version("3.12.13".to_string())
+        ));
+    }
+
+    #[test]
+    fn a_pin_is_satisfied_by_a_version_that_records_more_segments() {
+        // The other direction, for a venv built from a system interpreter:
+        // uv wrote `version_info = 3.13.14` there.
+        assert!(satisfies_pin(
+            "3.13.14",
+            &PythonPin::Version("3.13".to_string())
+        ));
+    }
+
+    #[test]
+    fn a_pin_is_not_satisfied_by_a_different_minor_version() {
+        assert!(!satisfies_pin(
+            "3.13.14",
+            &PythonPin::Version("3.12".to_string())
+        ));
+        assert!(!satisfies_pin(
+            "3.12.13",
+            &PythonPin::Version("3.12.14".to_string())
+        ));
+    }
+
+    #[test]
+    fn an_unpinned_project_is_satisfied_by_anything() {
+        assert!(satisfies_pin("3.9.1", &PythonPin::Unpinned));
+        assert!(satisfies_pin("", &PythonPin::Unpinned));
+    }
+
+    #[test]
+    fn a_version_that_parses_to_nothing_does_not_satisfy_a_pin() {
+        // An unreadable `pyvenv.cfg` value must not read as agreement. The
+        // caller has a venv it cannot vouch for, and "this matches" would be
+        // a claim from nothing.
+        assert!(!satisfies_pin(
+            "not-a-version",
+            &PythonPin::Version("3.12".to_string())
+        ));
     }
 
     #[test]

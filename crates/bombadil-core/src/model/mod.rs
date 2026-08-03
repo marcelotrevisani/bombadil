@@ -1,5 +1,6 @@
 mod env_var;
 mod index;
+mod inherit;
 mod member;
 mod project;
 mod script;
@@ -7,6 +8,7 @@ mod settings;
 
 pub use env_var::EnvVar;
 pub use index::{Index, IndexAuth, IndexKind};
+pub use inherit::{Override, PythonPin};
 pub use member::{MemberOrigin, MemberRef, MemberSelection};
 pub use project::{Project, VenvLocation};
 pub use script::Script;
@@ -83,8 +85,8 @@ impl Default for Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeMap;
     use std::path::PathBuf;
-    use uuid::Uuid;
 
     fn fully_populated() -> Config {
         Config {
@@ -96,6 +98,7 @@ mod tests {
                 default_venv_location: DefaultVenvLocation::Central {
                     path: PathBuf::from("/home/t/.venvs"),
                 },
+                python: PythonPin::Version("3.12.13".into()),
             },
             indexes: vec![
                 Index {
@@ -126,7 +129,6 @@ mod tests {
                 enabled: true,
             }],
             projects: vec![Project {
-                id: Uuid::nil(),
                 label: "my-api".into(),
                 pyproject_path: PathBuf::from("/proj/my-api/pyproject.toml"),
                 index_names: vec!["priv".into(), "extra".into()],
@@ -143,7 +145,18 @@ mod tests {
                     args: vec![],
                     enabled: false,
                 }],
+                // Every field named on purpose: this fixture exists to prove
+                // a whole `Config` round-trips through TOML, and a
+                // `..Project::default()` tail would let a field added later
+                // slip past the very test that would have caught it.
+                id: uuid::Uuid::nil(),
                 members: MemberSelection::default(),
+                python: Override::Set(PythonPin::Version("3.11".into())),
+                uv_source: Override::Set(UvSource::FromPath),
+                terminals: BTreeMap::from([(
+                    crate::terminal::Os::Linux,
+                    TerminalChoice::Detected(crate::terminal::TerminalKind::Konsole),
+                )]),
             }],
             terminal_defaults: BTreeMap::from([
                 (

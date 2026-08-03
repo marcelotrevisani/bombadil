@@ -16,7 +16,7 @@ use crate::sidebar;
 use crate::theme;
 use bombadil_core::envspec::{self, EnvInputs};
 use bombadil_core::model::{
-    Config, DefaultVenvLocation, Project, Settings, TerminalChoice, UvSource,
+    Config, DefaultVenvLocation, Project, PythonPin, Settings, TerminalChoice, UvSource,
 };
 use bombadil_core::process::CommandRunner;
 use bombadil_core::pyproject::PyProject;
@@ -145,6 +145,10 @@ pub struct App {
     /// fills this in -- `RecreateVenvConfirmed` is the only message that
     /// reaches `venv_path::delete`.
     pub confirm_recreate: Option<context_menu::ConfirmRecreate>,
+    /// The pending "syncing will delete this environment" confirmation.
+    /// `Message::PinChangeConfirmed` is the only message that reaches a
+    /// pinned sync against an environment on another version.
+    pub confirm_pin_change: Option<context_menu::ConfirmPinChange>,
     /// Whether the top bar's Help menu is open.
     pub menu_open: bool,
     /// Which modal is open over the application, if any.
@@ -444,6 +448,11 @@ pub enum Message {
     RecreateVenvConfirmed,
     /// The confirmation was dismissed. Nothing has been deleted.
     RecreateVenvCancelled,
+    /// The pin-change confirmation was accepted: run the sync that deletes
+    /// the environment and rebuilds it on the pinned interpreter.
+    PinChangeConfirmed,
+    /// It was declined. Nothing runs and nothing is deleted.
+    PinChangeCancelled,
     /// "Open folder" was picked for `projects[usize]` (spec §8): show the
     /// project's directory in the platform's file manager. Non-destructive,
     /// and dispatched as background work like every other process spawn here.
@@ -687,6 +696,7 @@ impl App {
             persist: Arc::new(NullPersist),
             context_menu: None,
             confirm_recreate: None,
+            confirm_pin_change: None,
             menu_open: false,
             modal: None,
             deps: None,
@@ -1111,6 +1121,30 @@ pub fn update(app: &mut App, message: Message, runner: Arc<dyn CommandRunner>) -
                 if let Some((kind, discovered)) = members_context(app, i) {
                     return dispatch_members_sync(app, project, kind, discovered, runner);
                 }
+                // uv does not migrate an environment to another interpreter,
+                // it deletes the directory and builds a new one -- so a pin
+                // that disagrees with what is there is a destructive action,
+                // and gets the same confirmation Recreate venv does.
+                let pin =
+                    bombadil_core::resolve::effective(&app.config, &project, Os::host()).python;
+                let venv_version = app
+                    .entries
+                    .get(i)
+                    .and_then(|entry| entry.python_version.clone());
+                if sync_would_delete(&pin, venv_version.as_deref())
+                    && let PythonPin::Version(to) = &pin
+                    && let Some(from) = &venv_version
+                    && let Ok(venv_path) = venv_path::resolve(&project, &app.config.settings)
+                {
+                    app.confirm_pin_change = Some(context_menu::ConfirmPinChange {
+                        project_id: project.id,
+                        label: project.label.clone(),
+                        venv_path,
+                        from: from.clone(),
+                        to: to.clone(),
+                    });
+                    return Task::none();
+                }
                 let config = app.config.clone();
                 app.syncing = Some(project.id.to_string());
                 // Fresh drawer per run, but showing a *running* status rather
@@ -1271,6 +1305,15 @@ pub fn update(app: &mut App, message: Message, runner: Arc<dyn CommandRunner>) -
                     // `probe_every_venv` needs one for a project loaded from
                     // config with no draft behind it.
                     requires_python: draft.requires_python.clone(),
+                    // Resolved against the config the project was just pushed
+                    // into, so a global pin applies to it from the first
+                    // frame rather than only after the next `boot`.
+                    pin: bombadil_core::resolve::effective(
+                        &app.config,
+                        &project,
+                        bombadil_core::terminal::Os::host(),
+                    )
+                    .python,
                 });
                 let index = app.config.projects.len() - 1;
                 app.selected = Some(index);
@@ -1487,6 +1530,31 @@ pub fn update(app: &mut App, message: Message, runner: Arc<dyn CommandRunner>) -
         }
         Message::RecreateVenvCancelled => {
             app.confirm_recreate = None;
+        }
+        Message::PinChangeCancelled => {
+            app.confirm_pin_change = None;
+        }
+        Message::PinChangeConfirmed => {
+            // `take` unconditionally: whether or not work is dispatched, the
+            // user has answered and the dialog is done. Re-resolved by id,
+            // not by an index, for the reason `ConfirmRecreate` documents.
+            if let Some(confirm) = app.confirm_pin_change.take()
+                && app.syncing.is_none()
+                && let Some(project) = app
+                    .config
+                    .projects
+                    .iter()
+                    .find(|p| p.id == confirm.project_id)
+                    .cloned()
+            {
+                let config = app.config.clone();
+                app.syncing = Some(project.id.to_string());
+                app.drawer = drawer::Drawer {
+                    status: format!("syncing {}...", project.label),
+                    ..drawer::Drawer::default()
+                };
+                return Task::stream(sync_project(project, config, runner));
+            }
         }
         Message::RecreateVenvConfirmed => {
             // `take` unconditionally: whether or not the work is dispatched,
@@ -2506,8 +2574,31 @@ fn run_sync(
         project_dir: project_dir.to_path_buf(),
         venv_path: venv_path.clone(),
     };
-    let spec = uv::command::sync(&resolved_uv, &ctx);
+    // The pin, if one resolves. `sync_with_python` is the same builder the
+    // add-project dialog already uses, so there is one way to say "-p".
+    let spec = match bombadil_core::resolve::effective(config, project, Os::host()).python {
+        PythonPin::Version(version) => uv::command::sync_with_python(&resolved_uv, &ctx, &version),
+        PythonPin::Unpinned => uv::command::sync(&resolved_uv, &ctx),
+    };
     compose_and_stream(spec, project, config, &venv_path, store, runner, on_line)
+}
+
+/// Whether pressing Sync would destroy the existing environment.
+///
+/// True only when there is an environment, there is a pin, and the two
+/// disagree -- because that is exactly when uv removes the directory rather
+/// than reusing it. Verified against uv 0.12.1: `uv sync -p 3.12` on a 3.13
+/// venv prints `Removed virtual environment at: .venv`.
+///
+/// `None` for `venv_version` is the ordinary create path and must never be
+/// gated behind a confirmation: there is nothing to lose, and making a user
+/// confirm the creation of something that does not exist yet teaches them to
+/// click through the one that matters.
+fn sync_would_delete(pin: &PythonPin, venv_version: Option<&str>) -> bool {
+    let Some(version) = venv_version else {
+        return false;
+    };
+    !interpreter::satisfies_pin(version, pin)
 }
 
 /// The blocking half of a members-aware sync (spec §5a, Task 5, criterion
@@ -3453,6 +3544,13 @@ pub fn view(app: &App) -> iced::Element<'_, Message> {
         None => iced::widget::text("").into(),
     };
 
+    // The pin-change confirmation, rendered from the versions captured when
+    // it opened -- same freshness argument as `confirm_recreate_view`.
+    let confirm_pin_view: iced::Element<'_, Message> = match &app.confirm_pin_change {
+        Some(confirm) => context_menu::confirm_pin_view(confirm),
+        None => iced::widget::text("").into(),
+    };
+
     // The pending "sync would remove members" confirmation (spec §5a
     // criterion 4), rendered from the warning captured when it opened --
     // same freshness argument as `confirm_recreate_view`.
@@ -3502,6 +3600,9 @@ pub fn view(app: &App) -> iced::Element<'_, Message> {
     }
     if app.confirm_recreate.is_some() {
         layers = layers.push(shell::overlay_layer(confirm_recreate_view));
+    }
+    if app.confirm_pin_change.is_some() {
+        layers = layers.push(shell::overlay_layer(confirm_pin_view));
     }
     if app.confirm_member_sync.is_some() {
         layers = layers.push(shell::overlay_layer(confirm_member_sync_view));
@@ -4332,6 +4433,187 @@ mod tests {
             "the failing line must still be shown, redacted; got {:?}",
             app.drawer.lines
         );
+    }
+
+    #[test]
+    fn a_pinned_project_syncs_with_that_interpreter() {
+        let project = Project {
+            python: bombadil_core::model::Override::Set(PythonPin::Version("3.12".into())),
+            ..project("api")
+        };
+        let config = Config {
+            projects: vec![project.clone()],
+            settings: fake_uv_settings(),
+            ..Config::default()
+        };
+        let store = bombadil_core::secrets::InMemorySecretStore::new();
+        let runner = FakeCommandRunner::new();
+        version_probe(&runner);
+        runner.expect(
+            "uv",
+            &["sync"],
+            bombadil_core::process::CommandOutcome {
+                status: Some(0),
+                stdout: String::new(),
+                stderr: String::new(),
+            },
+        );
+
+        let (success, lines) =
+            collect_lines(|on_line| run_sync(&project, &config, &store, &runner, on_line));
+
+        assert!(success, "got {lines:?}");
+        let sync = runner
+            .calls()
+            .into_iter()
+            .find(|c| c.args.first().map(String::as_str) == Some("sync"))
+            .expect("a sync must have run");
+        assert!(
+            sync.args.windows(2).any(|w| w == ["-p", "3.12"]),
+            "the pin must reach uv; got {:?}",
+            sync.args
+        );
+    }
+
+    #[test]
+    fn an_unpinned_project_syncs_with_no_interpreter_argument() {
+        // The pin is opt-in. An unpinned project's command must be what it
+        // was before this feature existed -- every project is unpinned until
+        // someone sets one, so this is the path almost everyone is on.
+        let project = project("api");
+        let config = Config {
+            projects: vec![project.clone()],
+            settings: fake_uv_settings(),
+            ..Config::default()
+        };
+        let store = bombadil_core::secrets::InMemorySecretStore::new();
+        let runner = FakeCommandRunner::new();
+        version_probe(&runner);
+        runner.expect(
+            "uv",
+            &["sync"],
+            bombadil_core::process::CommandOutcome {
+                status: Some(0),
+                stdout: String::new(),
+                stderr: String::new(),
+            },
+        );
+
+        let _ = collect_lines(|on_line| run_sync(&project, &config, &store, &runner, on_line));
+
+        let sync = runner
+            .calls()
+            .into_iter()
+            .find(|c| c.args.first().map(String::as_str) == Some("sync"))
+            .expect("a sync must have run");
+        assert!(
+            !sync.args.iter().any(|a| a == "-p"),
+            "an unpinned project must not gain an interpreter argument; got {:?}",
+            sync.args
+        );
+    }
+
+    #[test]
+    fn syncing_a_venv_that_is_off_its_pin_would_delete_it() {
+        // Verified against uv 0.12.1: `uv sync -p 3.12` on a 3.13 venv prints
+        // "Removed virtual environment at: .venv". Everything outside the
+        // lock file is gone. That is the same class of action as Recreate
+        // venv, which this application has always guarded.
+        assert!(sync_would_delete(
+            &PythonPin::Version("3.12".into()),
+            Some("3.13.14")
+        ));
+    }
+
+    #[test]
+    fn syncing_a_venv_that_is_on_its_pin_deletes_nothing() {
+        // `pyvenv.cfg` records `3.12` for a venv built with `-p 3.12`. Reading
+        // that as a mismatch would put a confirmation in front of every
+        // ordinary sync, and answering it would delete a working environment.
+        assert!(!sync_would_delete(
+            &PythonPin::Version("3.12.13".into()),
+            Some("3.12")
+        ));
+    }
+
+    #[test]
+    fn syncing_without_a_pin_or_without_a_venv_deletes_nothing() {
+        // No pin: uv is passed no `-p` and removes nothing. No venv: this is
+        // the ordinary create path, and confirming the creation of something
+        // that does not exist teaches the user to click through the one that
+        // matters.
+        assert!(!sync_would_delete(&PythonPin::Unpinned, Some("3.13.14")));
+        assert!(!sync_would_delete(&PythonPin::Version("3.12".into()), None));
+    }
+
+    #[test]
+    fn pressing_sync_on_a_venv_off_its_pin_asks_before_it_deletes() {
+        // The whole point of the task: the press opens a confirmation instead
+        // of dispatching, and dispatches nothing at all until it is answered.
+        let project = Project {
+            python: bombadil_core::model::Override::Set(PythonPin::Version("3.12".into())),
+            ..project("api")
+        };
+        let mut app = App::new(Config {
+            projects: vec![project],
+            ..Config::default()
+        });
+        app.entries[0].python_version = Some("3.13.14".to_string());
+
+        let task = update(&mut app, Message::SyncRequested(0), unused_runner());
+
+        assert_eq!(task.units(), 0, "nothing may run before the user answers");
+        assert!(
+            app.syncing.is_none(),
+            "the in-flight slot must not be taken"
+        );
+        let confirm = app
+            .confirm_pin_change
+            .as_ref()
+            .expect("the press must open the confirmation");
+        assert_eq!(confirm.from, "3.13.14");
+        assert_eq!(confirm.to, "3.12");
+    }
+
+    #[test]
+    fn pressing_sync_on_a_venv_that_matches_its_pin_just_syncs() {
+        // The other half: the guard must not stand in front of an ordinary
+        // sync. A confirmation on every press is one the user stops reading.
+        let project = Project {
+            python: bombadil_core::model::Override::Set(PythonPin::Version("3.12".into())),
+            ..project("api")
+        };
+        let mut app = App::new(Config {
+            projects: vec![project],
+            ..Config::default()
+        });
+        app.entries[0].python_version = Some("3.12".to_string());
+
+        let task = update(&mut app, Message::SyncRequested(0), unused_runner());
+
+        assert!(task.units() > 0, "the sync must dispatch");
+        assert!(app.confirm_pin_change.is_none(), "nothing to confirm");
+    }
+
+    #[test]
+    fn declining_the_pin_change_runs_nothing() {
+        let mut app = App::new(Config {
+            projects: vec![project("api")],
+            ..Config::default()
+        });
+        app.confirm_pin_change = Some(context_menu::ConfirmPinChange {
+            project_id: app.config.projects[0].id,
+            label: "api".into(),
+            venv_path: std::path::PathBuf::from("/p/api/.venv"),
+            from: "3.13.14".into(),
+            to: "3.12".into(),
+        });
+
+        let task = update(&mut app, Message::PinChangeCancelled, unused_runner());
+
+        assert_eq!(task.units(), 0, "declining must not delete anything");
+        assert!(app.confirm_pin_change.is_none());
+        assert!(app.syncing.is_none());
     }
 
     #[test]
@@ -8333,11 +8615,8 @@ mod tests {
             id: uuid::Uuid::new_v4(),
             label: label.into(),
             pyproject_path: std::path::PathBuf::from(format!("/p/{label}/pyproject.toml")),
-            index_names: vec![],
             venv: bombadil_core::model::VenvLocation::Alongside,
-            env: vec![],
-            scripts: vec![],
-            members: Default::default(),
+            ..bombadil_core::model::Project::default()
         }
     }
 }

@@ -279,11 +279,8 @@ mod tests {
             id: Uuid::from_u128(7),
             label: "my-api".into(),
             pyproject_path: PathBuf::from("/proj/my-api/pyproject.toml"),
-            index_names: vec![],
             venv: VenvLocation::Alongside,
-            env: vec![],
-            scripts: vec![],
-            members: Default::default(),
+            ..Project::default()
         }
     }
 

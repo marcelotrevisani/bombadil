@@ -20,7 +20,8 @@
 //! of the application already trained the eye to expect. Fixed alongside
 //! Task 5.
 
-use bombadil_core::model::Config;
+use bombadil_core::model::{Config, PythonPin};
+use bombadil_core::terminal::Os;
 
 use crate::app::Message;
 use crate::interpreter;
@@ -38,6 +39,10 @@ pub struct Entry {
     /// `interpreter::version_satisfies` does, as nothing to check against
     /// rather than a mismatch.
     pub requires_python: Option<String>,
+    /// The interpreter this project is pinned to, from
+    /// `bombadil_core::resolve::effective`. `Unpinned` until someone sets
+    /// one, which is every project today.
+    pub pin: PythonPin,
 }
 
 /// Builds one `Entry` per project, in config order.
@@ -56,6 +61,7 @@ pub fn entries(config: &Config) -> Vec<Entry> {
             venv_exists: false,
             python_version: None,
             requires_python: None,
+            pin: bombadil_core::resolve::effective(config, project, Os::host()).python,
         })
         .collect()
 }
@@ -78,7 +84,12 @@ pub fn state(entry: &Entry) -> State {
     match &entry.python_version {
         None => State::Absent,
         Some(version) => {
-            if interpreter::version_satisfies(version, entry.requires_python.as_deref()) {
+            // Two independent reasons to drift, and the venv has to clear
+            // both: the manifest's own `requires-python`, and the pin the
+            // user set. Either alone would let the other's mismatch pass.
+            let agrees = interpreter::version_satisfies(version, entry.requires_python.as_deref())
+                && interpreter::satisfies_pin(version, &entry.pin);
+            if agrees {
                 State::Present
             } else {
                 State::Drifted
@@ -201,7 +212,47 @@ mod tests {
             venv_exists: python_version.is_some(),
             python_version: python_version.map(String::from),
             requires_python: requires_python.map(String::from),
+            pin: PythonPin::Unpinned,
         }
+    }
+
+    /// An entry pinned to `pin`, with no `requires-python` in play -- so a
+    /// test about the pin is not quietly also a test about the manifest.
+    fn pinned(python_version: &str, pin: &str) -> Entry {
+        Entry {
+            pin: PythonPin::Version(pin.into()),
+            ..entry(Some(python_version), None)
+        }
+    }
+
+    #[test]
+    fn a_venv_off_its_pin_reads_as_drift() {
+        assert_eq!(state(&pinned("3.11.9", "3.12")), State::Drifted);
+    }
+
+    #[test]
+    fn a_venv_on_its_pin_is_present_even_when_it_records_fewer_segments() {
+        // The destructive-loop guard, at the level the user actually sees:
+        // `pyvenv.cfg` records `3.12` for a venv built with `-p 3.12`, and
+        // reading that as drift would make every Sync delete and rebuild it.
+        assert_eq!(state(&pinned("3.12", "3.12.13")), State::Present);
+    }
+
+    #[test]
+    fn an_unpinned_project_still_reports_drift_against_requires_python() {
+        // The pin is an addition to the existing check, not a replacement.
+        assert_eq!(state(&entry(Some("3.9.1"), Some(">=3.11"))), State::Drifted);
+    }
+
+    #[test]
+    fn a_venv_on_its_pin_but_off_requires_python_still_drifts() {
+        // Both checks have to hold. Satisfying the pin must not excuse a
+        // manifest the environment cannot actually run.
+        let entry = Entry {
+            pin: PythonPin::Version("3.9".into()),
+            ..entry(Some("3.9.1"), Some(">=3.11"))
+        };
+        assert_eq!(state(&entry), State::Drifted);
     }
 
     #[test]
@@ -283,11 +334,8 @@ mod tests {
             id: uuid::Uuid::new_v4(),
             label: label.into(),
             pyproject_path: std::path::PathBuf::from(format!("/p/{label}/pyproject.toml")),
-            index_names: vec![],
             venv: bombadil_core::model::VenvLocation::Alongside,
-            env: vec![],
-            scripts: vec![],
-            members: Default::default(),
+            ..bombadil_core::model::Project::default()
         }
     }
 }

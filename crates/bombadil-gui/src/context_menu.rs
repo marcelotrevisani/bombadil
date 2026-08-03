@@ -204,6 +204,73 @@ pub fn recreate_confirmation(label: &str, venv_path: &Path) -> String {
     )
 }
 
+/// The pending "syncing will delete this environment" confirmation.
+///
+/// `project_id`, not an index, for the reason [`ConfirmRecreate`]'s own doc
+/// gives at length: an index is only meaningful against the list as it stood
+/// when the confirmation opened.
+///
+/// `venv_path`, `from` and `to` are captured when it opens rather than
+/// re-derived by `view`: the sentence the user agrees to and the directory
+/// that gets deleted must be the same one.
+pub struct ConfirmPinChange {
+    pub project_id: Uuid,
+    pub label: String,
+    pub venv_path: PathBuf,
+    /// The version the environment is on now.
+    pub from: String,
+    /// The version it is pinned to.
+    pub to: String,
+}
+
+/// What the user agrees to before a pinned Sync deletes an environment.
+///
+/// Worded like [`recreate_confirmation`] because it is the same action: uv
+/// does not migrate an environment to another interpreter, it removes the
+/// directory and builds a new one. Verified against uv 0.12.1, which prints
+/// `Removed virtual environment at: .venv`.
+pub fn pin_change_confirmation(label: &str, venv_path: &Path, from: &str, to: &str) -> String {
+    format!(
+        "{label} is pinned to Python {to}, but its environment is on {from}.\n\n\
+         Syncing will delete {} and build a new one on {to}. Anything installed \
+         in it that is not in the lock file will be lost.\n\n\
+         If the rebuild fails -- no network, a lock file that no longer resolves -- \
+         the old environment has already been deleted and cannot be restored.",
+        venv_path.display()
+    )
+}
+
+/// Renders it. Deliberately dumb, like [`confirm_view`]: the sentence worth
+/// testing is [`pin_change_confirmation`]'s.
+pub fn confirm_pin_view<'a>(confirm: &ConfirmPinChange) -> iced::Element<'a, Message> {
+    iced::widget::container(
+        iced::widget::column![
+            iced::widget::text(pin_change_confirmation(
+                &confirm.label,
+                &confirm.venv_path,
+                &confirm.from,
+                &confirm.to,
+            ))
+            .size(theme::BODY),
+            iced::widget::row![
+                iced::widget::button(iced::widget::text("Delete and rebuild").size(theme::BODY))
+                    .on_press(Message::PinChangeConfirmed)
+                    .padding([theme::SPACE_1, theme::SPACE_3])
+                    .style(theme::button_danger),
+                iced::widget::button(iced::widget::text("Cancel").size(theme::BODY))
+                    .on_press(Message::PinChangeCancelled)
+                    .padding([theme::SPACE_1, theme::SPACE_3])
+                    .style(theme::button_quiet),
+            ]
+            .spacing(theme::SPACE_2),
+        ]
+        .spacing(theme::SPACE_3),
+    )
+    .padding(theme::SPACE_3)
+    .style(theme::panel)
+    .into()
+}
+
 /// Renders the pending Recreate venv confirmation. Deliberately dumb, like
 /// `view`: the sentence worth testing is `recreate_confirmation`'s.
 ///
@@ -554,6 +621,31 @@ mod tests {
         // are the same empty list -- and the button would probe forever.
         assert_eq!(one_press_plan(None, Some(&[])), OpenPlan::Nothing);
         assert_ne!(one_press_plan(None, Some(&[])), one_press_plan(None, None));
+    }
+
+    #[test]
+    fn the_pin_change_confirmation_names_both_versions_and_the_directory() {
+        // "Are you sure?" is not a confirmation. The user has to see which
+        // directory stops existing and what it is being rebuilt as -- and
+        // that it is *deleted*, not migrated, because uv does not migrate.
+        let text = pin_change_confirmation(
+            "api",
+            Path::new("/home/t/.venvs/api-1f2e3d"),
+            "3.13.14",
+            "3.12",
+        );
+        assert!(text.contains("/home/t/.venvs/api-1f2e3d"), "got {text}");
+        assert!(text.contains("3.13.14"), "got {text}");
+        assert!(text.contains("3.12"), "got {text}");
+        assert!(
+            text.contains("deleted"),
+            "the user must be told the environment is deleted, not rebuilt; got {text}"
+        );
+        assert!(
+            text.contains("lock file will be lost"),
+            "the cost the user cannot see -- anything not in the lock file -- \
+             has to be stated; got {text}"
+        );
     }
 
     #[test]

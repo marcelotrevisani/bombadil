@@ -156,20 +156,15 @@ pub fn delete(project: &Project, settings: &Settings, path: &Path) -> Result<(),
 mod tests {
     use super::{central_dir_name, delete, probe, resolve};
     use crate::error::VenvDeleteError;
-    use crate::model::{DefaultVenvLocation, Project, Settings, UvSource, VenvLocation};
+    use crate::model::{DefaultVenvLocation, Project, PythonPin, Settings, UvSource, VenvLocation};
     use std::path::{Path, PathBuf};
-    use uuid::Uuid;
 
     fn project(venv: VenvLocation) -> Project {
         Project {
-            id: Uuid::nil(),
             label: "my-api".into(),
             pyproject_path: PathBuf::from("/proj/my-api/pyproject.toml"),
-            index_names: vec![],
             venv,
-            env: vec![],
-            scripts: vec![],
-            members: Default::default(),
+            ..Project::default()
         }
     }
 
@@ -177,6 +172,7 @@ mod tests {
         Settings {
             uv_source: UvSource::Auto,
             default_venv_location,
+            python: PythonPin::default(),
         }
     }
 

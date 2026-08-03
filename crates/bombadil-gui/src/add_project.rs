@@ -189,15 +189,12 @@ pub fn to_project(draft: &Draft) -> Project {
             .clone()
             .unwrap_or_else(|| fallback_label(&draft.pyproject_path)),
         pyproject_path: draft.pyproject_path.clone(),
-        index_names: Vec::new(),
         venv: match &draft.venv_choice {
             VenvChoice::SettingsDefault => VenvLocation::Default,
             VenvChoice::Alongside => VenvLocation::Alongside,
             VenvChoice::Chosen(path) => VenvLocation::Custom { path: path.clone() },
         },
-        env: Vec::new(),
-        scripts: Vec::new(),
-        members: Default::default(),
+        ..Project::default()
     }
 }
 

@@ -199,11 +199,11 @@ mod tests {
     use super::*;
     use crate::model::{
         CURRENT_SCHEMA_VERSION, Config, DefaultVenvLocation, EnvVar, Index, IndexAuth, IndexKind,
-        MemberOrigin, MemberRef, MemberSelection, Project, Script, Settings, UvSource,
-        VenvLocation,
+        MemberOrigin, MemberRef, MemberSelection, Override, Project, PythonPin, Script, Settings,
+        TerminalChoice, UvSource, VenvLocation,
     };
+    use std::collections::BTreeMap;
     use std::path::PathBuf;
-    use uuid::Uuid;
 
     /// Hand-authored, not serde-generated (see the file's own header comment):
     /// a generated fixture would just re-encode whatever bug is already in the
@@ -227,6 +227,7 @@ mod tests {
                 default_venv_location: DefaultVenvLocation::Central {
                     path: PathBuf::from("/home/t/.venvs"),
                 },
+                python: PythonPin::Version("3.12.13".into()),
             },
             indexes: vec![
                 Index {
@@ -257,7 +258,6 @@ mod tests {
                 enabled: true,
             }],
             projects: vec![Project {
-                id: Uuid::nil(),
                 label: "my-api".into(),
                 pyproject_path: PathBuf::from("/proj/my-api/pyproject.toml"),
                 index_names: vec!["priv".into(), "extra".into()],
@@ -291,6 +291,16 @@ mod tests {
                         },
                     ],
                 },
+                // Every field named on purpose -- see the twin fixture in
+                // `model::tests`. A `..Project::default()` tail would let a
+                // field added later slip past this round-trip.
+                id: uuid::Uuid::nil(),
+                python: Override::Set(PythonPin::Version("3.11".into())),
+                uv_source: Override::Set(UvSource::FromPath),
+                terminals: BTreeMap::from([(
+                    crate::terminal::Os::Linux,
+                    TerminalChoice::Detected(crate::terminal::TerminalKind::Konsole),
+                )]),
             }],
             terminal_defaults: std::collections::BTreeMap::new(),
         };
@@ -310,6 +320,78 @@ mod tests {
 
     fn temp_config_path(dir: &tempfile::TempDir) -> PathBuf {
         paths::config_file_in(dir.path())
+    }
+
+    #[test]
+    fn a_config_written_before_the_override_fields_existed_still_loads() {
+        // The safety property of adding them: every one is
+        // `#[serde(default)]`, so a config from an older build must load, and
+        // must load as "follow the global" -- never as an override of
+        // something the user never set. Getting this wrong does not fail
+        // loudly; it silently gives a project settings nobody chose.
+        //
+        // The fixture with the new tables stripped out, which is exactly what
+        // an older build wrote.
+        //
+        // Line by line through `str::lines`, never by splitting on `"\n\n"`:
+        // git checks this file out with CRLF on Windows, so a blank-line split
+        // matched nothing there, the whole fixture came back as one block, that
+        // block contained every header, and the filter deleted all of it. The
+        // test then failed with "missing field `schema_version`" against an
+        // empty string. `lines` handles `\r\n` and `\n` alike.
+        //
+        // The same shape of mistake this crate's GUI docs already warn about
+        // for `display()`ed paths: a platform assumption hiding in a test
+        // rather than in the code, invisible on Linux and macOS.
+        const STRIPPED: [&str; 4] = [
+            "[settings.python]",
+            "[projects.python",
+            "[projects.uv_source",
+            "[projects.terminals.",
+        ];
+        let mut older = String::new();
+        let mut skipping = false;
+        for line in GOLDEN_FIXTURE.lines() {
+            let trimmed = line.trim_start();
+            // A table header ends whatever was being skipped and decides
+            // whether the next one starts.
+            if trimmed.starts_with('[') {
+                skipping = STRIPPED.iter().any(|header| trimmed.starts_with(header));
+            }
+            if !skipping {
+                older.push_str(line);
+                older.push('\n');
+            }
+        }
+        for header in STRIPPED {
+            assert!(
+                !older.contains(header),
+                "the stripped fixture still carries {header}, so this test would \
+                 prove nothing about a config that lacks it"
+            );
+        }
+        assert!(
+            older.contains("schema_version"),
+            "the stripped fixture must still be a config -- if the filter ate \
+             everything, `from_str` fails for a reason that has nothing to do \
+             with the fields this test is about"
+        );
+
+        let got: Config = toml::from_str(&older).expect("an older config must still parse");
+
+        assert_eq!(got.settings.python, PythonPin::Unpinned);
+        let project = &got.projects[0];
+        assert_eq!(project.python, Override::Inherit);
+        assert_eq!(project.uv_source, Override::Inherit);
+        assert!(project.terminals.is_empty());
+        // And nothing else moved: the rest of the config is byte-identical to
+        // what the full fixture produces, so this proves the new fields
+        // default without proving it by ignoring everything else.
+        let full: Config = toml::from_str(GOLDEN_FIXTURE).unwrap();
+        assert_eq!(got.indexes, full.indexes);
+        assert_eq!(got.global_env, full.global_env);
+        assert_eq!(got.projects[0].env, full.projects[0].env);
+        assert_eq!(got.projects[0].members, full.projects[0].members);
     }
 
     #[test]
