@@ -28,6 +28,7 @@
 
 use crate::about;
 use crate::app::Message;
+use crate::preferences;
 use crate::theme;
 
 /// Which modal is open. `App` holds an `Option<Modal>`; `None` is "no modal",
@@ -52,12 +53,56 @@ impl Modal {
     }
 }
 
-/// Every entry in the Help menu, in the order it is shown. One list, so the
-/// menu and the test that holds it to having a licence entry cannot disagree.
-pub const MENU_ENTRIES: [(&str, Modal); 2] = [
-    ("About Bombadil", Modal::About),
-    ("Bundled licences", Modal::Licences),
-];
+/// Which top-bar menu is open.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TopMenu {
+    /// Every global setting, each entry landing on its own section.
+    Settings,
+    /// About and the bundled licences.
+    Help,
+}
+
+impl TopMenu {
+    pub fn label(self) -> &'static str {
+        match self {
+            TopMenu::Settings => "Settings",
+            TopMenu::Help => "Help",
+        }
+    }
+
+    /// What this menu offers, in the order it is shown.
+    ///
+    /// The Settings menu names every global setting rather than offering one
+    /// "Preferences" entry, and that is the whole point of it: the Env vars,
+    /// Indexes and Settings tabs were absorbed into Preferences, and with
+    /// them went the only place a user could *see* what was configurable. A
+    /// single button hides that list behind a click. This one shows it.
+    ///
+    /// A `Message` rather than a `Modal`, which it was until Preferences
+    /// existed: Preferences is a working surface whose controls write
+    /// straight through to the config, not a read-only card, so no `Modal`
+    /// can describe it.
+    pub fn entries(self) -> Vec<(&'static str, Message)> {
+        match self {
+            TopMenu::Settings => preferences::Section::ALL
+                .iter()
+                .map(|section| {
+                    (
+                        section.menu_label(),
+                        Message::PreferencesSectionOpened(*section),
+                    )
+                })
+                .collect(),
+            TopMenu::Help => vec![
+                ("About Bombadil", Message::ModalOpened(Modal::About)),
+                ("Bundled licences", Message::ModalOpened(Modal::Licences)),
+            ],
+        }
+    }
+}
+
+/// Both top-bar menus, left to right.
+pub const TOP_MENUS: [TopMenu; 2] = [TopMenu::Settings, TopMenu::Help];
 
 /// This build's version, for the About modal.
 pub fn version() -> &'static str {
@@ -66,7 +111,7 @@ pub fn version() -> &'static str {
 
 /// The top bar: the application's name on the left, the Help menu on the
 /// right, on a `bark` surface with a hairline beneath it.
-pub fn topbar<'a>(menu_open: bool) -> iced::Element<'a, Message> {
+pub fn topbar<'a>(open_menu: Option<TopMenu>) -> iced::Element<'a, Message> {
     let name = iced::widget::text("Bombadil")
         .font(theme::FONT_PROSE_SEMIBOLD)
         .size(theme::TITLE);
@@ -74,20 +119,26 @@ pub fn topbar<'a>(menu_open: bool) -> iced::Element<'a, Message> {
     // Toggles rather than opens: pressing the button that opened the menu is
     // how a user closes it again, and a press that did nothing would read as
     // a broken control.
-    let help = iced::widget::button(iced::widget::text("Help").size(theme::BODY))
-        .on_press(Message::MenuToggled)
-        .padding([theme::SPACE_1, theme::SPACE_2])
-        .style(theme::button_bare(if menu_open {
-            theme::PARCHMENT
-        } else {
-            theme::SLATE
-        }));
+    let mut menus = iced::widget::row![].spacing(theme::SPACE_1);
+    for menu in TOP_MENUS {
+        let open = open_menu == Some(menu);
+        menus = menus.push(
+            iced::widget::button(iced::widget::text(menu.label()).size(theme::BODY))
+                .on_press(Message::MenuToggled(menu))
+                .padding([theme::SPACE_1, theme::SPACE_2])
+                .style(theme::button_bare(if open {
+                    theme::PARCHMENT
+                } else {
+                    theme::SLATE
+                })),
+        );
+    }
 
     let bar = iced::widget::container(
         iced::widget::row![
             name,
             iced::widget::Space::new().width(iced::Length::Fill),
-            help
+            menus
         ]
         .align_y(iced::Alignment::Center),
     )
@@ -105,12 +156,12 @@ pub fn topbar<'a>(menu_open: bool) -> iced::Element<'a, Message> {
 /// no popover, so the panel is positioned by aligning it within a
 /// transparent full-size layer, and that layer is also what makes a press
 /// anywhere else dismiss the menu.
-pub fn menu_layer<'a>() -> iced::Element<'a, Message> {
+pub fn menu_layer<'a>(menu: TopMenu) -> iced::Element<'a, Message> {
     let mut panel = iced::widget::column![].spacing(0);
-    for (label, modal) in MENU_ENTRIES {
+    for (label, message) in menu.entries() {
         panel = panel.push(
             iced::widget::button(iced::widget::text(label).size(theme::BODY))
-                .on_press(Message::ModalOpened(modal))
+                .on_press(message)
                 .width(iced::Length::Fill)
                 .padding([theme::SPACE_2, theme::SPACE_3])
                 .style(theme::button_bare(theme::PARCHMENT)),
@@ -354,27 +405,89 @@ mod tests {
         // only route to it. An entry list that lost it would be a licence
         // violation shipped as a layout tweak.
         assert!(
-            MENU_ENTRIES
+            TopMenu::Help
+                .entries()
                 .iter()
-                .any(|(_, modal)| *modal == Modal::Licences),
+                .any(|(_, message)| matches!(message, Message::ModalOpened(Modal::Licences))),
             "no menu entry opens the licences"
         );
     }
 
     #[test]
-    fn every_menu_entry_is_labelled_and_opens_a_distinct_modal() {
-        // Two entries opening the same modal would make one of them a lie
-        // about what pressing it does.
-        for (label, _) in MENU_ENTRIES {
-            assert!(!label.trim().is_empty(), "a menu entry has no label");
-        }
-        let modals: Vec<Modal> = MENU_ENTRIES.iter().map(|(_, modal)| *modal).collect();
-        for (i, modal) in modals.iter().enumerate() {
+    fn every_menu_entry_is_labelled_and_does_something_distinct() {
+        // Two entries doing the same thing would make one of them a lie about
+        // what pressing it does. Compared through `Debug` because `Message`
+        // has no `PartialEq` -- it carries payloads that do not need one.
+        for menu in TOP_MENUS {
+            let entries = menu.entries();
             assert!(
-                !modals[i + 1..].contains(modal),
-                "{modal:?} is opened by two entries"
+                !entries.is_empty(),
+                "{:?} is a menu button that opens an empty panel",
+                menu
+            );
+            for (label, _) in entries.iter() {
+                assert!(!label.trim().is_empty(), "a menu entry has no label");
+            }
+            let actions: Vec<String> = entries
+                .iter()
+                .map(|(_, message)| format!("{message:?}"))
+                .collect();
+            for (i, action) in actions.iter().enumerate() {
+                assert!(
+                    !actions[i + 1..].contains(action),
+                    "{action} is reached by two entries in {menu:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_settings_menu_names_every_section() {
+        // The whole reason it is a menu rather than one "Preferences" button.
+        // The Env vars, Indexes and Settings tabs were absorbed into
+        // Preferences, and with them went the only place a user could *see*
+        // what was configurable -- the first report after that change was
+        // that env vars were "not showing". A menu that listed fewer sections
+        // than exist would hide them again, one at a time.
+        let entries = TopMenu::Settings.entries();
+        assert_eq!(
+            entries.len(),
+            preferences::Section::ALL.len(),
+            "every section must be reachable from the Settings menu"
+        );
+        for section in preferences::Section::ALL {
+            assert!(
+                entries.iter().any(|(_, message)| matches!(
+                    message,
+                    Message::PreferencesSectionOpened(opened) if *opened == section
+                )),
+                "{section:?} is not in the Settings menu"
             );
         }
+    }
+
+    #[test]
+    fn settings_and_help_are_separate_menus() {
+        // "Help" is where a user looks for documentation, not for the thing
+        // that replaced three tabs.
+        let settings: Vec<String> = TopMenu::Settings
+            .entries()
+            .iter()
+            .map(|(label, _)| label.to_string())
+            .collect();
+        assert!(
+            !settings.iter().any(|label| label.contains("licence")),
+            "the licences belong under Help"
+        );
+        let help: Vec<String> = TopMenu::Help
+            .entries()
+            .iter()
+            .map(|(label, _)| label.to_string())
+            .collect();
+        assert!(
+            !help.iter().any(|label| label.contains("variable")),
+            "settings belong under Settings"
+        );
     }
 
     #[test]

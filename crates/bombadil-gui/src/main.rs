@@ -33,6 +33,7 @@ mod index_editor;
 mod interpreter;
 mod job;
 mod members_editor;
+mod preferences;
 mod scripts_editor;
 mod settings_editor;
 mod shell;

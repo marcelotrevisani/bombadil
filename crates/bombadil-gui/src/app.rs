@@ -9,6 +9,7 @@ use crate::index_editor;
 use crate::interpreter;
 use crate::job;
 use crate::members_editor;
+use crate::preferences;
 use crate::scripts_editor;
 use crate::settings_editor;
 use crate::shell;
@@ -16,7 +17,7 @@ use crate::sidebar;
 use crate::theme;
 use bombadil_core::envspec::{self, EnvInputs};
 use bombadil_core::model::{
-    Config, DefaultVenvLocation, Project, PythonPin, Settings, TerminalChoice, UvSource,
+    Config, DefaultVenvLocation, Override, Project, PythonPin, Settings, TerminalChoice, UvSource,
 };
 use bombadil_core::process::CommandRunner;
 use bombadil_core::pyproject::PyProject;
@@ -149,8 +150,12 @@ pub struct App {
     /// `Message::PinChangeConfirmed` is the only message that reaches a
     /// pinned sync against an environment on another version.
     pub confirm_pin_change: Option<context_menu::ConfirmPinChange>,
-    /// Whether the top bar's Help menu is open.
-    pub menu_open: bool,
+    /// Which top-bar menu is open, if any.
+    ///
+    /// One field rather than a `bool` per menu: two menus open at once is a
+    /// state neither of them wants, and a `bool` each makes that
+    /// representable and then someone has to remember to close the other.
+    pub open_menu: Option<shell::TopMenu>,
     /// Which modal is open over the application, if any.
     ///
     /// This is what reaches the bundled licence text Apache-2.0 section 4 and
@@ -159,6 +164,13 @@ pub struct App {
     /// bottom of every frame -- the obligation is that the user *can* read
     /// thousands of words of boilerplate, not that they always are.
     pub modal: Option<shell::Modal>,
+    /// What Preferences is showing, or `None` when it is closed.
+    ///
+    /// Separate from `modal`: that is a stack of read-only cards with a Close
+    /// button, and this is a working surface whose controls write through to
+    /// `Config`. Sharing the field would mean one Close doing two different
+    /// things.
+    pub preferences: Option<preferences::State>,
     /// The Dependencies tab (spec §8) for whichever project it was last
     /// fetched for, paired with that project's index so a result that
     /// arrives after the selection has moved on is never shown against the
@@ -248,31 +260,23 @@ pub enum Tab {
     #[default]
     Dependencies,
     Members,
-    EnvVars,
     Scripts,
-    Indexes,
-    Settings,
 }
 
 impl Tab {
     /// Every tab, in the order the selector renders them.
-    pub const ALL: [Tab; 6] = [
-        Tab::Dependencies,
-        Tab::Members,
-        Tab::EnvVars,
-        Tab::Scripts,
-        Tab::Indexes,
-        Tab::Settings,
-    ];
+    /// Every tab, in the order the selector renders them.
+    ///
+    /// Env vars, Indexes and Settings are not here: Preferences absorbed
+    /// them, so each is now reachable in both scopes from one screen rather
+    /// than as a tab that only ever showed the selected project's half.
+    pub const ALL: [Tab; 3] = [Tab::Dependencies, Tab::Members, Tab::Scripts];
 
     pub fn label(self) -> &'static str {
         match self {
             Tab::Dependencies => "Dependencies",
             Tab::Members => "Members",
-            Tab::EnvVars => "Env vars",
             Tab::Scripts => "Scripts",
-            Tab::Indexes => "Indexes",
-            Tab::Settings => "Settings",
         }
     }
 }
@@ -460,10 +464,10 @@ pub enum Message {
     /// The background open finished. `Err` carries the spawn failure --
     /// nothing composed reaches this path, so there is nothing to redact.
     OpenFolderFinished(Result<(), String>),
-    /// The top bar's Help button was pressed: open the menu, or close it if
-    /// it is already open. A press that did nothing would read as a broken
+    /// A top-bar menu button was pressed: open that menu, or close it if it
+    /// is already open. A press that did nothing would read as a broken
     /// control.
-    MenuToggled,
+    MenuToggled(shell::TopMenu),
     /// A press landed outside the open menu: close it without choosing.
     MenuDismissed,
     /// A menu entry was chosen. Opening a modal always closes the menu --
@@ -472,6 +476,27 @@ pub enum Message {
     ModalOpened(shell::Modal),
     /// The modal's Close button, or a press on its scrim.
     ModalClosed,
+    /// A Settings-menu entry: open Preferences straight onto that section, in
+    /// Global scope.
+    PreferencesSectionOpened(preferences::Section),
+    /// Its Close button, or a press on its scrim. Not an undo: every control
+    /// in there has already written through to `Config` and persisted.
+    PreferencesClosed,
+    /// The scope switch: whose settings to show.
+    PreferencesScopeSelected(preferences::Scope),
+    /// The section list down the left.
+    PreferencesSectionSelected(preferences::Section),
+    /// The Python section's version box, in `scope`. An empty box is not a
+    /// pin -- typing and clearing must leave `Unpinned`, not a `Version("")`
+    /// that uv would refuse with a confusing error.
+    PreferencesPythonPinChanged(preferences::Scope, String),
+    /// "Inherit from global" was ticked back on for `section` in `scope`.
+    /// Only meaningful for a project scope; Global has nothing to inherit.
+    PreferencesInheritToggled(preferences::Scope, preferences::Section),
+    /// The uv section's choice, in `scope`.
+    PreferencesUvSourceOverridden(preferences::Scope, UvSource),
+    /// The Terminal section's choice, in `scope`.
+    PreferencesTerminalOverridden(preferences::Scope, TerminalChoice),
     /// The Env vars tab's "Add variable" button was pressed for `scope`
     /// (spec §5, Task 2).
     EnvVarAdded(env_editor::EnvScope),
@@ -697,8 +722,9 @@ impl App {
             context_menu: None,
             confirm_recreate: None,
             confirm_pin_change: None,
-            menu_open: false,
+            open_menu: None,
             modal: None,
+            preferences: None,
             deps: None,
             index_credential_drafts,
             index_credential_names,
@@ -1605,18 +1631,132 @@ pub fn update(app: &mut App, message: Message, runner: Arc<dyn CommandRunner>) -
                 app.drawer.expanded = true;
             }
         }
-        Message::MenuToggled => {
-            app.menu_open = !app.menu_open;
+        Message::MenuToggled(menu) => {
+            app.open_menu = if app.open_menu == Some(menu) {
+                None
+            } else {
+                Some(menu)
+            };
         }
         Message::MenuDismissed => {
-            app.menu_open = false;
+            app.open_menu = None;
         }
         Message::ModalOpened(modal) => {
             app.modal = Some(modal);
-            app.menu_open = false;
+            app.open_menu = None;
         }
         Message::ModalClosed => {
             app.modal = None;
+        }
+        Message::PreferencesSectionOpened(section) => {
+            // Straight to the section the user named, always in Global scope.
+            // The Settings menu exists so the settings are *visible* without
+            // opening anything first -- landing on a different section than
+            // the one pressed would undo that.
+            app.preferences = Some(preferences::State {
+                scope: preferences::Scope::Global,
+                section,
+            });
+            // The menu closes behind what it opened, the same as
+            // `ModalOpened`: two layers claiming the pointer at once is how a
+            // press both dismisses and activates.
+            app.open_menu = None;
+        }
+        Message::PreferencesClosed => {
+            // No undo: every control in there has already written through to
+            // `Config` and persisted, the same as the tabs it replaces.
+            app.preferences = None;
+        }
+        Message::PreferencesScopeSelected(scope) => {
+            if let Some(state) = &mut app.preferences {
+                // The section is deliberately untouched. The two axes are
+                // independent, and comparing one project against the global
+                // value is the main thing this screen is for -- resetting to
+                // the top of the list on every scope change would undo that.
+                state.scope = scope;
+            }
+        }
+        Message::PreferencesSectionSelected(section) => {
+            if let Some(state) = &mut app.preferences {
+                state.section = section;
+            }
+        }
+        Message::PreferencesPythonPinChanged(scope, version) => {
+            let pin = preferences::pin_from_input(&version);
+            // The RAW scope, never `resolve_scope`. That function answers
+            // `Global` for a project that no longer exists, which is right for
+            // deciding what to *render* and catastrophic for deciding where to
+            // *write*: an edit meant for a removed project would silently
+            // change the global setting for every project. Landing nowhere is
+            // the only safe answer.
+            match scope {
+                preferences::Scope::Global => app.config.settings.python = pin,
+                preferences::Scope::Project(id) => {
+                    let Some(project) = app.config.projects.iter_mut().find(|p| p.id == id) else {
+                        return Task::none();
+                    };
+                    project.python = Override::Set(pin);
+                }
+            }
+            return persist_env_edit(app);
+        }
+        Message::PreferencesUvSourceOverridden(scope, source) => {
+            // The raw scope -- see `PreferencesPythonPinChanged`.
+            match scope {
+                preferences::Scope::Global => app.config.settings.uv_source = source,
+                preferences::Scope::Project(id) => {
+                    let Some(project) = app.config.projects.iter_mut().find(|p| p.id == id) else {
+                        return Task::none();
+                    };
+                    project.uv_source = Override::Set(source);
+                }
+            }
+            return persist_env_edit(app);
+        }
+        Message::PreferencesTerminalOverridden(scope, choice) => {
+            let os = Os::host();
+            // The raw scope -- see `PreferencesPythonPinChanged`.
+            match scope {
+                preferences::Scope::Global => {
+                    app.config.terminal_defaults.insert(os, choice);
+                }
+                preferences::Scope::Project(id) => {
+                    let Some(project) = app.config.projects.iter_mut().find(|p| p.id == id) else {
+                        return Task::none();
+                    };
+                    project.terminals.insert(os, choice);
+                }
+            }
+            return persist_env_edit(app);
+        }
+        Message::PreferencesInheritToggled(scope, section) => {
+            // Only a project can inherit. Global has nothing above it, and a
+            // control that did something there would be lying about what the
+            // scope means.
+            // The raw scope -- see `PreferencesPythonPinChanged`. Here it
+            // matters twice: `resolve_scope` would turn a removed project into
+            // `Global`, and Global has nothing to inherit, so this would
+            // silently do nothing instead of visibly doing nothing.
+            let preferences::Scope::Project(id) = scope else {
+                return Task::none();
+            };
+            let Some(project) = app.config.projects.iter_mut().find(|p| p.id == id) else {
+                return Task::none();
+            };
+            match section {
+                preferences::Section::Python => project.python = Override::Inherit,
+                preferences::Section::Uv => project.uv_source = Override::Inherit,
+                preferences::Section::Terminal => {
+                    project.terminals.remove(&Os::host());
+                }
+                // The list sections merge rather than override, so there is
+                // nothing here to hand back. See `preferences`'s module doc.
+                preferences::Section::Environments
+                | preferences::Section::Scripts
+                | preferences::Section::EnvVars
+                | preferences::Section::Indexes => return Task::none(),
+            }
+            return persist_env_edit(app);
         }
         Message::EnvVarAdded(scope) => {
             if let Some(vars) = env_editor::vars_mut(&mut app.config, scope) {
@@ -3340,27 +3480,11 @@ pub fn view(app: &App) -> iced::Element<'_, Message> {
             },
             _ => iced::widget::text("").into(),
         },
-        // Global variables are always shown; the project half only once a
-        // project is selected -- the same `app.selected` `env_editor::view`
-        // needs to know which project's `env` to show alongside them.
-        Tab::EnvVars => env_editor::view(&app.config, app.selected, &app.env_value_drafts),
-        // Same shape as the Env vars tab: global scripts always shown, the
-        // project's own scripts once one is selected.
+        // Global scripts always shown, the project's own once one is
+        // selected. The one editor Preferences did not absorb -- pre-activate
+        // hooks are a project's own behaviour rather than a setting, and the
+        // user asked for it to keep its tab.
         Tab::Scripts => scripts_editor::view(&app.config, app.selected),
-        // Every configured index, plus (once a project is selected) that
-        // project's own selection among them (spec §7, Task 4).
-        Tab::Indexes => index_editor::view(&app.config, app.selected, &app.index_credential_drafts),
-        // Which uv binary to run and where new venvs go (spec §5, Task 6).
-        // `resolved_default_venv_paths` recomputes fresh from `app.config` on
-        // every render, the same "recompute, don't cache" trick the Env vars
-        // and Indexes tabs already rely on, which is what makes criterion 3
-        // visible the instant a location change lands, with no restart.
-        Tab::Settings => settings_editor::view(
-            &app.config.settings,
-            &app.config.projects,
-            &app.uv_custom_path_draft,
-            app.uv_custom_validation.as_ref(),
-        ),
     };
 
     // The current tab's own button is disabled rather than hidden -- the
@@ -3566,7 +3690,7 @@ pub fn view(app: &App) -> iced::Element<'_, Message> {
     // a hairline above: a running command's transcript is the one thing that
     // must not move when the pane above it scrolls.
     let frame = iced::widget::column![
-        shell::topbar(app.menu_open),
+        shell::topbar(app.open_menu),
         banner::view(&problems),
         body,
         theme::hairline_row(),
@@ -3607,8 +3731,24 @@ pub fn view(app: &App) -> iced::Element<'_, Message> {
     if app.confirm_member_sync.is_some() {
         layers = layers.push(shell::overlay_layer(confirm_member_sync_view));
     }
-    if app.menu_open {
-        layers = layers.push(shell::menu_layer());
+    if let Some(menu) = app.open_menu {
+        layers = layers.push(shell::menu_layer(menu));
+    }
+    if let Some(state) = app.preferences {
+        // `resolve_scope` here, at render, rather than stored: recomputing it
+        // every frame is the same "recompute, don't cache" discipline
+        // `banner::problems` follows, and it is what makes a project removed
+        // behind this surface take effect immediately.
+        let scope = preferences::resolve_scope(state.scope, &app.config);
+        layers = layers.push(preferences::view(
+            state.section,
+            scope,
+            &app.config,
+            &app.env_value_drafts,
+            &app.index_credential_drafts,
+            &app.uv_custom_path_draft,
+            app.uv_custom_validation.as_ref(),
+        ));
     }
     if let Some(modal) = app.modal {
         layers = layers.push(shell::modal_layer(modal));
@@ -3700,11 +3840,11 @@ mod tests {
 
         let task = update(
             &mut app,
-            Message::TabSelected(Tab::Indexes),
+            Message::TabSelected(Tab::Scripts),
             unused_runner(),
         );
 
-        assert_eq!(app.tab, Tab::Indexes);
+        assert_eq!(app.tab, Tab::Scripts);
         assert_eq!(
             task.units(),
             0,
@@ -6620,6 +6760,356 @@ mod tests {
     }
 
     #[test]
+    fn setting_a_global_pin_writes_it_through_and_persists() {
+        let mut app = App::new(Config {
+            projects: vec![project("api")],
+            ..Config::default()
+        });
+        let persist = Arc::new(FakeConfigPersist::default());
+        app.persist = persist.clone();
+
+        let _ = update(
+            &mut app,
+            Message::PreferencesSectionOpened(preferences::Section::default()),
+            unused_runner(),
+        );
+        let _ = update(
+            &mut app,
+            Message::PreferencesPythonPinChanged(preferences::Scope::Global, "3.12".into()),
+            unused_runner(),
+        );
+
+        assert_eq!(
+            app.config.settings.python,
+            PythonPin::Version("3.12".into())
+        );
+        // Same shape every other settings test uses: the dispatched persist
+        // is not driven by a unit test, so the config is saved directly to
+        // prove it survives a restart.
+        assert!(block_on(persist_config(
+            app.config.clone(),
+            persist.clone()
+        )));
+        assert_eq!(
+            persist.saved()[0].settings.python,
+            PythonPin::Version("3.12".into())
+        );
+    }
+
+    #[test]
+    fn an_emptied_pin_box_unpins_rather_than_pinning_to_nothing() {
+        // Typing a version and clearing it must leave `Unpinned`. A
+        // `Version("")` would reach uv as `-p ""` and be refused with an
+        // error about an interpreter nobody asked for.
+        let mut app = App::new(Config::default());
+
+        let _ = update(
+            &mut app,
+            Message::PreferencesSectionOpened(preferences::Section::default()),
+            unused_runner(),
+        );
+        let _ = update(
+            &mut app,
+            Message::PreferencesPythonPinChanged(preferences::Scope::Global, "3.12".into()),
+            unused_runner(),
+        );
+        let _ = update(
+            &mut app,
+            Message::PreferencesPythonPinChanged(preferences::Scope::Global, "   ".into()),
+            unused_runner(),
+        );
+
+        assert_eq!(app.config.settings.python, PythonPin::Unpinned);
+    }
+
+    #[test]
+    fn a_project_pin_overrides_the_global_one_without_touching_it() {
+        let mut app = App::new(Config {
+            projects: vec![project("api")],
+            settings: Settings {
+                python: PythonPin::Version("3.12".into()),
+                ..Settings::default()
+            },
+            ..Config::default()
+        });
+        let id = app.config.projects[0].id;
+
+        let _ = update(
+            &mut app,
+            Message::PreferencesSectionOpened(preferences::Section::default()),
+            unused_runner(),
+        );
+        let _ = update(
+            &mut app,
+            Message::PreferencesPythonPinChanged(preferences::Scope::Project(id), "3.11".into()),
+            unused_runner(),
+        );
+
+        assert_eq!(
+            app.config.projects[0].python,
+            Override::Set(PythonPin::Version("3.11".into()))
+        );
+        assert_eq!(
+            app.config.settings.python,
+            PythonPin::Version("3.12".into()),
+            "a project override must not write into the global value"
+        );
+    }
+
+    #[test]
+    fn toggling_inherit_back_on_discards_the_override_not_the_global() {
+        let mut app = App::new(Config {
+            projects: vec![project("api")],
+            settings: Settings {
+                python: PythonPin::Version("3.12".into()),
+                ..Settings::default()
+            },
+            ..Config::default()
+        });
+        let id = app.config.projects[0].id;
+        app.config.projects[0].python = Override::Set(PythonPin::Version("3.11".into()));
+
+        let _ = update(
+            &mut app,
+            Message::PreferencesSectionOpened(preferences::Section::default()),
+            unused_runner(),
+        );
+        let _ = update(
+            &mut app,
+            Message::PreferencesInheritToggled(
+                preferences::Scope::Project(id),
+                preferences::Section::Python,
+            ),
+            unused_runner(),
+        );
+
+        assert_eq!(app.config.projects[0].python, Override::Inherit);
+        assert_eq!(
+            app.config.settings.python,
+            PythonPin::Version("3.12".into())
+        );
+    }
+
+    #[test]
+    fn an_edit_in_a_scope_whose_project_is_gone_writes_nothing() {
+        // Preferences can be open while the project it is showing is removed.
+        // The edit must land nowhere rather than in whichever project took its
+        // place -- the class of bug `ConfirmRecreate` carries a `Uuid` for --
+        // and, just as importantly, not in the global settings.
+        let mut app = App::new(Config {
+            projects: vec![project("api")],
+            ..Config::default()
+        });
+        let gone = uuid::Uuid::from_u128(99);
+
+        let _ = update(
+            &mut app,
+            Message::PreferencesSectionOpened(preferences::Section::default()),
+            unused_runner(),
+        );
+        let _ = update(
+            &mut app,
+            Message::PreferencesPythonPinChanged(preferences::Scope::Project(gone), "3.11".into()),
+            unused_runner(),
+        );
+
+        assert_eq!(app.config.projects[0].python, Override::Inherit);
+        assert_eq!(app.config.settings.python, PythonPin::Unpinned);
+    }
+
+    #[test]
+    fn a_project_uv_override_leaves_the_global_choice_alone() {
+        let mut app = App::new(Config {
+            projects: vec![project("api")],
+            settings: Settings {
+                uv_source: UvSource::Bundled,
+                ..Settings::default()
+            },
+            ..Config::default()
+        });
+        let id = app.config.projects[0].id;
+
+        let _ = update(
+            &mut app,
+            Message::PreferencesSectionOpened(preferences::Section::default()),
+            unused_runner(),
+        );
+        let _ = update(
+            &mut app,
+            Message::PreferencesUvSourceOverridden(
+                preferences::Scope::Project(id),
+                UvSource::FromPath,
+            ),
+            unused_runner(),
+        );
+
+        assert_eq!(
+            app.config.projects[0].uv_source,
+            Override::Set(UvSource::FromPath)
+        );
+        assert_eq!(app.config.settings.uv_source, UvSource::Bundled);
+    }
+
+    #[test]
+    fn a_project_terminal_override_is_per_os_and_leaves_the_others_alone() {
+        // `Project::terminals` is a map for exactly this reason: an override
+        // set on this machine must not decide what happens on another.
+        let mut app = App::new(Config {
+            projects: vec![project("api")],
+            ..Config::default()
+        });
+        let id = app.config.projects[0].id;
+        let other = match Os::host() {
+            Os::Linux => Os::Windows,
+            _ => Os::Linux,
+        };
+
+        let _ = update(
+            &mut app,
+            Message::PreferencesSectionOpened(preferences::Section::default()),
+            unused_runner(),
+        );
+        let _ = update(
+            &mut app,
+            Message::PreferencesTerminalOverridden(
+                preferences::Scope::Project(id),
+                TerminalChoice::Detected(TerminalKind::Xterm),
+            ),
+            unused_runner(),
+        );
+
+        let terminals = &app.config.projects[0].terminals;
+        assert_eq!(
+            terminals.get(&Os::host()),
+            Some(&TerminalChoice::Detected(TerminalKind::Xterm))
+        );
+        assert_eq!(
+            terminals.get(&other),
+            None,
+            "an override must speak only for the OS it was set on"
+        );
+    }
+
+    #[test]
+    fn a_pin_set_here_reaches_the_confirmation_when_sync_would_delete() {
+        // The end-to-end proof that Plan A's guard is wired to something a
+        // user can actually reach. Until this task nothing could set a pin,
+        // so `sync_would_delete` had never fired from a real press.
+        let mut app = App::new(Config {
+            projects: vec![project("api")],
+            ..Config::default()
+        });
+        let id = app.config.projects[0].id;
+        app.entries[0].python_version = Some("3.13.14".to_string());
+
+        let _ = update(
+            &mut app,
+            Message::PreferencesSectionOpened(preferences::Section::default()),
+            unused_runner(),
+        );
+        let _ = update(
+            &mut app,
+            Message::PreferencesPythonPinChanged(preferences::Scope::Project(id), "3.12".into()),
+            unused_runner(),
+        );
+        let task = update(&mut app, Message::SyncRequested(0), unused_runner());
+
+        assert_eq!(task.units(), 0, "nothing may run before the user answers");
+        let confirm = app
+            .confirm_pin_change
+            .as_ref()
+            .expect("a pin set in Preferences must reach the same guard");
+        assert_eq!(confirm.from, "3.13.14");
+        assert_eq!(confirm.to, "3.12");
+    }
+
+    #[test]
+    fn preferences_opens_on_global_and_closes_the_menu() {
+        let mut app = App::new(Config {
+            projects: vec![project("api")],
+            ..Config::default()
+        });
+
+        let _ = update(
+            &mut app,
+            Message::MenuToggled(shell::TopMenu::Help),
+            unused_runner(),
+        );
+        let _ = update(
+            &mut app,
+            Message::PreferencesSectionOpened(preferences::Section::default()),
+            unused_runner(),
+        );
+
+        let state = app.preferences.expect("Preferences must open");
+        assert_eq!(state.scope, preferences::Scope::Global);
+        assert!(
+            app.open_menu.is_none(),
+            "an open Help menu must close behind it -- two layers claiming the \
+             pointer at once is how a press both dismisses and activates"
+        );
+    }
+
+    #[test]
+    fn switching_scope_keeps_the_section_you_were_reading() {
+        // Scope and section are independent axes. Resetting the section on a
+        // scope change would throw the user back to the top of the list every
+        // time they compared a project against the global value -- which is
+        // the main thing this screen is for.
+        let mut app = App::new(Config {
+            projects: vec![project("api")],
+            ..Config::default()
+        });
+        let id = app.config.projects[0].id;
+
+        let _ = update(
+            &mut app,
+            Message::PreferencesSectionOpened(preferences::Section::default()),
+            unused_runner(),
+        );
+        let _ = update(
+            &mut app,
+            Message::PreferencesSectionSelected(preferences::Section::Python),
+            unused_runner(),
+        );
+        let _ = update(
+            &mut app,
+            Message::PreferencesScopeSelected(preferences::Scope::Project(id)),
+            unused_runner(),
+        );
+
+        let state = app.preferences.expect("still open");
+        assert_eq!(state.scope, preferences::Scope::Project(id));
+        assert_eq!(state.section, preferences::Section::Python);
+    }
+
+    #[test]
+    fn closing_preferences_keeps_every_edit_made_in_it() {
+        // There is no OK/Cancel here: every control writes straight through to
+        // `Config` and persists, the same as the tabs it replaces. Closing is
+        // not an undo, and must never read as one.
+        let mut app = App::new(Config {
+            projects: vec![project("api")],
+            ..Config::default()
+        });
+
+        let _ = update(
+            &mut app,
+            Message::PreferencesSectionOpened(preferences::Section::default()),
+            unused_runner(),
+        );
+        let _ = update(
+            &mut app,
+            Message::SettingsUvSourceChoiceChanged(settings_editor::UvSourceChoice::Bundled),
+            unused_runner(),
+        );
+        let _ = update(&mut app, Message::PreferencesClosed, unused_runner());
+
+        assert!(app.preferences.is_none());
+        assert_eq!(app.config.settings.uv_source, UvSource::Bundled);
+    }
+
+    #[test]
     fn the_bundled_licence_is_reachable_through_the_help_menu() {
         // Apache-2.0 section 4 and OFL 1.1 oblige the text to be reachable.
         // It is compiled into the executable and had no consumer at all until
@@ -6630,8 +7120,16 @@ mod tests {
         let mut app = App::new(Config::default());
         assert_eq!(app.modal, None, "no modal is open on start");
 
-        let _ = update(&mut app, Message::MenuToggled, unused_runner());
-        assert!(app.menu_open, "the Help menu must open");
+        let _ = update(
+            &mut app,
+            Message::MenuToggled(shell::TopMenu::Help),
+            unused_runner(),
+        );
+        assert_eq!(
+            app.open_menu,
+            Some(shell::TopMenu::Help),
+            "the Help menu must open"
+        );
 
         let _ = update(
             &mut app,
@@ -6640,7 +7138,7 @@ mod tests {
         );
         assert_eq!(app.modal, Some(shell::Modal::Licences));
         assert!(
-            !app.menu_open,
+            app.open_menu.is_none(),
             "the menu must close behind the modal it opened; two layers \
              claiming the pointer at once is how a press both dismisses and \
              activates"
@@ -6656,14 +7154,29 @@ mod tests {
         // it must close it, and so must a press anywhere else.
         let mut app = App::new(Config::default());
 
-        let _ = update(&mut app, Message::MenuToggled, unused_runner());
-        let _ = update(&mut app, Message::MenuToggled, unused_runner());
-        assert!(!app.menu_open, "the Help button must toggle, not only open");
+        let _ = update(
+            &mut app,
+            Message::MenuToggled(shell::TopMenu::Help),
+            unused_runner(),
+        );
+        let _ = update(
+            &mut app,
+            Message::MenuToggled(shell::TopMenu::Help),
+            unused_runner(),
+        );
+        assert!(
+            app.open_menu.is_none(),
+            "the Help button must toggle, not only open"
+        );
         assert_eq!(app.modal, None, "dismissing must not open anything");
 
-        let _ = update(&mut app, Message::MenuToggled, unused_runner());
+        let _ = update(
+            &mut app,
+            Message::MenuToggled(shell::TopMenu::Help),
+            unused_runner(),
+        );
         let _ = update(&mut app, Message::MenuDismissed, unused_runner());
-        assert!(!app.menu_open);
+        assert!(app.open_menu.is_none());
         assert_eq!(app.modal, None);
     }
 

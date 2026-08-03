@@ -209,6 +209,14 @@ pub const OVERLAY_MAX_HEIGHT: f32 = 560.0;
 /// transcript scrolls: a thousand-line resolution must not push the
 /// application off the top of the window.
 pub const DRAWER_MAX_HEIGHT: f32 = 220.0;
+/// Width of the Preferences card. Wider than a modal: it carries a scope
+/// switch, a section list and a panel of fields side by side.
+pub const PREFS_WIDTH: f32 = 860.0;
+/// Height of the Preferences body, so a long section scrolls inside the card
+/// rather than growing it past the window.
+pub const PREFS_BODY_HEIGHT: f32 = 420.0;
+/// Width of the section list down the left of Preferences.
+pub const PREFS_SECTION_WIDTH: f32 = 150.0;
 /// Width of the project context menu's panel. Wider than the Help menu: its
 /// rows carry a second line naming what a terminal will not activate.
 pub const CONTEXT_MENU_WIDTH: f32 = 320.0;
