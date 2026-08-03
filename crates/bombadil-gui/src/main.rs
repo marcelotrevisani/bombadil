@@ -51,9 +51,15 @@ use std::sync::Arc;
 /// Raw rather than a PNG because `iced::window::icon::from_rgba` wants exactly
 /// this, and decoding a PNG for it would mean pulling an image decoder into a
 /// binary that otherwise renders every pixel itself. `just icon` regenerates
-/// this and every PNG beside it from `assets/icon.svg`, which is the file to
-/// edit -- this one is a build product that happens to be committed.
-const ICON_RGBA: &[u8] = include_bytes!("../../../assets/icon-64.rgba");
+/// it, and every PNG in the repo's own `assets/`, from `assets/icon.svg` --
+/// the file to edit; this one is a build product that happens to be committed.
+///
+/// Inside this crate rather than beside the SVG it comes from, because
+/// `cargo package` only takes files under the crate root: an
+/// `include_bytes!("../../../assets/...")` packages cleanly and then fails to
+/// compile for whoever installs it. The repo's `assets/` keeps the sources and
+/// the PNGs that only the repo and the desktop entry need.
+const ICON_RGBA: &[u8] = include_bytes!("../assets/icon-64.rgba");
 const ICON_SIDE: u32 = 64;
 
 /// The window icon, or `None` if the bytes will not make one.

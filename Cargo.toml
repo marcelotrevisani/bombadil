@@ -7,6 +7,13 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.88"
 license = "Apache-2.0"
+# crates.io requires a description and rejects a publish without one; the rest
+# is what makes a listing usable rather than a name and a version number.
+repository = "https://github.com/marcelotrevisani/bombadil"
+homepage = "https://github.com/marcelotrevisani/bombadil"
+authors = ["Marcelo Duarte Trevisani"]
+keywords = ["uv", "python", "virtualenv", "venv", "gui"]
+categories = ["development-tools"]
 
 [workspace.dependencies]
 serde = { version = "1.0.229", features = ["derive"] }

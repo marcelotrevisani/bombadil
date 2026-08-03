@@ -4,6 +4,12 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+description = "The engine behind Bombadil: virtual environment model, config store, uv invocation, environment composition and keychain access, with no GUI."
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+keywords.workspace = true
+categories.workspace = true
 
 [features]
 default = []

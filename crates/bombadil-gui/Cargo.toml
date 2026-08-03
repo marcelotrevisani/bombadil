@@ -4,6 +4,13 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+description = "A desktop keeper for uv virtual environments: track, sync and open the environments you already have."
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+keywords.workspace = true
+categories.workspace = true
+readme = "../../README.md"
 
 [dependencies]
 bombadil-core = { path = "../bombadil-core", version = "0.1.0" }
