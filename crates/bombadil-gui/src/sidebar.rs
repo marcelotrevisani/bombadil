@@ -21,7 +21,6 @@
 //! Task 5.
 
 use bombadil_core::model::{Config, PythonPin};
-use bombadil_core::terminal::Os;
 
 use crate::app::Message;
 use crate::interpreter;
@@ -61,7 +60,10 @@ pub fn entries(config: &Config) -> Vec<Entry> {
             venv_exists: false,
             python_version: None,
             requires_python: None,
-            pin: bombadil_core::resolve::effective(config, project, Os::host()).python,
+            pin: project
+                .active_environment()
+                .map(|environment| environment.python.clone())
+                .unwrap_or_default(),
         })
         .collect()
 }

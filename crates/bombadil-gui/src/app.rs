@@ -1165,8 +1165,11 @@ pub fn update(app: &mut App, message: Message, runner: Arc<dyn CommandRunner>) -
                 // it deletes the directory and builds a new one -- so a pin
                 // that disagrees with what is there is a destructive action,
                 // and gets the same confirmation Recreate venv does.
-                let pin =
-                    bombadil_core::resolve::effective(&app.config, &project, Os::host()).python;
+                // The active environment's own pin -- see `run_sync`.
+                let pin = project
+                    .active_environment()
+                    .map(|environment| environment.python.clone())
+                    .unwrap_or_default();
                 let venv_version = app
                     .entries
                     .get(i)
@@ -1363,12 +1366,10 @@ pub fn update(app: &mut App, message: Message, runner: Arc<dyn CommandRunner>) -
                     // Resolved against the config the project was just pushed
                     // into, so a global pin applies to it from the first
                     // frame rather than only after the next `boot`.
-                    pin: bombadil_core::resolve::effective(
-                        &app.config,
-                        &project,
-                        bombadil_core::terminal::Os::host(),
-                    )
-                    .python,
+                    pin: project
+                        .active_environment()
+                        .map(|environment| environment.python.clone())
+                        .unwrap_or_default(),
                 });
                 let index = app.config.projects.len() - 1;
                 app.selected = Some(index);
@@ -2852,9 +2853,14 @@ fn run_sync(
         project_dir: project_dir.to_path_buf(),
         venv_path: venv_path.clone(),
     };
-    // The pin, if one resolves. `sync_with_python` is the same builder the
-    // add-project dialog already uses, so there is one way to say "-p".
-    let spec = match bombadil_core::resolve::effective(config, project, Os::host()).python {
+    // The ACTIVE environment's own pin. Not the project's -- a project has
+    // none now -- and not another environment's: a project with a 3.11 and a
+    // 3.12 environment must build each with its own interpreter, which is the
+    // entire reason to have both.
+    //
+    // `sync_with_python` is the same builder the add-project dialog uses, so
+    // there is one way to say "-p".
+    let spec = match environment.python.clone() {
         PythonPin::Version(version) => uv::command::sync_with_python(&resolved_uv, &ctx, &version),
         PythonPin::Unpinned => uv::command::sync(&resolved_uv, &ctx),
     };
@@ -4771,6 +4777,68 @@ mod tests {
         assert!(
             sync.args.windows(2).any(|w| w == ["-p", "3.12"]),
             "the pin must reach uv; got {:?}",
+            sync.args
+        );
+    }
+
+    #[test]
+    fn sync_pins_from_the_active_environment_not_another_one() {
+        // The property the whole feature rests on. A project with a 3.11 and
+        // a 3.12 environment must build each with its own interpreter -- and
+        // uv *deletes* an environment whose version differs from `-p`, so
+        // reading the wrong one destroys the wrong directory.
+        let target = VenvLocation::Custom {
+            path: std::path::PathBuf::from("/envs/api-312"),
+        };
+        let project = Project {
+            environments: vec![
+                bombadil_core::model::Environment {
+                    location: VenvLocation::Alongside,
+                    python: PythonPin::Version("3.11".into()),
+                },
+                bombadil_core::model::Environment {
+                    location: target.clone(),
+                    python: PythonPin::Version("3.12".into()),
+                },
+            ],
+            active: target,
+            ..project("api")
+        };
+        let config = Config {
+            projects: vec![project.clone()],
+            settings: fake_uv_settings(),
+            ..Config::default()
+        };
+        let store = bombadil_core::secrets::InMemorySecretStore::new();
+        let runner = FakeCommandRunner::new();
+        version_probe(&runner);
+        runner.expect(
+            "uv",
+            &["sync"],
+            bombadil_core::process::CommandOutcome {
+                status: Some(0),
+                stdout: String::new(),
+                stderr: String::new(),
+            },
+        );
+
+        let (success, lines) =
+            collect_lines(|on_line| run_sync(&project, &config, &store, &runner, on_line));
+
+        assert!(success, "got {lines:?}");
+        let sync = runner
+            .calls()
+            .into_iter()
+            .find(|c| c.args.first().map(String::as_str) == Some("sync"))
+            .expect("a sync must have run");
+        assert!(
+            sync.args.windows(2).any(|w| w == ["-p", "3.12"]),
+            "the ACTIVE environment's pin must reach uv; got {:?}",
+            sync.args
+        );
+        assert!(
+            !sync.args.iter().any(|a| a == "3.11"),
+            "the inactive environment's pin must not; got {:?}",
             sync.args
         );
     }
