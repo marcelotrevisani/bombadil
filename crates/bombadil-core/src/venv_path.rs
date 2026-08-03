@@ -1,5 +1,5 @@
 use crate::error::{VenvDeleteError, VenvPathError};
-use crate::model::{DefaultVenvLocation, Project, Settings, VenvLocation};
+use crate::model::{DefaultVenvLocation, Environment, Project, Settings, VenvLocation};
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 
@@ -44,7 +44,11 @@ pub fn central_dir_name(project_dir: &Path) -> String {
 ///
 /// Performs no filesystem access, so it is safe to call for projects whose
 /// directory no longer exists.
-pub fn resolve(project: &Project, settings: &Settings) -> Result<PathBuf, VenvPathError> {
+pub fn resolve(
+    project: &Project,
+    environment: &Environment,
+    settings: &Settings,
+) -> Result<PathBuf, VenvPathError> {
     let project_dir = project
         .pyproject_path
         .parent()
@@ -53,7 +57,7 @@ pub fn resolve(project: &Project, settings: &Settings) -> Result<PathBuf, VenvPa
             pyproject_path: project.pyproject_path.clone(),
         })?;
 
-    Ok(match &project.venv {
+    Ok(match &environment.location {
         VenvLocation::Custom { path } => path.clone(),
         VenvLocation::Alongside => project_dir.join(".venv"),
         VenvLocation::Default => match &settings.default_venv_location {
@@ -122,8 +126,13 @@ pub fn probe(venv: &Path) -> Option<String> {
 /// unexpected, and a project configured with `VenvLocation::Custom` pointing
 /// at a directory the user cares about -- if they wrote a `pyvenv.cfg` into
 /// it, it is a virtual environment by every test uv itself applies.
-pub fn delete(project: &Project, settings: &Settings, path: &Path) -> Result<(), VenvDeleteError> {
-    let expected = resolve(project, settings)?;
+pub fn delete(
+    project: &Project,
+    environment: &Environment,
+    settings: &Settings,
+    path: &Path,
+) -> Result<(), VenvDeleteError> {
+    let expected = resolve(project, environment, settings)?;
     if path != expected {
         return Err(VenvDeleteError::OutsideProject {
             path: path.to_path_buf(),
@@ -155,17 +164,40 @@ pub fn delete(project: &Project, settings: &Settings, path: &Path) -> Result<(),
 #[cfg(test)]
 mod tests {
     use super::{central_dir_name, delete, probe, resolve};
-    use crate::error::VenvDeleteError;
-    use crate::model::{DefaultVenvLocation, Project, PythonPin, Settings, UvSource, VenvLocation};
+    use crate::error::{VenvDeleteError, VenvPathError};
+    use crate::model::{
+        DefaultVenvLocation, Environment, Project, PythonPin, Settings, UvSource, VenvLocation,
+    };
     use std::path::{Path, PathBuf};
 
     fn project(venv: VenvLocation) -> Project {
         Project {
             label: "my-api".into(),
             pyproject_path: PathBuf::from("/proj/my-api/pyproject.toml"),
-            venv,
+            environments: vec![Environment {
+                location: venv.clone(),
+                ..Environment::default()
+            }],
+            active: venv,
             ..Project::default()
         }
+    }
+
+    /// `resolve` for a project's active environment -- the shape every test
+    /// here used before environments became a list.
+    fn resolve_active(project: &Project, settings: &Settings) -> Result<PathBuf, VenvPathError> {
+        let environment = project.active_environment().cloned().unwrap_or_default();
+        resolve(project, &environment, settings)
+    }
+
+    /// `delete` for a project's active environment, likewise.
+    fn delete_active(
+        project: &Project,
+        settings: &Settings,
+        path: &Path,
+    ) -> Result<(), VenvDeleteError> {
+        let environment = project.active_environment().cloned().unwrap_or_default();
+        delete(project, &environment, settings, path)
     }
 
     fn settings(default_venv_location: DefaultVenvLocation) -> Settings {
@@ -178,7 +210,7 @@ mod tests {
 
     #[test]
     fn alongside_puts_the_venv_next_to_the_pyproject() {
-        let got = resolve(
+        let got = resolve_active(
             &project(VenvLocation::Alongside),
             &settings(DefaultVenvLocation::Alongside),
         )
@@ -188,7 +220,7 @@ mod tests {
 
     #[test]
     fn a_custom_location_is_used_verbatim() {
-        let got = resolve(
+        let got = resolve_active(
             &project(VenvLocation::Custom {
                 path: PathBuf::from("/mnt/fast/envs/api"),
             }),
@@ -202,7 +234,7 @@ mod tests {
 
     #[test]
     fn default_follows_the_alongside_setting() {
-        let got = resolve(
+        let got = resolve_active(
             &project(VenvLocation::Default),
             &settings(DefaultVenvLocation::Alongside),
         )
@@ -212,7 +244,7 @@ mod tests {
 
     #[test]
     fn default_follows_the_central_setting_and_names_by_directory_plus_hash() {
-        let got = resolve(
+        let got = resolve_active(
             &project(VenvLocation::Default),
             &settings(DefaultVenvLocation::Central {
                 path: PathBuf::from("/home/t/.venvs"),
@@ -271,7 +303,7 @@ mod tests {
     fn a_pyproject_path_with_no_parent_is_an_error() {
         let mut p = project(VenvLocation::Default);
         p.pyproject_path = PathBuf::from("pyproject.toml");
-        assert!(resolve(&p, &settings(DefaultVenvLocation::Alongside)).is_err());
+        assert!(resolve_active(&p, &settings(DefaultVenvLocation::Alongside)).is_err());
     }
 
     #[test]
@@ -379,7 +411,6 @@ mod tests {
     fn project_in(dir: &Path) -> Project {
         Project {
             pyproject_path: dir.join("proj").join("pyproject.toml"),
-            venv: VenvLocation::Alongside,
             ..project(VenvLocation::Alongside)
         }
     }
@@ -402,10 +433,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let project = project_in(dir.path());
         let settings = settings(DefaultVenvLocation::Alongside);
-        let venv = resolve(&project, &settings).unwrap();
+        let venv = resolve_active(&project, &settings).unwrap();
         make_venv(&venv);
 
-        delete(&project, &settings, &venv).expect("a real venv must be removable");
+        delete_active(&project, &settings, &venv).expect("a real venv must be removable");
 
         assert!(!venv.exists(), "{venv:?} must be gone");
         assert!(
@@ -422,11 +453,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let project = project_in(dir.path());
         let settings = settings(DefaultVenvLocation::Alongside);
-        let venv = resolve(&project, &settings).unwrap();
+        let venv = resolve_active(&project, &settings).unwrap();
         std::fs::create_dir_all(venv.join("src")).unwrap();
         std::fs::write(venv.join("src").join("main.py"), "print(1)").unwrap();
 
-        let err = delete(&project, &settings, &venv).unwrap_err();
+        let err = delete_active(&project, &settings, &venv).unwrap_err();
 
         assert!(
             matches!(err, VenvDeleteError::NotAVenv { .. }),
@@ -448,7 +479,7 @@ mod tests {
         let elsewhere = dir.path().join("someone-elses-venv");
         make_venv(&elsewhere);
 
-        let err = delete(&project, &settings, &elsewhere).unwrap_err();
+        let err = delete_active(&project, &settings, &elsewhere).unwrap_err();
 
         assert!(
             matches!(err, VenvDeleteError::OutsideProject { .. }),
@@ -467,9 +498,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let project = project_in(dir.path());
         let settings = settings(DefaultVenvLocation::Alongside);
-        let venv = resolve(&project, &settings).unwrap();
+        let venv = resolve_active(&project, &settings).unwrap();
 
-        let err = delete(&project, &settings, &venv).unwrap_err();
+        let err = delete_active(&project, &settings, &venv).unwrap_err();
 
         assert!(
             matches!(err, VenvDeleteError::NotADirectory { .. }),
@@ -482,11 +513,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let project = project_in(dir.path());
         let settings = settings(DefaultVenvLocation::Alongside);
-        let venv = resolve(&project, &settings).unwrap();
+        let venv = resolve_active(&project, &settings).unwrap();
         std::fs::create_dir_all(venv.parent().unwrap()).unwrap();
         std::fs::write(&venv, "not a directory").unwrap();
 
-        let err = delete(&project, &settings, &venv).unwrap_err();
+        let err = delete_active(&project, &settings, &venv).unwrap_err();
 
         assert!(
             matches!(err, VenvDeleteError::NotADirectory { .. }),
@@ -509,14 +540,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let project = project_in(dir.path());
         let settings = settings(DefaultVenvLocation::Alongside);
-        let venv = resolve(&project, &settings).unwrap();
+        let venv = resolve_active(&project, &settings).unwrap();
         let target = dir.path().join("real-venv");
         make_venv(&target);
         std::fs::create_dir_all(venv.parent().unwrap()).unwrap();
         std::os::unix::fs::symlink(&target, &venv).unwrap();
         assert!(probe(&venv).is_some(), "the symlink must probe as a venv");
 
-        let err = delete(&project, &settings, &venv).unwrap_err();
+        let err = delete_active(&project, &settings, &venv).unwrap_err();
 
         assert!(
             matches!(err, VenvDeleteError::NotADirectory { .. }),
@@ -536,7 +567,7 @@ mod tests {
     fn a_project_with_no_directory_is_refused_before_anything_is_touched() {
         let mut project = project(VenvLocation::Alongside);
         project.pyproject_path = PathBuf::from("pyproject.toml");
-        let err = delete(
+        let err = delete_active(
             &project,
             &settings(DefaultVenvLocation::Alongside),
             Path::new(".venv"),
@@ -553,17 +584,19 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let project = project_in(dir.path());
         let settings = settings(DefaultVenvLocation::Alongside);
-        let venv = resolve(&project, &settings).unwrap();
+        let venv = resolve_active(&project, &settings).unwrap();
 
         std::fs::create_dir_all(&venv).unwrap();
-        let not_a_venv = delete(&project, &settings, &venv).unwrap_err().to_string();
+        let not_a_venv = delete_active(&project, &settings, &venv)
+            .unwrap_err()
+            .to_string();
         assert!(
             not_a_venv.contains(&venv.display().to_string()),
             "got {not_a_venv}"
         );
 
         let elsewhere = dir.path().join("elsewhere");
-        let outside = delete(&project, &settings, &elsewhere)
+        let outside = delete_active(&project, &settings, &elsewhere)
             .unwrap_err()
             .to_string();
         assert!(

@@ -271,6 +271,65 @@ pub fn confirm_pin_view<'a>(confirm: &ConfirmPinChange) -> iced::Element<'a, Mes
     .into()
 }
 
+/// The pending "this environment will stop existing" confirmation.
+///
+/// Removing an environment is the same act as Recreate venv -- a directory
+/// full of installed packages stops being there -- so it asks the same way,
+/// naming the directory rather than asking "are you sure?".
+pub struct ConfirmEnvironmentRemoval {
+    pub project_id: Uuid,
+    pub label: String,
+    pub location: bombadil_core::model::VenvLocation,
+    pub venv_path: PathBuf,
+}
+
+/// What the user agrees to before an environment is removed.
+///
+/// Says plainly that the directory is *not* deleted from disk. Bombadil keeps
+/// an account of environments it does not own, and removing one from that
+/// account is not the same as destroying it -- claiming otherwise would be
+/// the more alarming lie of the two.
+pub fn environment_removal_confirmation(label: &str, venv_path: &Path) -> String {
+    format!(
+        "Remove this environment from {label}?\n\n\
+         {} stays on disk -- Bombadil stops keeping an account of it, and will \
+         not sync it or open a terminal on it again. Delete the directory \
+         yourself if you want the space back.",
+        venv_path.display()
+    )
+}
+
+/// Renders it. Deliberately dumb, like the other two confirmations: the
+/// sentence worth testing is `environment_removal_confirmation`'s.
+pub fn confirm_environment_removal_view<'a>(
+    confirm: &ConfirmEnvironmentRemoval,
+) -> iced::Element<'a, Message> {
+    iced::widget::container(
+        iced::widget::column![
+            iced::widget::text(environment_removal_confirmation(
+                &confirm.label,
+                &confirm.venv_path,
+            ))
+            .size(theme::BODY),
+            iced::widget::row![
+                iced::widget::button(iced::widget::text("Remove").size(theme::BODY))
+                    .on_press(Message::EnvironmentRemovalConfirmed)
+                    .padding([theme::SPACE_1, theme::SPACE_3])
+                    .style(theme::button_danger),
+                iced::widget::button(iced::widget::text("Cancel").size(theme::BODY))
+                    .on_press(Message::EnvironmentRemovalCancelled)
+                    .padding([theme::SPACE_1, theme::SPACE_3])
+                    .style(theme::button_quiet),
+            ]
+            .spacing(theme::SPACE_2),
+        ]
+        .spacing(theme::SPACE_3),
+    )
+    .padding(theme::SPACE_3)
+    .style(theme::panel)
+    .into()
+}
+
 /// Renders the pending Recreate venv confirmation. Deliberately dumb, like
 /// `view`: the sentence worth testing is `recreate_confirmation`'s.
 ///
@@ -621,6 +680,21 @@ mod tests {
         // are the same empty list -- and the button would probe forever.
         assert_eq!(one_press_plan(None, Some(&[])), OpenPlan::Nothing);
         assert_ne!(one_press_plan(None, Some(&[])), one_press_plan(None, None));
+    }
+
+    #[test]
+    fn the_removal_confirmation_says_the_directory_is_not_deleted() {
+        // Bombadil keeps an account of environments it does not own. Claiming
+        // to delete one would be the more alarming lie of the two, and a user
+        // who believed it would go looking for a directory that is still
+        // there.
+        let text = environment_removal_confirmation("api", Path::new("/envs/api-311"));
+        assert!(text.contains("/envs/api-311"), "got {text}");
+        assert!(
+            text.contains("stays on disk"),
+            "the user must be told the directory survives; got {text}"
+        );
+        assert!(text.contains("api"), "got {text}");
     }
 
     #[test]

@@ -7,16 +7,18 @@
 //!
 //! Not every setting is in [`Effective`]. Environment variables and indexes
 //! *merge* rather than override -- a project's variables layer over the global
-//! ones by key -- and `envspec::compose` already owns that. Only the settings
-//! where a project replaces one value with another live here.
+//! ones by key -- and `envspec::compose` already owns that. The interpreter
+//! pin is not here either: it belongs to an *environment*, not a project, and
+//! a project can have several. Callers ask the environment they are acting on.
+//! Only the settings where a project replaces one global value with another
+//! live here.
 
-use crate::model::{Config, Project, PythonPin, TerminalChoice, UvSource};
+use crate::model::{Config, Project, TerminalChoice, UvSource};
 use crate::terminal::Os;
 
 /// What applies to one project, after its overrides are resolved.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Effective {
-    pub python: PythonPin,
     pub uv_source: UvSource,
     /// `None` when neither the project nor the global config names one. The
     /// caller decides what to do about that -- the GUI's one-press button
@@ -35,7 +37,6 @@ pub struct Effective {
 /// silently answer about a different project when the two disagree.
 pub fn effective(config: &Config, project: &Project, os: Os) -> Effective {
     Effective {
-        python: project.python.resolve(&config.settings.python).clone(),
         uv_source: project
             .uv_source
             .resolve(&config.settings.uv_source)
@@ -69,7 +70,6 @@ mod tests {
     #[test]
     fn a_project_that_overrides_nothing_gets_every_global_value() {
         let settings = Settings {
-            python: PythonPin::Version("3.12".into()),
             uv_source: UvSource::Bundled,
             ..Settings::default()
         };
@@ -81,7 +81,6 @@ mod tests {
 
         let got = effective(&config, &project, Os::Linux);
 
-        assert_eq!(got.python, PythonPin::Version("3.12".into()));
         assert_eq!(got.uv_source, UvSource::Bundled);
         assert_eq!(
             got.terminal,
@@ -92,12 +91,10 @@ mod tests {
     #[test]
     fn a_project_override_replaces_the_global_value() {
         let settings = Settings {
-            python: PythonPin::Version("3.12".into()),
             uv_source: UvSource::Bundled,
             ..Settings::default()
         };
         let project = Project {
-            python: Override::Set(PythonPin::Version("3.11".into())),
             uv_source: Override::Set(UvSource::FromPath),
             ..Project::default()
         };
@@ -105,28 +102,7 @@ mod tests {
 
         let got = effective(&config, &project, Os::Linux);
 
-        assert_eq!(got.python, PythonPin::Version("3.11".into()));
         assert_eq!(got.uv_source, UvSource::FromPath);
-    }
-
-    #[test]
-    fn a_project_can_unpin_against_a_global_pin() {
-        // The reason `PythonPin::Unpinned` is a value and not the absence of
-        // one. `Override::Inherit` would hand the global pin straight back.
-        let settings = Settings {
-            python: PythonPin::Version("3.12".into()),
-            ..Settings::default()
-        };
-        let project = Project {
-            python: Override::Set(PythonPin::Unpinned),
-            ..Project::default()
-        };
-        let config = config_with(settings, project.clone());
-
-        assert_eq!(
-            effective(&config, &project, Os::Linux).python,
-            PythonPin::Unpinned
-        );
     }
 
     #[test]

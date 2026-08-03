@@ -1,4 +1,5 @@
 mod env_var;
+mod environment;
 mod index;
 mod inherit;
 mod member;
@@ -7,6 +8,7 @@ mod script;
 mod settings;
 
 pub use env_var::EnvVar;
+pub use environment::Environment;
 pub use index::{Index, IndexAuth, IndexKind};
 pub use inherit::{Override, PythonPin};
 pub use member::{MemberOrigin, MemberRef, MemberSelection};
@@ -44,7 +46,7 @@ pub enum TerminalChoice {
 /// field sets will silently lose each other's settings on round-trip. Plan 2
 /// must decide explicitly — retain unknown fields, or bump the version on
 /// every field addition — rather than inherit this hole unexamined.
-pub const CURRENT_SCHEMA_VERSION: u32 = 1;
+pub const CURRENT_SCHEMA_VERSION: u32 = 2;
 
 /// The entire persisted state of the application.
 ///
@@ -132,9 +134,29 @@ mod tests {
                 label: "my-api".into(),
                 pyproject_path: PathBuf::from("/proj/my-api/pyproject.toml"),
                 index_names: vec!["priv".into(), "extra".into()],
-                venv: VenvLocation::Custom {
-                    path: PathBuf::from("/mnt/envs/my-api"),
-                },
+                // Two environments, because that is the shape this
+                // schema exists to carry, and a fixture with one could not
+                // catch a serialiser that only ever wrote the first.
+                environments: vec![
+                    Environment {
+                        location: VenvLocation::Custom {
+                            path: PathBuf::from("/mnt/envs/my-api"),
+                        },
+                        python: PythonPin::Version("3.11".into()),
+                    },
+                    Environment {
+                        location: VenvLocation::Alongside,
+                        python: PythonPin::Unpinned,
+                    },
+                ],
+                active: VenvLocation::Alongside,
+                expanded: false,
+                // Never present in a version-2 config: they are
+                // `skip_serializing`, read once by the migration and dropped.
+                // Named here because this fixture names every field on
+                // purpose -- that is how a field added later gets caught.
+                legacy_venv: None,
+                legacy_python: None,
                 env: vec![EnvVar {
                     key: "DATABASE_PASSWORD".into(),
                     value: String::new(),
@@ -151,7 +173,6 @@ mod tests {
                 // slip past the very test that would have caught it.
                 id: uuid::Uuid::nil(),
                 members: MemberSelection::default(),
-                python: Override::Set(PythonPin::Version("3.11".into())),
                 uv_source: Override::Set(UvSource::FromPath),
                 terminals: BTreeMap::from([(
                     crate::terminal::Os::Linux,
@@ -191,7 +212,10 @@ mod tests {
 
     #[test]
     fn a_minimal_file_fills_in_every_default() {
-        let back: Config = toml::from_str("schema_version = 1\n").expect("deserialize");
+        // The version the file declares is the version it declares -- this
+        // reads a v2 file, so the only thing left to prove is that every
+        // other field falls back to its default.
+        let back: Config = toml::from_str("schema_version = 2\n").expect("deserialize");
         assert_eq!(back, Config::default());
     }
 

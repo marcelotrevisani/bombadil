@@ -151,6 +151,8 @@ pub struct App {
     /// `Message::PinChangeConfirmed` is the only message that reaches a
     /// pinned sync against an environment on another version.
     pub confirm_pin_change: Option<context_menu::ConfirmPinChange>,
+    /// The pending "this environment will stop existing" confirmation.
+    pub confirm_environment_removal: Option<context_menu::ConfirmEnvironmentRemoval>,
     /// Which top-bar menu is open, if any.
     ///
     /// One field rather than a `bool` per menu: two menus open at once is a
@@ -261,23 +263,39 @@ pub enum Tab {
     #[default]
     Dependencies,
     Members,
+    EnvVars,
     Scripts,
+    Indexes,
 }
 
 impl Tab {
     /// Every tab, in the order the selector renders them.
     /// Every tab, in the order the selector renders them.
     ///
-    /// Env vars, Indexes and Settings are not here: Preferences absorbed
-    /// them, so each is now reachable in both scopes from one screen rather
-    /// than as a tab that only ever showed the selected project's half.
-    pub const ALL: [Tab; 3] = [Tab::Dependencies, Tab::Members, Tab::Scripts];
+    /// The split these follow: **a tab is what this project has, the Settings
+    /// menu is what every project has.** Env vars and Indexes each have both
+    /// halves, so they appear in both places showing different things -- the
+    /// tab shows this project's own variables and index selection, the menu
+    /// shows the global ones they layer over.
+    ///
+    /// Settings has no per-project half worth a tab (uv, terminal and the
+    /// venv default are all resolved per project from Preferences), so it is
+    /// the one that stayed absorbed.
+    pub const ALL: [Tab; 5] = [
+        Tab::Dependencies,
+        Tab::Members,
+        Tab::EnvVars,
+        Tab::Scripts,
+        Tab::Indexes,
+    ];
 
     pub fn label(self) -> &'static str {
         match self {
             Tab::Dependencies => "Dependencies",
             Tab::Members => "Members",
+            Tab::EnvVars => "Env vars",
             Tab::Scripts => "Scripts",
+            Tab::Indexes => "Indexes",
         }
     }
 }
@@ -297,6 +315,11 @@ pub enum Message {
     /// permissive fallback `interpreter::version_satisfies` already applies.
     VenvProbed {
         index: usize,
+        /// Which environment of that project was probed. A project has
+        /// several probes in flight at once and they land in whatever order
+        /// the filesystem answers, so the result has to say which row it
+        /// belongs to -- a position would be meaningless by then.
+        location: VenvLocation,
         python_version: Option<String>,
         requires_python: Option<String>,
     },
@@ -321,6 +344,19 @@ pub enum Message {
     /// `uv sync` -- which prunes packages absent from the target's lockfile
     /// -- against an environment the user never named.
     SyncRequested(usize),
+    /// The output drawer's own disclosure control. The only thing that opens
+    /// or closes it -- output arriving no longer does, and neither does a
+    /// command finishing.
+    DrawerToggled,
+    /// The sidebar's disclosure control for `projects[usize]`. Persisted, so
+    /// a project you collapse stays collapsed across a restart.
+    ProjectExpandToggled(usize),
+    /// An environment row in the tree was pressed: make it the one Sync,
+    /// Open terminal and Recreate act on.
+    ///
+    /// A single press, because it is not destructive: nothing is deleted, the
+    /// next Sync simply builds against a different directory.
+    EnvironmentActivated(usize, VenvLocation),
     /// One line of a running uv command's output, already redacted on the job
     /// thread. Spec §8: the drawer streams live output, so these arrive one
     /// at a time while the command runs rather than in a batch after it
@@ -498,17 +534,33 @@ pub enum Message {
     PreferencesUvSourceOverridden(preferences::Scope, UvSource),
     /// The Terminal section's choice, in `scope`.
     PreferencesTerminalOverridden(preferences::Scope, TerminalChoice),
-    /// The Environments section, project scope: where this project's venv
-    /// lives. Carries a `Uuid` rather than a `Scope`, because this setting
-    /// only exists for a project -- `VenvLocation::Default` is already its
-    /// inherit state, which is why this section has no separate inherit
-    /// control.
-    PreferencesProjectVenvSelected(uuid::Uuid, VenvLocation),
-    /// The Environments section, project scope: choose a folder for it.
-    PreferencesProjectVenvPickFolderRequested(uuid::Uuid),
-    /// That picker finished. `None` when cancelled, which leaves the previous
-    /// location untouched.
-    PreferencesProjectVenvFolderPicked(uuid::Uuid, Option<PathBuf>),
+    /// Move one environment to another location. Carries where it is now,
+    /// because that is how an environment is identified.
+    EnvironmentLocationSelected(uuid::Uuid, VenvLocation, VenvLocation),
+    /// Choose a folder for one.
+    EnvironmentPickFolderRequested(uuid::Uuid, VenvLocation),
+    /// That picker finished. `None` when cancelled, which leaves it alone.
+    EnvironmentFolderPicked(uuid::Uuid, VenvLocation, Option<PathBuf>),
+    /// Add an environment to `Uuid`: opens a folder picker.
+    ///
+    /// A picker rather than a generated name. The first version invented
+    /// `.venv-1` and added it silently, which told the user nothing about
+    /// where it was -- and an environment is its directory, so choosing that
+    /// directory *is* creating it. It also has to be a picker for the case
+    /// this exists for: pointing at an environment that already exists on
+    /// disk, including one another project uses.
+    EnvironmentAdded(uuid::Uuid),
+    /// The picker finished. `None` when cancelled, which adds nothing.
+    EnvironmentAddFolderPicked(uuid::Uuid, Option<PathBuf>),
+    /// Set one environment's own interpreter pin.
+    EnvironmentPinChanged(uuid::Uuid, VenvLocation, String),
+    /// Remove one. Opens a confirmation rather than removing: an environment
+    /// stopping existing is the same act as Recreate venv.
+    EnvironmentRemoveRequested(uuid::Uuid, VenvLocation),
+    /// The confirmation was accepted.
+    EnvironmentRemovalConfirmed,
+    /// It was declined. Nothing is removed.
+    EnvironmentRemovalCancelled,
     /// The Env vars tab's "Add variable" button was pressed for `scope`
     /// (spec §5, Task 2).
     EnvVarAdded(env_editor::EnvScope),
@@ -734,6 +786,7 @@ impl App {
             context_menu: None,
             confirm_recreate: None,
             confirm_pin_change: None,
+            confirm_environment_removal: None,
             open_menu: None,
             modal: None,
             preferences: None,
@@ -792,17 +845,25 @@ fn probe_every_venv(app: &App) -> Task<Message> {
             .projects
             .iter()
             .enumerate()
-            .filter_map(|(i, project)| {
-                let path = venv_path::resolve(project, &app.config.settings).ok()?;
-                let pyproject_path = project.pyproject_path.clone();
-                Some(Task::perform(
-                    probe_venv_and_requirement(path, pyproject_path),
-                    move |(python_version, requires_python)| Message::VenvProbed {
-                        index: i,
-                        python_version,
-                        requires_python,
-                    },
-                ))
+            // One probe per *environment*, not per project: the tree shows
+            // them all, and a project's glyph rolls up what every one of them
+            // reports.
+            .flat_map(|(i, project)| {
+                project.environments.iter().filter_map(move |environment| {
+                    let path =
+                        venv_path::resolve(project, environment, &app.config.settings).ok()?;
+                    let pyproject_path = project.pyproject_path.clone();
+                    let location = environment.location.clone();
+                    Some(Task::perform(
+                        probe_venv_and_requirement(path, pyproject_path),
+                        move |(python_version, requires_python)| Message::VenvProbed {
+                            index: i,
+                            location: location.clone(),
+                            python_version,
+                            requires_python,
+                        },
+                    ))
+                })
             })
             .collect::<Vec<_>>(),
     )
@@ -878,7 +939,8 @@ fn deps_command_context(project: &Project, config: &Config) -> Option<uv::comman
         .pyproject_path
         .parent()
         .filter(|p| !p.as_os_str().is_empty())?;
-    let venv_path = venv_path::resolve(project, &config.settings).ok()?;
+    let venv_path =
+        venv_path::resolve(project, project.active_environment()?, &config.settings).ok()?;
     Some(uv::command::ProjectContext {
         project_dir: project_dir.to_path_buf(),
         venv_path,
@@ -1108,11 +1170,20 @@ pub fn update(app: &mut App, message: Message, runner: Arc<dyn CommandRunner>) -
         }
         Message::VenvProbed {
             index,
+            location,
             python_version,
             requires_python,
         } if index < app.entries.len() => {
-            app.entries[index].venv_exists = python_version.is_some();
-            app.entries[index].python_version = python_version;
+            // Matched by location, never by position: a project has several
+            // probes in flight at once, and they land in whatever order the
+            // filesystem answers.
+            if let Some(row) = app.entries[index]
+                .environments
+                .iter_mut()
+                .find(|row| row.location == location)
+            {
+                row.python_version = python_version;
+            }
             app.entries[index].requires_python = requires_python;
         }
         // A stale probe result for a project that no longer exists.
@@ -1145,6 +1216,54 @@ pub fn update(app: &mut App, message: Message, runner: Arc<dyn CommandRunner>) -
         // The menu closes either way, the same as `OpenTerminalRequested`
         // and `RemoveProjectRequested`: an action taken from the menu
         // dismisses it, whether or not the press was swallowed.
+        Message::DrawerToggled => {
+            app.drawer.expanded = !app.drawer.expanded;
+        }
+        Message::ProjectExpandToggled(i) => {
+            let Some(project) = app.config.projects.get_mut(i) else {
+                return Task::none();
+            };
+            project.expanded = !project.expanded;
+            if let Some(entry) = app.entries.get_mut(i) {
+                entry.expanded = project.expanded;
+            }
+            return persist_env_edit(app);
+        }
+        Message::EnvironmentActivated(i, location) => {
+            let Some(project) = app.config.projects.get_mut(i) else {
+                return Task::none();
+            };
+            // Only an environment this project actually has. A press naming
+            // one it does not would otherwise leave `active` pointing at
+            // nothing, and every caller falling back to the first -- which
+            // looks like the click did something arbitrary.
+            if !project
+                .environments
+                .iter()
+                .any(|environment| environment.location == location)
+            {
+                return Task::none();
+            }
+            project.active = location.clone();
+            for row in app
+                .entries
+                .get_mut(i)
+                .into_iter()
+                .flat_map(|entry| entry.environments.iter_mut())
+            {
+                row.active = row.location == location;
+            }
+            // Selecting the project too. Pressing one of its environments is
+            // a statement about *that* project, and leaving the selection
+            // where it was meant the detail header, the tabs and the refresh
+            // below all went on describing a different one -- so the press
+            // appeared to do nothing at all.
+            app.selected = Some(i);
+            // The tabs describe the active environment, so they are re-read
+            // for the same reason a finished sync re-reads them -- and now
+            // for the project that was actually pressed.
+            return Task::batch([persist_env_edit(app), refresh_after_sync(app, runner)]);
+        }
         Message::SyncRequested(i) => {
             app.context_menu = None;
             if app.syncing.is_none()
@@ -1163,16 +1282,24 @@ pub fn update(app: &mut App, message: Message, runner: Arc<dyn CommandRunner>) -
                 // it deletes the directory and builds a new one -- so a pin
                 // that disagrees with what is there is a destructive action,
                 // and gets the same confirmation Recreate venv does.
-                let pin =
-                    bombadil_core::resolve::effective(&app.config, &project, Os::host()).python;
-                let venv_version = app
-                    .entries
-                    .get(i)
-                    .and_then(|entry| entry.python_version.clone());
+                // The active environment's own pin -- see `run_sync`.
+                let pin = project
+                    .active_environment()
+                    .map(|environment| environment.python.clone())
+                    .unwrap_or_default();
+                let venv_version = app.entries.get(i).and_then(|entry| {
+                    entry
+                        .environments
+                        .iter()
+                        .find(|row| row.active)
+                        .and_then(|row| row.python_version.clone())
+                });
                 if sync_would_delete(&pin, venv_version.as_deref())
                     && let PythonPin::Version(to) = &pin
                     && let Some(from) = &venv_version
-                    && let Ok(venv_path) = venv_path::resolve(&project, &app.config.settings)
+                    && let Some(environment) = project.active_environment()
+                    && let Ok(venv_path) =
+                        venv_path::resolve(&project, environment, &app.config.settings)
                 {
                     app.confirm_pin_change = Some(context_menu::ConfirmPinChange {
                         project_id: project.id,
@@ -1224,17 +1351,12 @@ pub fn update(app: &mut App, message: Message, runner: Arc<dyn CommandRunner>) -
                 "sync failed".to_string()
             };
             drawer::set_idle(&mut app.drawer, status);
-            // Collapsing is right on success -- spec §8 asks for exactly that
-            // status line. On failure spec §9 asks for a banner *plus the
-            // full transcript*, and `set_idle` has just collapsed it: without
-            // re-expanding here, iced only ever renders after `update`
-            // returns, so `expanded` is never observably true and the user
-            // sees "sync failed" with no exit code and no reason. Done at
-            // the call site rather than inside `set_idle`, which means one
-            // thing and should keep meaning it.
-            if !success && !app.drawer.lines.is_empty() {
-                app.drawer.expanded = true;
-            }
+            // Nothing re-expands here any more. `set_idle` no longer
+            // collapses, so there is nothing to undo -- and forcing the
+            // drawer open on failure would overrule a user who had closed
+            // it. A failed status renders in `boot` and the header says how
+            // many lines are waiting, which is the signal without the
+            // hijack.
             // A sync is the one action that changes what every read-only
             // surface describes: it installs and removes packages, and it
             // creates the environment when there was none. Without re-reading
@@ -1333,7 +1455,7 @@ pub fn update(app: &mut App, message: Message, runner: Arc<dyn CommandRunner>) -
         }
         Message::AddProjectConfirmed => {
             if let Some(draft) = app.add_project.take() {
-                let project = add_project::to_project(&draft);
+                let project = add_project::to_project(&draft, &app.config.settings);
                 let python_version = interpreter::preselect(
                     draft.interpreters.available(),
                     draft.requires_python.as_deref(),
@@ -1348,9 +1470,8 @@ pub fn update(app: &mut App, message: Message, runner: Arc<dyn CommandRunner>) -
                 // this file.
                 app.config.projects.push(project.clone());
                 app.entries.push(sidebar::Entry {
+                    id: project.id,
                     label: project.label.clone(),
-                    venv_exists: false,
-                    python_version: None,
                     // Free: the dialog already parsed the manifest into
                     // `draft`, so there is no read to wait on here the way
                     // `probe_every_venv` needs one for a project loaded from
@@ -1359,12 +1480,19 @@ pub fn update(app: &mut App, message: Message, runner: Arc<dyn CommandRunner>) -
                     // Resolved against the config the project was just pushed
                     // into, so a global pin applies to it from the first
                     // frame rather than only after the next `boot`.
-                    pin: bombadil_core::resolve::effective(
-                        &app.config,
-                        &project,
-                        bombadil_core::terminal::Os::host(),
-                    )
-                    .python,
+                    environments: project
+                        .environments
+                        .iter()
+                        .map(|environment| sidebar::EnvironmentRow {
+                            location: environment.location.clone(),
+                            path: venv_path::resolve(&project, environment, &app.config.settings)
+                                .unwrap_or_default(),
+                            python_version: None,
+                            pin: environment.python.clone(),
+                            active: environment.location == project.active,
+                        })
+                        .collect(),
+                    expanded: project.expanded,
                 });
                 let index = app.config.projects.len() - 1;
                 app.selected = Some(index);
@@ -1416,13 +1544,16 @@ pub fn update(app: &mut App, message: Message, runner: Arc<dyn CommandRunner>) -
             // other project's venv status, rather than trusting `success` to
             // imply a venv now exists.
             if let Some(project) = app.config.projects.get(index).cloned()
-                && let Ok(path) = venv_path::resolve(&project, &app.config.settings)
+                && let Some(environment) = project.active_environment()
+                && let Ok(path) = venv_path::resolve(&project, environment, &app.config.settings)
             {
                 let pyproject_path = project.pyproject_path.clone();
+                let location = environment.location.clone();
                 return Task::perform(
                     probe_venv_and_requirement(path, pyproject_path),
                     move |(python_version, requires_python)| Message::VenvProbed {
                         index,
+                        location: location.clone(),
                         python_version,
                         requires_python,
                     },
@@ -1518,9 +1649,6 @@ pub fn update(app: &mut App, message: Message, runner: Arc<dyn CommandRunner>) -
             // same discipline `SyncFinished` follows for `run_sync`.
             drawer::push_line(&mut app.drawer, &message, &[]);
             drawer::set_idle(&mut app.drawer, "open terminal failed".to_string());
-            if !app.drawer.lines.is_empty() {
-                app.drawer.expanded = true;
-            }
         }
         Message::RemoveProjectRequested(i) if i < app.config.projects.len() => {
             // In-memory first, synchronously -- the same discipline
@@ -1570,7 +1698,9 @@ pub fn update(app: &mut App, message: Message, runner: Arc<dyn CommandRunner>) -
         Message::RecreateVenvRequested(i) => {
             app.context_menu = None;
             if let Some(project) = app.config.projects.get(i)
-                && let Ok(venv_path) = venv_path::resolve(project, &app.config.settings)
+                && let Some(environment) = project.active_environment()
+                && let Ok(venv_path) =
+                    venv_path::resolve(project, environment, &app.config.settings)
             {
                 app.confirm_recreate = Some(context_menu::ConfirmRecreate {
                     project_id: project.id,
@@ -1652,9 +1782,6 @@ pub fn update(app: &mut App, message: Message, runner: Arc<dyn CommandRunner>) -
         Message::OpenFolderFinished(Err(message)) => {
             drawer::push_line(&mut app.drawer, &message, &[]);
             drawer::set_idle(&mut app.drawer, "open folder failed".to_string());
-            if !app.drawer.lines.is_empty() {
-                app.drawer.expanded = true;
-            }
         }
         Message::MenuToggled(menu) => {
             app.open_menu = if app.open_menu == Some(menu) {
@@ -1717,10 +1844,25 @@ pub fn update(app: &mut App, message: Message, runner: Arc<dyn CommandRunner>) -
             match scope {
                 preferences::Scope::Global => app.config.settings.python = pin,
                 preferences::Scope::Project(id) => {
+                    // Onto the active environment, which is where the pin
+                    // lives now. A project no longer has one of its own.
                     let Some(project) = app.config.projects.iter_mut().find(|p| p.id == id) else {
                         return Task::none();
                     };
-                    project.python = Override::Set(pin);
+                    let active = project.active.clone();
+                    let index = project
+                        .environments
+                        .iter()
+                        .position(|environment| environment.location == active)
+                        .or(if project.environments.is_empty() {
+                            None
+                        } else {
+                            Some(0)
+                        });
+                    let Some(index) = index else {
+                        return Task::none();
+                    };
+                    project.environments[index].python = pin;
                 }
             }
             return persist_env_edit(app);
@@ -1754,30 +1896,160 @@ pub fn update(app: &mut App, message: Message, runner: Arc<dyn CommandRunner>) -
             }
             return persist_env_edit(app);
         }
-        Message::PreferencesProjectVenvSelected(id, location) => {
-            let Some(project) = app.config.projects.iter_mut().find(|p| p.id == id) else {
-                return Task::none();
-            };
-            project.venv = location;
-            // Re-probed, not just persisted: the sidebar's venv status
-            // describes wherever each project resolved when it was last
-            // probed, and this just moved that. The same reasoning the global
-            // default location already follows.
-            return Task::batch([persist_env_edit(app), probe_every_venv(app)]);
-        }
-        Message::PreferencesProjectVenvPickFolderRequested(id) => {
+        Message::EnvironmentAdded(id) => {
             return Task::perform(pick_folder(), move |path| {
-                Message::PreferencesProjectVenvFolderPicked(id, path)
+                Message::EnvironmentAddFolderPicked(id, path)
             });
         }
-        // Cancelled -- leave the previous location untouched.
-        Message::PreferencesProjectVenvFolderPicked(_, None) => {}
-        Message::PreferencesProjectVenvFolderPicked(id, Some(path)) => {
+        // Cancelled -- nothing is added.
+        Message::EnvironmentAddFolderPicked(_, None) => {}
+        Message::EnvironmentAddFolderPicked(id, Some(path)) => {
+            let seed = app.config.settings.python.clone();
             let Some(project) = app.config.projects.iter_mut().find(|p| p.id == id) else {
                 return Task::none();
             };
-            project.venv = VenvLocation::Custom { path };
+            let location = VenvLocation::Custom { path };
+            // Two environments cannot share a directory -- that is what
+            // identifies them -- so choosing one this project already has is
+            // a no-op rather than a duplicate row.
+            if project
+                .environments
+                .iter()
+                .any(|environment| environment.location == location)
+            {
+                return Task::none();
+            }
+            project
+                .environments
+                .push(bombadil_core::model::Environment {
+                    location,
+                    // `Settings::python` is the pin a new environment starts with,
+                    // which is the meaning it has now that the pin lives here. A
+                    // folder that already holds an environment reports its real
+                    // version once the probe lands, whatever this says.
+                    python: seed,
+                });
+            rebuild_entries(app);
             return Task::batch([persist_env_edit(app), probe_every_venv(app)]);
+        }
+        Message::EnvironmentPinChanged(id, location, version) => {
+            let pin = preferences::pin_from_input(&version);
+            let Some(project) = app.config.projects.iter_mut().find(|p| p.id == id) else {
+                return Task::none();
+            };
+            let Some(environment) = project
+                .environments
+                .iter_mut()
+                .find(|environment| environment.location == location)
+            else {
+                return Task::none();
+            };
+            environment.python = pin;
+            // The row shows its own pin, and drift is judged against it.
+            rebuild_entries(app);
+            return persist_env_edit(app);
+        }
+        Message::EnvironmentRemoveRequested(id, location) => {
+            let Some(project) = app.config.projects.iter().find(|p| p.id == id) else {
+                return Task::none();
+            };
+            let Some(environment) = project
+                .environments
+                .iter()
+                .find(|environment| environment.location == location)
+            else {
+                return Task::none();
+            };
+            let Ok(venv_path) = venv_path::resolve(project, environment, &app.config.settings)
+            else {
+                return Task::none();
+            };
+            app.confirm_environment_removal = Some(context_menu::ConfirmEnvironmentRemoval {
+                project_id: id,
+                label: project.label.clone(),
+                location,
+                venv_path,
+            });
+        }
+        Message::EnvironmentRemovalCancelled => {
+            app.confirm_environment_removal = None;
+        }
+        Message::EnvironmentRemovalConfirmed => {
+            // `take` unconditionally: the user has answered either way.
+            let Some(confirm) = app.confirm_environment_removal.take() else {
+                return Task::none();
+            };
+            let Some(project) = app
+                .config
+                .projects
+                .iter_mut()
+                .find(|p| p.id == confirm.project_id)
+            else {
+                return Task::none();
+            };
+            project
+                .environments
+                .retain(|environment| environment.location != confirm.location);
+            // If the removed one was active, `active` now names nothing.
+            // `active_environment` already falls back to the first, but
+            // leaving it dangling would make the sidebar's active marker
+            // disagree with what Sync would build.
+            if project.active == confirm.location {
+                project.active = project
+                    .environments
+                    .first()
+                    .map(|environment| environment.location.clone())
+                    .unwrap_or_default();
+            }
+            rebuild_entries(app);
+            return Task::batch([persist_env_edit(app), probe_every_venv(app)]);
+        }
+        Message::EnvironmentLocationSelected(id, from, to) => {
+            let Some(project) = app.config.projects.iter_mut().find(|p| p.id == id) else {
+                return Task::none();
+            };
+            // Two environments cannot share a directory -- that is what
+            // identifies them -- so a move onto one that is taken is refused
+            // rather than silently merging the two.
+            if from != to
+                && project
+                    .environments
+                    .iter()
+                    .any(|environment| environment.location == to)
+            {
+                return Task::none();
+            }
+            let Some(environment) = project
+                .environments
+                .iter_mut()
+                .find(|environment| environment.location == from)
+            else {
+                return Task::none();
+            };
+            environment.location = to.clone();
+            // `active` names a location, so moving the active environment has
+            // to move it too or it would name one that no longer exists.
+            if project.active == from {
+                project.active = to;
+            }
+            // Re-probed: the sidebar's glyph describes wherever an
+            // environment last resolved, and this moved that.
+            rebuild_entries(app);
+            return Task::batch([persist_env_edit(app), probe_every_venv(app)]);
+        }
+        Message::EnvironmentPickFolderRequested(id, from) => {
+            return Task::perform(pick_folder(), move |path| {
+                Message::EnvironmentFolderPicked(id, from.clone(), path)
+            });
+        }
+        // Cancelled -- leave the environment where it is.
+        Message::EnvironmentFolderPicked(_, _, None) => {}
+        Message::EnvironmentFolderPicked(id, from, Some(path)) => {
+            return Task::done(Message::EnvironmentLocationSelected(
+                id,
+                from,
+                VenvLocation::Custom { path },
+            ));
         }
         Message::PreferencesInheritToggled(scope, section) => {
             // Only a project can inherit. Global has nothing above it, and a
@@ -1794,7 +2066,10 @@ pub fn update(app: &mut App, message: Message, runner: Arc<dyn CommandRunner>) -
                 return Task::none();
             };
             match section {
-                preferences::Section::Python => project.python = Override::Inherit,
+                // The pin is per environment now, and an environment either
+                // has one or does not -- there is nothing above it to inherit
+                // from. Task 5 replaces this control for the Python section.
+                preferences::Section::Python => return Task::none(),
                 preferences::Section::Uv => project.uv_source = Override::Inherit,
                 preferences::Section::Terminal => {
                     project.terminals.remove(&Os::host());
@@ -2216,6 +2491,58 @@ pub fn update(app: &mut App, message: Message, runner: Arc<dyn CommandRunner>) -
         }
     }
     Task::none()
+}
+
+/// Rebuilds `app.entries` from `app.config`, keeping what has already been
+/// probed.
+///
+/// `entries` is what the sidebar renders; `config` is what is persisted.
+/// Anything that changes a project's environments has to update both, and
+/// writing only the second is a bug this project has already been bitten by
+/// once -- `App::projects` was a stale clone, the file on disk stayed
+/// correct, and restarting "fixed" it, which is precisely why manual testing
+/// missed it. It came back here as "the add environment button is not
+/// working": the environment was added and persisted, and the tree went on
+/// showing the old list.
+///
+/// Probed versions are carried across by location rather than dropped. A
+/// rebuild that dropped them would blank every row to "not created" on each
+/// add, until the probes landed again.
+fn rebuild_entries(app: &mut App) {
+    /// What a rebuild has to carry across: a project's `requires-python` and
+    /// each environment's probed version, keyed by the location that
+    /// identifies it.
+    type Probed = (
+        Option<String>,
+        Vec<(bombadil_core::model::VenvLocation, Option<String>)>,
+    );
+
+    let probed: Vec<Probed> = app
+        .entries
+        .iter()
+        .map(|entry| {
+            (
+                entry.requires_python.clone(),
+                entry
+                    .environments
+                    .iter()
+                    .map(|row| (row.location.clone(), row.python_version.clone()))
+                    .collect(),
+            )
+        })
+        .collect();
+
+    app.entries = sidebar::entries(&app.config);
+
+    for (entry, (requires_python, rows)) in app.entries.iter_mut().zip(probed) {
+        entry.requires_python = requires_python;
+        for row in &mut entry.environments {
+            if let Some((_, version)) = rows.iter().find(|(location, _)| *location == row.location)
+            {
+                row.python_version = version.clone();
+            }
+        }
+    }
 }
 
 /// Re-read everything a finished sync has just invalidated.
@@ -2783,7 +3110,10 @@ fn run_sync(
     // `match`, not `let ... else`: the error names the offending path, and
     // "could not resolve a virtual environment path" tells the user nothing
     // they can act on.
-    let venv_path = match venv_path::resolve(project, &config.settings) {
+    let Some(environment) = project.active_environment().cloned() else {
+        return (false, vec!["this project has no environment".to_string()]);
+    };
+    let venv_path = match venv_path::resolve(project, &environment, &config.settings) {
         Ok(path) => path,
         Err(err) => return (false, vec![err.to_string()]),
     };
@@ -2797,9 +3127,14 @@ fn run_sync(
         project_dir: project_dir.to_path_buf(),
         venv_path: venv_path.clone(),
     };
-    // The pin, if one resolves. `sync_with_python` is the same builder the
-    // add-project dialog already uses, so there is one way to say "-p".
-    let spec = match bombadil_core::resolve::effective(config, project, Os::host()).python {
+    // The ACTIVE environment's own pin. Not the project's -- a project has
+    // none now -- and not another environment's: a project with a 3.11 and a
+    // 3.12 environment must build each with its own interpreter, which is the
+    // entire reason to have both.
+    //
+    // `sync_with_python` is the same builder the add-project dialog uses, so
+    // there is one way to say "-p".
+    let spec = match environment.python.clone() {
         PythonPin::Version(version) => uv::command::sync_with_python(&resolved_uv, &ctx, &version),
         PythonPin::Unpinned => uv::command::sync(&resolved_uv, &ctx),
     };
@@ -2848,7 +3183,10 @@ fn run_members_sync(
     else {
         return (false, vec!["no project directory to run uv in".to_string()]);
     };
-    let venv_path = match venv_path::resolve(project, &config.settings) {
+    let Some(environment) = project.active_environment().cloned() else {
+        return (false, vec!["this project has no environment".to_string()]);
+    };
+    let venv_path = match venv_path::resolve(project, &environment, &config.settings) {
         Ok(path) => path,
         Err(err) => return (false, vec![err.to_string()]),
     };
@@ -2921,7 +3259,10 @@ fn run_recreate_venv(
     on_line: &mut dyn FnMut(String),
     delete: impl Fn(&Path) -> Result<(), String>,
 ) -> (bool, Vec<String>) {
-    let venv_path = match venv_path::resolve(project, &config.settings) {
+    let Some(environment) = project.active_environment().cloned() else {
+        return (false, vec!["this project has no environment".to_string()]);
+    };
+    let venv_path = match venv_path::resolve(project, &environment, &config.settings) {
         Ok(path) => path,
         Err(err) => return (false, vec![err.to_string()]),
     };
@@ -2959,7 +3300,11 @@ fn recreate_venv(
                 &KeyringSecretStore::new(),
                 runner.as_ref(),
                 on_line,
-                |path| venv_path::delete(target, &settings, path).map_err(|err| err.to_string()),
+                |path| {
+                    let environment = target.active_environment().cloned().unwrap_or_default();
+                    venv_path::delete(target, &environment, &settings, path)
+                        .map_err(|e| e.to_string())
+                },
             )
         },
         "recreating the environment timed out",
@@ -2989,7 +3334,10 @@ fn run_confirm_add_project(
         return (false, vec![err]);
     }
 
-    let venv_path = match venv_path::resolve(project, &config.settings) {
+    let Some(environment) = project.active_environment().cloned() else {
+        return (false, vec!["this project has no environment".to_string()]);
+    };
+    let venv_path = match venv_path::resolve(project, &environment, &config.settings) {
         Ok(path) => path,
         Err(err) => return (false, vec![err.to_string()]),
     };
@@ -3189,7 +3537,12 @@ fn run_open_terminal(
     runner: &dyn CommandRunner,
     scratch_dir: &Path,
 ) -> Result<(), String> {
-    let venv_path = venv_path::resolve(project, &config.settings).map_err(|e| e.to_string())?;
+    let environment = project
+        .active_environment()
+        .cloned()
+        .ok_or_else(|| "this project has no environment".to_string())?;
+    let venv_path =
+        venv_path::resolve(project, &environment, &config.settings).map_err(|e| e.to_string())?;
     let inputs = EnvInputs {
         parent: std::env::vars().collect(),
         config: config.clone(),
@@ -3519,7 +3872,27 @@ pub fn view(app: &App) -> iced::Element<'_, Message> {
         // tasks are what keep that cache current.
         Some((i, project)) => {
             let entry = app.entries.get(i);
-            let header = detail::header(project, &|_| entry.and_then(|e| e.python_version.clone()));
+            // The active environment's version: the header describes what
+            // Sync and Open terminal would act on.
+            // The active environment's resolved path, from the entries cache
+            // the sidebar already built -- not a fresh `venv_path::resolve` on
+            // every frame.
+            let venv_path = entry.and_then(|entry| {
+                entry
+                    .environments
+                    .iter()
+                    .find(|row| row.active)
+                    .map(|row| row.path.clone())
+            });
+            let header = detail::header(project, venv_path, &|_| {
+                entry.and_then(|entry| {
+                    entry
+                        .environments
+                        .iter()
+                        .find(|row| row.active)
+                        .and_then(|row| row.python_version.clone())
+                })
+            });
             detail::view(&header, i)
         }
         None => iced::widget::text("").into(),
@@ -3563,11 +3936,20 @@ pub fn view(app: &App) -> iced::Element<'_, Message> {
             },
             _ => iced::widget::text("").into(),
         },
-        // Global scripts always shown, the project's own once one is
-        // selected. The one editor Preferences did not absorb -- pre-activate
-        // hooks are a project's own behaviour rather than a setting, and the
-        // user asked for it to keep its tab.
+        // This project's own variables, and which global ones they shadow.
+        // The global list itself is Settings > Environment variables.
+        Tab::EnvVars => match app.selected {
+            Some(i) => env_editor::project_view(&app.config, i, &app.env_value_drafts),
+            None => iced::widget::text("").into(),
+        },
+        // Global scripts always shown, the project's own beneath them.
         Tab::Scripts => scripts_editor::view(&app.config, app.selected),
+        // Which of the globally defined indexes this project resolves
+        // against. Defining them is Settings > Package indexes and auth.
+        Tab::Indexes => match app.selected {
+            Some(i) => index_editor::project_view(&app.config, i),
+            None => iced::widget::text("").into(),
+        },
     };
 
     // The current tab's own button is disabled rather than hidden -- the
@@ -3811,6 +4193,11 @@ pub fn view(app: &App) -> iced::Element<'_, Message> {
     if app.confirm_pin_change.is_some() {
         layers = layers.push(shell::overlay_layer(confirm_pin_view));
     }
+    if let Some(confirm) = &app.confirm_environment_removal {
+        layers = layers.push(shell::overlay_layer(
+            context_menu::confirm_environment_removal_view(confirm),
+        ));
+    }
     if app.confirm_member_sync.is_some() {
         layers = layers.push(shell::overlay_layer(confirm_member_sync_view));
     }
@@ -3845,6 +4232,21 @@ mod tests {
     use bombadil_core::model::Config;
     use bombadil_core::process::FakeCommandRunner;
     use std::path::Path;
+
+    /// Marks a project's ACTIVE environment as probed at `version`.
+    ///
+    /// A helper rather than an inline field write: the sidebar carries one
+    /// row per environment now, and a test that reached for "the project's
+    /// version" would have to pick one -- which is exactly the ambiguity the
+    /// rows exist to remove.
+    fn set_probed_version(app: &mut App, project: usize, version: &str) {
+        let row = app.entries[project]
+            .environments
+            .iter_mut()
+            .find(|row| row.active)
+            .expect("the project must have an active environment to probe");
+        row.python_version = Some(version.to_string());
+    }
 
     /// The selected project's label. A test helper rather than a method on
     /// `App`: nothing in the real code path resolves a project from the
@@ -4248,7 +4650,10 @@ mod tests {
         };
         let mut app = App::new(config);
         assert!(
-            !app.entries[0].venv_exists,
+            app.entries[0]
+                .environments
+                .iter()
+                .all(|row| row.python_version.is_none()),
             "a freshly constructed App has not been probed yet -- entries start hollow"
         );
 
@@ -4326,9 +4731,53 @@ mod tests {
     }
 
     #[test]
-    fn a_successful_sync_collapses_to_a_status_line() {
-        // The other half: collapsing IS right on success (spec §8), so the
-        // failure fix must not turn into "always expanded".
+    fn the_user_can_close_the_drawer_and_it_stays_closed() {
+        // The whole point of the control: output arriving and a command
+        // finishing both used to drive it, so "closed" lasted until the next
+        // line. Now nothing but this message changes it.
+        let mut app = App::new(Config {
+            projects: vec![project("api")],
+            ..Config::default()
+        });
+        assert!(app.drawer.expanded, "it starts open");
+
+        let _ = update(&mut app, Message::DrawerToggled, unused_runner());
+        assert!(!app.drawer.expanded);
+
+        let _ = update(
+            &mut app,
+            Message::SyncLine("Resolved 12 packages".to_string()),
+            unused_runner(),
+        );
+        let _ = update(
+            &mut app,
+            Message::SyncFinished {
+                success: false,
+                lines: Vec::new(),
+            },
+            unused_runner(),
+        );
+
+        assert!(
+            !app.drawer.expanded,
+            "neither output nor a failure may reopen a drawer the user closed"
+        );
+        assert!(
+            !app.drawer.lines.is_empty(),
+            "the transcript is still collected, ready for when they open it"
+        );
+
+        let _ = update(&mut app, Message::DrawerToggled, unused_runner());
+        assert!(app.drawer.expanded, "and reopening shows it");
+    }
+
+    #[test]
+    fn a_successful_sync_leaves_its_transcript_on_screen() {
+        // Supersedes spec §8's "reduces to a single status line once idle",
+        // at the user's request: the output of a command they just ran is
+        // what they asked for, and collapsing it on success meant a
+        // successful sync's transcript existed only while it was running.
+        // Closing it is now a press, and it stays closed.
         let mut app = App::new(Config {
             projects: vec![project("api")],
             ..Config::default()
@@ -4343,8 +4792,12 @@ mod tests {
             unused_runner(),
         );
 
-        assert!(!app.drawer.expanded, "a successful sync must collapse");
+        assert!(
+            app.drawer.expanded,
+            "a successful sync must leave its output readable"
+        );
         assert_eq!(app.drawer.status, "sync succeeded");
+        assert!(!app.drawer.lines.is_empty(), "and its lines with it");
     }
 
     #[test]
@@ -4661,7 +5114,11 @@ mod tests {
     #[test]
     fn a_pinned_project_syncs_with_that_interpreter() {
         let project = Project {
-            python: bombadil_core::model::Override::Set(PythonPin::Version("3.12".into())),
+            environments: vec![bombadil_core::model::Environment {
+                location: VenvLocation::Alongside,
+                python: PythonPin::Version("3.12".into()),
+            }],
+            active: VenvLocation::Alongside,
             ..project("api")
         };
         let config = Config {
@@ -4694,6 +5151,810 @@ mod tests {
         assert!(
             sync.args.windows(2).any(|w| w == ["-p", "3.12"]),
             "the pin must reach uv; got {:?}",
+            sync.args
+        );
+    }
+
+    #[test]
+    fn a_probe_result_lands_on_the_environment_it_probed() {
+        // One project now has several probes in flight at once, and they land
+        // in whatever order the filesystem answers. Matching by position
+        // instead of by location would pile every result onto the first row --
+        // so a 3.11 environment would report the 3.12 one's version, and the
+        // drift glyph would describe the wrong directory.
+        let second = VenvLocation::Custom {
+            path: std::path::PathBuf::from("/envs/api-311"),
+        };
+        let mut app = App::new(Config {
+            projects: vec![Project {
+                environments: vec![
+                    bombadil_core::model::Environment {
+                        location: VenvLocation::Alongside,
+                        python: PythonPin::Unpinned,
+                    },
+                    bombadil_core::model::Environment {
+                        location: second.clone(),
+                        python: PythonPin::Unpinned,
+                    },
+                ],
+                active: VenvLocation::Alongside,
+                ..project("api")
+            }],
+            ..Config::default()
+        });
+
+        let _ = update(
+            &mut app,
+            Message::VenvProbed {
+                index: 0,
+                location: second.clone(),
+                python_version: Some("3.11.9".to_string()),
+                requires_python: None,
+            },
+            unused_runner(),
+        );
+
+        let rows = &app.entries[0].environments;
+        assert_eq!(
+            rows.iter()
+                .find(|row| row.location == second)
+                .and_then(|row| row.python_version.clone()),
+            Some("3.11.9".to_string()),
+            "the probed environment must carry its own result"
+        );
+        assert_eq!(
+            rows[0].python_version, None,
+            "and no other environment may pick it up"
+        );
+    }
+
+    #[test]
+    fn a_probe_for_an_environment_the_project_no_longer_has_is_dropped() {
+        // The same staleness guard every indexed message here carries: an
+        // environment can be removed while its probe is in flight.
+        let mut app = App::new(Config {
+            projects: vec![project("api")],
+            ..Config::default()
+        });
+
+        let _ = update(
+            &mut app,
+            Message::VenvProbed {
+                index: 0,
+                location: VenvLocation::Custom {
+                    path: std::path::PathBuf::from("/gone"),
+                },
+                python_version: Some("3.11.9".to_string()),
+                requires_python: None,
+            },
+            unused_runner(),
+        );
+
+        assert!(
+            app.entries[0]
+                .environments
+                .iter()
+                .all(|row| row.python_version.is_none()),
+            "a result for an environment that is gone must land nowhere"
+        );
+    }
+
+    #[test]
+    fn a_projects_own_env_vars_and_indexes_are_reachable_from_its_tabs() {
+        // The split this application settled on: a tab is what *this project*
+        // has, the Settings menu is what every project has. Env vars and
+        // indexes have both halves, so they appear in both places showing
+        // different things.
+        //
+        // Absorbing the per-project halves into Preferences was reported
+        // twice as the tab having gone missing, which is what this holds
+        // against a future tidy-up.
+        for tab in [Tab::EnvVars, Tab::Indexes, Tab::Scripts] {
+            assert!(
+                Tab::ALL.contains(&tab),
+                "{tab:?} is a per-project surface and belongs in the tab bar"
+            );
+        }
+        assert_eq!(
+            Tab::ALL.len(),
+            5,
+            "Dependencies, Members, Env vars, Scripts, Indexes -- and Settings \
+             deliberately not, since it has no per-project half"
+        );
+    }
+
+    #[test]
+    fn adding_an_environment_creates_nothing_until_a_folder_is_picked() {
+        // Reported as: pressing add "simply appearing a new env that I don't
+        // know how it was created". An environment *is* its directory, so
+        // choosing that directory is the act of creating it -- inventing a
+        // name and adding it silently tells the user nothing about where it
+        // went, and cannot express the case this exists for: pointing at an
+        // environment already on disk.
+        //
+        // What this proves is that the press creates nothing on its own;
+        // `EnvironmentAddFolderPicked` is the only arm that adds. That *the
+        // dispatched task is a folder picker* is not provable here -- a
+        // `Task` is opaque, and dispatching an invented path would look
+        // identical -- so it is confirmed by hand instead. Named for the
+        // claim it actually carries rather than the one I wanted it to.
+        let mut app = App::new(Config {
+            projects: vec![project("api")],
+            ..Config::default()
+        });
+        let id = app.config.projects[0].id;
+        let before = app.config.projects[0].environments.len();
+
+        let task = update(&mut app, Message::EnvironmentAdded(id), unused_runner());
+
+        assert!(task.units() > 0, "the press must dispatch something");
+        assert_eq!(
+            app.config.projects[0].environments.len(),
+            before,
+            "nothing may be created before the user has said where"
+        );
+        assert!(
+            app.entries[0].environments.len() == before,
+            "and nothing may appear in the tree either"
+        );
+    }
+
+    #[test]
+    fn cancelling_the_folder_picker_adds_nothing() {
+        let mut app = App::new(Config {
+            projects: vec![project("api")],
+            ..Config::default()
+        });
+        let id = app.config.projects[0].id;
+        let before = app.config.projects[0].environments.len();
+
+        let task = update(
+            &mut app,
+            Message::EnvironmentAddFolderPicked(id, None),
+            unused_runner(),
+        );
+
+        assert_eq!(app.config.projects[0].environments.len(), before);
+        assert_eq!(task.units(), 0);
+    }
+
+    #[test]
+    fn the_chosen_folder_is_where_the_environment_goes() {
+        let chosen = std::path::PathBuf::from("/home/me/envs/shared");
+        let mut app = App::new(Config {
+            projects: vec![project("api")],
+            ..Config::default()
+        });
+        let id = app.config.projects[0].id;
+
+        let _ = update(
+            &mut app,
+            Message::EnvironmentAddFolderPicked(id, Some(chosen.clone())),
+            unused_runner(),
+        );
+
+        assert_eq!(
+            app.config.projects[0].environments.last().unwrap().location,
+            VenvLocation::Custom {
+                path: chosen.clone()
+            },
+            "the environment must live exactly where the user pointed"
+        );
+        assert!(
+            app.entries[0]
+                .environments
+                .iter()
+                .any(|row| row.path == chosen),
+            "and the tree must show that directory"
+        );
+    }
+
+    #[test]
+    fn choosing_a_folder_this_project_already_uses_adds_nothing() {
+        // Two environments cannot share a directory -- that is what
+        // identifies them -- so this is a no-op rather than a duplicate row
+        // the user would then have to work out how to remove.
+        let chosen = std::path::PathBuf::from("/home/me/envs/shared");
+        let mut app = App::new(Config {
+            projects: vec![Project {
+                environments: vec![bombadil_core::model::Environment {
+                    location: VenvLocation::Custom {
+                        path: chosen.clone(),
+                    },
+                    python: PythonPin::Unpinned,
+                }],
+                active: VenvLocation::Custom {
+                    path: chosen.clone(),
+                },
+                ..project("api")
+            }],
+            ..Config::default()
+        });
+        let id = app.config.projects[0].id;
+
+        let task = update(
+            &mut app,
+            Message::EnvironmentAddFolderPicked(id, Some(chosen)),
+            unused_runner(),
+        );
+
+        assert_eq!(app.config.projects[0].environments.len(), 1);
+        assert_eq!(task.units(), 0);
+    }
+
+    #[test]
+    fn an_added_environment_appears_in_the_sidebar_at_once() {
+        // `app.entries` is what the tree renders; `app.config` is what is
+        // persisted. Writing only the second is the bug the whole-branch
+        // review already caught once, in `App::projects`: the file on disk is
+        // right, the screen is wrong, and restarting "fixes" it -- which is
+        // exactly why manual testing misses it.
+        //
+        // Reported as "the add environment button is not working".
+        let mut app = App::new(Config {
+            projects: vec![project("api")],
+            ..Config::default()
+        });
+        let id = app.config.projects[0].id;
+        let before = app.entries[0].environments.len();
+
+        let _ = update(
+            &mut app,
+            Message::EnvironmentAddFolderPicked(id, Some(std::path::PathBuf::from("/envs/new"))),
+            unused_runner(),
+        );
+
+        assert_eq!(
+            app.config.projects[0].environments.len(),
+            before + 1,
+            "the config must carry it"
+        );
+        assert_eq!(
+            app.entries[0].environments.len(),
+            before + 1,
+            "and the sidebar must show it without waiting for a restart"
+        );
+    }
+
+    #[test]
+    fn a_removed_environment_leaves_the_sidebar_at_once() {
+        let spare = VenvLocation::Custom {
+            path: std::path::PathBuf::from("/envs/spare"),
+        };
+        let mut app = App::new(Config {
+            projects: vec![Project {
+                environments: vec![
+                    bombadil_core::model::Environment {
+                        location: VenvLocation::Alongside,
+                        python: PythonPin::Unpinned,
+                    },
+                    bombadil_core::model::Environment {
+                        location: spare.clone(),
+                        python: PythonPin::Unpinned,
+                    },
+                ],
+                active: VenvLocation::Alongside,
+                ..project("api")
+            }],
+            ..Config::default()
+        });
+        let id = app.config.projects[0].id;
+
+        let _ = update(
+            &mut app,
+            Message::EnvironmentRemoveRequested(id, spare.clone()),
+            unused_runner(),
+        );
+        let _ = update(
+            &mut app,
+            Message::EnvironmentRemovalConfirmed,
+            unused_runner(),
+        );
+
+        assert_eq!(app.entries[0].environments.len(), 1);
+        assert!(
+            app.entries[0]
+                .environments
+                .iter()
+                .all(|row| row.location != spare),
+            "the removed environment must be gone from the tree too"
+        );
+    }
+
+    #[test]
+    fn rebuilding_the_sidebar_keeps_versions_already_probed() {
+        // A rebuild that dropped them would blank every row to "not created"
+        // on each add, and they would only come back when the probes landed.
+        let mut app = App::new(Config {
+            projects: vec![project("api")],
+            ..Config::default()
+        });
+        let id = app.config.projects[0].id;
+        set_probed_version(&mut app, 0, "3.12.13");
+
+        let _ = update(
+            &mut app,
+            Message::EnvironmentAddFolderPicked(id, Some(std::path::PathBuf::from("/envs/new"))),
+            unused_runner(),
+        );
+
+        assert_eq!(
+            app.entries[0]
+                .environments
+                .iter()
+                .find(|row| row.active)
+                .and_then(|row| row.python_version.clone()),
+            Some("3.12.13".to_string()),
+            "an environment already probed must not blank on an unrelated add"
+        );
+    }
+
+    #[test]
+    fn a_new_environment_starts_from_the_global_pin() {
+        // `Settings::python` stops being inherited at sync time and becomes
+        // the pin a new environment is created with -- the changed meaning
+        // this design gives it, written as a test so it cannot quietly revert.
+        let mut app = App::new(Config {
+            projects: vec![project("api")],
+            settings: Settings {
+                python: PythonPin::Version("3.12".into()),
+                ..Settings::default()
+            },
+            ..Config::default()
+        });
+        let id = app.config.projects[0].id;
+        let before = app.config.projects[0].environments.len();
+
+        let _ = update(
+            &mut app,
+            Message::EnvironmentAddFolderPicked(id, Some(std::path::PathBuf::from("/envs/new"))),
+            unused_runner(),
+        );
+
+        assert_eq!(app.config.projects[0].environments.len(), before + 1);
+        assert_eq!(
+            app.config.projects[0].environments.last().unwrap().python,
+            PythonPin::Version("3.12".into())
+        );
+    }
+
+    #[test]
+    fn two_environments_of_one_project_never_share_a_directory() {
+        // The location is what identifies an environment, so a collision
+        // would make two rows the same row -- and whichever the user pressed,
+        // Sync would build one directory.
+        let mut app = App::new(Config {
+            projects: vec![project("api")],
+            ..Config::default()
+        });
+        let id = app.config.projects[0].id;
+
+        for n in 0..3 {
+            let _ = update(
+                &mut app,
+                Message::EnvironmentAddFolderPicked(
+                    id,
+                    Some(std::path::PathBuf::from(format!("/envs/api-{n}"))),
+                ),
+                unused_runner(),
+            );
+        }
+
+        let locations: Vec<_> = app.config.projects[0]
+            .environments
+            .iter()
+            .map(|environment| environment.location.clone())
+            .collect();
+        for (i, location) in locations.iter().enumerate() {
+            assert!(
+                !locations[i + 1..].contains(location),
+                "two environments landed on {location:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn moving_an_environment_onto_a_taken_directory_is_refused() {
+        // Rather than silently merging the two, which would lose one of them
+        // along with the account of what is installed in it.
+        let taken = VenvLocation::Custom {
+            path: std::path::PathBuf::from("/envs/taken"),
+        };
+        let mut app = App::new(Config {
+            projects: vec![Project {
+                environments: vec![
+                    bombadil_core::model::Environment {
+                        location: VenvLocation::Alongside,
+                        python: PythonPin::Unpinned,
+                    },
+                    bombadil_core::model::Environment {
+                        location: taken.clone(),
+                        python: PythonPin::Unpinned,
+                    },
+                ],
+                active: VenvLocation::Alongside,
+                ..project("api")
+            }],
+            ..Config::default()
+        });
+        let id = app.config.projects[0].id;
+
+        let task = update(
+            &mut app,
+            Message::EnvironmentLocationSelected(id, VenvLocation::Alongside, taken.clone()),
+            unused_runner(),
+        );
+
+        assert_eq!(task.units(), 0);
+        assert_eq!(
+            app.config.projects[0].environments.len(),
+            2,
+            "neither environment may be lost to the collision"
+        );
+        assert_eq!(
+            app.config.projects[0].environments[0].location,
+            VenvLocation::Alongside,
+            "the one that was moved must stay where it is"
+        );
+    }
+
+    #[test]
+    fn removing_an_environment_asks_first() {
+        // The same act as Recreate venv: an environment stops being one this
+        // application keeps an account of.
+        let spare = VenvLocation::Custom {
+            path: std::path::PathBuf::from("/envs/spare"),
+        };
+        let mut app = App::new(Config {
+            projects: vec![Project {
+                environments: vec![
+                    bombadil_core::model::Environment {
+                        location: VenvLocation::Alongside,
+                        python: PythonPin::Unpinned,
+                    },
+                    bombadil_core::model::Environment {
+                        location: spare.clone(),
+                        python: PythonPin::Unpinned,
+                    },
+                ],
+                active: VenvLocation::Alongside,
+                ..project("api")
+            }],
+            ..Config::default()
+        });
+        let id = app.config.projects[0].id;
+
+        let task = update(
+            &mut app,
+            Message::EnvironmentRemoveRequested(id, spare),
+            unused_runner(),
+        );
+
+        assert_eq!(task.units(), 0, "nothing may go before the user answers");
+        assert_eq!(
+            app.config.projects[0].environments.len(),
+            2,
+            "it must still be there until confirmed"
+        );
+        assert!(app.confirm_environment_removal.is_some());
+    }
+
+    #[test]
+    fn removing_the_active_environment_moves_active_to_a_survivor() {
+        // `active` names a location. Left pointing at the removed one it
+        // would name nothing, and the sidebar's active marker would disagree
+        // with what Sync builds.
+        let spare = VenvLocation::Custom {
+            path: std::path::PathBuf::from("/envs/spare"),
+        };
+        let mut app = App::new(Config {
+            projects: vec![Project {
+                environments: vec![
+                    bombadil_core::model::Environment {
+                        location: VenvLocation::Alongside,
+                        python: PythonPin::Unpinned,
+                    },
+                    bombadil_core::model::Environment {
+                        location: spare.clone(),
+                        python: PythonPin::Unpinned,
+                    },
+                ],
+                active: VenvLocation::Alongside,
+                ..project("api")
+            }],
+            ..Config::default()
+        });
+        let id = app.config.projects[0].id;
+
+        let _ = update(
+            &mut app,
+            Message::EnvironmentRemoveRequested(id, VenvLocation::Alongside),
+            unused_runner(),
+        );
+        let _ = update(
+            &mut app,
+            Message::EnvironmentRemovalConfirmed,
+            unused_runner(),
+        );
+
+        assert_eq!(app.config.projects[0].environments.len(), 1);
+        assert_eq!(
+            app.config.projects[0].active, spare,
+            "active must name an environment that still exists"
+        );
+    }
+
+    #[test]
+    fn declining_a_removal_removes_nothing() {
+        let mut app = App::new(Config {
+            projects: vec![project("api")],
+            ..Config::default()
+        });
+        app.confirm_environment_removal = Some(context_menu::ConfirmEnvironmentRemoval {
+            project_id: app.config.projects[0].id,
+            label: "api".into(),
+            location: VenvLocation::Alongside,
+            venv_path: std::path::PathBuf::from("/p/api/.venv"),
+        });
+        let before = app.config.projects[0].environments.len();
+
+        let task = update(
+            &mut app,
+            Message::EnvironmentRemovalCancelled,
+            unused_runner(),
+        );
+
+        assert_eq!(task.units(), 0);
+        assert!(app.confirm_environment_removal.is_none());
+        assert_eq!(app.config.projects[0].environments.len(), before);
+    }
+
+    #[test]
+    fn collapsing_a_project_persists() {
+        // A config field rather than view state: a project you collapse stays
+        // collapsed across a restart.
+        let mut app = App::new(Config {
+            projects: vec![project("api")],
+            ..Config::default()
+        });
+        assert!(app.config.projects[0].expanded, "projects start expanded");
+
+        let task = update(&mut app, Message::ProjectExpandToggled(0), unused_runner());
+
+        assert!(!app.config.projects[0].expanded);
+        assert!(!app.entries[0].expanded, "the sidebar must follow at once");
+        assert!(task.units() > 0, "a persisted setting must be persisted");
+    }
+
+    #[test]
+    fn activating_an_environment_moves_what_sync_acts_on() {
+        let target = VenvLocation::Custom {
+            path: std::path::PathBuf::from("/envs/api-311"),
+        };
+        let mut app = App::new(Config {
+            projects: vec![Project {
+                environments: vec![
+                    bombadil_core::model::Environment {
+                        location: VenvLocation::Alongside,
+                        python: PythonPin::Unpinned,
+                    },
+                    bombadil_core::model::Environment {
+                        location: target.clone(),
+                        python: PythonPin::Version("3.11".into()),
+                    },
+                ],
+                active: VenvLocation::Alongside,
+                ..project("api")
+            }],
+            ..Config::default()
+        });
+
+        let _ = update(
+            &mut app,
+            Message::EnvironmentActivated(0, target.clone()),
+            unused_runner(),
+        );
+
+        assert_eq!(app.config.projects[0].active, target);
+        assert_eq!(
+            app.config.projects[0]
+                .active_environment()
+                .map(|e| e.python.clone()),
+            Some(PythonPin::Version("3.11".into())),
+            "what Sync pins from must move with it"
+        );
+        assert!(
+            app.entries[0]
+                .environments
+                .iter()
+                .any(|row| row.active && row.location == target),
+            "exactly the pressed row must read as active in the sidebar"
+        );
+        assert_eq!(
+            app.entries[0]
+                .environments
+                .iter()
+                .filter(|row| row.active)
+                .count(),
+            1,
+            "one active environment, never two"
+        );
+    }
+
+    #[test]
+    fn pressing_the_environment_a_project_already_uses_still_selects_it() {
+        // Reported as: clicking an environment in one project then one in
+        // another "is not changing (maybe because the second project only has
+        // one virtual environment)". Exactly that. The row was pressable only
+        // when it was *not* already the default, so a project with one
+        // environment had a permanently dead row -- and since the press is
+        // also what selects the project, that project could never be reached
+        // by clicking its environment at all.
+        let only = VenvLocation::Custom {
+            path: std::path::PathBuf::from("/envs/web"),
+        };
+        let mut app = App::new(Config {
+            projects: vec![
+                project("api"),
+                Project {
+                    id: uuid::Uuid::from_u128(2),
+                    environments: vec![bombadil_core::model::Environment {
+                        location: only.clone(),
+                        python: PythonPin::Unpinned,
+                    }],
+                    active: only.clone(),
+                    ..project("web")
+                },
+            ],
+            ..Config::default()
+        });
+        app.selected = Some(0);
+
+        // The environment is already this project's default -- the press is
+        // a no-op for `active` and the whole point for `selected`.
+        let task = update(
+            &mut app,
+            Message::EnvironmentActivated(1, only.clone()),
+            unused_runner(),
+        );
+
+        assert_eq!(
+            app.selected,
+            Some(1),
+            "pressing a project's only environment must still reach that project"
+        );
+        assert_eq!(app.config.projects[1].active, only);
+        assert!(task.units() > 0, "and re-read its dependencies");
+    }
+
+    #[test]
+    fn activating_an_environment_selects_its_project_too() {
+        // Reported as clicking between environments "not changing the
+        // project, and dependencies and everything else". Pressing one of a
+        // project's environments is a statement about that project; leaving
+        // the selection where it was meant the header, the tabs and the
+        // re-read all described a different one, so the press looked inert.
+        let target = VenvLocation::Custom {
+            path: std::path::PathBuf::from("/envs/web"),
+        };
+        let mut app = App::new(Config {
+            projects: vec![
+                project("api"),
+                Project {
+                    id: uuid::Uuid::from_u128(2),
+                    environments: vec![bombadil_core::model::Environment {
+                        location: target.clone(),
+                        python: PythonPin::Unpinned,
+                    }],
+                    active: target.clone(),
+                    ..project("web")
+                },
+            ],
+            ..Config::default()
+        });
+        app.selected = Some(0);
+
+        let task = update(
+            &mut app,
+            Message::EnvironmentActivated(1, target),
+            unused_runner(),
+        );
+
+        assert_eq!(
+            app.selected,
+            Some(1),
+            "the pressed environment's project must become the selected one"
+        );
+        assert!(
+            task.units() > 0,
+            "and its dependencies and members must be re-read"
+        );
+    }
+
+    #[test]
+    fn activating_an_environment_a_project_does_not_have_changes_nothing() {
+        // `active` naming a location the project does not have would leave
+        // every caller falling back to the first, which looks like the click
+        // did something arbitrary.
+        let mut app = App::new(Config {
+            projects: vec![project("api")],
+            ..Config::default()
+        });
+        let before = app.config.projects[0].active.clone();
+
+        let task = update(
+            &mut app,
+            Message::EnvironmentActivated(
+                0,
+                VenvLocation::Custom {
+                    path: std::path::PathBuf::from("/not/ours"),
+                },
+            ),
+            unused_runner(),
+        );
+
+        assert_eq!(app.config.projects[0].active, before);
+        assert_eq!(task.units(), 0);
+    }
+
+    #[test]
+    fn sync_pins_from_the_active_environment_not_another_one() {
+        // The property the whole feature rests on. A project with a 3.11 and
+        // a 3.12 environment must build each with its own interpreter -- and
+        // uv *deletes* an environment whose version differs from `-p`, so
+        // reading the wrong one destroys the wrong directory.
+        let target = VenvLocation::Custom {
+            path: std::path::PathBuf::from("/envs/api-312"),
+        };
+        let project = Project {
+            environments: vec![
+                bombadil_core::model::Environment {
+                    location: VenvLocation::Alongside,
+                    python: PythonPin::Version("3.11".into()),
+                },
+                bombadil_core::model::Environment {
+                    location: target.clone(),
+                    python: PythonPin::Version("3.12".into()),
+                },
+            ],
+            active: target,
+            ..project("api")
+        };
+        let config = Config {
+            projects: vec![project.clone()],
+            settings: fake_uv_settings(),
+            ..Config::default()
+        };
+        let store = bombadil_core::secrets::InMemorySecretStore::new();
+        let runner = FakeCommandRunner::new();
+        version_probe(&runner);
+        runner.expect(
+            "uv",
+            &["sync"],
+            bombadil_core::process::CommandOutcome {
+                status: Some(0),
+                stdout: String::new(),
+                stderr: String::new(),
+            },
+        );
+
+        let (success, lines) =
+            collect_lines(|on_line| run_sync(&project, &config, &store, &runner, on_line));
+
+        assert!(success, "got {lines:?}");
+        let sync = runner
+            .calls()
+            .into_iter()
+            .find(|c| c.args.first().map(String::as_str) == Some("sync"))
+            .expect("a sync must have run");
+        assert!(
+            sync.args.windows(2).any(|w| w == ["-p", "3.12"]),
+            "the ACTIVE environment's pin must reach uv; got {:?}",
+            sync.args
+        );
+        assert!(
+            !sync.args.iter().any(|a| a == "3.11"),
+            "the inactive environment's pin must not; got {:?}",
             sync.args
         );
     }
@@ -4774,14 +6035,18 @@ mod tests {
         // The whole point of the task: the press opens a confirmation instead
         // of dispatching, and dispatches nothing at all until it is answered.
         let project = Project {
-            python: bombadil_core::model::Override::Set(PythonPin::Version("3.12".into())),
+            environments: vec![bombadil_core::model::Environment {
+                location: VenvLocation::Alongside,
+                python: PythonPin::Version("3.12".into()),
+            }],
+            active: VenvLocation::Alongside,
             ..project("api")
         };
         let mut app = App::new(Config {
             projects: vec![project],
             ..Config::default()
         });
-        app.entries[0].python_version = Some("3.13.14".to_string());
+        set_probed_version(&mut app, 0, "3.13.14");
 
         let task = update(&mut app, Message::SyncRequested(0), unused_runner());
 
@@ -4803,14 +6068,18 @@ mod tests {
         // The other half: the guard must not stand in front of an ordinary
         // sync. A confirmation on every press is one the user stops reading.
         let project = Project {
-            python: bombadil_core::model::Override::Set(PythonPin::Version("3.12".into())),
+            environments: vec![bombadil_core::model::Environment {
+                location: VenvLocation::Alongside,
+                python: PythonPin::Version("3.12".into()),
+            }],
+            active: VenvLocation::Alongside,
             ..project("api")
         };
         let mut app = App::new(Config {
             projects: vec![project],
             ..Config::default()
         });
-        app.entries[0].python_version = Some("3.12".to_string());
+        set_probed_version(&mut app, 0, "3.12");
 
         let task = update(&mut app, Message::SyncRequested(0), unused_runner());
 
@@ -6767,10 +8036,16 @@ mod tests {
         // along. Deriving it keeps the whole path asserted -- the message has
         // to name which environment is gone, and a central-store venv is a
         // hashed directory the user has never seen.
-        let expected = venv_path::resolve(&project, &config.settings)
-            .expect("this project's venv path must resolve")
-            .display()
-            .to_string();
+        let expected = venv_path::resolve(
+            &project,
+            project
+                .active_environment()
+                .expect("this project has an environment"),
+            &config.settings,
+        )
+        .expect("this project's venv path must resolve")
+        .display()
+        .to_string();
         assert!(
             joined.contains(&expected) && joined.contains("deleted"),
             "the user must be told the environment was deleted and not rebuilt; \
@@ -7010,47 +8285,15 @@ mod tests {
         );
 
         assert_eq!(
-            app.config.projects[0].python,
-            Override::Set(PythonPin::Version("3.11".into()))
+            app.config.projects[0]
+                .active_environment()
+                .map(|e| e.python.clone()),
+            Some(PythonPin::Version("3.11".into()))
         );
         assert_eq!(
             app.config.settings.python,
             PythonPin::Version("3.12".into()),
             "a project override must not write into the global value"
-        );
-    }
-
-    #[test]
-    fn toggling_inherit_back_on_discards_the_override_not_the_global() {
-        let mut app = App::new(Config {
-            projects: vec![project("api")],
-            settings: Settings {
-                python: PythonPin::Version("3.12".into()),
-                ..Settings::default()
-            },
-            ..Config::default()
-        });
-        let id = app.config.projects[0].id;
-        app.config.projects[0].python = Override::Set(PythonPin::Version("3.11".into()));
-
-        let _ = update(
-            &mut app,
-            Message::PreferencesSectionOpened(preferences::Section::default()),
-            unused_runner(),
-        );
-        let _ = update(
-            &mut app,
-            Message::PreferencesInheritToggled(
-                preferences::Scope::Project(id),
-                preferences::Section::Python,
-            ),
-            unused_runner(),
-        );
-
-        assert_eq!(app.config.projects[0].python, Override::Inherit);
-        assert_eq!(
-            app.config.settings.python,
-            PythonPin::Version("3.12".into())
         );
     }
 
@@ -7077,7 +8320,12 @@ mod tests {
             unused_runner(),
         );
 
-        assert_eq!(app.config.projects[0].python, Override::Inherit);
+        assert_eq!(
+            app.config.projects[0]
+                .active_environment()
+                .map(|e| e.python.clone()),
+            Some(PythonPin::Unpinned)
+        );
         assert_eq!(app.config.settings.python, PythonPin::Unpinned);
     }
 
@@ -7092,10 +8340,12 @@ mod tests {
         });
         let id = app.config.projects[0].id;
 
+        let from = app.config.projects[0].active.clone();
         let task = update(
             &mut app,
-            Message::PreferencesProjectVenvSelected(
+            Message::EnvironmentLocationSelected(
                 id,
+                from,
                 VenvLocation::Custom {
                     path: std::path::PathBuf::from("/envs/api"),
                 },
@@ -7103,11 +8353,16 @@ mod tests {
             unused_runner(),
         );
 
+        let moved = VenvLocation::Custom {
+            path: std::path::PathBuf::from("/envs/api"),
+        };
         assert_eq!(
-            app.config.projects[0].venv,
-            VenvLocation::Custom {
-                path: std::path::PathBuf::from("/envs/api")
-            }
+            app.config.projects[0].environments[0].location, moved,
+            "the environment itself must move"
+        );
+        assert_eq!(
+            app.config.projects[0].active, moved,
+            "and `active` with it, or it names a location that is gone"
         );
         assert!(
             task.units() > 0,
@@ -7122,7 +8377,11 @@ mod tests {
         // to an empty path.
         let mut app = App::new(Config {
             projects: vec![Project {
-                venv: VenvLocation::Alongside,
+                environments: vec![bombadil_core::model::Environment {
+                    location: VenvLocation::Alongside,
+                    python: PythonPin::Unpinned,
+                }],
+                active: VenvLocation::Alongside,
                 ..project("api")
             }],
             ..Config::default()
@@ -7131,11 +8390,11 @@ mod tests {
 
         let task = update(
             &mut app,
-            Message::PreferencesProjectVenvFolderPicked(id, None),
+            Message::EnvironmentFolderPicked(id, VenvLocation::Alongside, None),
             unused_runner(),
         );
 
-        assert_eq!(app.config.projects[0].venv, VenvLocation::Alongside);
+        assert_eq!(app.config.projects[0].active, VenvLocation::Alongside);
         assert_eq!(task.units(), 0, "cancelling must change nothing");
     }
 
@@ -7149,11 +8408,12 @@ mod tests {
         // Captured rather than hardcoded: the `project` helper picks a
         // location of its own, and asserting a literal here tests the helper
         // instead of the behaviour.
-        let before = app.config.projects[0].venv.clone();
+        let before = app.config.projects[0].environments[0].location.clone();
         let task = update(
             &mut app,
-            Message::PreferencesProjectVenvSelected(
+            Message::EnvironmentLocationSelected(
                 uuid::Uuid::from_u128(99),
+                VenvLocation::Alongside,
                 VenvLocation::Custom {
                     path: std::path::PathBuf::from("/elsewhere"),
                 },
@@ -7161,7 +8421,7 @@ mod tests {
             unused_runner(),
         );
 
-        assert_eq!(app.config.projects[0].venv, before);
+        assert_eq!(app.config.projects[0].environments[0].location, before);
         assert_eq!(task.units(), 0);
     }
 
@@ -7248,7 +8508,7 @@ mod tests {
             ..Config::default()
         });
         let id = app.config.projects[0].id;
-        app.entries[0].python_version = Some("3.13.14".to_string());
+        set_probed_version(&mut app, 0, "3.13.14");
 
         let _ = update(
             &mut app,
@@ -9149,7 +10409,11 @@ mod tests {
     #[test]
     fn changing_the_default_venv_location_changes_the_resolved_path_for_a_default_project() {
         let project_at = |dir: &Path| Project {
-            venv: bombadil_core::model::VenvLocation::Default,
+            environments: vec![bombadil_core::model::Environment {
+                location: bombadil_core::model::VenvLocation::Default,
+                python: PythonPin::Unpinned,
+            }],
+            active: bombadil_core::model::VenvLocation::Default,
             pyproject_path: dir.join("pyproject.toml"),
             ..project("api")
         };
@@ -9162,7 +10426,14 @@ mod tests {
             },
             ..Config::default()
         });
-        let before = venv_path::resolve(&app.config.projects[0], &app.config.settings).unwrap();
+        let before = venv_path::resolve(
+            &app.config.projects[0],
+            app.config.projects[0]
+                .active_environment()
+                .expect("this project has an environment"),
+            &app.config.settings,
+        )
+        .unwrap();
         assert_eq!(before, dir.path().join(".venv"));
 
         let central = tempfile::tempdir().unwrap();
@@ -9178,7 +10449,14 @@ mod tests {
                 path: central.path().to_path_buf()
             }
         );
-        let after = venv_path::resolve(&app.config.projects[0], &app.config.settings).unwrap();
+        let after = venv_path::resolve(
+            &app.config.projects[0],
+            app.config.projects[0]
+                .active_environment()
+                .expect("this project has an environment"),
+            &app.config.settings,
+        )
+        .unwrap();
         assert_ne!(
             after, before,
             "the resolved path for a Default project must change with the setting"
@@ -9201,7 +10479,11 @@ mod tests {
         // `AddProjectConfirmFinished` already re-dispatches for exactly this
         // reason.
         let default_project = |label: &str| Project {
-            venv: bombadil_core::model::VenvLocation::Default,
+            environments: vec![bombadil_core::model::Environment {
+                location: bombadil_core::model::VenvLocation::Default,
+                python: PythonPin::Unpinned,
+            }],
+            active: bombadil_core::model::VenvLocation::Default,
             ..project(label)
         };
         let mut app = App::new(Config {
@@ -9257,7 +10539,11 @@ mod tests {
 
         let mut app = App::new(Config {
             projects: vec![Project {
-                venv: bombadil_core::model::VenvLocation::Default,
+                environments: vec![bombadil_core::model::Environment {
+                    location: bombadil_core::model::VenvLocation::Default,
+                    python: PythonPin::Unpinned,
+                }],
+                active: bombadil_core::model::VenvLocation::Default,
                 pyproject_path: dir.path().join("pyproject.toml"),
                 ..project("api")
             }],
@@ -9276,7 +10562,14 @@ mod tests {
             fake.clone(),
         );
 
-        let new_path = venv_path::resolve(&app.config.projects[0], &app.config.settings).unwrap();
+        let new_path = venv_path::resolve(
+            &app.config.projects[0],
+            app.config.projects[0]
+                .active_environment()
+                .expect("this project has an environment"),
+            &app.config.settings,
+        )
+        .unwrap();
         assert!(
             old_venv.exists() && old_venv.join("pyvenv.cfg").exists(),
             "the venv at the OLD resolved location must survive the settings change untouched"
@@ -9320,7 +10613,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut app = App::new(Config {
             projects: vec![Project {
-                venv: bombadil_core::model::VenvLocation::Default,
+                environments: vec![bombadil_core::model::Environment {
+                    location: bombadil_core::model::VenvLocation::Default,
+                    python: PythonPin::Unpinned,
+                }],
+                active: bombadil_core::model::VenvLocation::Default,
                 pyproject_path: dir.path().join("pyproject.toml"),
                 ..project("api")
             }],
@@ -9376,7 +10673,11 @@ mod tests {
             id: uuid::Uuid::new_v4(),
             label: label.into(),
             pyproject_path: std::path::PathBuf::from(format!("/p/{label}/pyproject.toml")),
-            venv: bombadil_core::model::VenvLocation::Alongside,
+            environments: vec![bombadil_core::model::Environment {
+                location: bombadil_core::model::VenvLocation::Alongside,
+                python: PythonPin::Unpinned,
+            }],
+            active: bombadil_core::model::VenvLocation::Alongside,
             ..bombadil_core::model::Project::default()
         }
     }
