@@ -107,14 +107,46 @@ fn split_requirement(requirement: &str) -> (String, Option<String>) {
 /// Joins one group's declared requirement strings against what is installed,
 /// by name (criterion 1). Matching is case-insensitive: PyPI package names
 /// are, by PEP 503, case-insensitive and `pip`/`uv` normalise them.
+/// A package name in PEP 503 canonical form: lowercased, with every run of
+/// `-`, `_` or `.` collapsed to a single `-`.
+///
+/// Python treats `calc_service`, `calc-service` and `Calc.Service` as one
+/// package, and the two sides of this tab spell it differently: a
+/// `pyproject.toml` declares whatever the author typed, while `uv pip list`
+/// reports the canonical form. Comparing them case-insensitively is not
+/// enough -- `calc_service` and `calc-service` differ by a character that is
+/// not a case difference.
+///
+/// The symptom was a monorepo's own members, every one of them installed
+/// editable, showing as "not installed" in the Dependencies tab: their
+/// declared names carry underscores, and uv reports them with hyphens.
+fn canonical_name(name: &str) -> String {
+    let mut out = String::with_capacity(name.len());
+    let mut previous_was_separator = false;
+    for character in name.chars() {
+        if matches!(character, '-' | '_' | '.') {
+            // A *run* collapses to one `-`, per PEP 503's `[-_.]+`.
+            if !previous_was_separator {
+                out.push('-');
+                previous_was_separator = true;
+            }
+        } else {
+            out.extend(character.to_lowercase());
+            previous_was_separator = false;
+        }
+    }
+    out
+}
+
 fn join_rows(requirements: &[String], installed: &[InstalledPackage]) -> Vec<DepRow> {
     requirements
         .iter()
         .map(|requirement| {
             let (name, constraint) = split_requirement(requirement);
+            let canonical = canonical_name(&name);
             let version = installed
                 .iter()
-                .find(|pkg| pkg.name.eq_ignore_ascii_case(&name))
+                .find(|pkg| canonical_name(&pkg.name) == canonical)
                 .map(|pkg| pkg.version.clone());
             DepRow {
                 name,
@@ -180,7 +212,7 @@ pub fn build(
 
     let main_rows = join_rows(&pyproject.dependencies, installed);
     for row in &main_rows {
-        declared_anywhere.insert(row.name.to_ascii_lowercase());
+        declared_anywhere.insert(canonical_name(&row.name));
     }
 
     for name in pyproject.dependency_groups.keys() {
@@ -188,7 +220,7 @@ pub fn build(
         let requirements = resolve_group(pyproject, name, &mut visited);
         let rows = join_rows(&requirements, installed);
         for row in &rows {
-            declared_anywhere.insert(row.name.to_ascii_lowercase());
+            declared_anywhere.insert(canonical_name(&row.name));
         }
         groups.push(DepGroup {
             kind: GroupKind::Group(name.clone()),
@@ -199,7 +231,7 @@ pub fn build(
     for (name, requirements) in &pyproject.optional_dependencies {
         let rows = join_rows(requirements, installed);
         for row in &rows {
-            declared_anywhere.insert(row.name.to_ascii_lowercase());
+            declared_anywhere.insert(canonical_name(&row.name));
         }
         groups.push(DepGroup {
             kind: GroupKind::Extra(name.clone()),
@@ -215,7 +247,7 @@ pub fn build(
     // install is.
     let mut main_rows = main_rows;
     for pkg in installed {
-        if !declared_anywhere.contains(&pkg.name.to_ascii_lowercase()) {
+        if !declared_anywhere.contains(&canonical_name(&pkg.name)) {
             main_rows.push(DepRow {
                 name: pkg.name.clone(),
                 constraint: None,
@@ -510,6 +542,95 @@ pub fn view<'a>(fetched: &Result<DepsTab, String>) -> iced::Element<'a, crate::a
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_member_declared_with_underscores_matches_the_hyphenated_install() {
+        // The reported bug, in one assertion. A monorepo declares its own
+        // members as `calc_service` and uv reports them as `calc-service`, so
+        // every editable member showed as "not installed" -- the Dependencies
+        // tab telling the user to sync an environment that was already right.
+        let rows = join_rows(
+            &["calc_service>=15.0.0".to_string()],
+            &[InstalledPackage {
+                name: "calc-service".into(),
+                version: "15.2.28".into(),
+                // Editable, which is what a workspace member is: the exact
+                // shape the report came from.
+                editable_project_location: Some("/repo/lib/calc_service".into()),
+            }],
+        );
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].version.as_deref(),
+            Some("15.2.28"),
+            "an underscore and a hyphen are the same package to Python"
+        );
+        assert_eq!(state(&rows[0]), theme::State::Present);
+    }
+
+    #[test]
+    fn a_matched_member_does_not_also_appear_as_an_undeclared_leftover() {
+        // The other half, and the one that would have left the tab listing
+        // the package twice: `declared_anywhere` has to be keyed the same way
+        // the join is, or a member matched above comes back as a leftover.
+        let pyproject = PyProject {
+            dependencies: vec!["calc_service>=15.0.0".to_string()],
+            ..PyProject::default()
+        };
+        let installed = vec![InstalledPackage {
+            name: "calc-service".into(),
+            version: "15.2.28".into(),
+            editable_project_location: Some("/repo/lib/calc_service".into()),
+        }];
+
+        let tab = build(&pyproject, &installed, Err("no tree".to_string()));
+
+        let named: Vec<&DepRow> = tab
+            .groups
+            .iter()
+            .flat_map(|group| group.rows.iter())
+            .filter(|row| canonical_name(&row.name) == "calc-service")
+            .collect();
+        assert_eq!(
+            named.len(),
+            1,
+            "the package must appear once, not once declared and once as a \
+             leftover; got {named:?}"
+        );
+        assert!(named[0].declared);
+    }
+
+    #[test]
+    fn canonical_names_follow_pep_503() {
+        // Lowercase, and every run of `-`, `_` or `.` collapsed to one `-`.
+        for (raw, want) in [
+            ("calc_service", "calc-service"),
+            ("calc-service", "calc-service"),
+            ("Calc.Service", "calc-service"),
+            ("calc__service", "calc-service"),
+            ("calc_-.service", "calc-service"),
+            ("ThornOfficialConfig", "thornofficialconfig"),
+            ("zope.interface", "zope-interface"),
+        ] {
+            assert_eq!(canonical_name(raw), want, "{raw}");
+        }
+    }
+
+    #[test]
+    fn two_genuinely_different_packages_do_not_collapse_together() {
+        // The normalisation must not be so eager that it matches things
+        // Python would keep apart. Only `-`, `_` and `.` are equivalent.
+        assert_ne!(
+            canonical_name("calc_service"),
+            canonical_name("calcservice")
+        );
+        assert_ne!(
+            canonical_name("calc_service"),
+            canonical_name("calc_services")
+        );
+    }
+
     use std::collections::BTreeMap;
 
     /// A tree result for a test that is not about the tree: `Err`, since
