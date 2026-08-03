@@ -67,6 +67,12 @@ fn window_icon() -> Option<iced::window::Icon> {
 /// The name the desktop expects this application to answer to: the basename of
 /// `assets/bombadil.desktop`, the `Icon=` key inside it, and the file installed
 /// into the hicolor icon theme all have to be this same word.
+///
+/// `cfg`-gated because its only reader is, and a constant that exists on a
+/// platform nothing reads it from is dead code -- which this repo denies. The
+/// same class of mistake as comparing a `display()`ed path to a literal:
+/// invisible on the machine it was written on, a CI failure on the other two.
+#[cfg(target_os = "linux")]
 const APP_ID: &str = "bombadil";
 
 /// The window, with an icon set two different ways because desktops disagree
