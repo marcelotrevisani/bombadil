@@ -177,6 +177,39 @@ pub fn modal_layer<'a>(modal: Modal) -> iced::Element<'a, Message> {
     )
 }
 
+/// A panel anchored beside the sidebar, dismissed by a press anywhere else.
+///
+/// For the project context menu. A right-click menu is the one surface that
+/// must *not* be centred over a scrim: it belongs next to the thing it acts
+/// on, and dimming the whole application to offer four entries reads as a
+/// dialog demanding an answer rather than a menu offering choices.
+///
+/// ponytail: anchored to the sidebar's edge, not to the pointer.
+/// `mouse_area::on_right_press` carries no coordinates in iced 0.14, so
+/// placing it under the cursor would mean tracking every mouse move through
+/// `update` to keep a position nothing else needs. The menu names the project
+/// it acts on instead. Track the cursor if that stops being enough.
+pub fn anchored_layer<'a>(
+    content: iced::Element<'a, Message>,
+    dismiss: Message,
+) -> iced::Element<'a, Message> {
+    let panel = iced::widget::container(content)
+        .width(theme::CONTEXT_MENU_WIDTH)
+        .style(theme::panel);
+
+    let anchored = iced::widget::container(panel)
+        .width(iced::Length::Fill)
+        .height(iced::Length::Fill)
+        .padding([
+            theme::TOPBAR_HEIGHT + theme::SPACE_3,
+            theme::SIDEBAR_WIDTH + theme::SPACE_2,
+        ])
+        .align_x(iced::alignment::Horizontal::Left)
+        .align_y(iced::alignment::Vertical::Top);
+
+    iced::widget::opaque(iced::widget::mouse_area(iced::widget::opaque(anchored)).on_press(dismiss))
+}
+
 /// Puts `content` on a card over a scrim, as a layer of its own.
 ///
 /// For the application's existing dialogs -- add project, the context menu,
