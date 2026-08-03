@@ -1271,6 +1271,15 @@ pub fn update(app: &mut App, message: Message, runner: Arc<dyn CommandRunner>) -
                     // `probe_every_venv` needs one for a project loaded from
                     // config with no draft behind it.
                     requires_python: draft.requires_python.clone(),
+                    // Resolved against the config the project was just pushed
+                    // into, so a global pin applies to it from the first
+                    // frame rather than only after the next `boot`.
+                    pin: bombadil_core::resolve::effective(
+                        &app.config,
+                        &project,
+                        bombadil_core::terminal::Os::host(),
+                    )
+                    .python,
                 });
                 let index = app.config.projects.len() - 1;
                 app.selected = Some(index);
