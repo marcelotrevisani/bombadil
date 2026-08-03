@@ -119,6 +119,17 @@ pub fn vars_mut(config: &mut Config, scope: EnvScope) -> Option<&mut Vec<EnvVar>
     }
 }
 
+/// [`vars_mut`]'s read-only half, for a caller that needs to look a row up
+/// without announcing an edit it is not making -- `app::update` reads a row's
+/// key to build its `SecretKey` before deciding whether anything changes at
+/// all.
+pub fn vars(config: &Config, scope: EnvScope) -> Option<&Vec<EnvVar>> {
+    match scope {
+        EnvScope::Global => Some(&config.global_env),
+        EnvScope::Project(i) => config.projects.get(i).map(|p| &p.env),
+    }
+}
+
 /// The keychain account a scope's variable named `key` lives under -- spec
 /// §5's two account shapes, `SecretKey::GlobalEnv` and `SecretKey::ProjectEnv`.
 /// `project_id` is the project's own id, not its index, so it must be

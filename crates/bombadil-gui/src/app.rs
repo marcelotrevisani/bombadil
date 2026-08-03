@@ -539,9 +539,20 @@ pub enum Message {
     /// closure by ordinary move semantics inside `update`, never through this
     /// message. See `env_editor`'s module doc.
     EnvVarSecretToggled(env_editor::EnvScope, usize),
-    /// The background half of an env var edit finished: a plain edit's
-    /// persist, or a secret toggle's keychain write/delete plus persist.
+    /// The background half of a plain env var edit finished: just the persist.
     EnvVarPersistFinished {
+        success: bool,
+    },
+    /// A secret toggle's keychain write (or delete) plus persist finished.
+    ///
+    /// Separate from [`Message::EnvVarPersistFinished`] because this one is
+    /// not a report -- it is the instruction to apply the toggle to
+    /// `app.config`, which deliberately has not been touched until now.
+    /// Carries the row it belongs to, and no value: what the keychain now
+    /// holds never travels through a message.
+    EnvVarSecretWritten {
+        scope: env_editor::EnvScope,
+        index: usize,
         success: bool,
     },
     /// The Scripts tab's "Add script" button was pressed for `scope` (spec
@@ -610,6 +621,14 @@ pub enum Message {
     /// for this row's current name (criterion 2) -- `view` disables the
     /// button otherwise, so this arm never has to re-check before writing.
     IndexCredentialSaveRequested(usize),
+    /// The keychain write and persist behind a "save credential" press
+    /// finished. Like [`Message::EnvVarSecretWritten`], this is the
+    /// instruction to clear the draft and record the account the credential
+    /// now lives under -- neither of which happens until the write has landed.
+    IndexCredentialWritten {
+        index: usize,
+        success: bool,
+    },
     /// The background half of an index edit finished: a plain field edit's
     /// persist, a credential save's keychain write plus persist, or a
     /// project's selection toggle's persist.
@@ -1876,37 +1895,43 @@ pub fn update(app: &mut App, message: Message, runner: Arc<dyn CommandRunner>) -
                     None => return Task::none(),
                 },
             };
-            let Some(vars) = env_editor::vars_mut(&mut app.config, scope) else {
-                return Task::none();
-            };
-            let Some(key_name) = vars.get(index).map(|var| var.key.clone()) else {
+            let Some(key_name) = env_editor::vars(&app.config, scope)
+                .and_then(|vars| vars.get(index))
+                .map(|var| var.key.clone())
+            else {
                 return Task::none();
             };
             let secret_key = env_editor::secret_key(scope, project_id, &key_name);
+            let persist = app.persist.clone();
 
-            // In-memory first, synchronously -- the same discipline every
-            // other edit in this file uses -- then the keychain call and the
-            // persist that must agree with it happen together in one
-            // background job.
-            // Takes the plaintext from the row's draft -- where, on this tab's
-            // own workflow, it is the only copy, `Config` never having seen it
-            // -- or from `Config` for a value committed earlier.
-            if let Some(plain_value) =
-                env_editor::take_secret_value(vars, &mut app.env_value_drafts, scope, index)
-            {
-                let config = app.config.clone();
-                let persist = app.persist.clone();
-                return Task::perform(
-                    mark_secret_job(secret_key, plain_value, config, persist),
-                    |success| Message::EnvVarPersistFinished { success },
-                );
-            }
-            if env_editor::unmark_secret(vars, index) {
-                let config = app.config.clone();
-                let persist = app.persist.clone();
-                return Task::perform(unmark_secret_job(secret_key, config, persist), |success| {
-                    Message::EnvVarPersistFinished { success }
-                });
+            // `app.config` is deliberately not touched here -- see
+            // `plan_secret_toggle` for why this one edit cannot follow the
+            // "in-memory first" discipline the rest of this file uses.
+            match plan_secret_toggle(&app.config, &app.env_value_drafts, scope, index) {
+                Some(SecretToggle::Mark {
+                    candidate,
+                    plain_value,
+                }) => {
+                    return Task::perform(
+                        mark_secret_job(secret_key, plain_value, candidate, persist),
+                        move |success| Message::EnvVarSecretWritten {
+                            scope,
+                            index,
+                            success,
+                        },
+                    );
+                }
+                Some(SecretToggle::Unmark { candidate }) => {
+                    return Task::perform(
+                        unmark_secret_job(secret_key, candidate, persist),
+                        move |success| Message::EnvVarSecretWritten {
+                            scope,
+                            index,
+                            success,
+                        },
+                    );
+                }
+                None => {}
             }
         }
         Message::EnvVarPersistFinished { success } => {
@@ -1915,6 +1940,34 @@ pub fn update(app: &mut App, message: Message, runner: Arc<dyn CommandRunner>) -
                     &mut app.drawer,
                     "env var change failed to persist".to_string(),
                 );
+            }
+        }
+        // Applies to `app.config` what the job already wrote to the keychain
+        // and to disk, and only then. Re-deriving the direction from the row's
+        // *current* state is what keeps this arm honest: `app.config` has not
+        // been touched since the toggle, so a row that still reads
+        // `secret == false` was being marked and one that reads `true` was
+        // being unmarked. A `secret: bool` passed through the message would
+        // say the same thing while being free to disagree with the config it
+        // is about to edit.
+        Message::EnvVarSecretWritten {
+            scope,
+            index,
+            success,
+        } => {
+            if !success {
+                // Nothing was blanked, nothing was persisted, and the draft
+                // the user typed is still in the textbox. Retrying the toggle
+                // is all this costs them.
+                drawer::set_idle(
+                    &mut app.drawer,
+                    "env var change failed to persist".to_string(),
+                );
+            } else if let Some(vars) = env_editor::vars_mut(&mut app.config, scope)
+                && env_editor::take_secret_value(vars, &mut app.env_value_drafts, scope, index)
+                    .is_none()
+            {
+                env_editor::unmark_secret(vars, index);
             }
         }
         Message::ScriptAddRequested(scope) => {
@@ -2038,27 +2091,48 @@ pub fn update(app: &mut App, message: Message, runner: Arc<dyn CommandRunner>) -
             if let Some((key, plain_value)) =
                 index_editor::credential_save(&app.config, &app.index_credential_drafts, i)
             {
-                // Cleared the instant it is handed off -- criterion 4's other
-                // angle: this must not keep sitting in `App` state, readable
-                // by a later render, any longer than typing takes.
-                app.index_credential_drafts[i] = String::new();
+                // Neither the draft nor the record of which account holds the
+                // credential is touched here -- both wait for the write to
+                // land, in `IndexCredentialWritten`. Doing them now costs
+                // twice on a keychain that refuses: the typed credential is
+                // gone from the box that was the only place it existed, and
+                // `index_credential_names` claims an account the keychain has
+                // never heard of, so the next rename commit moves *from* an
+                // entry that is not there and the real one is left behind
+                // under its old name.
+                let config = app.config.clone();
+                let persist = app.persist.clone();
+                return Task::perform(
+                    mark_secret_job(key, plain_value, config, persist),
+                    move |success| Message::IndexCredentialWritten { index: i, success },
+                );
+            }
+        }
+        Message::IndexCredentialWritten { index: i, success } => {
+            if !success {
+                drawer::set_idle(
+                    &mut app.drawer,
+                    "index change failed to persist".to_string(),
+                );
+            } else {
+                // Criterion 4's other angle: the plaintext must not keep
+                // sitting in `App` state, readable by a later render, any
+                // longer than it has to. It is in the keychain now, so now is
+                // when it goes.
+                if let Some(slot) = app.index_credential_drafts.get_mut(i) {
+                    *slot = String::new();
+                }
                 // `credential_save` resolved the account from the row's
-                // *current* name, and the job below persists that same config,
-                // so this is now where the credential lives -- recorded, or a
-                // later commit would try to rename an entry that has already
-                // moved and overwrite it with the old one.
+                // *current* name and the job persisted that same config, so
+                // this is where the credential lives -- recorded, or a later
+                // commit would try to rename an entry that has already moved
+                // and overwrite it with the old one.
                 if let (Some(index), Some(slot)) = (
                     app.config.indexes.get(i),
                     app.index_credential_names.get_mut(i),
                 ) {
                     *slot = index.name.clone();
                 }
-                let config = app.config.clone();
-                let persist = app.persist.clone();
-                return Task::perform(
-                    mark_secret_job(key, plain_value, config, persist),
-                    |success| Message::IndexPersistFinished { success },
-                );
             }
         }
         Message::IndexPersistFinished { success } => {
@@ -3414,6 +3488,71 @@ async fn persist_config(config: Config, persist: Arc<dyn ConfigPersist>) -> bool
         job::JobResult::Done(success) => success,
         job::JobResult::TimedOut | job::JobResult::Failed => false,
     }
+}
+
+/// What a secret toggle owes the keychain, and the `Config` that must reach
+/// disk alongside it.
+///
+/// `candidate` is a *copy* of `app.config` with the edit already applied.
+/// Nothing in `App` has been changed to produce it.
+#[derive(Debug)]
+enum SecretToggle {
+    /// The row is becoming secret: write `plain_value` to the keychain, then
+    /// persist `candidate`, in which that value is already blank.
+    Mark {
+        candidate: Config,
+        plain_value: String,
+    },
+    /// The row is no longer secret: delete the keychain entry, then persist.
+    Unmark { candidate: Config },
+}
+
+/// Works out what toggling `index` in `scope` would do, without doing any of
+/// it. `None` when there is no such row.
+///
+/// This is the one edit in this file that cannot follow the usual "in-memory
+/// first, synchronously" discipline, and the reason is that marking a row
+/// secret does not *change* a value -- it destroys one. `take_secret_value`
+/// blanks the row and yields the only remaining copy of the plaintext, which
+/// then goes into the background job. Applied to `app.config` up front, a
+/// keychain that refuses the write leaves the plaintext gone with the job,
+/// the row empty and flagged secret, and the next unrelated env edit
+/// persisting that -- taking the plaintext off disk too. A status line saying
+/// "failed" does not give it back.
+///
+/// So the edit is made here, on a copy. `app.config` is caught up in
+/// `EnvVarSecretWritten` once the write has actually landed. That the copy is
+/// what gets persisted is the point rather than a side effect: the config
+/// reaching disk has to be the blanked one, or the plaintext this whole
+/// exchange exists to move into the keychain stays sitting in `config.toml`.
+fn plan_secret_toggle(
+    config: &Config,
+    drafts: &env_editor::ValueDrafts,
+    scope: env_editor::EnvScope,
+    index: usize,
+) -> Option<SecretToggle> {
+    let mut candidate = config.clone();
+    // A copy too: `take_secret_value` consumes the row's draft, and the real
+    // one must survive a failed write -- it is where the typed value still is.
+    let mut drafts = drafts.clone();
+    let plain_value = {
+        let vars = env_editor::vars_mut(&mut candidate, scope)?;
+        // Takes the plaintext from the row's draft -- where, on this tab's own
+        // workflow, it is the only copy, `Config` never having seen it -- or
+        // from `Config` for a value committed earlier.
+        match env_editor::take_secret_value(vars, &mut drafts, scope, index) {
+            Some(value) => Some(value),
+            None if env_editor::unmark_secret(vars, index) => None,
+            None => return None,
+        }
+    };
+    Some(match plain_value {
+        Some(plain_value) => SecretToggle::Mark {
+            candidate,
+            plain_value,
+        },
+        None => SecretToggle::Unmark { candidate },
+    })
 }
 
 /// The blocking half of marking an env var secret (criterion 2): write the
@@ -7557,14 +7696,20 @@ mod tests {
 
         let _ = update(&mut app, toggle, unused_runner());
 
-        // The value has now actually moved out of `Config` (see the
-        // previous test for where it went) -- so there is nothing left in
-        // `app.config` for any later `Debug` render to print either.
+        // The message that reports the write back carries no value either --
+        // it names the row and says whether the keychain took it.
+        let written = Message::EnvVarSecretWritten {
+            scope: env_editor::EnvScope::Global,
+            index: 0,
+            success: true,
+        };
+        assert!(!format!("{written:?}").contains("hunter2"));
+
+        // Only once that arrives does the value leave `Config` -- so there is
+        // nothing left in `app.config` for any later `Debug` render to print.
+        let _ = update(&mut app, written, unused_runner());
         assert_eq!(app.config.global_env[0].value, "");
         assert!(app.config.global_env[0].secret);
-
-        let finished = Message::EnvVarPersistFinished { success: true };
-        assert!(!format!("{finished:?}").contains("hunter2"));
     }
 
     #[test]
@@ -7725,25 +7870,43 @@ mod tests {
             unused_runner(),
         );
         assert!(task.units() > 0, "marking secret must dispatch its own job");
-        assert!(
-            app.env_value_drafts.is_empty(),
-            "the toggle must have taken the draft -- if it is still here, the value \
-             `update` handed the keychain job did not come from what the user typed"
+
+        // What `update` handed that job, derived the same way `update` derives
+        // it. The `Task` is opaque, so this is the only way to see the config
+        // that will actually reach disk -- and seeing it is the point: it is a
+        // *copy*, and the plaintext must already be out of it.
+        let Some(SecretToggle::Mark {
+            candidate,
+            plain_value,
+        }) = plan_secret_toggle(
+            &app.config,
+            &app.env_value_drafts,
+            env_editor::EnvScope::Global,
+            0,
+        )
+        else {
+            panic!("ticking secret on a typed row must plan a keychain write");
+        };
+        assert_eq!(
+            plain_value, "hunter2",
+            "the value handed to the keychain must be what the user typed"
         );
+        assert_eq!(
+            candidate.global_env[0].value, "",
+            "and must already be out of the config that goes to disk with it"
+        );
+        assert!(candidate.global_env[0].secret);
 
         // The keychain half runs against the in-memory store the real job's
-        // `KeyringSecretStore` stands in for. Which plaintext
-        // `env_editor::take_secret_value` yields for this state is proven
-        // directly in `env_editor`'s own tests; what is proven here is that
-        // `update` reaches it and leaves nothing behind.
+        // `KeyringSecretStore` stands in for.
         let key = SecretKey::GlobalEnv {
             key: "TOKEN".to_string(),
         };
         let store = bombadil_core::secrets::InMemorySecretStore::new();
         assert!(run_secret_write(
             &key,
-            "hunter2",
-            &app.config,
+            &plain_value,
+            &candidate,
             &store,
             &persist
         ));
@@ -7753,8 +7916,6 @@ mod tests {
             Some("hunter2"),
             "the value the user typed must be what the keychain ends up holding"
         );
-        assert!(app.config.global_env[0].secret);
-        assert_eq!(app.config.global_env[0].value, "");
         assert!(
             persist
                 .saved()
@@ -7762,6 +7923,140 @@ mod tests {
                 .all(|c| !format!("{c:?}").contains("hunter2")),
             "no config that was ever handed to a persister may contain the plaintext"
         );
+
+        // Now that it has landed, `app.config` catches up and the draft goes.
+        let _ = update(
+            &mut app,
+            Message::EnvVarSecretWritten {
+                scope: env_editor::EnvScope::Global,
+                index: 0,
+                success: true,
+            },
+            unused_runner(),
+        );
+        assert!(app.config.global_env[0].secret);
+        assert_eq!(app.config.global_env[0].value, "");
+        assert!(
+            app.env_value_drafts.is_empty(),
+            "the draft is redundant once the keychain holds the value"
+        );
+    }
+
+    #[test]
+    fn a_secret_write_the_keychain_refused_destroys_nothing() {
+        // The data-loss path this sequencing exists to close. Marking a row
+        // secret does not change a value, it destroys one: the plaintext is
+        // blanked out of `Config` and handed to the job. Do that before the
+        // keychain has accepted it and a refusal leaves the value nowhere at
+        // all -- gone with the job, the row empty and flagged secret, and the
+        // *next* unrelated env edit persisting that state, so the copy on
+        // disk goes too.
+        let mut app = App::new(Config {
+            global_env: vec![plain_var("TOKEN", "hunter2")],
+            ..Config::default()
+        });
+
+        let _ = update(
+            &mut app,
+            Message::EnvVarSecretToggled(env_editor::EnvScope::Global, 0),
+            unused_runner(),
+        );
+        assert_eq!(
+            app.config.global_env[0].value, "hunter2",
+            "nothing may be destroyed while the write is still in flight"
+        );
+
+        let _ = update(
+            &mut app,
+            Message::EnvVarSecretWritten {
+                scope: env_editor::EnvScope::Global,
+                index: 0,
+                success: false,
+            },
+            unused_runner(),
+        );
+
+        assert_eq!(
+            app.config.global_env[0].value, "hunter2",
+            "a refused write must leave the value exactly where it was"
+        );
+        assert!(
+            !app.config.global_env[0].secret,
+            "and must not flag the row secret -- there is no keychain entry behind it"
+        );
+        assert!(
+            app.drawer.status.contains("failed"),
+            "the failure must still be reported; got {:?}",
+            app.drawer.status
+        );
+    }
+
+    #[test]
+    fn unmarking_a_secret_the_keychain_refused_leaves_the_row_secret() {
+        // Less costly than the mark direction -- nothing is destroyed -- but
+        // the same speculative edit. A row that reads "not secret" while the
+        // keychain still holds the entry and the config on disk still says
+        // secret is a lie the next restart silently corrects.
+        let mut app = App::new(Config {
+            global_env: vec![bombadil_core::model::EnvVar {
+                key: "TOKEN".into(),
+                value: String::new(),
+                secret: true,
+            }],
+            ..Config::default()
+        });
+
+        let _ = update(
+            &mut app,
+            Message::EnvVarSecretToggled(env_editor::EnvScope::Global, 0),
+            unused_runner(),
+        );
+        let _ = update(
+            &mut app,
+            Message::EnvVarSecretWritten {
+                scope: env_editor::EnvScope::Global,
+                index: 0,
+                success: false,
+            },
+            unused_runner(),
+        );
+
+        assert!(
+            app.config.global_env[0].secret,
+            "a refused delete must leave the row matching what disk and the keychain still say"
+        );
+    }
+
+    #[test]
+    fn unmarking_a_secret_that_landed_clears_the_flag() {
+        // The other half: the success path still actually applies. Without
+        // this, an implementation that simply never applied the toggle would
+        // pass every failure test above.
+        let mut app = App::new(Config {
+            global_env: vec![bombadil_core::model::EnvVar {
+                key: "TOKEN".into(),
+                value: String::new(),
+                secret: true,
+            }],
+            ..Config::default()
+        });
+
+        let _ = update(
+            &mut app,
+            Message::EnvVarSecretToggled(env_editor::EnvScope::Global, 0),
+            unused_runner(),
+        );
+        let _ = update(
+            &mut app,
+            Message::EnvVarSecretWritten {
+                scope: env_editor::EnvScope::Global,
+                index: 0,
+                success: true,
+            },
+            unused_runner(),
+        );
+
+        assert!(!app.config.global_env[0].secret);
     }
 
     // --- Task 3: the Scripts tab ---
@@ -8347,8 +8642,8 @@ mod tests {
             "the keychain write must be dispatched as background work, not run inline"
         );
         assert_eq!(
-            app.index_credential_drafts[0], "",
-            "the draft must be cleared the instant it is handed off"
+            app.index_credential_drafts[0], "hunter2",
+            "the draft must survive until the write lands -- it is the only copy"
         );
         assert!(
             persist.saved().is_empty(),
@@ -8385,6 +8680,72 @@ mod tests {
         assert!(
             !rendered.contains("hunter2"),
             "the persisted config must never carry the credential, even in Debug; got:\n{rendered}"
+        );
+
+        // And now the write has landed, so the draft goes.
+        let _ = update(
+            &mut app,
+            Message::IndexCredentialWritten {
+                index: 0,
+                success: true,
+            },
+            unused_runner(),
+        );
+        assert_eq!(
+            app.index_credential_drafts[0], "",
+            "once the keychain holds it, it must not stay in App state readable by a render"
+        );
+        assert_eq!(
+            app.index_credential_names[0], "priv",
+            "and the account it now lives under must be recorded"
+        );
+    }
+
+    #[test]
+    fn a_credential_the_keychain_refused_is_still_in_the_box() {
+        // The user typed it and pressed save; the box is the only place that
+        // value exists. Clearing it on the way to a keychain that then
+        // refused would lose it outright, and the status line does not give
+        // it back.
+        //
+        // `index_credential_names` matters just as much and is less visible:
+        // recording the new account for a write that never happened points a
+        // later rename commit at an entry the keychain has never heard of, so
+        // the move finds nothing, and the real credential is left behind
+        // under the old name.
+        let mut app = App::new(Config {
+            indexes: vec![index_with_auth(
+                "renamed",
+                bombadil_core::model::IndexAuth::Basic {
+                    username: "alice".into(),
+                },
+            )],
+            ..Config::default()
+        });
+        app.index_credential_drafts = vec!["hunter2".to_string()];
+        app.index_credential_names = vec!["original".to_string()];
+
+        let _ = update(
+            &mut app,
+            Message::IndexCredentialWritten {
+                index: 0,
+                success: false,
+            },
+            unused_runner(),
+        );
+
+        assert_eq!(
+            app.index_credential_drafts[0], "hunter2",
+            "a refused write must leave the typed credential where the user can retry it"
+        );
+        assert_eq!(
+            app.index_credential_names[0], "original",
+            "and must not claim the credential moved to an account that holds nothing"
+        );
+        assert!(
+            app.drawer.status.contains("failed"),
+            "the failure must still be reported; got {:?}",
+            app.drawer.status
         );
     }
 
