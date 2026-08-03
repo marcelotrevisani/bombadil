@@ -10,10 +10,18 @@
 //! `Drawer` carries no `failed: bool` -- every failure status `app::update`
 //! ever sets (`"sync failed"`, `"open terminal failed"`, `"env var change
 //! failed to persist"`, ...) already contains the word "failed", and every
-//! success or in-progress status (`"sync succeeded"`, `"project added"`,
-//! `"syncing api..."`, `"idle"`) never does. [`is_failure`] reads that
-//! existing convention rather than adding a field every one of those call
-//! sites in `app.rs` would then have to set explicitly.
+//! success status (`"sync succeeded"`, `"project added"`, `"idle"`) never
+//! does. [`is_failure`] reads that existing convention rather than adding a
+//! field every one of those call sites in `app.rs` would then have to set
+//! explicitly.
+//!
+//! The in-progress statuses are the exception, and the reason [`is_failure`]
+//! is not a bare `contains`: `"syncing api..."`, `"recreating api..."` and
+//! `"syncing members for api..."` all interpolate a *project label*, which
+//! the user chose. A project named `failed-migrations` would make a healthy
+//! sync's status line read as a failure. All three end in `"..."`, the
+//! in-progress marker, so [`is_failure`] excludes those first and the label
+//! can never reach the substring test.
 
 use crate::app::Message;
 use crate::theme;
@@ -89,12 +97,26 @@ pub fn set_idle(drawer: &mut Drawer, status: impl Into<String>) {
 /// Whether `status` names a failure -- see the module doc for the convention
 /// this reads rather than re-derives.
 ///
-/// ponytail: a string convention, not a typed flag. A future status that
-/// fails without the word "failed" would silently miss the banner; upgrade to
-/// a `Drawer::failed: bool` set at each `app::update` call site if that ever
-/// bites.
+/// The `ends_with("...")` guard is the whole point of this function having a
+/// second clause. Three statuses interpolate a project's own label
+/// (`format!("syncing {}...", project.label)` and friends in `app::update`),
+/// and that label comes from `[project].name` or a directory name -- so a
+/// project called `failed-migrations` would otherwise paint its status line
+/// `boot` for the whole of a perfectly successful sync. `boot` is the one
+/// colour this application cannot afford to spend on a non-failure (see
+/// `theme`'s module doc), and user-controlled data must not be able to spend
+/// it. `"..."` is the in-progress convention, and every status that carries
+/// user data is in progress.
+///
+/// ponytail: still a string convention, not a typed flag, and it now has two
+/// ceilings rather than one. The harmless one: a future *failure* worded
+/// without "failed" misses the banner. The costly one: a future status that
+/// interpolates user data and does *not* end in `"..."` puts the rationed
+/// colour back within reach of a project name. Upgrade to a
+/// `Drawer::failed: bool` set at each `app::update` call site if either
+/// bites -- the second one first.
 fn is_failure(status: &str) -> bool {
-    status.contains("failed")
+    !status.ends_with("...") && status.contains("failed")
 }
 
 /// Renders the drawer: a `bark` surface, collapsed to one status line while
@@ -254,6 +276,29 @@ mod tests {
             "recreating api...",
         ] {
             assert!(!is_failure(status), "{status:?} must not read as a failure");
+        }
+    }
+
+    #[test]
+    fn a_project_label_containing_failed_does_not_paint_a_healthy_sync_boot() {
+        // The label is user data -- `[project].name`, or the directory name.
+        // These are the exact strings `app::update` builds at the three
+        // `format!` call sites that interpolate one. `boot` is rationed to
+        // "this needs you"; a project called `failed-migrations` spending it
+        // on an entire successful sync is the one way user data could take
+        // the rationing away, and the whole system depends on it not doing
+        // so.
+        for status in [
+            "syncing failed-migrations...",
+            "recreating failed-migrations...",
+            "syncing members for failed-migrations...",
+            // The pathological case: the label is the marker itself.
+            "syncing failed...",
+        ] {
+            assert!(
+                !is_failure(status),
+                "{status:?} is a sync in flight, not a failure"
+            );
         }
     }
 }
