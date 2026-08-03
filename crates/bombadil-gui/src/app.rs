@@ -3871,7 +3871,17 @@ pub fn view(app: &App) -> iced::Element<'_, Message> {
             let entry = app.entries.get(i);
             // The active environment's version: the header describes what
             // Sync and Open terminal would act on.
-            let header = detail::header(project, &|_| {
+            // The active environment's resolved path, from the entries cache
+            // the sidebar already built -- not a fresh `venv_path::resolve` on
+            // every frame.
+            let venv_path = entry.and_then(|entry| {
+                entry
+                    .environments
+                    .iter()
+                    .find(|row| row.active)
+                    .map(|row| row.path.clone())
+            });
+            let header = detail::header(project, venv_path, &|_| {
                 entry.and_then(|entry| {
                     entry
                         .environments

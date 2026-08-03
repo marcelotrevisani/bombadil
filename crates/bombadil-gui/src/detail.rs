@@ -30,16 +30,30 @@ pub struct Header {
     pub path: PathBuf,
     pub venv_status: VenvStatus,
     pub python_version: Option<String>,
+    /// Where the *active* environment resolves to.
+    ///
+    /// Shown beneath the project's own path, because a project can have
+    /// several environments now and the header describes the one Sync and
+    /// Open terminal act on -- which the project path alone cannot say. `None`
+    /// for a project with no environments at all.
+    pub venv_path: Option<PathBuf>,
 }
 
 /// Builds the header for `project`.
 ///
 /// `venv_probe` is a parameter rather than a filesystem call, so this is
-/// testable without touching disk. `header` has no `Settings` to resolve a
-/// venv path with, so the probe is asked about the project directly; the
-/// real caller in `app::view` answers from `App`'s already-probed
-/// `entries` cache rather than touching disk again on every frame.
-pub fn header(project: &Project, venv_probe: &dyn Fn(&Project) -> Option<String>) -> Header {
+/// testable without touching disk. The real caller in `app::view` answers
+/// from `App`'s already-probed `entries` cache rather than touching disk
+/// again on every frame.
+///
+/// `venv_path` likewise comes from the caller: resolving it needs `Settings`,
+/// which this function deliberately does not take -- one resolver, called
+/// where the config already is.
+pub fn header(
+    project: &Project,
+    venv_path: Option<PathBuf>,
+    venv_probe: &dyn Fn(&Project) -> Option<String>,
+) -> Header {
     let python_version = venv_probe(project);
     let venv_status = if python_version.is_some() {
         VenvStatus::Present
@@ -52,6 +66,7 @@ pub fn header(project: &Project, venv_probe: &dyn Fn(&Project) -> Option<String>
         path: project_dir(project),
         venv_status,
         python_version,
+        venv_path,
     }
 }
 
@@ -163,7 +178,19 @@ pub fn view<'a>(header: &Header, index: usize) -> iced::Element<'a, Message> {
     .spacing(theme::SPACE_2)
     .align_y(iced::Alignment::Center);
 
-    iced::widget::column![title_row, path_row]
+    // The active environment's path, beneath the project's own. A project can
+    // have several environments, so "which one do Sync and Open terminal act
+    // on" is a question the project path cannot answer -- and it is the one
+    // the two buttons on the row above make urgent.
+    let venv_row: iced::Element<'_, Message> = match &header.venv_path {
+        Some(path) => theme::labeled_value("environment", path.display().to_string()),
+        None => iced::widget::text("no environment configured")
+            .size(theme::DATA)
+            .color(theme::SLATE)
+            .into(),
+    };
+
+    iced::widget::column![title_row, path_row, venv_row]
         .spacing(theme::SPACE_2)
         .into()
 }
@@ -173,8 +200,36 @@ mod tests {
     use super::*;
 
     #[test]
+    fn the_header_carries_the_active_environments_path() {
+        // A project can have several environments, so "which one do Sync and
+        // Open terminal act on" is a question the project's own path cannot
+        // answer -- and the two buttons sitting on that row make it urgent.
+        let path = PathBuf::from("/home/me/envs/api-312");
+        let header = header(&project("api"), Some(path.clone()), &|_| {
+            Some("3.12.1".into())
+        });
+
+        assert_eq!(header.venv_path, Some(path));
+        assert_ne!(
+            header.venv_path.as_ref(),
+            Some(&header.path),
+            "the environment path is not the project path -- showing one twice \
+             would say nothing"
+        );
+    }
+
+    #[test]
+    fn a_project_with_no_environments_carries_no_path() {
+        // Reachable between removing the last environment and adding another.
+        // `None` rather than the project directory, which would claim an
+        // environment lives somewhere it does not.
+        let header = header(&project("api"), None, &|_| None);
+        assert_eq!(header.venv_path, None);
+    }
+
+    #[test]
     fn a_project_with_a_venv_shows_its_python_version() {
-        let header = header(&project("api"), &|_| Some("3.12.1".into()));
+        let header = header(&project("api"), None, &|_| Some("3.12.1".into()));
         assert_eq!(header.python_version.as_deref(), Some("3.12.1"));
         assert_eq!(header.venv_status, VenvStatus::Present);
     }
@@ -185,7 +240,7 @@ mod tests {
         // whether Sync is still offered for it is `update`'s concern, not
         // `header`'s -- covered in `app.rs` where the Sync message is
         // dispatched independently of venv state.
-        let header = header(&project("api"), &|_| None);
+        let header = header(&project("api"), None, &|_| None);
         assert_eq!(header.python_version, None);
         assert_eq!(header.venv_status, VenvStatus::Absent);
     }
@@ -194,7 +249,7 @@ mod tests {
     fn the_displayed_path_is_the_project_directory_not_the_manifest_file() {
         // A user recognises the directory they added, not the manifest file
         // inside it.
-        let header = header(&project("api"), &|_| None);
+        let header = header(&project("api"), None, &|_| None);
         assert_eq!(header.path, PathBuf::from("/p/api"));
         assert_ne!(header.path, PathBuf::from("/p/api/pyproject.toml"));
     }
