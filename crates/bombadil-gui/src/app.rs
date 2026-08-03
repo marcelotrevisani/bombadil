@@ -3115,12 +3115,25 @@ pub fn view(app: &App) -> iced::Element<'_, Message> {
     // `jacket` underline beneath it, the rest in `slate` -- no boxes, no
     // pills, no background fill. Each button is styled with no background
     // and no border to strip the default button chrome down to bare text;
-    // the underline is a `container` holding fixed-height `Space`, coloured
-    // `jacket` only when selected, laid out in a `Shrink`-width column below
-    // the label so iced's flex layout sizes it to the label's own width
-    // rather than the tab bar's -- that indicator is deliberately the tab
-    // bar's only affordance, consistent with the state glyph column being
-    // the application's one symbolic vocabulary (see `theme`'s module doc).
+    // the underline is a `Fill`-width `container` holding fixed-height
+    // `Space`, coloured `jacket` only when selected. That indicator is
+    // deliberately the tab bar's only affordance, consistent with the state
+    // glyph column being the application's one symbolic vocabulary (see
+    // `theme`'s module doc).
+    //
+    // The column MUST be built with `Column::from_vec`, not `column![]`.
+    // `column![]` goes through `Column::push`, which calls
+    // `Length::enclose` on each child's `size_hint` -- and the underline's
+    // hint is `Fill` (`Container::new` derives its width from its content
+    // via `Length::fluid`), so `push` would promote the whole column to
+    // `Fill`. A `Fill` column inside this `Fill` row makes iced's flex third
+    // pass hand every tab an equal share of the bar's full width, and the
+    // underline then spans that share instead of its label: measured at
+    // 256pt under an 800pt bar for an 80pt label. `from_vec` deliberately
+    // skips `enclose`, so the column stays `Shrink`, the row stays `Shrink`,
+    // and the cross-axis pass sizes the underline to the label -- measured
+    // at exactly the label's 80pt.
+
     let mut tab_bar = iced::widget::row![].spacing(theme::SPACE_3);
     for tab in Tab::ALL {
         let is_selected = tab == app.tab;
@@ -3143,6 +3156,7 @@ pub fn view(app: &App) -> iced::Element<'_, Message> {
                 .width(iced::Length::Fill)
                 .height(theme::TAB_UNDERLINE),
         )
+        .width(iced::Length::Fill)
         .style(move |_theme| {
             let style = iced::widget::container::Style::default();
             if is_selected {
@@ -3152,7 +3166,10 @@ pub fn view(app: &App) -> iced::Element<'_, Message> {
             }
         });
 
-        tab_bar = tab_bar.push(iced::widget::column![label, underline].spacing(theme::SPACE_1));
+        tab_bar = tab_bar.push(
+            iced::widget::Column::from_vec(vec![label.into(), underline.into()])
+                .spacing(theme::SPACE_1),
+        );
     }
 
     let detail_and_drawer = iced::widget::column![detail, tab_bar, pane, drawer::view(&app.drawer)]
@@ -3164,11 +3181,11 @@ pub fn view(app: &App) -> iced::Element<'_, Message> {
         add_project_button,
         sidebar::view(&app.entries, app.selected)
     ]
-    .spacing(8);
+    .spacing(theme::SPACE_2);
 
     let body = iced::widget::row![
         iced::widget::container(sidebar_and_controls).width(theme::SIDEBAR_WIDTH),
-        iced::widget::container(detail_and_drawer).padding(12),
+        iced::widget::container(detail_and_drawer).padding(theme::SPACE_3),
     ];
 
     // Recomputed fresh on every render from `app.add_project`'s current
