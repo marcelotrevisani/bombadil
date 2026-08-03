@@ -3110,16 +3110,53 @@ pub fn view(app: &App) -> iced::Element<'_, Message> {
     // same "no press needed, no press possible" treatment `index_editor`'s
     // auth buttons and `scripts_editor`'s move buttons give a control whose
     // action is already the state.
-    let mut tab_bar = iced::widget::row![].spacing(4);
+    //
+    // A single row of words; the selected one in `parchment` with a
+    // `jacket` underline beneath it, the rest in `slate` -- no boxes, no
+    // pills, no background fill. Each button is styled with no background
+    // and no border to strip the default button chrome down to bare text;
+    // the underline is a `container` holding fixed-height `Space`, coloured
+    // `jacket` only when selected, laid out in a `Shrink`-width column below
+    // the label so iced's flex layout sizes it to the label's own width
+    // rather than the tab bar's -- that indicator is deliberately the tab
+    // bar's only affordance, consistent with the state glyph column being
+    // the application's one symbolic vocabulary (see `theme`'s module doc).
+    let mut tab_bar = iced::widget::row![].spacing(theme::SPACE_3);
     for tab in Tab::ALL {
-        tab_bar = tab_bar.push(
-            iced::widget::button(iced::widget::text(tab.label()))
-                .on_press_maybe((tab != app.tab).then_some(Message::TabSelected(tab))),
-        );
+        let is_selected = tab == app.tab;
+        let text_color = if is_selected {
+            theme::PARCHMENT
+        } else {
+            theme::SLATE
+        };
+
+        let label = iced::widget::button(iced::widget::text(tab.label()).size(theme::TITLE))
+            .on_press_maybe((!is_selected).then_some(Message::TabSelected(tab)))
+            .style(move |_theme, _status| iced::widget::button::Style {
+                background: None,
+                text_color,
+                ..iced::widget::button::Style::default()
+            });
+
+        let underline = iced::widget::container(
+            iced::widget::Space::new()
+                .width(iced::Length::Fill)
+                .height(theme::TAB_UNDERLINE),
+        )
+        .style(move |_theme| {
+            let style = iced::widget::container::Style::default();
+            if is_selected {
+                style.background(theme::JACKET)
+            } else {
+                style
+            }
+        });
+
+        tab_bar = tab_bar.push(iced::widget::column![label, underline].spacing(theme::SPACE_1));
     }
 
-    let detail_and_drawer =
-        iced::widget::column![detail, tab_bar, pane, drawer::view(&app.drawer)].spacing(8);
+    let detail_and_drawer = iced::widget::column![detail, tab_bar, pane, drawer::view(&app.drawer)]
+        .spacing(theme::SPACE_4);
 
     let add_project_button = iced::widget::button(iced::widget::text("Add project"))
         .on_press(Message::AddProjectPickManifestRequested);

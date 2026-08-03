@@ -55,15 +55,15 @@
 //! # Why parts of this module still look unused
 //!
 //! `bombadil-gui` is a binary crate, so an unused `pub` item is flagged as
-//! dead code with no external crate to excuse it. Task 2 (the sidebar) has
-//! now pulled in `SLATE`, `JACKET`, `PARCHMENT`, `BODY`, `DATA`, `SPACE_1`,
-//! `SPACE_2`, `SIDEBAR_WIDTH`, `FONT_DATA`, `FONT_PROSE_SEMIBOLD` and
-//! [`state_glyph`] itself, so the blanket allow Task 1 left on the whole
-//! module is gone. What remains genuinely unused -- `BARK`, `LABEL`,
-//! `TITLE`, `DISPLAY`, `SPACE_3`, `SPACE_4` -- carries its own narrow
+//! dead code with no external crate to excuse it. Task 2 (the sidebar) pulled
+//! in `SLATE`, `JACKET`, `PARCHMENT`, `BODY`, `DATA`, `SPACE_1`, `SPACE_2`,
+//! `SIDEBAR_WIDTH`, `FONT_DATA`, `FONT_PROSE_SEMIBOLD` and [`state_glyph`]
+//! itself. Task 3 (the detail header and tab bar) pulled in `DISPLAY`,
+//! `TITLE`, `SPACE_3`, `SPACE_4` and `TAB_UNDERLINE`. What remains genuinely
+//! unused -- `BARK` and `LABEL` -- carries its own narrow
 //! `#[allow(dead_code)]` naming the task that consumes it, so this list
-//! shrinks item by item as tasks 3 through 5 land instead of vanishing all
-//! at once.
+//! shrinks item by item as tasks 4 and 5 land instead of vanishing all at
+//! once.
 
 use iced::font::Weight;
 use iced::{Color, Font, Theme, color};
@@ -121,14 +121,9 @@ pub const LABEL: f32 = 11.0;
 pub const DATA: f32 = 12.0;
 /// Default prose size.
 pub const BODY: f32 = 13.0;
-/// Section and pane titles.
-#[allow(
-    dead_code,
-    reason = "consumed by task 3 (tab bar, detail header titles)"
-)]
+/// Section and pane titles -- the tab bar's labels, in `app::view`.
 pub const TITLE: f32 = 17.0;
 /// The project label in the detail header -- the largest thing on screen.
-#[allow(dead_code, reason = "consumed by task 3 (detail header)")]
 pub const DISPLAY: f32 = 22.0;
 
 // ---------------------------------------------------------------------------
@@ -141,14 +136,11 @@ pub const SPACE_BASE: f32 = 4.0;
 pub const SPACE_1: f32 = SPACE_BASE;
 /// Between related rows.
 pub const SPACE_2: f32 = SPACE_BASE * 2.0;
-/// Between unrelated groups within a pane.
-#[allow(
-    dead_code,
-    reason = "consumed by tasks 3-5 (panes with multiple groups)"
-)]
+/// Between unrelated groups within a pane -- e.g. one tab bar entry to the
+/// next in `app::view`.
 pub const SPACE_3: f32 = SPACE_BASE * 4.0;
-/// Between panes and major sections.
-#[allow(dead_code, reason = "consumed by tasks 3-5 (pane and section layout)")]
+/// Between panes and major sections -- e.g. the detail header, tab bar, pane
+/// and drawer stacked in `app::view`.
 pub const SPACE_4: f32 = SPACE_BASE * 6.0;
 
 // ---------------------------------------------------------------------------
@@ -158,6 +150,10 @@ pub const SPACE_4: f32 = SPACE_BASE * 6.0;
 /// Fixed sidebar width, so the dependency table keeps the full remaining
 /// width instead of the sidebar's own content deciding the split.
 pub const SIDEBAR_WIDTH: f32 = 240.0;
+/// Thickness of the selected tab's underline in the tab bar -- the bar's
+/// only indicator (no boxes, no pills, no background fill), so the state
+/// glyph column stays the application's one symbolic vocabulary.
+pub const TAB_UNDERLINE: f32 = 2.0;
 
 // ---------------------------------------------------------------------------
 // Fonts
