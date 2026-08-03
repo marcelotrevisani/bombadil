@@ -214,7 +214,29 @@ pub fn preselect<'a>(
 ) -> Option<&'a Interpreter> {
     satisfying(interpreters, requires_python)
         .into_iter()
-        .max_by(|a, b| cmp_segments(&release_segments(&a.version), &release_segments(&b.version)))
+        .max_by(|a, b| {
+            // Stable first, newest second. `bool`'s own order puts `false`
+            // (stable) below `true`, so the comparison is reversed to make a
+            // stable release the greater of the two.
+            is_prerelease(&b.version)
+                .cmp(&is_prerelease(&a.version))
+                .then_with(|| {
+                    cmp_segments(&release_segments(&a.version), &release_segments(&b.version))
+                })
+        })
+}
+
+/// Whether `version` names a pre-release: an alpha, a beta, a release
+/// candidate, anything that is not a plain dotted number.
+///
+/// `release_segments` throws the suffix away -- `3.15.0b4` and `3.15.0` are
+/// both `[3, 15, 0]` to it -- so without this a beta outranks every stable
+/// release below it, and a machine with a Python beta installed had every new
+/// project preselected onto it. The requirement `>=3.12.0` is satisfied by
+/// `3.15.0b4`, so nothing downstream would have objected: the environment
+/// would simply have been built on a beta nobody chose.
+fn is_prerelease(version: &str) -> bool {
+    version.chars().any(|c| !c.is_ascii_digit() && c != '.')
 }
 
 /// A plain version string to hand `uv python install` when nothing
@@ -398,6 +420,54 @@ mod tests {
     fn an_empty_interpreter_list_preselects_nothing() {
         assert_eq!(preselect(&[], Some(">=3.11")), None);
         assert_eq!(preselect(&[], None), None);
+    }
+
+    #[test]
+    fn a_stable_release_is_preselected_over_a_newer_prerelease() {
+        // Seen in the wild: `requires-python = ">=3.12.0"` on a machine with a
+        // 3.15 beta installed preselected `3.15.0b4`. It satisfies the
+        // requirement, so nothing downstream objected -- the environment would
+        // just have been built on a beta nobody chose.
+        let all = vec![interp("3.12.13"), interp("3.15.0b4"), interp("3.11.9")];
+        assert_eq!(
+            preselect(&all, Some(">=3.12.0")).map(|i| i.version.as_str()),
+            Some("3.12.13")
+        );
+    }
+
+    #[test]
+    fn the_newest_stable_still_wins_among_stables() {
+        // The fix must not cost the ordering it was built on.
+        let all = vec![interp("3.12.13"), interp("3.13.2"), interp("3.11.9")];
+        assert_eq!(
+            preselect(&all, Some(">=3.11")).map(|i| i.version.as_str()),
+            Some("3.13.2")
+        );
+    }
+
+    #[test]
+    fn a_prerelease_is_still_offered_when_it_is_the_only_thing_that_fits() {
+        // Preferring stable is not refusing prereleases: with nothing else
+        // satisfying the requirement, a beta beats offering nothing and
+        // sending the user to install an interpreter they already have.
+        let all = vec![interp("3.11.9"), interp("3.15.0b4")];
+        assert_eq!(
+            preselect(&all, Some(">=3.13")).map(|i| i.version.as_str()),
+            Some("3.15.0b4")
+        );
+    }
+
+    #[test]
+    fn every_shape_of_prerelease_is_recognised() {
+        for version in ["3.15.0b4", "3.14.0rc1", "3.16.0a1", "3.13.0-dev"] {
+            assert!(
+                is_prerelease(version),
+                "{version} must read as a prerelease"
+            );
+        }
+        for version in ["3.12.13", "3.11", "3"] {
+            assert!(!is_prerelease(version), "{version} must read as stable");
+        }
     }
 
     #[test]

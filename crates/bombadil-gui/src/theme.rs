@@ -372,6 +372,32 @@ pub fn button_quiet(_theme: &Theme, status: button::Status) -> button::Style {
     }
 }
 
+/// One option of a segmented choice -- three buttons that are really one
+/// setting with three values.
+///
+/// The selected one carries a [`JACKET`] outline and [`PARCHMENT`] text on a
+/// [`BARK`] fill; the rest are quiet. An outline, not a fill, for the same
+/// reason the tab bar underlines and the sidebar marks a leading edge:
+/// indicators in this application are edges, and a [`JACKET`] fill could not
+/// carry legible text anyway.
+pub fn button_choice(selected: bool) -> impl Fn(&Theme, button::Status) -> button::Style {
+    move |_theme, status| button::Style {
+        background: match (selected, status) {
+            (true, _) | (_, button::Status::Hovered) | (_, button::Status::Pressed) => {
+                Some(iced::Background::Color(BARK))
+            }
+            _ => None,
+        },
+        text_color: if selected { PARCHMENT } else { SLATE },
+        border: iced::Border {
+            color: if selected { JACKET } else { EDGE },
+            width: if selected { SELECTED_MARKER } else { HAIRLINE },
+            radius: RADIUS.into(),
+        },
+        ..button::Style::default()
+    }
+}
+
 /// A destructive confirm: the [`BOOT`] fill this palette rations. Never use
 /// for anything else -- see the module docs on what that ration protects.
 pub fn button_danger(_theme: &Theme, status: button::Status) -> button::Style {

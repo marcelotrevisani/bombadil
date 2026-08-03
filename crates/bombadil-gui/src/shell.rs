@@ -117,23 +117,46 @@ pub fn menu_layer<'a>() -> iced::Element<'a, Message> {
         );
     }
 
-    let anchored = iced::widget::container(
+    dismissable(
         iced::widget::container(panel)
             .width(theme::MENU_WIDTH)
-            .style(theme::panel),
+            .style(theme::panel)
+            .into(),
+        [theme::TOPBAR_HEIGHT + theme::SPACE_1, theme::SPACE_3],
+        iced::alignment::Horizontal::Right,
+        Message::MenuDismissed,
     )
-    .width(iced::Length::Fill)
-    .height(iced::Length::Fill)
-    .padding([theme::TOPBAR_HEIGHT + theme::SPACE_1, theme::SPACE_3])
-    .align_x(iced::alignment::Horizontal::Right)
-    .align_y(iced::alignment::Vertical::Top);
+}
 
-    // `opaque` so the press lands here instead of on whatever is underneath;
-    // without it the menu would dismiss *and* activate the control beneath
-    // the pointer in the same click.
-    iced::widget::opaque(
-        iced::widget::mouse_area(iced::widget::opaque(anchored)).on_press(Message::MenuDismissed),
-    )
+/// A floating panel over a full-window layer that dismisses on a press
+/// outside it.
+///
+/// The nesting is the whole point and it is easy to get backwards. `opaque`
+/// goes around **the panel**, so presses on the panel stop there; the
+/// `mouse_area` wraps the full-window positioner *outside* that, so presses
+/// anywhere else reach it and dismiss. Written the other way round --
+/// `mouse_area(opaque(positioner))` -- the opaque layer swallows every press
+/// before the `mouse_area` can see one, and nothing ever dismisses. That was
+/// a real bug in all three of these layers: the context menu stayed on screen
+/// through any number of clicks elsewhere.
+///
+/// No scrim: a menu is a list of choices, not a demand for an answer, and
+/// dimming the application behind one says the wrong thing. `modal_layer`
+/// builds its own.
+fn dismissable<'a>(
+    panel: iced::Element<'a, Message>,
+    padding: [f32; 2],
+    align_x: iced::alignment::Horizontal,
+    dismiss: Message,
+) -> iced::Element<'a, Message> {
+    let positioner = iced::widget::container(iced::widget::opaque(panel))
+        .width(iced::Length::Fill)
+        .height(iced::Length::Fill)
+        .padding(padding)
+        .align_x(align_x)
+        .align_y(iced::alignment::Vertical::Top);
+
+    iced::widget::opaque(iced::widget::mouse_area(positioner).on_press(dismiss))
 }
 
 /// Wraps `body` in a modal card over a scrim: a title, the body, and a Close
@@ -164,7 +187,10 @@ pub fn modal_layer<'a>(modal: Modal) -> iced::Element<'a, Message> {
     .padding(theme::SPACE_4)
     .style(theme::panel);
 
-    let scrim = iced::widget::container(iced::widget::center(iced::widget::opaque(card)))
+    // Centred rather than anchored, so it gets `center` inside the positioner
+    // instead of a top alignment -- otherwise the same nesting as
+    // `dismissable`, for the same reason.
+    let positioner = iced::widget::container(iced::widget::center(iced::widget::opaque(card)))
         .width(iced::Length::Fill)
         .height(iced::Length::Fill)
         .style(|_theme| iced::widget::container::Style {
@@ -172,9 +198,7 @@ pub fn modal_layer<'a>(modal: Modal) -> iced::Element<'a, Message> {
             ..iced::widget::container::Style::default()
         });
 
-    iced::widget::opaque(
-        iced::widget::mouse_area(iced::widget::opaque(scrim)).on_press(Message::ModalClosed),
-    )
+    iced::widget::opaque(iced::widget::mouse_area(positioner).on_press(Message::ModalClosed))
 }
 
 /// A panel anchored beside the sidebar, dismissed by a press anywhere else.
@@ -193,21 +217,18 @@ pub fn anchored_layer<'a>(
     content: iced::Element<'a, Message>,
     dismiss: Message,
 ) -> iced::Element<'a, Message> {
-    let panel = iced::widget::container(content)
-        .width(theme::CONTEXT_MENU_WIDTH)
-        .style(theme::panel);
-
-    let anchored = iced::widget::container(panel)
-        .width(iced::Length::Fill)
-        .height(iced::Length::Fill)
-        .padding([
+    dismissable(
+        iced::widget::container(content)
+            .width(theme::CONTEXT_MENU_WIDTH)
+            .style(theme::panel)
+            .into(),
+        [
             theme::TOPBAR_HEIGHT + theme::SPACE_3,
             theme::SIDEBAR_WIDTH + theme::SPACE_2,
-        ])
-        .align_x(iced::alignment::Horizontal::Left)
-        .align_y(iced::alignment::Vertical::Top);
-
-    iced::widget::opaque(iced::widget::mouse_area(iced::widget::opaque(anchored)).on_press(dismiss))
+        ],
+        iced::alignment::Horizontal::Left,
+        dismiss,
+    )
 }
 
 /// Puts `content` on a card over a scrim, as a layer of its own.
