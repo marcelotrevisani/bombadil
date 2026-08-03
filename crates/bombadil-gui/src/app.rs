@@ -17,7 +17,7 @@ use crate::sidebar;
 use crate::theme;
 use bombadil_core::envspec::{self, EnvInputs};
 use bombadil_core::model::{
-    Config, DefaultVenvLocation, Project, PythonPin, Settings, TerminalChoice, UvSource,
+    Config, DefaultVenvLocation, Override, Project, PythonPin, Settings, TerminalChoice, UvSource,
 };
 use bombadil_core::process::CommandRunner;
 use bombadil_core::pyproject::PyProject;
@@ -481,6 +481,17 @@ pub enum Message {
     PreferencesScopeSelected(preferences::Scope),
     /// The section list down the left.
     PreferencesSectionSelected(preferences::Section),
+    /// The Python section's version box, in `scope`. An empty box is not a
+    /// pin -- typing and clearing must leave `Unpinned`, not a `Version("")`
+    /// that uv would refuse with a confusing error.
+    PreferencesPythonPinChanged(preferences::Scope, String),
+    /// "Inherit from global" was ticked back on for `section` in `scope`.
+    /// Only meaningful for a project scope; Global has nothing to inherit.
+    PreferencesInheritToggled(preferences::Scope, preferences::Section),
+    /// The uv section's choice, in `scope`.
+    PreferencesUvSourceOverridden(preferences::Scope, UvSource),
+    /// The Terminal section's choice, in `scope`.
+    PreferencesTerminalOverridden(preferences::Scope, TerminalChoice),
     /// The Env vars tab's "Add variable" button was pressed for `scope`
     /// (spec §5, Task 2).
     EnvVarAdded(env_editor::EnvScope),
@@ -1653,6 +1664,82 @@ pub fn update(app: &mut App, message: Message, runner: Arc<dyn CommandRunner>) -
             if let Some(state) = &mut app.preferences {
                 state.section = section;
             }
+        }
+        Message::PreferencesPythonPinChanged(scope, version) => {
+            let pin = preferences::pin_from_input(&version);
+            // The RAW scope, never `resolve_scope`. That function answers
+            // `Global` for a project that no longer exists, which is right for
+            // deciding what to *render* and catastrophic for deciding where to
+            // *write*: an edit meant for a removed project would silently
+            // change the global setting for every project. Landing nowhere is
+            // the only safe answer.
+            match scope {
+                preferences::Scope::Global => app.config.settings.python = pin,
+                preferences::Scope::Project(id) => {
+                    let Some(project) = app.config.projects.iter_mut().find(|p| p.id == id) else {
+                        return Task::none();
+                    };
+                    project.python = Override::Set(pin);
+                }
+            }
+            return persist_env_edit(app);
+        }
+        Message::PreferencesUvSourceOverridden(scope, source) => {
+            // The raw scope -- see `PreferencesPythonPinChanged`.
+            match scope {
+                preferences::Scope::Global => app.config.settings.uv_source = source,
+                preferences::Scope::Project(id) => {
+                    let Some(project) = app.config.projects.iter_mut().find(|p| p.id == id) else {
+                        return Task::none();
+                    };
+                    project.uv_source = Override::Set(source);
+                }
+            }
+            return persist_env_edit(app);
+        }
+        Message::PreferencesTerminalOverridden(scope, choice) => {
+            let os = Os::host();
+            // The raw scope -- see `PreferencesPythonPinChanged`.
+            match scope {
+                preferences::Scope::Global => {
+                    app.config.terminal_defaults.insert(os, choice);
+                }
+                preferences::Scope::Project(id) => {
+                    let Some(project) = app.config.projects.iter_mut().find(|p| p.id == id) else {
+                        return Task::none();
+                    };
+                    project.terminals.insert(os, choice);
+                }
+            }
+            return persist_env_edit(app);
+        }
+        Message::PreferencesInheritToggled(scope, section) => {
+            // Only a project can inherit. Global has nothing above it, and a
+            // control that did something there would be lying about what the
+            // scope means.
+            // The raw scope -- see `PreferencesPythonPinChanged`. Here it
+            // matters twice: `resolve_scope` would turn a removed project into
+            // `Global`, and Global has nothing to inherit, so this would
+            // silently do nothing instead of visibly doing nothing.
+            let preferences::Scope::Project(id) = scope else {
+                return Task::none();
+            };
+            let Some(project) = app.config.projects.iter_mut().find(|p| p.id == id) else {
+                return Task::none();
+            };
+            match section {
+                preferences::Section::Python => project.python = Override::Inherit,
+                preferences::Section::Uv => project.uv_source = Override::Inherit,
+                preferences::Section::Terminal => {
+                    project.terminals.remove(&Os::host());
+                }
+                // The list sections merge rather than override, so there is
+                // nothing here to hand back. See `preferences`'s module doc.
+                preferences::Section::Environments
+                | preferences::Section::EnvVars
+                | preferences::Section::Indexes => return Task::none(),
+            }
+            return persist_env_edit(app);
         }
         Message::EnvVarAdded(scope) => {
             if let Some(vars) = env_editor::vars_mut(&mut app.config, scope) {
@@ -6653,6 +6740,238 @@ mod tests {
             runner.calls()
         );
         assert!(err.contains("pyproject.toml"), "got {err}");
+    }
+
+    #[test]
+    fn setting_a_global_pin_writes_it_through_and_persists() {
+        let mut app = App::new(Config {
+            projects: vec![project("api")],
+            ..Config::default()
+        });
+        let persist = Arc::new(FakeConfigPersist::default());
+        app.persist = persist.clone();
+
+        let _ = update(&mut app, Message::PreferencesOpened, unused_runner());
+        let _ = update(
+            &mut app,
+            Message::PreferencesPythonPinChanged(preferences::Scope::Global, "3.12".into()),
+            unused_runner(),
+        );
+
+        assert_eq!(
+            app.config.settings.python,
+            PythonPin::Version("3.12".into())
+        );
+        // Same shape every other settings test uses: the dispatched persist
+        // is not driven by a unit test, so the config is saved directly to
+        // prove it survives a restart.
+        assert!(block_on(persist_config(
+            app.config.clone(),
+            persist.clone()
+        )));
+        assert_eq!(
+            persist.saved()[0].settings.python,
+            PythonPin::Version("3.12".into())
+        );
+    }
+
+    #[test]
+    fn an_emptied_pin_box_unpins_rather_than_pinning_to_nothing() {
+        // Typing a version and clearing it must leave `Unpinned`. A
+        // `Version("")` would reach uv as `-p ""` and be refused with an
+        // error about an interpreter nobody asked for.
+        let mut app = App::new(Config::default());
+
+        let _ = update(&mut app, Message::PreferencesOpened, unused_runner());
+        let _ = update(
+            &mut app,
+            Message::PreferencesPythonPinChanged(preferences::Scope::Global, "3.12".into()),
+            unused_runner(),
+        );
+        let _ = update(
+            &mut app,
+            Message::PreferencesPythonPinChanged(preferences::Scope::Global, "   ".into()),
+            unused_runner(),
+        );
+
+        assert_eq!(app.config.settings.python, PythonPin::Unpinned);
+    }
+
+    #[test]
+    fn a_project_pin_overrides_the_global_one_without_touching_it() {
+        let mut app = App::new(Config {
+            projects: vec![project("api")],
+            settings: Settings {
+                python: PythonPin::Version("3.12".into()),
+                ..Settings::default()
+            },
+            ..Config::default()
+        });
+        let id = app.config.projects[0].id;
+
+        let _ = update(&mut app, Message::PreferencesOpened, unused_runner());
+        let _ = update(
+            &mut app,
+            Message::PreferencesPythonPinChanged(preferences::Scope::Project(id), "3.11".into()),
+            unused_runner(),
+        );
+
+        assert_eq!(
+            app.config.projects[0].python,
+            Override::Set(PythonPin::Version("3.11".into()))
+        );
+        assert_eq!(
+            app.config.settings.python,
+            PythonPin::Version("3.12".into()),
+            "a project override must not write into the global value"
+        );
+    }
+
+    #[test]
+    fn toggling_inherit_back_on_discards_the_override_not_the_global() {
+        let mut app = App::new(Config {
+            projects: vec![project("api")],
+            settings: Settings {
+                python: PythonPin::Version("3.12".into()),
+                ..Settings::default()
+            },
+            ..Config::default()
+        });
+        let id = app.config.projects[0].id;
+        app.config.projects[0].python = Override::Set(PythonPin::Version("3.11".into()));
+
+        let _ = update(&mut app, Message::PreferencesOpened, unused_runner());
+        let _ = update(
+            &mut app,
+            Message::PreferencesInheritToggled(
+                preferences::Scope::Project(id),
+                preferences::Section::Python,
+            ),
+            unused_runner(),
+        );
+
+        assert_eq!(app.config.projects[0].python, Override::Inherit);
+        assert_eq!(
+            app.config.settings.python,
+            PythonPin::Version("3.12".into())
+        );
+    }
+
+    #[test]
+    fn an_edit_in_a_scope_whose_project_is_gone_writes_nothing() {
+        // Preferences can be open while the project it is showing is removed.
+        // The edit must land nowhere rather than in whichever project took its
+        // place -- the class of bug `ConfirmRecreate` carries a `Uuid` for --
+        // and, just as importantly, not in the global settings.
+        let mut app = App::new(Config {
+            projects: vec![project("api")],
+            ..Config::default()
+        });
+        let gone = uuid::Uuid::from_u128(99);
+
+        let _ = update(&mut app, Message::PreferencesOpened, unused_runner());
+        let _ = update(
+            &mut app,
+            Message::PreferencesPythonPinChanged(preferences::Scope::Project(gone), "3.11".into()),
+            unused_runner(),
+        );
+
+        assert_eq!(app.config.projects[0].python, Override::Inherit);
+        assert_eq!(app.config.settings.python, PythonPin::Unpinned);
+    }
+
+    #[test]
+    fn a_project_uv_override_leaves_the_global_choice_alone() {
+        let mut app = App::new(Config {
+            projects: vec![project("api")],
+            settings: Settings {
+                uv_source: UvSource::Bundled,
+                ..Settings::default()
+            },
+            ..Config::default()
+        });
+        let id = app.config.projects[0].id;
+
+        let _ = update(&mut app, Message::PreferencesOpened, unused_runner());
+        let _ = update(
+            &mut app,
+            Message::PreferencesUvSourceOverridden(
+                preferences::Scope::Project(id),
+                UvSource::FromPath,
+            ),
+            unused_runner(),
+        );
+
+        assert_eq!(
+            app.config.projects[0].uv_source,
+            Override::Set(UvSource::FromPath)
+        );
+        assert_eq!(app.config.settings.uv_source, UvSource::Bundled);
+    }
+
+    #[test]
+    fn a_project_terminal_override_is_per_os_and_leaves_the_others_alone() {
+        // `Project::terminals` is a map for exactly this reason: an override
+        // set on this machine must not decide what happens on another.
+        let mut app = App::new(Config {
+            projects: vec![project("api")],
+            ..Config::default()
+        });
+        let id = app.config.projects[0].id;
+        let other = match Os::host() {
+            Os::Linux => Os::Windows,
+            _ => Os::Linux,
+        };
+
+        let _ = update(&mut app, Message::PreferencesOpened, unused_runner());
+        let _ = update(
+            &mut app,
+            Message::PreferencesTerminalOverridden(
+                preferences::Scope::Project(id),
+                TerminalChoice::Detected(TerminalKind::Xterm),
+            ),
+            unused_runner(),
+        );
+
+        let terminals = &app.config.projects[0].terminals;
+        assert_eq!(
+            terminals.get(&Os::host()),
+            Some(&TerminalChoice::Detected(TerminalKind::Xterm))
+        );
+        assert_eq!(
+            terminals.get(&other),
+            None,
+            "an override must speak only for the OS it was set on"
+        );
+    }
+
+    #[test]
+    fn a_pin_set_here_reaches_the_confirmation_when_sync_would_delete() {
+        // The end-to-end proof that Plan A's guard is wired to something a
+        // user can actually reach. Until this task nothing could set a pin,
+        // so `sync_would_delete` had never fired from a real press.
+        let mut app = App::new(Config {
+            projects: vec![project("api")],
+            ..Config::default()
+        });
+        let id = app.config.projects[0].id;
+        app.entries[0].python_version = Some("3.13.14".to_string());
+
+        let _ = update(&mut app, Message::PreferencesOpened, unused_runner());
+        let _ = update(
+            &mut app,
+            Message::PreferencesPythonPinChanged(preferences::Scope::Project(id), "3.12".into()),
+            unused_runner(),
+        );
+        let task = update(&mut app, Message::SyncRequested(0), unused_runner());
+
+        assert_eq!(task.units(), 0, "nothing may run before the user answers");
+        let confirm = app
+            .confirm_pin_change
+            .as_ref()
+            .expect("a pin set in Preferences must reach the same guard");
+        assert_eq!(confirm.from, "3.13.14");
+        assert_eq!(confirm.to, "3.12");
     }
 
     #[test]

@@ -18,7 +18,8 @@
 use crate::app::Message;
 use crate::theme;
 use crate::{env_editor, index_editor, settings_editor};
-use bombadil_core::model::Config;
+use bombadil_core::model::{Config, PythonPin, TerminalChoice, UvSource};
+use bombadil_core::terminal::Os;
 use uuid::Uuid;
 
 /// Whose settings are on screen.
@@ -106,6 +107,50 @@ pub fn resolve_scope(scope: Scope, config: &Config) -> Scope {
     }
 }
 
+/// What a typed version box means.
+///
+/// An empty or whitespace-only box is not a pin: typing a version and then
+/// clearing it must leave `Unpinned`, not `Version("")`, which uv would
+/// refuse with an error about an interpreter nobody asked for.
+pub fn pin_from_input(input: &str) -> PythonPin {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        PythonPin::Unpinned
+    } else {
+        PythonPin::Version(trimmed.to_string())
+    }
+}
+
+/// What a project would get if it inherited `section`, in words.
+///
+/// Shown beside the inherit control. A checkbox saying "Inherit from global"
+/// with no indication of what that *is* makes the user close Preferences,
+/// switch scope, read the value, and come back.
+pub fn inherited_label(section: Section, config: &Config, os: Os) -> String {
+    match section {
+        Section::Python => match &config.settings.python {
+            PythonPin::Unpinned => "no pin -- uv chooses".to_string(),
+            PythonPin::Version(version) => version.clone(),
+        },
+        Section::Uv => match &config.settings.uv_source {
+            UvSource::Auto => "auto".to_string(),
+            UvSource::Bundled => "bundled".to_string(),
+            UvSource::FromPath => "from PATH".to_string(),
+            UvSource::Custom { path } => path.display().to_string(),
+        },
+        Section::Terminal => match config.terminal_defaults.get(&os) {
+            Some(TerminalChoice::Detected(kind)) => {
+                crate::context_menu::terminal_name(*kind).to_string()
+            }
+            Some(TerminalChoice::Custom { .. }) => "a custom command".to_string(),
+            None => "none set".to_string(),
+        },
+        // These merge rather than override, so "what you would inherit" is
+        // not a single value and the panel says so in prose instead.
+        Section::Environments | Section::EnvVars | Section::Indexes => String::new(),
+    }
+}
+
 /// Renders Preferences: the scope switch across the top, the section list
 /// down the left, the chosen section's fields on the right.
 ///
@@ -166,20 +211,21 @@ pub fn view<'a>(
         (Section::EnvVars, Some(i)) => env_editor::project_view(config, i, env_drafts),
         (Section::Indexes, None) => index_editor::global_view(config, credential_drafts),
         (Section::Indexes, Some(i)) => index_editor::project_view(config, i),
-        (Section::Environments | Section::Uv, _) => settings_editor::global_view(
+        (Section::Environments, _) => settings_editor::global_view(
             &config.settings,
             &config.projects,
             uv_custom_path_draft,
             uv_custom_validation,
         ),
-        // Filled in by the next task. Said out loud rather than rendered as an
-        // empty panel, which reads as broken rather than unfinished.
-        (Section::Python | Section::Terminal, _) => {
-            iced::widget::text("Not built yet -- the next task fills this in.")
-                .size(theme::BODY)
-                .color(theme::SLATE)
-                .into()
-        }
+        (Section::Uv, None) => settings_editor::global_view(
+            &config.settings,
+            &config.projects,
+            uv_custom_path_draft,
+            uv_custom_validation,
+        ),
+        (Section::Uv, Some(i)) => uv_panel(config, scope, i),
+        (Section::Python, _) => python_panel(config, scope, selected_project),
+        (Section::Terminal, _) => terminal_panel(config, scope, selected_project),
     };
 
     let card = iced::widget::container(
@@ -222,6 +268,208 @@ pub fn view<'a>(
         });
 
     iced::widget::opaque(iced::widget::mouse_area(positioner).on_press(Message::PreferencesClosed))
+}
+
+/// The Python section: the pin, and what changing it costs.
+fn python_panel<'a>(
+    config: &Config,
+    scope: Scope,
+    project_index: Option<usize>,
+) -> iced::Element<'a, Message> {
+    let project = project_index.and_then(|i| config.projects.get(i));
+    let inheriting = project.is_some_and(|p| p.python == bombadil_core::model::Override::Inherit);
+    let effective = match project {
+        Some(project) => project.python.resolve(&config.settings.python).clone(),
+        None => config.settings.python.clone(),
+    };
+    let current = match &effective {
+        PythonPin::Version(version) => version.clone(),
+        PythonPin::Unpinned => String::new(),
+    };
+
+    let mut column = iced::widget::column![
+        iced::widget::text(
+            "The interpreter Sync builds this environment with. Leave it empty to let uv \
+             choose, subject to the manifest's requires-python."
+        )
+        .size(theme::BODY)
+        .color(theme::SLATE),
+    ]
+    .spacing(theme::SPACE_3);
+
+    if project.is_some() {
+        column = column.push(inherit_row(Section::Python, config, scope, inheriting));
+    }
+
+    column = column.push(
+        iced::widget::text_input("3.12, or 3.12.13", &current)
+            .on_input(move |version| Message::PreferencesPythonPinChanged(scope, version))
+            .font(theme::FONT_DATA)
+            .size(theme::DATA)
+            .padding(theme::SPACE_2),
+    );
+
+    // Stated here, not only in the confirmation. uv does not migrate an
+    // environment to another interpreter -- it deletes the directory and
+    // builds a new one -- and the confirmation is the last line of defence,
+    // not the only warning.
+    column
+        .push(
+            iced::widget::text(
+                "Changing this deletes the existing environment and rebuilds it. Anything \
+                 installed in it that is not in the lock file is lost. Sync asks first.",
+            )
+            .size(theme::LABEL)
+            .color(theme::SLATE),
+        )
+        .into()
+}
+
+/// The uv section, project scope: which uv runs this project.
+///
+/// Only `Auto`, `Bundled` and `FromPath`. A custom binary needs a path and a
+/// version probe before it can be trusted, and that machinery
+/// (`uv_custom_path_draft`, `SettingsUvCustomValidated`) is global. A project
+/// that needs a specific binary sets it globally and inherits it; offering a
+/// second, unvalidated path box here would be a way to configure a uv that
+/// has never been run.
+fn uv_panel<'a>(config: &Config, scope: Scope, project_index: usize) -> iced::Element<'a, Message> {
+    let Some(project) = config.projects.get(project_index) else {
+        return iced::widget::text("").into();
+    };
+    let inheriting = project.uv_source == bombadil_core::model::Override::Inherit;
+    let effective = project
+        .uv_source
+        .resolve(&config.settings.uv_source)
+        .clone();
+
+    let mut column = iced::widget::column![
+        iced::widget::text("Which uv runs this project's commands.")
+            .size(theme::BODY)
+            .color(theme::SLATE),
+        inherit_row(Section::Uv, config, scope, inheriting),
+    ]
+    .spacing(theme::SPACE_2);
+
+    for (label, source) in [
+        ("auto", UvSource::Auto),
+        ("bundled", UvSource::Bundled),
+        ("from PATH", UvSource::FromPath),
+    ] {
+        let selected = !inheriting && effective == source;
+        column = column.push(
+            iced::widget::button(iced::widget::text(label).size(theme::BODY))
+                .on_press(Message::PreferencesUvSourceOverridden(scope, source))
+                .padding([theme::SPACE_1, theme::SPACE_3])
+                .style(theme::button_choice(selected)),
+        );
+    }
+
+    column
+        .push(
+            iced::widget::text(
+                "A specific uv binary is configured globally, in this section's Global \
+                 scope, because it is probed for its version before it is trusted.",
+            )
+            .size(theme::LABEL)
+            .color(theme::SLATE),
+        )
+        .into()
+}
+
+/// The Terminal section: which terminal this scope opens, on this OS.
+fn terminal_panel<'a>(
+    config: &Config,
+    scope: Scope,
+    project_index: Option<usize>,
+) -> iced::Element<'a, Message> {
+    let os = Os::host();
+    let project = project_index.and_then(|i| config.projects.get(i));
+    let inheriting = project.is_some_and(|p| !p.terminals.contains_key(&os));
+    let current = match project {
+        Some(project) => project
+            .terminals
+            .get(&os)
+            .or_else(|| config.terminal_defaults.get(&os)),
+        None => config.terminal_defaults.get(&os),
+    }
+    .cloned();
+
+    let mut column = iced::widget::column![
+        iced::widget::text(
+            "Which terminal the Open terminal action launches. Set per operating system, \
+             because the terminals that exist differ between them."
+        )
+        .size(theme::BODY)
+        .color(theme::SLATE),
+    ]
+    .spacing(theme::SPACE_2);
+
+    if project.is_some() {
+        column = column.push(inherit_row(Section::Terminal, config, scope, inheriting));
+    }
+
+    for kind in bombadil_core::terminal::TerminalKind::for_os(os) {
+        let selected = current == Some(TerminalChoice::Detected(kind));
+        let warning = crate::context_menu::activation_warning(kind);
+        let mut label = iced::widget::column![
+            iced::widget::text(crate::context_menu::terminal_name(kind)).size(theme::BODY),
+        ];
+        if !warning.is_empty() {
+            label = label.push(
+                iced::widget::text(warning.trim())
+                    .size(theme::LABEL)
+                    .color(theme::SLATE),
+            );
+        }
+        column = column.push(
+            iced::widget::button(label)
+                .on_press(Message::PreferencesTerminalOverridden(
+                    scope,
+                    TerminalChoice::Detected(kind),
+                ))
+                .width(iced::Length::Fill)
+                .padding([theme::SPACE_1, theme::SPACE_2])
+                .style(theme::button_choice(selected)),
+        );
+    }
+
+    column
+        .push(
+            iced::widget::text(
+                "Listed for this machine's OS. A terminal that is not installed reports so \
+                 when opened rather than being hidden here.",
+            )
+            .size(theme::LABEL)
+            .color(theme::SLATE),
+        )
+        .into()
+}
+
+/// The "Inherit from global" control, with the value it would inherit beside
+/// it -- otherwise the user has to switch scope, read it, and come back.
+fn inherit_row<'a>(
+    section: Section,
+    config: &Config,
+    scope: Scope,
+    inheriting: bool,
+) -> iced::Element<'a, Message> {
+    let inherited = inherited_label(section, config, Os::host());
+    iced::widget::row![
+        iced::widget::checkbox(inheriting)
+            .label("Inherit from global")
+            .text_size(theme::BODY)
+            .on_toggle_maybe(
+                (!inheriting)
+                    .then_some(move |_| Message::PreferencesInheritToggled(scope, section))
+            ),
+        iced::widget::text(format!("({inherited})"))
+            .size(theme::DATA)
+            .color(theme::SLATE),
+    ]
+    .spacing(theme::SPACE_2)
+    .align_y(iced::Alignment::Center)
+    .into()
 }
 
 /// One option of the scope switch. The current one is not pressable, the same
