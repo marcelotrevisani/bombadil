@@ -53,11 +53,20 @@ impl Modal {
 }
 
 /// Every entry in the Help menu, in the order it is shown. One list, so the
-/// menu and the test that holds it to having a licence entry cannot disagree.
-pub const MENU_ENTRIES: [(&str, Modal); 2] = [
-    ("About Bombadil", Modal::About),
-    ("Bundled licences", Modal::Licences),
-];
+/// menu and the tests that hold it to still offering the licences cannot
+/// disagree.
+///
+/// A `Message` rather than a `Modal`, which it was until Preferences existed:
+/// Preferences is a working surface whose controls write straight through to
+/// the config, not a read-only card with a Close button, so it is not a modal
+/// and cannot be described by one.
+pub fn menu_entries() -> [(&'static str, Message); 3] {
+    [
+        ("Preferences", Message::PreferencesOpened),
+        ("About Bombadil", Message::ModalOpened(Modal::About)),
+        ("Bundled licences", Message::ModalOpened(Modal::Licences)),
+    ]
+}
 
 /// This build's version, for the About modal.
 pub fn version() -> &'static str {
@@ -107,10 +116,10 @@ pub fn topbar<'a>(menu_open: bool) -> iced::Element<'a, Message> {
 /// anywhere else dismiss the menu.
 pub fn menu_layer<'a>() -> iced::Element<'a, Message> {
     let mut panel = iced::widget::column![].spacing(0);
-    for (label, modal) in MENU_ENTRIES {
+    for (label, message) in menu_entries() {
         panel = panel.push(
             iced::widget::button(iced::widget::text(label).size(theme::BODY))
-                .on_press(Message::ModalOpened(modal))
+                .on_press(message)
                 .width(iced::Length::Fill)
                 .padding([theme::SPACE_2, theme::SPACE_3])
                 .style(theme::button_bare(theme::PARCHMENT)),
@@ -354,27 +363,44 @@ mod tests {
         // only route to it. An entry list that lost it would be a licence
         // violation shipped as a layout tweak.
         assert!(
-            MENU_ENTRIES
+            menu_entries()
                 .iter()
-                .any(|(_, modal)| *modal == Modal::Licences),
+                .any(|(_, message)| matches!(message, Message::ModalOpened(Modal::Licences))),
             "no menu entry opens the licences"
         );
     }
 
     #[test]
-    fn every_menu_entry_is_labelled_and_opens_a_distinct_modal() {
-        // Two entries opening the same modal would make one of them a lie
-        // about what pressing it does.
-        for (label, _) in MENU_ENTRIES {
+    fn every_menu_entry_is_labelled_and_does_something_distinct() {
+        // Two entries doing the same thing would make one of them a lie about
+        // what pressing it does. Compared through `Debug` because `Message`
+        // has no `PartialEq` -- it carries payloads that do not need one.
+        let entries = menu_entries();
+        for (label, _) in entries.iter() {
             assert!(!label.trim().is_empty(), "a menu entry has no label");
         }
-        let modals: Vec<Modal> = MENU_ENTRIES.iter().map(|(_, modal)| *modal).collect();
-        for (i, modal) in modals.iter().enumerate() {
+        let actions: Vec<String> = entries
+            .iter()
+            .map(|(_, message)| format!("{message:?}"))
+            .collect();
+        for (i, action) in actions.iter().enumerate() {
             assert!(
-                !modals[i + 1..].contains(modal),
-                "{modal:?} is opened by two entries"
+                !actions[i + 1..].contains(action),
+                "{action} is reached by two entries"
             );
         }
+    }
+
+    #[test]
+    fn the_menu_offers_preferences() {
+        // Every setting in the application is behind this one entry now: the
+        // Env vars, Indexes and Settings tabs are gone.
+        assert!(
+            menu_entries()
+                .iter()
+                .any(|(_, message)| matches!(message, Message::PreferencesOpened)),
+            "no menu entry opens Preferences"
+        );
     }
 
     #[test]

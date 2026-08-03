@@ -9,6 +9,7 @@ use crate::index_editor;
 use crate::interpreter;
 use crate::job;
 use crate::members_editor;
+use crate::preferences;
 use crate::scripts_editor;
 use crate::settings_editor;
 use crate::shell;
@@ -159,6 +160,13 @@ pub struct App {
     /// bottom of every frame -- the obligation is that the user *can* read
     /// thousands of words of boilerplate, not that they always are.
     pub modal: Option<shell::Modal>,
+    /// What Preferences is showing, or `None` when it is closed.
+    ///
+    /// Separate from `modal`: that is a stack of read-only cards with a Close
+    /// button, and this is a working surface whose controls write through to
+    /// `Config`. Sharing the field would mean one Close doing two different
+    /// things.
+    pub preferences: Option<preferences::State>,
     /// The Dependencies tab (spec §8) for whichever project it was last
     /// fetched for, paired with that project's index so a result that
     /// arrives after the selection has moved on is never shown against the
@@ -472,6 +480,15 @@ pub enum Message {
     ModalOpened(shell::Modal),
     /// The modal's Close button, or a press on its scrim.
     ModalClosed,
+    /// Help > Preferences.
+    PreferencesOpened,
+    /// Its Close button, or a press on its scrim. Not an undo: every control
+    /// in there has already written through to `Config` and persisted.
+    PreferencesClosed,
+    /// The scope switch: whose settings to show.
+    PreferencesScopeSelected(preferences::Scope),
+    /// The section list down the left.
+    PreferencesSectionSelected(preferences::Section),
     /// The Env vars tab's "Add variable" button was pressed for `scope`
     /// (spec §5, Task 2).
     EnvVarAdded(env_editor::EnvScope),
@@ -699,6 +716,7 @@ impl App {
             confirm_pin_change: None,
             menu_open: false,
             modal: None,
+            preferences: None,
             deps: None,
             index_credential_drafts,
             index_credential_names,
@@ -1617,6 +1635,32 @@ pub fn update(app: &mut App, message: Message, runner: Arc<dyn CommandRunner>) -
         }
         Message::ModalClosed => {
             app.modal = None;
+        }
+        Message::PreferencesOpened => {
+            app.preferences = Some(preferences::State::default());
+            // The menu closes behind what it opened, the same as
+            // `ModalOpened`: two layers claiming the pointer at once is how a
+            // press both dismisses and activates.
+            app.menu_open = false;
+        }
+        Message::PreferencesClosed => {
+            // No undo: every control in there has already written through to
+            // `Config` and persisted, the same as the tabs it replaces.
+            app.preferences = None;
+        }
+        Message::PreferencesScopeSelected(scope) => {
+            if let Some(state) = &mut app.preferences {
+                // The section is deliberately untouched. The two axes are
+                // independent, and comparing one project against the global
+                // value is the main thing this screen is for -- resetting to
+                // the top of the list on every scope change would undo that.
+                state.scope = scope;
+            }
+        }
+        Message::PreferencesSectionSelected(section) => {
+            if let Some(state) = &mut app.preferences {
+                state.section = section;
+            }
         }
         Message::EnvVarAdded(scope) => {
             if let Some(vars) = env_editor::vars_mut(&mut app.config, scope) {
@@ -3609,6 +3653,22 @@ pub fn view(app: &App) -> iced::Element<'_, Message> {
     }
     if app.menu_open {
         layers = layers.push(shell::menu_layer());
+    }
+    if let Some(state) = app.preferences {
+        // `resolve_scope` here, at render, rather than stored: recomputing it
+        // every frame is the same "recompute, don't cache" discipline
+        // `banner::problems` follows, and it is what makes a project removed
+        // behind this surface take effect immediately.
+        let scope = preferences::resolve_scope(state.scope, &app.config);
+        layers = layers.push(preferences::view(
+            state.section,
+            scope,
+            &app.config,
+            &app.env_value_drafts,
+            &app.index_credential_drafts,
+            &app.uv_custom_path_draft,
+            app.uv_custom_validation.as_ref(),
+        ));
     }
     if let Some(modal) = app.modal {
         layers = layers.push(shell::modal_layer(modal));
@@ -6617,6 +6677,75 @@ mod tests {
             runner.calls()
         );
         assert!(err.contains("pyproject.toml"), "got {err}");
+    }
+
+    #[test]
+    fn the_help_menu_opens_preferences_on_global() {
+        let mut app = App::new(Config {
+            projects: vec![project("api")],
+            ..Config::default()
+        });
+
+        let _ = update(&mut app, Message::MenuToggled, unused_runner());
+        let _ = update(&mut app, Message::PreferencesOpened, unused_runner());
+
+        let state = app.preferences.expect("Preferences must open");
+        assert_eq!(state.scope, preferences::Scope::Global);
+        assert!(
+            !app.menu_open,
+            "the menu must close behind what it opened, as `ModalOpened` does"
+        );
+    }
+
+    #[test]
+    fn switching_scope_keeps_the_section_you_were_reading() {
+        // Scope and section are independent axes. Resetting the section on a
+        // scope change would throw the user back to the top of the list every
+        // time they compared a project against the global value -- which is
+        // the main thing this screen is for.
+        let mut app = App::new(Config {
+            projects: vec![project("api")],
+            ..Config::default()
+        });
+        let id = app.config.projects[0].id;
+
+        let _ = update(&mut app, Message::PreferencesOpened, unused_runner());
+        let _ = update(
+            &mut app,
+            Message::PreferencesSectionSelected(preferences::Section::Python),
+            unused_runner(),
+        );
+        let _ = update(
+            &mut app,
+            Message::PreferencesScopeSelected(preferences::Scope::Project(id)),
+            unused_runner(),
+        );
+
+        let state = app.preferences.expect("still open");
+        assert_eq!(state.scope, preferences::Scope::Project(id));
+        assert_eq!(state.section, preferences::Section::Python);
+    }
+
+    #[test]
+    fn closing_preferences_keeps_every_edit_made_in_it() {
+        // There is no OK/Cancel here: every control writes straight through to
+        // `Config` and persists, the same as the tabs it replaces. Closing is
+        // not an undo, and must never read as one.
+        let mut app = App::new(Config {
+            projects: vec![project("api")],
+            ..Config::default()
+        });
+
+        let _ = update(&mut app, Message::PreferencesOpened, unused_runner());
+        let _ = update(
+            &mut app,
+            Message::SettingsUvSourceChoiceChanged(settings_editor::UvSourceChoice::Bundled),
+            unused_runner(),
+        );
+        let _ = update(&mut app, Message::PreferencesClosed, unused_runner());
+
+        assert!(app.preferences.is_none());
+        assert_eq!(app.config.settings.uv_source, UvSource::Bundled);
     }
 
     #[test]
