@@ -300,18 +300,16 @@ pub fn confirm_view<'a>(confirm: &ConfirmMemberSync) -> iced::Element<'a, Messag
 /// any other path in this application, so it renders in Plex rather than the
 /// checkbox's default prose font. The row sits on a `bark` raised surface,
 /// the same treatment every row in every pane gets.
+///
+/// The "cannot be installed" note is a separate widget rather than a suffix
+/// on the checkbox's own label: appended, it would inherit the checkbox's
+/// Plex, and it is a sentence about the member, not a value to compare.
 fn member_row<'a>(row: &MemberRow, project_index: usize) -> iced::Element<'a, Message> {
     let glyph = theme::state_glyph(state(row));
 
-    let label = display_label(row);
-    let label = if row.name.is_none() {
-        format!("{label} (no [project].name -- cannot be installed)")
-    } else {
-        label
-    };
     let path = row.path.clone();
     let checkbox = iced::widget::checkbox(row.selected)
-        .label(label)
+        .label(display_label(row))
         .font(theme::FONT_DATA)
         .text_size(theme::DATA)
         .on_toggle_maybe(
@@ -320,7 +318,7 @@ fn member_row<'a>(row: &MemberRow, project_index: usize) -> iced::Element<'a, Me
                 .then_some(move |_| Message::MemberToggled(project_index, path.clone())),
         );
 
-    let line = iced::widget::row![
+    let mut line = iced::widget::row![
         iced::widget::text(glyph.glyph.to_string())
             .size(theme::BODY)
             .color(glyph.colour)
@@ -328,6 +326,15 @@ fn member_row<'a>(row: &MemberRow, project_index: usize) -> iced::Element<'a, Me
         checkbox,
     ]
     .spacing(theme::SPACE_1);
+
+    if row.name.is_none() {
+        line = line.push(
+            iced::widget::text("(no [project].name -- cannot be installed)")
+                .font(theme::FONT_PROSE)
+                .size(theme::DATA)
+                .color(theme::SLATE),
+        );
+    }
 
     iced::widget::container(line)
         .padding(theme::SPACE_1)

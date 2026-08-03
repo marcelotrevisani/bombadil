@@ -337,9 +337,10 @@ pub fn unmark_secret(vars: &mut [EnvVar], index: usize) -> bool {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Override {
     pub key: String,
-    /// Via [`display_value`]: `"(secret)"`-shaped text rather than the real
-    /// text when the global itself is marked secret, so an override row can
-    /// never be the leak criterion 4 exists to catch either.
+    /// Via [`display_value`]: a fixed run of dots (see [`SECRET_DOT_COUNT`])
+    /// rather than the real text when the global itself is marked secret, so
+    /// an override row can never be the leak criterion 4 exists to catch
+    /// either.
     pub global_display: String,
 }
 
@@ -436,9 +437,17 @@ pub fn view<'a>(
     drafts: &ValueDrafts,
 ) -> iced::Element<'a, Message> {
     let mut column = iced::widget::column![
-        iced::widget::text("Global variables")
+        // Pane title, then subheads -- the shape `scripts_editor` and
+        // `index_editor` use. "Global variables" was set at `TITLE`, which
+        // made every scope heading compete with the tab bar; `LABEL`/`slate`
+        // is the subhead role in every other pane.
+        iced::widget::text("Env vars")
             .font(theme::FONT_PROSE_SEMIBOLD)
             .size(theme::TITLE),
+        iced::widget::text("Global variables")
+            .font(theme::FONT_PROSE)
+            .size(theme::LABEL)
+            .color(theme::SLATE),
         rows(EnvScope::Global, &config.global_env, drafts),
         iced::widget::button(iced::widget::text("Add global variable"))
             .on_press(Message::EnvVarAdded(EnvScope::Global)),
@@ -450,8 +459,9 @@ pub fn view<'a>(
     {
         column = column.push(
             iced::widget::text("Project variables")
-                .font(theme::FONT_PROSE_SEMIBOLD)
-                .size(theme::TITLE),
+                .font(theme::FONT_PROSE)
+                .size(theme::LABEL)
+                .color(theme::SLATE),
         );
         column = column.push(rows(EnvScope::Project(i), &project.env, drafts));
         column = column.push(

@@ -8,6 +8,7 @@
 
 use crate::app::Message;
 use crate::interpreter;
+use crate::theme;
 use bombadil_core::error::VenvPathError;
 use bombadil_core::model::{Project, Settings, VenvLocation};
 use bombadil_core::uv::results::Interpreter;
@@ -248,6 +249,13 @@ fn venv_outcome_status(draft: &Draft) -> Option<String> {
 /// `resolved` is computed by the caller (`app::view`) so it is recomputed
 /// fresh on every render rather than something `view` would have to know how
 /// to derive.
+///
+/// This is the first screen a new user reaches, so it follows the same rules
+/// as every pane behind it: a semibold `TITLE` heading, the manifest path in
+/// Plex (it is a path), and the name, `requires-python` and resolved venv
+/// path as [`theme::labeled_value`] pairs -- prose label, Plex value -- since
+/// all three are values the user compares character by character. The
+/// interpreter and adopt-or-create lines are sentences, so they stay prose.
 pub fn view<'a>(draft: &Draft, resolved: &str) -> iced::Element<'a, Message> {
     let name = draft
         .name
@@ -267,15 +275,23 @@ pub fn view<'a>(draft: &Draft, resolved: &str) -> iced::Element<'a, Message> {
         iced::widget::button(iced::widget::text("Choose folder..."))
             .on_press(Message::AddProjectPickVenvFolderRequested),
     ]
-    .spacing(8);
+    .spacing(theme::SPACE_2);
 
     let mut column = iced::widget::column![
-        iced::widget::text(draft.pyproject_path.display().to_string()),
-        iced::widget::text(format!("name: {name}")),
-        iced::widget::text(format!("requires-python: {requires_python}")),
-        iced::widget::text(interpreter_status(draft)),
+        iced::widget::text("Add project")
+            .font(theme::FONT_PROSE_SEMIBOLD)
+            .size(theme::TITLE),
+        iced::widget::text(draft.pyproject_path.display().to_string())
+            .font(theme::FONT_DATA)
+            .size(theme::DATA)
+            .color(theme::SLATE),
+        theme::labeled_value("name:", name),
+        theme::labeled_value("requires-python:", requires_python),
+        iced::widget::text(interpreter_status(draft))
+            .size(theme::BODY)
+            .color(theme::SLATE),
     ]
-    .spacing(4);
+    .spacing(theme::SPACE_1);
 
     if needs_install_offer(draft) {
         column = column.push(
@@ -289,14 +305,18 @@ pub fn view<'a>(draft: &Draft, resolved: &str) -> iced::Element<'a, Message> {
             .on_press(Message::AddProjectConfirmed),
         iced::widget::button(iced::widget::text("Cancel")).on_press(Message::AddProjectCancelled),
     ]
-    .spacing(8);
+    .spacing(theme::SPACE_2);
 
     column = column
         .push(venv_row)
-        .push(iced::widget::text(format!("venv: {resolved}")));
+        .push(theme::labeled_value("venv:", resolved.to_string()));
 
     if let Some(outcome) = venv_outcome_status(draft) {
-        column = column.push(iced::widget::text(outcome));
+        column = column.push(
+            iced::widget::text(outcome)
+                .size(theme::BODY)
+                .color(theme::SLATE),
+        );
     }
 
     column.push(actions).into()

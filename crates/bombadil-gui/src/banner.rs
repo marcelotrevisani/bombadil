@@ -19,6 +19,7 @@
 //! message through. The test below guards that invariant rather than
 //! catching a live bug -- see the task report for the fuller reasoning.
 
+use crate::theme;
 use bombadil_core::model::Config;
 use bombadil_core::store::Loaded;
 use bombadil_core::validate::{self, Problem};
@@ -68,15 +69,34 @@ pub fn problems(config: &Config) -> Problems {
 /// in `problems`. Empty `problems` renders nothing -- a banner that showed
 /// unconditionally would train users to ignore it, which is exactly what
 /// criterion 1 (see the task brief) exists to catch.
+///
+/// # Why this is `boot`
+///
+/// `boot` is rationed to "this needs you and nothing else" (see `theme`'s
+/// module doc). A config problem is exactly that, and it passes the ration's
+/// own test: the banner renders *nothing at all* when there is no problem, so
+/// `boot` cannot appear here while everything is fine. It sits on a `bark`
+/// raised surface, the same treatment `drawer::view` gives the status line it
+/// also paints `boot` on failure.
 pub fn view<'a>(problems: &Problems) -> iced::Element<'a, crate::app::Message> {
     if problems.is_empty() {
         return iced::widget::text("").into();
     }
-    let mut list = iced::widget::column![].spacing(2);
+    let mut list = iced::widget::column![].spacing(theme::SPACE_1);
     for problem in problems {
-        list = list.push(iced::widget::text(problem.message.clone()));
+        list = list.push(
+            iced::widget::text(problem.message.clone())
+                .size(theme::BODY)
+                .color(theme::BOOT),
+        );
     }
-    iced::widget::container(list).into()
+    iced::widget::container(list)
+        .padding(theme::SPACE_2)
+        .style(|_theme| iced::widget::container::Style {
+            background: Some(iced::Background::Color(theme::BARK)),
+            ..iced::widget::container::Style::default()
+        })
+        .into()
 }
 
 #[cfg(test)]

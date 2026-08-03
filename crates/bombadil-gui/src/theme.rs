@@ -17,10 +17,18 @@
 //!
 //! `BOOT` appears only where the user must look: a venv that does not exist,
 //! a dependency declared but not installed, a member that syncing will
-//! remove, and the confirm button of a destructive action. If it appears
+//! remove, the confirm button of a destructive action, a failed command's
+//! status in the drawer, and a config problem in the banner. If it appears
 //! anywhere else it stops meaning anything -- the whole system depends on it
 //! staying rare, which is why [`only_the_drifted_state_uses_the_attention_colour`]
 //! is the most important test in this module.
+//!
+//! Every one of those six passes the same test: the thing painted `BOOT`
+//! does not render at all when nothing is wrong. `banner::view` returns an
+//! empty `text` for an empty problem list; `drawer::is_failure` is false for
+//! every non-failure status -- including one carrying a user-chosen project
+//! label, which is the one way user data could otherwise paint `BOOT` on a
+//! healthy sync.
 //!
 //! # The state glyph is the only symbolic vocabulary
 //!
@@ -69,7 +77,10 @@
 //! consumer outside this module: `context_menu::confirm_view`'s "Delete and
 //! recreate" button paints its own text in `INK`, since `PARCHMENT` reads
 //! poorly against `BOOT`'s yellow. Nothing in this module remains unused as
-//! of Task 5.
+//! of Task 5. The branch-review round added [`labeled_value`] (lifted out of
+//! `settings_editor`, now shared with `add_project`) and [`labeled_prose`],
+//! its sibling for a `match` arm whose value is words rather than a value to
+//! compare -- the prose/Plex split is a type decision, so both live here.
 
 use iced::font::Weight;
 use iced::{Color, Font, Theme, color};
@@ -193,6 +204,52 @@ pub const ATKINSON_REGULAR: &[u8] = include_bytes!("../fonts/AtkinsonHyperlegibl
 pub const ATKINSON_SEMIBOLD: &[u8] =
     include_bytes!("../fonts/AtkinsonHyperlegibleNext-SemiBold.ttf");
 pub const PLEX_MONO_REGULAR: &[u8] = include_bytes!("../fonts/IBMPlexMono-Regular.ttf");
+
+// ---------------------------------------------------------------------------
+// Typographic compounds
+// ---------------------------------------------------------------------------
+
+/// A prose label followed by a mono value -- the crate's one shape for
+/// "`name:` *value*". It lives here rather than in any one pane because the
+/// prose/Plex split it encodes is a type decision and this module owns those;
+/// `settings_editor` and `add_project` both render it.
+///
+/// Generic over the message type only so this module keeps knowing nothing
+/// about `app::Message`; both callers instantiate it with that one type.
+pub fn labeled_value<'a, Message: 'a>(
+    label: &'static str,
+    value: String,
+) -> iced::Element<'a, Message> {
+    iced::widget::row![
+        iced::widget::text(label).size(BODY).color(SLATE),
+        iced::widget::text(value)
+            .font(FONT_DATA)
+            .size(DATA)
+            .color(SLATE),
+    ]
+    .spacing(SPACE_1)
+    .into()
+}
+
+/// [`labeled_value`]'s sibling for a value that is *words*, not a value the
+/// user compares character by character: "auto", "from PATH", "alongside each
+/// project". The whole prose/Plex split is meaningless if a face is chosen by
+/// the variable's name rather than by what the branch actually put in it, so
+/// a `match` whose arms mix a path with a phrase must pick per arm.
+pub fn labeled_prose<'a, Message: 'a>(
+    label: &'static str,
+    value: &'static str,
+) -> iced::Element<'a, Message> {
+    iced::widget::row![
+        iced::widget::text(label).size(BODY).color(SLATE),
+        iced::widget::text(value)
+            .font(FONT_PROSE)
+            .size(BODY)
+            .color(SLATE),
+    ]
+    .spacing(SPACE_1)
+    .into()
+}
 
 // ---------------------------------------------------------------------------
 // The state glyph

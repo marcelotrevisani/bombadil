@@ -146,27 +146,6 @@ fn uv_source_button<'a>(
         .into()
 }
 
-/// One label/value pair: a prose label in `slate`, and a value in Plex --
-/// also `slate`, since every use here is secondary "here is the current
-/// state" text rather than the tab's own primary content. Shared by every
-/// "current: ..." readout below so the split between the words and the
-/// value they describe (a source name, a path) is made the same way each
-/// time, per the plan's own rule that keys, values and paths are Plex while
-/// the prose around them is Atkinson.
-fn labeled_value<'a>(label: &'static str, value: String) -> iced::Element<'a, Message> {
-    iced::widget::row![
-        iced::widget::text(label)
-            .size(theme::BODY)
-            .color(theme::SLATE),
-        iced::widget::text(value)
-            .font(theme::FONT_DATA)
-            .size(theme::DATA)
-            .color(theme::SLATE),
-    ]
-    .spacing(theme::SPACE_1)
-    .into()
-}
-
 /// Renders the whole tab.
 pub fn view<'a>(
     settings: &Settings,
@@ -182,11 +161,15 @@ pub fn view<'a>(
     ]
     .spacing(theme::SPACE_1);
 
-    let current_source_value = match &settings.uv_source {
-        UvSource::Auto => "auto".to_string(),
-        UvSource::Bundled => "bundled".to_string(),
-        UvSource::FromPath => "from PATH".to_string(),
-        UvSource::Custom { path } => path.display().to_string(),
+    // Three of these four are words and one is a path, so the face is picked
+    // per arm rather than after the join -- see `theme::labeled_prose`.
+    let current_source: iced::Element<'a, Message> = match &settings.uv_source {
+        UvSource::Auto => theme::labeled_prose("current uv source:", "auto"),
+        UvSource::Bundled => theme::labeled_prose("current uv source:", "bundled"),
+        UvSource::FromPath => theme::labeled_prose("current uv source:", "from PATH"),
+        UvSource::Custom { path } => {
+            theme::labeled_value("current uv source:", path.display().to_string())
+        }
     };
 
     let custom_path_input = iced::widget::text_input("path to a uv binary", uv_custom_path_draft)
@@ -207,7 +190,7 @@ pub fn view<'a>(
             .font(theme::FONT_PROSE)
             .size(theme::LABEL)
             .color(theme::SLATE),
-        labeled_value("current uv source:", current_source_value),
+        current_source,
         uv_source_buttons,
         iced::widget::row![custom_path_input, validate_button].spacing(theme::SPACE_2),
     ]
@@ -215,7 +198,7 @@ pub fn view<'a>(
 
     if let Some(validation) = uv_custom_validation {
         let row: iced::Element<'a, Message> = match validation {
-            Ok(version) => labeled_value("validated: uv", version.clone()),
+            Ok(version) => theme::labeled_value("validated: uv", version.clone()),
             Err(message) => iced::widget::text(format!("could not use this uv: {message}"))
                 .size(theme::BODY)
                 .into(),
@@ -223,9 +206,16 @@ pub fn view<'a>(
         column = column.push(row);
     }
 
-    let default_venv_value = match &settings.default_venv_location {
-        DefaultVenvLocation::Alongside => "alongside each project (<project>/.venv)".to_string(),
-        DefaultVenvLocation::Central { path } => path.display().to_string(),
+    // Same per-arm face choice as `current_source` above: a sentence in one
+    // arm, a path in the other.
+    let default_venv: iced::Element<'a, Message> = match &settings.default_venv_location {
+        DefaultVenvLocation::Alongside => theme::labeled_prose(
+            "current default:",
+            "alongside each project (<project>/.venv)",
+        ),
+        DefaultVenvLocation::Central { path } => {
+            theme::labeled_value("current default:", path.display().to_string())
+        }
     };
     let alongside_button = iced::widget::button(iced::widget::text("alongside each project"))
         .on_press_maybe(
@@ -246,7 +236,7 @@ pub fn view<'a>(
                 .size(theme::LABEL)
                 .color(theme::SLATE),
         )
-        .push(labeled_value("current default:", default_venv_value))
+        .push(default_venv)
         .push(iced::widget::row![alongside_button, choose_folder_button].spacing(theme::SPACE_2));
 
     for (label, resolved) in resolved_default_venv_paths(projects, settings) {

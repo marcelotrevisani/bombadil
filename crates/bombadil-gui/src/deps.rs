@@ -475,20 +475,28 @@ pub fn view<'a>(fetched: &Result<DepsTab, String>) -> iced::Element<'a, crate::a
                 && let Some(id) = find_id_by_name(graph, &row.name)
             {
                 for dep in transitive_dependencies(graph, id) {
+                    // Wrapped in the same `padding(SPACE_1)` container
+                    // `dep_row` uses (minus its `bark` fill -- a transitive
+                    // row is not a surface of its own). Without it the tree
+                    // sat 4pt to the left of the row it belongs to, which
+                    // reads as a different column rather than as a child.
                     rows = rows.push(
-                        iced::widget::row![
-                            iced::widget::Space::new().width(theme::GLYPH_COLUMN_WIDTH),
-                            iced::widget::text(format!("\u{2514} {}", dep.name))
-                                .font(theme::FONT_DATA)
-                                .size(theme::LABEL)
-                                .color(theme::SLATE)
-                                .width(theme::DEP_NAME_COLUMN_WIDTH),
-                            iced::widget::text(dep.version.clone())
-                                .font(theme::FONT_DATA)
-                                .size(theme::LABEL)
-                                .color(theme::SLATE),
-                        ]
-                        .spacing(theme::SPACE_1),
+                        iced::widget::container(
+                            iced::widget::row![
+                                iced::widget::Space::new().width(theme::GLYPH_COLUMN_WIDTH),
+                                iced::widget::text(format!("\u{2514} {}", dep.name))
+                                    .font(theme::FONT_DATA)
+                                    .size(theme::LABEL)
+                                    .color(theme::SLATE)
+                                    .width(theme::DEP_NAME_COLUMN_WIDTH),
+                                iced::widget::text(dep.version.clone())
+                                    .font(theme::FONT_DATA)
+                                    .size(theme::LABEL)
+                                    .color(theme::SLATE),
+                            ]
+                            .spacing(theme::SPACE_1),
+                        )
+                        .padding(theme::SPACE_1),
                     );
                 }
             }
