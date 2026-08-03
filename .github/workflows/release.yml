@@ -1,0 +1,177 @@
+name: Release
+
+# Publishing is irreversible: crates.io does not allow a version to be deleted
+# or replaced, only yanked -- and a yanked version is still downloadable by
+# anything that already has it in a lock file. So every gate below runs before
+# a single crate is uploaded, and the whole thing can be rehearsed end to end
+# with `dry_run`.
+on:
+  push:
+    tags: ["v*.*.*"]
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Package and verify everything, upload nothing"
+        type: boolean
+        default: true
+
+permissions:
+  contents: write # Creating the GitHub release.
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # The tag says one version and Cargo.toml says another is the mistake this
+  # exists to catch, because it is silent: the release notes would say v0.2.0
+  # while crates.io received 0.1.0, and neither can be taken back.
+  version:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.read.outputs.version }}
+    steps:
+      - uses: actions/checkout@v7
+      - id: read
+        name: Tag and workspace version must agree
+        run: |
+          set -euo pipefail
+          manifest=$(grep -m1 '^version = ' Cargo.toml | cut -d'"' -f2)
+          echo "version=$manifest" >> "$GITHUB_OUTPUT"
+          echo "workspace version: $manifest"
+          if [ "${{ github.event_name }}" = "push" ]; then
+            tag="${GITHUB_REF_NAME#v}"
+            echo "tag version:       $tag"
+            if [ "$tag" != "$manifest" ]; then
+              echo "::error::tag v$tag does not match the workspace version $manifest"
+              exit 1
+            fi
+          fi
+
+  # The full CI set, re-run against the exact commit being released rather
+  # than trusted from whenever it last ran on main. A release is the one place
+  # where "it was green yesterday" is not good enough.
+  verify:
+    needs: version
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Install GUI system dependencies
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libxkbcommon-dev libwayland-dev
+      - name: Format
+        run: cargo fmt --all --check
+      - name: Clippy
+        run: cargo clippy --all-targets --all-features --locked -- -D warnings
+      - name: Test
+        run: cargo test --workspace --locked
+
+  deny:
+    needs: version
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check
+
+  # Builds each crate exactly as crates.io will receive it -- from the packaged
+  # tarball, not the working tree. This is what catches a file the crate reads
+  # but does not ship: `include_bytes!` reaching outside the crate root
+  # packages cleanly and then fails to compile for whoever installs it.
+  #
+  # `bombadil-gui` cannot be verified this way until `bombadil-core` exists on
+  # crates.io, because packaging resolves its dependencies against the real
+  # index. `--no-verify` for that one, with `--list` proving its assets are in
+  # the tarball, which is the half that would otherwise go unchecked.
+  package:
+    needs: version
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install GUI system dependencies
+        run: sudo apt-get update && sudo apt-get install -y libxkbcommon-dev libwayland-dev
+      - name: Package the library crates, building each from its tarball
+        run: |
+          cargo package -p bombadil-core --locked
+          cargo package -p bombadil-uv-bin --locked
+      - name: The GUI tarball must contain the files the binary embeds
+        run: |
+          set -euo pipefail
+          files=$(cargo package -p bombadil-gui --locked --no-verify --list)
+          echo "$files"
+          for required in assets/icon-64.rgba fonts/IBMPlexMono-Regular.ttf; do
+            if ! grep -qx "$required" <<<"$files"; then
+              echo "::error::$required is embedded by the binary but missing from the package"
+              exit 1
+            fi
+          done
+
+  # One job, sequential, because the order is a dependency order: crates.io
+  # rejects a crate whose dependencies it does not have yet. `cargo publish`
+  # already waits for each upload to appear in the index before returning, so
+  # the next one finds what it needs.
+  publish:
+    needs: [version, verify, deny, package]
+    if: github.event_name == 'push' || !inputs.dry_run
+    runs-on: ubuntu-latest
+    # The token lives on this environment, not on the repository, so nothing
+    # outside a run that reaches this job can read it.
+    environment: crates_deploy
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install GUI system dependencies
+        run: sudo apt-get update && sudo apt-get install -y libxkbcommon-dev libwayland-dev
+      - name: Publish, in dependency order
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.RELEASE_TOKEN }}
+          # Through the environment rather than interpolated into the script.
+          # This one is read out of our own Cargo.toml so it is not attacker
+          # controlled, but a `${{ }}` inside `run:` is textual substitution --
+          # the habit is what keeps the next one, from a less trustworthy
+          # source, from becoming a shell injection.
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          for crate in bombadil-core bombadil-uv-bin bombadil-gui; do
+            echo "::group::$crate"
+            # An already-published version is not a failure worth stopping on:
+            # it means an earlier attempt got this far, and the run should be
+            # able to finish the crates that did not make it.
+            if cargo publish -p "$crate" --locked; then
+              echo "$crate published"
+            elif cargo search "$crate" --limit 1 | grep -qF "$crate = \"$VERSION\""; then
+              echo "$crate $VERSION was already on crates.io -- continuing"
+            else
+              echo "::error::publishing $crate failed"
+              exit 1
+            fi
+            echo "::endgroup::"
+          done
+
+  release:
+    needs: [version, publish]
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Create the GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            --title "Bombadil $GITHUB_REF_NAME" \
+            --generate-notes \
+            --notes "Published to crates.io: \`bombadil-core\`, \`bombadil-uv-bin\`, \`bombadil-gui\` $VERSION."

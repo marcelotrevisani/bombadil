@@ -141,6 +141,26 @@ which is why it is set both ways.
 
 Specs and implementation plans live in `docs/superpowers/`.
 
+### Releasing
+
+Publishing is irreversible — crates.io versions can be yanked but never
+replaced, and a yanked version still resolves for anything that already has it
+in a lock file. So the pipeline gates everything before it uploads anything, and
+can be rehearsed:
+
+1. Run **Release** from the Actions tab with `dry_run` left on. It packages and
+   verifies all three crates and uploads nothing.
+2. Bump `version` in the workspace `Cargo.toml`, commit, and tag it `vX.Y.Z`.
+   The tag and the manifest must agree — the pipeline refuses otherwise, because
+   a mismatch is silent and neither half can be taken back.
+3. Push the tag. It re-runs the full CI set against that exact commit, builds
+   each crate from its own packaged tarball, then publishes
+   `bombadil-core` → `bombadil-uv-bin` → `bombadil-gui` in dependency order and
+   opens a GitHub release.
+
+The crates.io token is `RELEASE_TOKEN` on the `crates_deploy` environment, so
+nothing outside the publish job can read it.
+
 ## Crates
 
 | Crate | What it is |

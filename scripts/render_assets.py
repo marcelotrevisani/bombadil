@@ -8,6 +8,9 @@ editing either SVG.
 
 `icon-64.rgba` is raw sRGB RGBA, the shape `iced::window::icon::from_rgba`
 takes -- shipping it decoded is what keeps an image decoder out of the binary.
+It is written into the GUI crate, not here: `cargo package` only takes files
+under the crate root, so an asset outside it packages cleanly and then fails to
+compile for whoever installs the published crate.
 
 The banner sets its own text in the application's own two typefaces, which are
 in the repo but not installed on any particular machine. Rather than ask a
@@ -128,7 +131,8 @@ def main() -> None:
     expected = RGBA_SIDE * RGBA_SIDE * 4
     assert (width, height) == (RGBA_SIDE, RGBA_SIDE), (width, height)
     assert len(rgba) == expected, f"{len(rgba)} bytes, expected {expected}"
-    target = ASSETS / "icon-64.rgba"
+    target = ROOT / "crates" / "bombadil-gui" / "assets" / "icon-64.rgba"
+    target.parent.mkdir(parents=True, exist_ok=True)
     target.write_bytes(rgba)
     print(f"wrote {target.relative_to(ROOT)} ({len(rgba)} bytes)")
 
