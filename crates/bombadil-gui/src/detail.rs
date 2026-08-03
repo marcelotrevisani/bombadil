@@ -11,6 +11,7 @@
 //! accidentally remove.
 
 use crate::app::Message;
+use crate::theme;
 use bombadil_core::model::Project;
 use std::path::{Path, PathBuf};
 
@@ -67,30 +68,72 @@ fn project_dir(project: &Project) -> PathBuf {
 }
 
 /// Renders the header. Deliberately dumb: all the logic worth testing lives
-/// in `header`. The Sync button is unconditional -- it does not read
-/// `venv_status` at all.
+/// in `header` -- this crate's convention is that `view` itself carries no
+/// test, since it returns an opaque `Element` no test can drive. The Sync
+/// button is unconditional -- it does not read `venv_status` to decide
+/// whether to render at all.
+///
+/// Two rows, both right-anchored: the project label (prose, `DISPLAY` --
+/// the largest thing on screen) sits across from the Python version, and
+/// the path beneath it sits across from Sync. The project label and Sync's
+/// own label are the only words here, so both stay in the prose face at
+/// their default colour; the path and the version are read character by
+/// character, so both are Plex at `DATA` in `slate` -- the same rule
+/// `sidebar` already applies to a project's path and version, held here too.
+///
+/// Sync gets no explicit style: an unstyled button already renders with
+/// `theme::JACKET` as its background, because `theme::theme` builds the
+/// application's palette with `primary: JACKET` and iced's default button
+/// style paints from the theme's primary colour. That is what makes Sync
+/// "the primary action in jacket" -- there is nothing here to style.
 ///
 /// `index` is the project's position in `App::config.projects`, carried into
 /// `Message::SyncRequested` so one message shape serves this button and the
 /// context menu's Sync entry -- see that message's own doc for why resolving
 /// against the selection instead is a bug.
 pub fn view<'a>(header: &Header, index: usize) -> iced::Element<'a, Message> {
-    let status = match header.venv_status {
-        VenvStatus::Present => match &header.python_version {
-            Some(version) => format!("Python {version}"),
-            None => "environment ready".to_string(),
-        },
-        VenvStatus::Absent => "no environment".to_string(),
+    // How a missing version renders is a decision, but it stays inline here
+    // rather than becoming a tested function, matching `sidebar::view`'s own
+    // precedent for the identical choice (its version line, Some vs the
+    // words "no env"): both are a single match producing an `Element`, not
+    // a mapping to a domain state, so there is nothing here for a mutation
+    // test to prove that `header`'s own tests do not already cover.
+    let version: iced::Element<'_, Message> = match (header.venv_status, &header.python_version) {
+        (VenvStatus::Present, Some(version)) => iced::widget::text(version.clone())
+            .font(theme::FONT_DATA)
+            .size(theme::DATA)
+            .into(),
+        (VenvStatus::Present, None) => iced::widget::text("environment ready")
+            .size(theme::DATA)
+            .color(theme::SLATE)
+            .into(),
+        (VenvStatus::Absent, _) => iced::widget::text("no environment")
+            .size(theme::DATA)
+            .color(theme::SLATE)
+            .into(),
     };
 
-    iced::widget::column![
-        iced::widget::text(header.label.clone()).size(20),
-        iced::widget::text(header.path.display().to_string()),
-        iced::widget::text(status),
-        iced::widget::button(iced::widget::text("Sync")).on_press(Message::SyncRequested(index)),
-    ]
-    .spacing(4)
-    .into()
+    let title_row = iced::widget::row![
+        iced::widget::text(header.label.clone()).size(theme::DISPLAY),
+        iced::widget::Space::new().width(iced::Length::Fill),
+        version,
+    ];
+
+    let sync =
+        iced::widget::button(iced::widget::text("Sync")).on_press(Message::SyncRequested(index));
+
+    let path_row = iced::widget::row![
+        iced::widget::text(header.path.display().to_string())
+            .font(theme::FONT_DATA)
+            .size(theme::DATA)
+            .color(theme::SLATE),
+        iced::widget::Space::new().width(iced::Length::Fill),
+        sync,
+    ];
+
+    iced::widget::column![title_row, path_row]
+        .spacing(theme::SPACE_2)
+        .into()
 }
 
 #[cfg(test)]

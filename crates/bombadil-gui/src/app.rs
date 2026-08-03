@@ -12,6 +12,7 @@ use crate::members_editor;
 use crate::scripts_editor;
 use crate::settings_editor;
 use crate::sidebar;
+use crate::theme;
 use bombadil_core::envspec::{self, EnvInputs};
 use bombadil_core::model::{
     Config, DefaultVenvLocation, Project, Settings, TerminalChoice, UvSource,
@@ -271,10 +272,19 @@ pub enum Message {
     ProjectSelected(usize),
     /// A tab in the detail area's selector was pressed (spec §8).
     TabSelected(Tab),
-    /// A background venv probe finished for `projects[usize]`. Carries the
+    /// A background venv probe finished for `projects[index]`. Carries the
     /// Python version on success; `None` covers "no venv", a probe that
     /// timed out, and a probe that failed -- all three degrade to hollow.
-    VenvProbed(usize, Option<String>),
+    /// Also carries `requires-python`, re-read from the manifest alongside
+    /// the venv probe (see `probe_venv_and_requirement`) so the sidebar can
+    /// tell a healthy venv from a drifted one via `sidebar::state`; `None`
+    /// there covers both "no requirement" and "could not be read", the same
+    /// permissive fallback `interpreter::version_satisfies` already applies.
+    VenvProbed {
+        index: usize,
+        python_version: Option<String>,
+        requires_python: Option<String>,
+    },
     /// The background fetch for the Dependencies tab finished for
     /// `projects[usize]` -- criterion 5: dispatched through `job::run`,
     /// never run inline, because `uv tree` on a large project is slow.
@@ -695,9 +705,15 @@ fn probe_every_venv(app: &App) -> Task<Message> {
             .enumerate()
             .filter_map(|(i, project)| {
                 let path = venv_path::resolve(project, &app.config.settings).ok()?;
-                Some(Task::perform(probe_venv(path), move |version| {
-                    Message::VenvProbed(i, version)
-                }))
+                let pyproject_path = project.pyproject_path.clone();
+                Some(Task::perform(
+                    probe_venv_and_requirement(path, pyproject_path),
+                    move |(python_version, requires_python)| Message::VenvProbed {
+                        index: i,
+                        python_version,
+                        requires_python,
+                    },
+                ))
             })
             .collect::<Vec<_>>(),
     )
@@ -710,6 +726,38 @@ async fn probe_venv(path: PathBuf) -> Option<String> {
     match job::run(move || venv_path::probe(&path), VENV_PROBE_TIMEOUT).await {
         job::JobResult::Done(version) => version,
         job::JobResult::TimedOut | job::JobResult::Failed => None,
+    }
+}
+
+/// Runs the venv probe and a `requires-python` re-read together, off the
+/// render thread, for the sidebar's drift check (`sidebar::state`). Not
+/// folded into `probe_venv` itself: that function is also reused by the
+/// add-project dialog's adopt-or-create probe (`probe_venv_outcome`), which
+/// has no project manifest in play at all, so bundling a pyproject read into
+/// it would give that call site a read it never asked for.
+///
+/// One `job::run` call rather than two: both reads are the same shape of
+/// small local file `VENV_PROBE_TIMEOUT` already covers -- see that
+/// constant's own doc. A read failure on either side (missing file,
+/// unparseable manifest) degrades to `None`, same as `probe_venv`.
+async fn probe_venv_and_requirement(
+    venv_path: PathBuf,
+    pyproject_path: PathBuf,
+) -> (Option<String>, Option<String>) {
+    match job::run(
+        move || {
+            let python_version = venv_path::probe(&venv_path);
+            let requires_python = bombadil_core::pyproject::load(&pyproject_path)
+                .ok()
+                .and_then(|p| p.requires_python);
+            (python_version, requires_python)
+        },
+        VENV_PROBE_TIMEOUT,
+    )
+    .await
+    {
+        job::JobResult::Done(result) => result,
+        job::JobResult::TimedOut | job::JobResult::Failed => (None, None),
     }
 }
 
@@ -969,12 +1017,17 @@ pub fn update(app: &mut App, message: Message, runner: Arc<dyn CommandRunner>) -
         Message::TabSelected(tab) => {
             app.tab = tab;
         }
-        Message::VenvProbed(i, version) if i < app.entries.len() => {
-            app.entries[i].venv_exists = version.is_some();
-            app.entries[i].python_version = version;
+        Message::VenvProbed {
+            index,
+            python_version,
+            requires_python,
+        } if index < app.entries.len() => {
+            app.entries[index].venv_exists = python_version.is_some();
+            app.entries[index].python_version = python_version;
+            app.entries[index].requires_python = requires_python;
         }
         // A stale probe result for a project that no longer exists.
-        Message::VenvProbed(_, _) => {}
+        Message::VenvProbed { .. } => {}
         Message::DepsLoaded(i, fetch) if i < app.config.projects.len() => {
             // The failure is kept, not flattened into an empty tab: `deps::view`
             // renders it as the reason it is, which is the one thing an empty
@@ -1164,6 +1217,11 @@ pub fn update(app: &mut App, message: Message, runner: Arc<dyn CommandRunner>) -
                     label: project.label.clone(),
                     venv_exists: false,
                     python_version: None,
+                    // Free: the dialog already parsed the manifest into
+                    // `draft`, so there is no read to wait on here the way
+                    // `probe_every_venv` needs one for a project loaded from
+                    // config with no draft behind it.
+                    requires_python: draft.requires_python.clone(),
                 });
                 let index = app.config.projects.len() - 1;
                 app.selected = Some(index);
@@ -1217,9 +1275,15 @@ pub fn update(app: &mut App, message: Message, runner: Arc<dyn CommandRunner>) -
             if let Some(project) = app.config.projects.get(index).cloned()
                 && let Ok(path) = venv_path::resolve(&project, &app.config.settings)
             {
-                return Task::perform(probe_venv(path), move |version| {
-                    Message::VenvProbed(index, version)
-                });
+                let pyproject_path = project.pyproject_path.clone();
+                return Task::perform(
+                    probe_venv_and_requirement(path, pyproject_path),
+                    move |(python_version, requires_python)| Message::VenvProbed {
+                        index,
+                        python_version,
+                        requires_python,
+                    },
+                );
             }
         }
         // A stale index can arrive the same way `ProjectSelected`'s can.
@@ -3046,16 +3110,70 @@ pub fn view(app: &App) -> iced::Element<'_, Message> {
     // same "no press needed, no press possible" treatment `index_editor`'s
     // auth buttons and `scripts_editor`'s move buttons give a control whose
     // action is already the state.
-    let mut tab_bar = iced::widget::row![].spacing(4);
+    //
+    // A single row of words; the selected one in `parchment` with a
+    // `jacket` underline beneath it, the rest in `slate` -- no boxes, no
+    // pills, no background fill. Each button is styled with no background
+    // and no border to strip the default button chrome down to bare text;
+    // the underline is a `Fill`-width `container` holding fixed-height
+    // `Space`, coloured `jacket` only when selected. That indicator is
+    // deliberately the tab bar's only affordance, consistent with the state
+    // glyph column being the application's one symbolic vocabulary (see
+    // `theme`'s module doc).
+    //
+    // The column MUST be built with `Column::from_vec`, not `column![]`.
+    // `column![]` goes through `Column::push`, which calls
+    // `Length::enclose` on each child's `size_hint` -- and the underline's
+    // hint is `Fill` (`Container::new` derives its width from its content
+    // via `Length::fluid`), so `push` would promote the whole column to
+    // `Fill`. A `Fill` column inside this `Fill` row makes iced's flex third
+    // pass hand every tab an equal share of the bar's full width, and the
+    // underline then spans that share instead of its label: measured at
+    // 256pt under an 800pt bar for an 80pt label. `from_vec` deliberately
+    // skips `enclose`, so the column stays `Shrink`, the row stays `Shrink`,
+    // and the cross-axis pass sizes the underline to the label -- measured
+    // at exactly the label's 80pt.
+
+    let mut tab_bar = iced::widget::row![].spacing(theme::SPACE_3);
     for tab in Tab::ALL {
+        let is_selected = tab == app.tab;
+        let text_color = if is_selected {
+            theme::PARCHMENT
+        } else {
+            theme::SLATE
+        };
+
+        let label = iced::widget::button(iced::widget::text(tab.label()).size(theme::TITLE))
+            .on_press_maybe((!is_selected).then_some(Message::TabSelected(tab)))
+            .style(move |_theme, _status| iced::widget::button::Style {
+                background: None,
+                text_color,
+                ..iced::widget::button::Style::default()
+            });
+
+        let underline = iced::widget::container(
+            iced::widget::Space::new()
+                .width(iced::Length::Fill)
+                .height(theme::TAB_UNDERLINE),
+        )
+        .width(iced::Length::Fill)
+        .style(move |_theme| {
+            let style = iced::widget::container::Style::default();
+            if is_selected {
+                style.background(theme::JACKET)
+            } else {
+                style
+            }
+        });
+
         tab_bar = tab_bar.push(
-            iced::widget::button(iced::widget::text(tab.label()))
-                .on_press_maybe((tab != app.tab).then_some(Message::TabSelected(tab))),
+            iced::widget::Column::from_vec(vec![label.into(), underline.into()])
+                .spacing(theme::SPACE_1),
         );
     }
 
-    let detail_and_drawer =
-        iced::widget::column![detail, tab_bar, pane, drawer::view(&app.drawer)].spacing(8);
+    let detail_and_drawer = iced::widget::column![detail, tab_bar, pane, drawer::view(&app.drawer)]
+        .spacing(theme::SPACE_4);
 
     let add_project_button = iced::widget::button(iced::widget::text("Add project"))
         .on_press(Message::AddProjectPickManifestRequested);
@@ -3063,11 +3181,11 @@ pub fn view(app: &App) -> iced::Element<'_, Message> {
         add_project_button,
         sidebar::view(&app.entries, app.selected)
     ]
-    .spacing(8);
+    .spacing(theme::SPACE_2);
 
     let body = iced::widget::row![
-        iced::widget::container(sidebar_and_controls).width(240),
-        iced::widget::container(detail_and_drawer).padding(12),
+        iced::widget::container(sidebar_and_controls).width(theme::SIDEBAR_WIDTH),
+        iced::widget::container(detail_and_drawer).padding(theme::SPACE_3),
     ];
 
     // Recomputed fresh on every render from `app.add_project`'s current

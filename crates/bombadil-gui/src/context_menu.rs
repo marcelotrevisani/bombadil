@@ -18,6 +18,7 @@
 //! `Message::RecreateVenvConfirmed` reaches the delete.
 
 use crate::app::Message;
+use crate::theme;
 use bombadil_core::model::TerminalChoice;
 use bombadil_core::terminal::{ActivationSupport, TerminalKind};
 use std::path::{Path, PathBuf};
@@ -169,14 +170,36 @@ pub fn recreate_confirmation(label: &str, venv_path: &Path) -> String {
 
 /// Renders the pending Recreate venv confirmation. Deliberately dumb, like
 /// `view`: the sentence worth testing is `recreate_confirmation`'s.
+///
+/// The confirmation sentence is one prose block, not split into a mono span
+/// for the venv path -- splitting it would mean `view` re-deriving the path's
+/// position in the sentence independently of the string
+/// `recreate_confirmation` returns and this module's own tests prove, which
+/// is exactly the "two derivations that could drift" risk `ConfirmRecreate`'s
+/// own doc warns against for `venv_path` itself.
+///
+/// Recreate venv is the only action in the application that destroys a
+/// user's work (`venv_path::delete`'s only call site is
+/// `Message::RecreateVenvConfirmed`, gated on this confirmation), so its
+/// confirm button is the only control anywhere styled with `boot`. `INK`
+/// text on it, not the usual `PARCHMENT`, because `boot`'s yellow is far
+/// too light for `PARCHMENT` to read against. Cancel gets no style of its
+/// own -- an unstyled button already paints from the theme's primary colour
+/// (`jacket`), the same reasoning `detail::view` gives for the Sync button.
 pub fn confirm_view<'a>(confirm: &ConfirmRecreate) -> iced::Element<'a, Message> {
     iced::widget::column![
-        iced::widget::text(recreate_confirmation(&confirm.label, &confirm.venv_path)),
+        iced::widget::text(recreate_confirmation(&confirm.label, &confirm.venv_path))
+            .size(theme::BODY),
         iced::widget::button(iced::widget::text("Delete and recreate"))
-            .on_press(Message::RecreateVenvConfirmed),
+            .on_press(Message::RecreateVenvConfirmed)
+            .style(|_theme, _status| iced::widget::button::Style {
+                background: Some(iced::Background::Color(theme::BOOT)),
+                text_color: theme::INK,
+                ..iced::widget::button::Style::default()
+            }),
         iced::widget::button(iced::widget::text("Cancel")).on_press(Message::RecreateVenvCancelled),
     ]
-    .spacing(8)
+    .spacing(theme::SPACE_2)
     .into()
 }
 
@@ -187,7 +210,8 @@ pub fn view<'a>(
     default: Option<&TerminalChoice>,
 ) -> iced::Element<'a, Message> {
     let index = menu.project_index;
-    let mut column = iced::widget::column![iced::widget::text("Open terminal")].spacing(4);
+    let mut column = iced::widget::column![iced::widget::text("Open terminal").size(theme::BODY)]
+        .spacing(theme::SPACE_1);
 
     for option in submenu(menu.terminals.clone(), default) {
         match option {

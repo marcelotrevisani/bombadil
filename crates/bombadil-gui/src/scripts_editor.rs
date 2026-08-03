@@ -25,6 +25,7 @@
 //! in `view` happen to read in the right order.
 
 use crate::app::Message;
+use crate::theme;
 use bombadil_core::model::{Config, Script};
 use std::path::PathBuf;
 
@@ -108,11 +109,18 @@ pub const ORDER_NOTE: &str = "Global scripts run first, in the order shown; proj
 
 /// Renders one scope's rows. Deliberately dumb, like every other `view` in
 /// this crate: all the logic worth testing lives in the functions above.
+///
+/// A script's path is data -- read character by character, the same as any
+/// other path in this application -- so it renders in Plex; "enabled" and the
+/// buttons are prose. Each row sits on a `bark` surface, the same treatment
+/// every row in every pane gets.
 fn rows<'a>(scope: ScriptScope, scripts: &[Script]) -> iced::Element<'a, Message> {
-    let mut column = iced::widget::column![].spacing(4);
+    let mut column = iced::widget::column![].spacing(theme::SPACE_2);
     let last_index = scripts.len().saturating_sub(1);
     for (index, script) in scripts.iter().enumerate() {
-        let path_text = iced::widget::text(script.path.display().to_string());
+        let path_text = iced::widget::text(script.path.display().to_string())
+            .font(theme::FONT_DATA)
+            .size(theme::DATA);
 
         let enabled_toggle = iced::widget::checkbox(script.enabled)
             .label("enabled")
@@ -127,16 +135,21 @@ fn rows<'a>(scope: ScriptScope, scripts: &[Script]) -> iced::Element<'a, Message
         let remove = iced::widget::button(iced::widget::text("remove"))
             .on_press(Message::ScriptRemoved(scope, index));
 
-        column = column.push(
-            iced::widget::row![
-                path_text,
-                enabled_toggle,
-                move_up_button,
-                move_down_button,
-                remove
-            ]
-            .spacing(6),
-        );
+        let row = iced::widget::row![
+            path_text,
+            enabled_toggle,
+            move_up_button,
+            move_down_button,
+            remove
+        ]
+        .spacing(theme::SPACE_2);
+
+        column = column.push(iced::widget::container(row).padding(theme::SPACE_1).style(
+            |_theme| iced::widget::container::Style {
+                background: Some(iced::Background::Color(theme::BARK)),
+                ..iced::widget::container::Style::default()
+            },
+        ));
     }
     column.into()
 }
@@ -145,19 +158,31 @@ fn rows<'a>(scope: ScriptScope, scripts: &[Script]) -> iced::Element<'a, Message
 /// project is selected -- that project's own scripts, which run after them.
 pub fn view<'a>(config: &Config, selected_project: Option<usize>) -> iced::Element<'a, Message> {
     let mut column = iced::widget::column![
-        iced::widget::text("Scripts").size(16),
-        iced::widget::text(ORDER_NOTE),
-        iced::widget::text("Global (runs first)").size(14),
+        iced::widget::text("Scripts")
+            .font(theme::FONT_PROSE_SEMIBOLD)
+            .size(theme::TITLE),
+        iced::widget::text(ORDER_NOTE)
+            .size(theme::BODY)
+            .color(theme::SLATE),
+        iced::widget::text("Global (runs first)")
+            .font(theme::FONT_PROSE)
+            .size(theme::LABEL)
+            .color(theme::SLATE),
         rows(ScriptScope::Global, &config.global_scripts),
         iced::widget::button(iced::widget::text("Add global script"))
             .on_press(Message::ScriptAddRequested(ScriptScope::Global)),
     ]
-    .spacing(8);
+    .spacing(theme::SPACE_3);
 
     if let Some(i) = selected_project
         && let Some(project) = config.projects.get(i)
     {
-        column = column.push(iced::widget::text("Project (runs after global)").size(14));
+        column = column.push(
+            iced::widget::text("Project (runs after global)")
+                .font(theme::FONT_PROSE)
+                .size(theme::LABEL)
+                .color(theme::SLATE),
+        );
         column = column.push(rows(ScriptScope::Project(i), &project.scripts));
         column = column.push(
             iced::widget::button(iced::widget::text("Add project script"))
@@ -168,9 +193,13 @@ pub fn view<'a>(config: &Config, selected_project: Option<usize>) -> iced::Eleme
         // out `ORDER_NOTE`'s claim as an actual count rather than leaving the
         // user to add up two sections themselves.
         let total = execution_order(&config.global_scripts, &project.scripts).len();
-        column = column.push(iced::widget::text(format!(
-            "{total} script(s) will run for this project, in the order above"
-        )));
+        column = column.push(
+            iced::widget::text(format!(
+                "{total} script(s) will run for this project, in the order above"
+            ))
+            .size(theme::BODY)
+            .color(theme::SLATE),
+        );
     }
 
     column.into()

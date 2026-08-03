@@ -59,6 +59,7 @@
 //! *looks* wrong.
 
 use crate::app::Message;
+use crate::theme;
 use bombadil_core::model::{DefaultVenvLocation, Project, Settings, UvSource, VenvLocation};
 use bombadil_core::venv_path;
 use std::path::PathBuf;
@@ -158,16 +159,22 @@ pub fn view<'a>(
         uv_source_button("bundled", UvSourceChoice::Bundled, current),
         uv_source_button("from PATH", UvSourceChoice::FromPath, current),
     ]
-    .spacing(4);
+    .spacing(theme::SPACE_1);
 
-    let current_source_text = match &settings.uv_source {
-        UvSource::Auto => "current: auto".to_string(),
-        UvSource::Bundled => "current: bundled".to_string(),
-        UvSource::FromPath => "current: from PATH".to_string(),
-        UvSource::Custom { path } => format!("current: custom ({})", path.display()),
+    // Three of these four are words and one is a path, so the face is picked
+    // per arm rather than after the join -- see `theme::labeled_prose`.
+    let current_source: iced::Element<'a, Message> = match &settings.uv_source {
+        UvSource::Auto => theme::labeled_prose("current uv source:", "auto"),
+        UvSource::Bundled => theme::labeled_prose("current uv source:", "bundled"),
+        UvSource::FromPath => theme::labeled_prose("current uv source:", "from PATH"),
+        UvSource::Custom { path } => {
+            theme::labeled_value("current uv source:", path.display().to_string())
+        }
     };
 
     let custom_path_input = iced::widget::text_input("path to a uv binary", uv_custom_path_draft)
+        .font(theme::FONT_DATA)
+        .size(theme::DATA)
         .on_input(Message::SettingsUvCustomPathChanged);
     let validate_button = iced::widget::button(iced::widget::text("validate and use"))
         .on_press_maybe(
@@ -176,28 +183,38 @@ pub fn view<'a>(
         );
 
     let mut column = iced::widget::column![
-        iced::widget::text("Settings").size(16),
-        iced::widget::text("uv binary").size(14),
-        iced::widget::text(current_source_text),
+        iced::widget::text("Settings")
+            .font(theme::FONT_PROSE_SEMIBOLD)
+            .size(theme::TITLE),
+        iced::widget::text("uv binary")
+            .font(theme::FONT_PROSE)
+            .size(theme::LABEL)
+            .color(theme::SLATE),
+        current_source,
         uv_source_buttons,
-        iced::widget::row![custom_path_input, validate_button].spacing(6),
+        iced::widget::row![custom_path_input, validate_button].spacing(theme::SPACE_2),
     ]
-    .spacing(8);
+    .spacing(theme::SPACE_3);
 
     if let Some(validation) = uv_custom_validation {
-        let text = match validation {
-            Ok(version) => format!("validated: uv {version}"),
-            Err(message) => format!("could not use this uv: {message}"),
+        let row: iced::Element<'a, Message> = match validation {
+            Ok(version) => theme::labeled_value("validated: uv", version.clone()),
+            Err(message) => iced::widget::text(format!("could not use this uv: {message}"))
+                .size(theme::BODY)
+                .into(),
         };
-        column = column.push(iced::widget::text(text));
+        column = column.push(row);
     }
 
-    let default_venv_text = match &settings.default_venv_location {
-        DefaultVenvLocation::Alongside => {
-            "current: alongside each project (<project>/.venv)".to_string()
-        }
+    // Same per-arm face choice as `current_source` above: a sentence in one
+    // arm, a path in the other.
+    let default_venv: iced::Element<'a, Message> = match &settings.default_venv_location {
+        DefaultVenvLocation::Alongside => theme::labeled_prose(
+            "current default:",
+            "alongside each project (<project>/.venv)",
+        ),
         DefaultVenvLocation::Central { path } => {
-            format!("current: central store ({})", path.display())
+            theme::labeled_value("current default:", path.display().to_string())
         }
     };
     let alongside_button = iced::widget::button(iced::widget::text("alongside each project"))
@@ -213,16 +230,36 @@ pub fn view<'a>(
             .on_press(Message::SettingsDefaultVenvLocationPickFolderRequested);
 
     column = column
-        .push(iced::widget::text("default venv location").size(14))
-        .push(iced::widget::text(default_venv_text))
-        .push(iced::widget::row![alongside_button, choose_folder_button].spacing(6));
+        .push(
+            iced::widget::text("default venv location")
+                .font(theme::FONT_PROSE)
+                .size(theme::LABEL)
+                .color(theme::SLATE),
+        )
+        .push(default_venv)
+        .push(iced::widget::row![alongside_button, choose_folder_button].spacing(theme::SPACE_2));
 
     for (label, resolved) in resolved_default_venv_paths(projects, settings) {
-        let text = match resolved {
-            Ok(path) => format!("{label}: {}", path.display()),
-            Err(message) => format!("{label}: {message}"),
+        let value: iced::Element<'a, Message> = match resolved {
+            Ok(path) => iced::widget::text(path.display().to_string())
+                .font(theme::FONT_DATA)
+                .size(theme::DATA)
+                .color(theme::SLATE)
+                .into(),
+            Err(message) => iced::widget::text(message)
+                .size(theme::DATA)
+                .color(theme::SLATE)
+                .into(),
         };
-        column = column.push(iced::widget::text(text));
+        column = column.push(
+            iced::widget::row![
+                iced::widget::text(format!("{label}:"))
+                    .size(theme::BODY)
+                    .color(theme::SLATE),
+                value,
+            ]
+            .spacing(theme::SPACE_1),
+        );
     }
 
     column.into()

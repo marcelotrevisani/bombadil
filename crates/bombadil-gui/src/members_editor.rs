@@ -39,6 +39,7 @@
 //! only) and still be a real, previously-`uv add --editable`'d sibling.
 
 use crate::app::Message;
+use crate::theme;
 use bombadil_core::members::{self, DiscoveredMember, WorkspaceKind};
 use bombadil_core::model::{MemberOrigin, MemberRef, MemberSelection};
 use bombadil_core::uv::results::InstalledPackage;
@@ -259,6 +260,27 @@ pub struct ConfirmMemberSync {
     pub warning: String,
 }
 
+/// Maps one member row to the glyph state it should render.
+///
+/// - Not installed: [`theme::State::Absent`], whether it is currently
+///   selected (nothing installed yet for a next sync to disagree with) or
+///   deselected (discovered, deselected -- the plain case).
+/// - Installed and still selected: [`theme::State::Present`] -- installed
+///   editable, and the next sync agrees.
+/// - Installed but no longer selected: [`theme::State::Drifted`] -- exactly
+///   the row [`will_remove`] flags: syncing now would uninstall it. Kept as
+///   the same underlying fact `will_remove`/`removal_warning` already prove,
+///   not a second derivation of "would removing this be a surprise."
+pub fn state(row: &MemberRow) -> theme::State {
+    if !row.installed {
+        theme::State::Absent
+    } else if row.selected {
+        theme::State::Present
+    } else {
+        theme::State::Drifted
+    }
+}
+
 /// Renders the pending sync confirmation. Deliberately dumb, like
 /// `context_menu::confirm_view`: the sentence worth testing is
 /// `removal_warning`'s.
@@ -269,41 +291,90 @@ pub fn confirm_view<'a>(confirm: &ConfirmMemberSync) -> iced::Element<'a, Messag
             .on_press(Message::MembersSyncConfirmed),
         iced::widget::button(iced::widget::text("Cancel")).on_press(Message::MembersSyncCancelled),
     ]
-    .spacing(8)
+    .spacing(theme::SPACE_2)
     .into()
+}
+
+/// Renders one member row: the state glyph, then the checkbox whose label is
+/// the member's name or path -- data, compared character by character like
+/// any other path in this application, so it renders in Plex rather than the
+/// checkbox's default prose font. The row sits on a `bark` raised surface,
+/// the same treatment every row in every pane gets.
+///
+/// The "cannot be installed" note is a separate widget rather than a suffix
+/// on the checkbox's own label: appended, it would inherit the checkbox's
+/// Plex, and it is a sentence about the member, not a value to compare.
+fn member_row<'a>(row: &MemberRow, project_index: usize) -> iced::Element<'a, Message> {
+    let glyph = theme::state_glyph(state(row));
+
+    let path = row.path.clone();
+    let checkbox = iced::widget::checkbox(row.selected)
+        .label(display_label(row))
+        .font(theme::FONT_DATA)
+        .text_size(theme::DATA)
+        .on_toggle_maybe(
+            row.name
+                .is_some()
+                .then_some(move |_| Message::MemberToggled(project_index, path.clone())),
+        );
+
+    let mut line = iced::widget::row![
+        iced::widget::text(glyph.glyph.to_string())
+            .size(theme::BODY)
+            .color(glyph.colour)
+            .width(theme::GLYPH_COLUMN_WIDTH),
+        checkbox,
+    ]
+    .spacing(theme::SPACE_1);
+
+    if row.name.is_none() {
+        line = line.push(
+            iced::widget::text("(no [project].name -- cannot be installed)")
+                .font(theme::FONT_PROSE)
+                .size(theme::DATA)
+                .color(theme::SLATE),
+        );
+    }
+
+    iced::widget::container(line)
+        .padding(theme::SPACE_1)
+        .style(|_theme| iced::widget::container::Style {
+            background: Some(iced::Background::Color(theme::BARK)),
+            ..iced::widget::container::Style::default()
+        })
+        .into()
 }
 
 /// Renders the checklist. Deliberately dumb, like every other `view` in this
 /// crate: all the logic worth testing lives in the functions above.
 pub fn view<'a>(tab: &MembersTab, project_index: usize) -> iced::Element<'a, Message> {
-    let mut column = iced::widget::column![iced::widget::text("Members").size(16)].spacing(4);
+    let mut column = iced::widget::column![
+        iced::widget::text("Members")
+            .font(theme::FONT_PROSE_SEMIBOLD)
+            .size(theme::TITLE)
+    ]
+    .spacing(theme::SPACE_2);
 
     if tab.rows.is_empty() {
-        column = column.push(iced::widget::text(
-            "No additional pyproject.toml files found below this project.",
-        ));
+        column = column.push(
+            iced::widget::text("No additional pyproject.toml files found below this project.")
+                .size(theme::BODY)
+                .color(theme::SLATE),
+        );
     }
 
     for row in &tab.rows {
-        let label = display_label(row);
-        let label = if row.name.is_none() {
-            format!("{label} (no [project].name -- cannot be installed)")
-        } else {
-            label
-        };
-        let path = row.path.clone();
-        let checkbox = iced::widget::checkbox(row.selected)
-            .label(label)
-            .on_toggle_maybe(
-                row.name
-                    .is_some()
-                    .then_some(move |_| Message::MemberToggled(project_index, path.clone())),
-            );
-        column = column.push(checkbox);
+        column = column.push(member_row(row, project_index));
     }
 
     if let Some(warning) = removal_warning(&tab.rows) {
-        column = column.push(iced::widget::text(warning));
+        // One of `BOOT`'s rationed cases by name: a member syncing will
+        // remove.
+        column = column.push(
+            iced::widget::text(warning)
+                .size(theme::BODY)
+                .color(theme::BOOT),
+        );
     }
 
     column = column.push(
@@ -666,5 +737,41 @@ mod tests {
             &[],
         );
         assert_eq!(tab.rows.len(), 2, "got {:?}", tab.rows);
+    }
+
+    // --- state: the glyph mapping for one member row ---
+
+    fn member_row(selected: bool, installed: bool) -> MemberRow {
+        MemberRow {
+            path: PathBuf::from("packages/alpha"),
+            name: Some("alpha".to_string()),
+            origin: MemberOrigin::Discovered,
+            selected,
+            installed,
+        }
+    }
+
+    #[test]
+    fn a_selected_installed_member_is_present() {
+        assert_eq!(state(&member_row(true, true)), theme::State::Present);
+    }
+
+    #[test]
+    fn a_discovered_deselected_never_installed_member_is_absent() {
+        assert_eq!(state(&member_row(false, false)), theme::State::Absent);
+    }
+
+    #[test]
+    fn a_selected_not_yet_installed_member_is_absent() {
+        // Mirrors deps' "declared, not installed": nothing installed yet for
+        // a next sync to disagree with.
+        assert_eq!(state(&member_row(true, false)), theme::State::Absent);
+    }
+
+    #[test]
+    fn a_deselected_but_still_installed_member_is_drifted() {
+        // The exact case `will_remove`/`removal_warning` exist to flag:
+        // syncing now would uninstall this member.
+        assert_eq!(state(&member_row(false, true)), theme::State::Drifted);
     }
 }

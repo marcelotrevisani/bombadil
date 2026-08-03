@@ -142,8 +142,13 @@ fn parse_requirement(requires_python: &str) -> Option<Vec<Clause>> {
         .filter(|clauses| !clauses.is_empty())
 }
 
-/// The interpreters, from `interpreters`, whose version satisfies
-/// `requires_python`.
+/// Whether a single Python `version` string satisfies `requires_python`.
+///
+/// The single-candidate form of the rule `satisfying` applies to a whole
+/// list -- extracted so a caller holding one version, not an `Interpreter`
+/// list, does not have to wrap it in a throwaway `Interpreter` just to reuse
+/// the comparator. `sidebar::state` is that caller: a venv's Python version
+/// is a bare string, not a discovered `Interpreter`.
 ///
 /// Handles `>=`, `>`, `==` (including the `==X.*` wildcard), `~=`, and bare
 /// versions, comma-separated -- the forms that cover the overwhelming
@@ -152,30 +157,41 @@ fn parse_requirement(requires_python: &str) -> Option<Vec<Clause>> {
 /// none of which are implemented here.
 ///
 /// When `requires_python` is absent, or present but this parser cannot make
-/// sense of it (any single clause outside the subset above), **every**
-/// interpreter is offered rather than none. The two failure modes are not
-/// symmetric: an over-strict filter can make a project impossible to add
-/// through the UI at all, with no recourse -- there is no escape hatch to
-/// bypass the check. An over-permissive filter just lets the user pick an
-/// interpreter uv itself will refuse, with a clear error, at `sync` time.
-/// Silently permissive beats silently strict only because "permissive"
-/// still leaves the user a path forward and "strict" does not -- which is
-/// exactly the asymmetry that makes the fallback direction a deliberate
+/// sense of it (any single clause outside the subset above), the version is
+/// treated as satisfying it rather than not. The two failure modes are not
+/// symmetric: for `satisfying`, an over-strict filter can make a project
+/// impossible to add through the UI at all, with no recourse. For
+/// `sidebar::state`, the same permissive fallback means a venv is never
+/// marked `Drifted` just because its manifest's `requires-python` used
+/// syntax this parser does not read -- that would be a false alarm over a
+/// working environment. An over-permissive filter or check just lets
+/// through what uv itself will still catch, with a clear error, at `sync`
+/// time. Silently permissive beats silently strict only because
+/// "permissive" still leaves a path forward and "strict" does not -- which
+/// is exactly the asymmetry that makes the fallback direction a deliberate
 /// choice rather than a coin flip.
+pub fn version_satisfies(version: &str, requires_python: Option<&str>) -> bool {
+    match requires_python.and_then(parse_requirement) {
+        None => true,
+        Some(clauses) => {
+            let segments = release_segments(version);
+            clauses.iter().all(|clause| clause.matches(&segments))
+        }
+    }
+}
+
+/// The interpreters, from `interpreters`, whose version satisfies
+/// `requires_python`. See [`version_satisfies`] for exactly which forms of
+/// `requires_python` are handled and which fallback direction an unparseable
+/// one takes -- this is that same check, run over a whole list.
 pub fn satisfying<'a>(
     interpreters: &'a [Interpreter],
     requires_python: Option<&str>,
 ) -> Vec<&'a Interpreter> {
-    match requires_python.and_then(parse_requirement) {
-        None => interpreters.iter().collect(),
-        Some(clauses) => interpreters
-            .iter()
-            .filter(|i| {
-                let segments = release_segments(&i.version);
-                clauses.iter().all(|clause| clause.matches(&segments))
-            })
-            .collect(),
-    }
+    interpreters
+        .iter()
+        .filter(|i| version_satisfies(&i.version, requires_python))
+        .collect()
 }
 
 /// The interpreter to preselect in the add-project dialog: the newest one
@@ -346,8 +362,12 @@ mod tests {
 
     #[test]
     fn an_unparseable_requirement_falls_back_to_offering_everything() {
+        // Both candidates must *violate* the requirement they are offered
+        // against, or the assertion holds whether the fallback fired or `<`
+        // were implemented tomorrow -- the same non-discrimination
+        // `sidebar` and `deps` carried with `<3.13`.
         let all = vec![interp("3.10.13"), interp("3.12.4")];
-        assert_eq!(satisfying(&all, Some("<3.13")).len(), 2);
+        assert_eq!(satisfying(&all, Some("<3.5")).len(), 2);
         assert_eq!(satisfying(&all, Some("not a specifier")).len(), 2);
         assert_eq!(satisfying(&all, Some("")).len(), 2);
     }
@@ -410,5 +430,27 @@ mod tests {
         // Nothing here confirms what "suitable" would mean, so guessing a
         // version to install would be worse than asking the user.
         assert_eq!(suggested_install_version(Some("<3.13")), None);
+    }
+
+    #[test]
+    fn version_satisfies_agrees_with_satisfying_on_a_single_candidate() {
+        // The whole point of extracting `version_satisfies` is that it is
+        // the same rule `satisfying` applies per-candidate, not a second
+        // one -- so it must agree with `satisfying` filtering a one-element
+        // list, in both directions.
+        assert!(version_satisfies("3.12.4", Some(">=3.11")));
+        assert!(!version_satisfies("3.9.18", Some(">=3.11")));
+    }
+
+    #[test]
+    fn version_satisfies_falls_back_to_true_when_the_requirement_is_unparseable() {
+        // Same fallback direction as `satisfying`: a requirement this parser
+        // cannot read must never read as "does not satisfy".
+        // `<3.5`, not `<3.13`: 3.9.18 satisfies `<3.13`, so that pair would
+        // hold even with `<` implemented and prove nothing about the
+        // fallback.
+        assert!(version_satisfies("3.9.18", Some("<3.5")));
+        assert!(version_satisfies("3.9.18", Some("not a specifier")));
+        assert!(version_satisfies("3.9.18", None));
     }
 }

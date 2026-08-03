@@ -36,6 +36,7 @@ mod members_editor;
 mod scripts_editor;
 mod settings_editor;
 mod sidebar;
+mod theme;
 
 use bombadil_core::model::Config;
 use bombadil_core::process::{CommandRunner, SystemCommandRunner};
@@ -63,6 +64,15 @@ fn main() -> iced::Result {
         app::view,
     )
     .title("Bombadil")
+    // Both weights of Atkinson Hyperlegible Next share one font family, so
+    // the renderer picks the right face by `Font::weight`; Plex Mono is
+    // registered separately for the data typeface. Licences for both ship
+    // in `about.rs`, alongside uv's.
+    .font(theme::ATKINSON_REGULAR)
+    .font(theme::ATKINSON_SEMIBOLD)
+    .font(theme::PLEX_MONO_REGULAR)
+    .default_font(theme::FONT_PROSE)
+    .theme(theme::theme())
     .run()
 }
 
