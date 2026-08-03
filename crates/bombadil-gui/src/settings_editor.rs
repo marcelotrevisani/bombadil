@@ -147,7 +147,12 @@ fn uv_source_button<'a>(
 }
 
 /// Renders the whole tab.
-pub fn view<'a>(
+/// The global half: which uv runs, and where new environments go.
+///
+/// Named `global_view` since Preferences arrived, because there is a project
+/// half now -- `Project::venv` and `Project::uv_source` -- rendered by
+/// `preferences` rather than here.
+pub fn global_view<'a>(
     settings: &Settings,
     projects: &[Project],
     uv_custom_path_draft: &str,

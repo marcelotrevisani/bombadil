@@ -162,9 +162,11 @@ pub fn view<'a>(
 
     // --- the chosen section ----------------------------------------------
     let panel: iced::Element<'a, Message> = match (section, selected_project) {
-        (Section::EnvVars, _) => env_editor::view(config, selected_project, env_drafts),
-        (Section::Indexes, _) => index_editor::view(config, selected_project, credential_drafts),
-        (Section::Environments | Section::Uv, _) => settings_editor::view(
+        (Section::EnvVars, None) => env_editor::global_view(config, env_drafts),
+        (Section::EnvVars, Some(i)) => env_editor::project_view(config, i, env_drafts),
+        (Section::Indexes, None) => index_editor::global_view(config, credential_drafts),
+        (Section::Indexes, Some(i)) => index_editor::project_view(config, i),
+        (Section::Environments | Section::Uv, _) => settings_editor::global_view(
             &config.settings,
             &config.projects,
             uv_custom_path_draft,

@@ -414,15 +414,21 @@ fn index_row<'a>(
 /// Renders the whole tab: every configured index, then -- once a project is
 /// selected -- a checkbox per index for that project's own selection
 /// (criterion 3).
-pub fn view<'a>(
+/// Every configured index: name, URL, kind, auth. Defined once, globally --
+/// so one index means one keychain credential, whichever projects use it.
+///
+/// Split from [`project_view`] because Preferences shows one scope at a time.
+pub fn global_view<'a>(
     config: &Config,
-    selected_project: Option<usize>,
     credential_drafts: &[String],
 ) -> iced::Element<'a, Message> {
     let mut column = iced::widget::column![
-        iced::widget::text("Indexes")
-            .font(theme::FONT_PROSE_SEMIBOLD)
-            .size(theme::TITLE)
+        iced::widget::text(
+            "Defined once and used by any project. Credentials live in the OS keychain, \
+             keyed by the index name."
+        )
+        .size(theme::BODY)
+        .color(theme::SLATE),
     ]
     .spacing(theme::SPACE_3);
 
@@ -431,57 +437,70 @@ pub fn view<'a>(
         column = column.push(index_row(i, index, config, draft));
     }
 
-    column = column
-        .push(iced::widget::button(iced::widget::text("Add index")).on_press(Message::IndexAdded));
+    column
+        .push(
+            iced::widget::button(iced::widget::text("Add index").size(theme::BODY))
+                .on_press(Message::IndexAdded)
+                .padding([theme::SPACE_1, theme::SPACE_3])
+                .style(theme::button_quiet),
+        )
+        .into()
+}
 
-    if let Some(i) = selected_project
-        && let Some(project) = config.projects.get(i)
-    {
+/// Which of the global indexes this project uses.
+///
+/// A selection, not a definition: adding an index is a global act, and this
+/// scope only ticks the ones that apply here.
+pub fn project_view<'a>(config: &Config, project_index: usize) -> iced::Element<'a, Message> {
+    let Some(project) = config.projects.get(project_index) else {
+        return iced::widget::text("").into();
+    };
+
+    let mut column = iced::widget::column![
+        iced::widget::text("Which of the indexes above this project resolves against.")
+            .size(theme::BODY)
+            .color(theme::SLATE),
+    ]
+    .spacing(theme::SPACE_2);
+
+    for index in &config.indexes {
+        let glyph = theme::state_glyph(state(&project.index_names, &index.name));
+        let selected = project.index_names.contains(&index.name);
+        let name = index.name.clone();
+        // The index name is the checkbox label -- data, the same as any other
+        // name compared character by character, so it renders in Plex rather
+        // than the checkbox's default prose font.
+        let checkbox = iced::widget::checkbox(selected)
+            .label(index.name.clone())
+            .font(theme::FONT_DATA)
+            .text_size(theme::DATA)
+            .on_toggle(move |_| Message::ProjectIndexToggled(project_index, name.clone()));
+        let line = iced::widget::row![
+            iced::widget::text(glyph.glyph.to_string())
+                .size(theme::BODY)
+                .color(glyph.colour)
+                .width(theme::GLYPH_COLUMN_WIDTH),
+            checkbox,
+        ]
+        .spacing(theme::SPACE_1);
         column = column.push(
-            iced::widget::text("Project indexes")
-                .font(theme::FONT_PROSE)
-                .size(theme::LABEL)
-                .color(theme::SLATE),
+            iced::widget::container(line)
+                .padding(theme::SPACE_1)
+                .style(theme::surface),
         );
-        for index in &config.indexes {
-            let glyph = theme::state_glyph(state(&project.index_names, &index.name));
-            let selected = project.index_names.contains(&index.name);
-            let name = index.name.clone();
-            // The index name is the checkbox label -- data, the same as any
-            // other name compared character by character, so it renders in
-            // Plex rather than the checkbox's default prose font.
-            let checkbox = iced::widget::checkbox(selected)
-                .label(index.name.clone())
-                .font(theme::FONT_DATA)
-                .text_size(theme::DATA)
-                .on_toggle(move |_| Message::ProjectIndexToggled(i, name.clone()));
-            let line = iced::widget::row![
-                iced::widget::text(glyph.glyph.to_string())
-                    .size(theme::BODY)
-                    .color(glyph.colour)
-                    .width(theme::GLYPH_COLUMN_WIDTH),
-                checkbox,
-            ]
-            .spacing(theme::SPACE_1);
-            column = column.push(iced::widget::container(line).padding(theme::SPACE_1).style(
-                |_theme| iced::widget::container::Style {
-                    background: Some(iced::Background::Color(theme::BARK)),
-                    ..iced::widget::container::Style::default()
-                },
-            ));
-        }
-        // Criterion 3's invariant, stated rather than only silently relied
-        // on: `banner::view` already reports a stale reference by name
-        // (`validate::validate`'s "references index ... which is not
-        // defined"), so this never fires in practice; it exists as the
-        // directly-testable guard this tab's own selection state has to
-        // keep satisfying, not a second copy of that user-facing message.
-        if !selected_are_subset(&project.index_names, &config.indexes) {
-            column = column.push(
-                iced::widget::text("this project selects an index that no longer exists")
-                    .size(theme::BODY),
-            );
-        }
+    }
+
+    // Criterion 3's invariant, stated rather than only silently relied on:
+    // `banner::view` already reports a stale reference by name
+    // (`validate::validate`'s "references index ... which is not defined"),
+    // so this never fires in practice; it exists as the directly-testable
+    // guard this scope's selection state has to keep satisfying, not a second
+    // copy of that user-facing message.
+    if !selected_are_subset(&project.index_names, &config.indexes) {
+        column = column.push(
+            iced::widget::text("this project selects an index that no longer exists")
+                .size(theme::BODY),
+        );
     }
 
     column.into()

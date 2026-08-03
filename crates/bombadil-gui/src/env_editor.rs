@@ -431,70 +431,76 @@ fn rows<'a>(scope: EnvScope, vars: &[EnvVar], drafts: &ValueDrafts) -> iced::Ele
 
 /// Renders the whole tab: global variables, then (if a project is selected)
 /// that project's own variables plus the overrides among them (criterion 1).
-pub fn view<'a>(
-    config: &Config,
-    selected_project: Option<usize>,
-    drafts: &ValueDrafts,
-) -> iced::Element<'a, Message> {
-    let mut column = iced::widget::column![
-        // Pane title, then subheads -- the shape `scripts_editor` and
-        // `index_editor` use. "Global variables" was set at `TITLE`, which
-        // made every scope heading compete with the tab bar; `LABEL`/`slate`
-        // is the subhead role in every other pane.
-        iced::widget::text("Env vars")
-            .font(theme::FONT_PROSE_SEMIBOLD)
-            .size(theme::TITLE),
-        iced::widget::text("Global variables")
-            .font(theme::FONT_PROSE)
-            .size(theme::LABEL)
+/// The global variables half: every project sees these unless it sets its own
+/// with the same key.
+///
+/// Split from [`project_view`] because Preferences shows one scope at a time.
+/// The two used to be stacked in one pane, which is exactly what the scope
+/// switch replaces.
+pub fn global_view<'a>(config: &Config, drafts: &ValueDrafts) -> iced::Element<'a, Message> {
+    iced::widget::column![
+        iced::widget::text("Every project sees these, unless it sets its own with the same key.")
+            .size(theme::BODY)
             .color(theme::SLATE),
         rows(EnvScope::Global, &config.global_env, drafts),
-        iced::widget::button(iced::widget::text("Add global variable"))
-            .on_press(Message::EnvVarAdded(EnvScope::Global)),
+        iced::widget::button(iced::widget::text("Add global variable").size(theme::BODY))
+            .on_press(Message::EnvVarAdded(EnvScope::Global))
+            .padding([theme::SPACE_1, theme::SPACE_3])
+            .style(theme::button_quiet),
+    ]
+    .spacing(theme::SPACE_3)
+    .into()
+}
+
+/// One project's own variables, and which global ones they shadow.
+///
+/// The shadowing list is [`overrides`], which already exists and is already
+/// tested; this is the view that used to hide it below a fold.
+pub fn project_view<'a>(
+    config: &Config,
+    project_index: usize,
+    drafts: &ValueDrafts,
+) -> iced::Element<'a, Message> {
+    let Some(project) = config.projects.get(project_index) else {
+        return iced::widget::text("").into();
+    };
+
+    let mut column = iced::widget::column![
+        iced::widget::text("These layer over the global variables. A key set here wins.")
+            .size(theme::BODY)
+            .color(theme::SLATE),
+        rows(EnvScope::Project(project_index), &project.env, drafts),
+        iced::widget::button(iced::widget::text("Add project variable").size(theme::BODY))
+            .on_press(Message::EnvVarAdded(EnvScope::Project(project_index)))
+            .padding([theme::SPACE_1, theme::SPACE_3])
+            .style(theme::button_quiet),
     ]
     .spacing(theme::SPACE_3);
 
-    if let Some(i) = selected_project
-        && let Some(project) = config.projects.get(i)
-    {
+    for over in overrides(&config.global_env, &project.env) {
+        // Key and the global's own value are both data; the sentence around
+        // them is prose. Kept as separate `text` widgets rather than one
+        // formatted string so the value -- a secret global's dots included --
+        // can carry its own colour without recolouring the words around it.
         column = column.push(
-            iced::widget::text("Project variables")
-                .font(theme::FONT_PROSE)
-                .size(theme::LABEL)
-                .color(theme::SLATE),
+            iced::widget::row![
+                iced::widget::text(over.key.clone())
+                    .font(theme::FONT_DATA)
+                    .size(theme::DATA)
+                    .color(theme::SLATE),
+                iced::widget::text("overrides the global value (")
+                    .size(theme::BODY)
+                    .color(theme::SLATE),
+                iced::widget::text(over.global_display.clone())
+                    .font(theme::FONT_DATA)
+                    .size(theme::DATA)
+                    .color(theme::SLATE),
+                iced::widget::text(")")
+                    .size(theme::BODY)
+                    .color(theme::SLATE),
+            ]
+            .spacing(theme::SPACE_1),
         );
-        column = column.push(rows(EnvScope::Project(i), &project.env, drafts));
-        column = column.push(
-            iced::widget::button(iced::widget::text("Add project variable"))
-                .on_press(Message::EnvVarAdded(EnvScope::Project(i))),
-        );
-
-        for over in overrides(&config.global_env, &project.env) {
-            // Key and the global's own value are both data; the sentence
-            // around them is prose. Kept as separate `text` widgets rather
-            // than one formatted string so the value -- a secret global's
-            // dots included -- can carry its own colour without recolouring
-            // the words around it.
-            column = column.push(
-                iced::widget::row![
-                    iced::widget::text(over.key.clone())
-                        .font(theme::FONT_DATA)
-                        .size(theme::DATA)
-                        .color(theme::SLATE),
-                    iced::widget::text("overrides the global value (")
-                        .size(theme::BODY)
-                        .color(theme::SLATE),
-                    iced::widget::text(over.global_display.clone())
-                        .font(theme::FONT_DATA)
-                        .size(theme::DATA)
-                        .color(theme::SLATE),
-                    iced::widget::text(")")
-                        .size(theme::BODY)
-                        .color(theme::SLATE),
-                ]
-                .spacing(theme::SPACE_1),
-            );
-        }
     }
 
     column.into()

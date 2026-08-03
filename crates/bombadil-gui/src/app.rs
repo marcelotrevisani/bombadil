@@ -256,31 +256,23 @@ pub enum Tab {
     #[default]
     Dependencies,
     Members,
-    EnvVars,
     Scripts,
-    Indexes,
-    Settings,
 }
 
 impl Tab {
     /// Every tab, in the order the selector renders them.
-    pub const ALL: [Tab; 6] = [
-        Tab::Dependencies,
-        Tab::Members,
-        Tab::EnvVars,
-        Tab::Scripts,
-        Tab::Indexes,
-        Tab::Settings,
-    ];
+    /// Every tab, in the order the selector renders them.
+    ///
+    /// Env vars, Indexes and Settings are not here: Preferences absorbed
+    /// them, so each is now reachable in both scopes from one screen rather
+    /// than as a tab that only ever showed the selected project's half.
+    pub const ALL: [Tab; 3] = [Tab::Dependencies, Tab::Members, Tab::Scripts];
 
     pub fn label(self) -> &'static str {
         match self {
             Tab::Dependencies => "Dependencies",
             Tab::Members => "Members",
-            Tab::EnvVars => "Env vars",
             Tab::Scripts => "Scripts",
-            Tab::Indexes => "Indexes",
-            Tab::Settings => "Settings",
         }
     }
 }
@@ -3384,27 +3376,11 @@ pub fn view(app: &App) -> iced::Element<'_, Message> {
             },
             _ => iced::widget::text("").into(),
         },
-        // Global variables are always shown; the project half only once a
-        // project is selected -- the same `app.selected` `env_editor::view`
-        // needs to know which project's `env` to show alongside them.
-        Tab::EnvVars => env_editor::view(&app.config, app.selected, &app.env_value_drafts),
-        // Same shape as the Env vars tab: global scripts always shown, the
-        // project's own scripts once one is selected.
+        // Global scripts always shown, the project's own once one is
+        // selected. The one editor Preferences did not absorb -- pre-activate
+        // hooks are a project's own behaviour rather than a setting, and the
+        // user asked for it to keep its tab.
         Tab::Scripts => scripts_editor::view(&app.config, app.selected),
-        // Every configured index, plus (once a project is selected) that
-        // project's own selection among them (spec §7, Task 4).
-        Tab::Indexes => index_editor::view(&app.config, app.selected, &app.index_credential_drafts),
-        // Which uv binary to run and where new venvs go (spec §5, Task 6).
-        // `resolved_default_venv_paths` recomputes fresh from `app.config` on
-        // every render, the same "recompute, don't cache" trick the Env vars
-        // and Indexes tabs already rely on, which is what makes criterion 3
-        // visible the instant a location change lands, with no restart.
-        Tab::Settings => settings_editor::view(
-            &app.config.settings,
-            &app.config.projects,
-            &app.uv_custom_path_draft,
-            app.uv_custom_validation.as_ref(),
-        ),
     };
 
     // The current tab's own button is disabled rather than hidden -- the
@@ -3760,11 +3736,11 @@ mod tests {
 
         let task = update(
             &mut app,
-            Message::TabSelected(Tab::Indexes),
+            Message::TabSelected(Tab::Scripts),
             unused_runner(),
         );
 
-        assert_eq!(app.tab, Tab::Indexes);
+        assert_eq!(app.tab, Tab::Scripts);
         assert_eq!(
             task.units(),
             0,
