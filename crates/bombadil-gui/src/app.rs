@@ -263,23 +263,39 @@ pub enum Tab {
     #[default]
     Dependencies,
     Members,
+    EnvVars,
     Scripts,
+    Indexes,
 }
 
 impl Tab {
     /// Every tab, in the order the selector renders them.
     /// Every tab, in the order the selector renders them.
     ///
-    /// Env vars, Indexes and Settings are not here: Preferences absorbed
-    /// them, so each is now reachable in both scopes from one screen rather
-    /// than as a tab that only ever showed the selected project's half.
-    pub const ALL: [Tab; 3] = [Tab::Dependencies, Tab::Members, Tab::Scripts];
+    /// The split these follow: **a tab is what this project has, the Settings
+    /// menu is what every project has.** Env vars and Indexes each have both
+    /// halves, so they appear in both places showing different things -- the
+    /// tab shows this project's own variables and index selection, the menu
+    /// shows the global ones they layer over.
+    ///
+    /// Settings has no per-project half worth a tab (uv, terminal and the
+    /// venv default are all resolved per project from Preferences), so it is
+    /// the one that stayed absorbed.
+    pub const ALL: [Tab; 5] = [
+        Tab::Dependencies,
+        Tab::Members,
+        Tab::EnvVars,
+        Tab::Scripts,
+        Tab::Indexes,
+    ];
 
     pub fn label(self) -> &'static str {
         match self {
             Tab::Dependencies => "Dependencies",
             Tab::Members => "Members",
+            Tab::EnvVars => "Env vars",
             Tab::Scripts => "Scripts",
+            Tab::Indexes => "Indexes",
         }
     }
 }
@@ -3842,11 +3858,20 @@ pub fn view(app: &App) -> iced::Element<'_, Message> {
             },
             _ => iced::widget::text("").into(),
         },
-        // Global scripts always shown, the project's own once one is
-        // selected. The one editor Preferences did not absorb -- pre-activate
-        // hooks are a project's own behaviour rather than a setting, and the
-        // user asked for it to keep its tab.
+        // This project's own variables, and which global ones they shadow.
+        // The global list itself is Settings > Environment variables.
+        Tab::EnvVars => match app.selected {
+            Some(i) => env_editor::project_view(&app.config, i, &app.env_value_drafts),
+            None => iced::widget::text("").into(),
+        },
+        // Global scripts always shown, the project's own beneath them.
         Tab::Scripts => scripts_editor::view(&app.config, app.selected),
+        // Which of the globally defined indexes this project resolves
+        // against. Defining them is Settings > Package indexes and auth.
+        Tab::Indexes => match app.selected {
+            Some(i) => index_editor::project_view(&app.config, i),
+            None => iced::widget::text("").into(),
+        },
     };
 
     // The current tab's own button is disabled rather than hidden -- the
@@ -5085,6 +5110,30 @@ mod tests {
                 .iter()
                 .all(|row| row.python_version.is_none()),
             "a result for an environment that is gone must land nowhere"
+        );
+    }
+
+    #[test]
+    fn a_projects_own_env_vars_and_indexes_are_reachable_from_its_tabs() {
+        // The split this application settled on: a tab is what *this project*
+        // has, the Settings menu is what every project has. Env vars and
+        // indexes have both halves, so they appear in both places showing
+        // different things.
+        //
+        // Absorbing the per-project halves into Preferences was reported
+        // twice as the tab having gone missing, which is what this holds
+        // against a future tidy-up.
+        for tab in [Tab::EnvVars, Tab::Indexes, Tab::Scripts] {
+            assert!(
+                Tab::ALL.contains(&tab),
+                "{tab:?} is a per-project surface and belongs in the tab bar"
+            );
+        }
+        assert_eq!(
+            Tab::ALL.len(),
+            5,
+            "Dependencies, Members, Env vars, Scripts, Indexes -- and Settings \
+             deliberately not, since it has no per-project half"
         );
     }
 

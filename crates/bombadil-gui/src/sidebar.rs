@@ -327,8 +327,7 @@ fn environment_row<'a>(
 ) -> iced::Element<'a, Message> {
     let glyph = theme::state_glyph(row_state(row, requires_python));
     // The directory's own name, which is what distinguishes two environments
-    // of one project -- `.venv` from `.venv-3.11`. The full path is the
-    // tooltip's job, not a sidebar 240pt wide.
+    // of one project -- `.venv` from `.venv-3.11`.
     let name = row
         .path
         .file_name()
@@ -340,36 +339,70 @@ fn environment_row<'a>(
     };
     let active = row.active;
 
-    iced::widget::button(
-        iced::widget::row![
-            iced::widget::Space::new().width(theme::SPACE_3),
-            iced::widget::text(glyph.glyph.to_string())
-                .size(theme::BODY)
-                .color(glyph.colour)
-                .width(theme::GLYPH_COLUMN_WIDTH),
-            iced::widget::column![
-                iced::widget::text(name)
-                    .font(theme::FONT_DATA)
-                    .size(theme::DATA),
-                iced::widget::text(version)
-                    .font(theme::FONT_DATA)
-                    .size(theme::LABEL)
-                    .color(theme::SLATE),
-            ]
-            .spacing(0),
+    // The active marker: a `jacket` bar down the leading edge, the same shape
+    // a selected project uses. It replaced a full outline around the row,
+    // which drew a heavy box the width of the sidebar and read as a control
+    // rather than as a state.
+    let marker = iced::widget::container(
+        iced::widget::Space::new()
+            .width(theme::SELECTED_MARKER)
+            .height(iced::Length::Fill),
+    )
+    .height(iced::Length::Fill)
+    .style(move |_theme| iced::widget::container::Style {
+        background: active.then_some(iced::Background::Color(theme::JACKET)),
+        ..iced::widget::container::Style::default()
+    });
+
+    let content = iced::widget::row![
+        marker,
+        iced::widget::text(glyph.glyph.to_string())
+            .size(theme::BODY)
+            .color(glyph.colour)
+            .width(theme::GLYPH_COLUMN_WIDTH),
+        iced::widget::column![
+            iced::widget::text(name)
+                .font(theme::FONT_DATA)
+                .size(theme::DATA),
+            iced::widget::text(version)
+                .font(theme::FONT_DATA)
+                .size(theme::LABEL)
+                .color(theme::SLATE),
         ]
-        .spacing(theme::SPACE_1)
-        .align_y(iced::Alignment::Center),
-    )
-    .on_press_maybe(
-        (!active).then_some(Message::EnvironmentActivated(project, row.location.clone())),
-    )
-    .width(iced::Length::Fill)
-    .padding(theme::SPACE_1)
-    // The active one carries the same `jacket` outline the segmented choices
-    // elsewhere use: an edge, never a fill, which is the indicator vocabulary
-    // this application settled on and the only one legible at these sizes.
-    .style(theme::button_choice(active))
+        .spacing(0),
+    ]
+    .spacing(theme::SPACE_1)
+    .align_y(iced::Alignment::Center);
+
+    // Indented past the disclosure control, so a child starts where its
+    // parent's glyph does rather than to the left of it. The row itself is
+    // built exactly like a project's -- same marker, same glyph column -- so
+    // the two read as one list at two depths.
+    iced::widget::row![
+        iced::widget::Space::new().width(theme::DISCLOSURE_WIDTH + theme::SPACE_2),
+        iced::widget::button(content)
+            .on_press_maybe(
+                (!active).then_some(Message::EnvironmentActivated(project, row.location.clone())),
+            )
+            .width(iced::Length::Fill)
+            .padding(theme::SPACE_1)
+            .style(move |_theme, status| iced::widget::button::Style {
+                background: match (active, status) {
+                    (true, _) => Some(iced::Background::Color(theme::INK)),
+                    (false, iced::widget::button::Status::Hovered) => {
+                        Some(iced::Background::Color(theme::INK))
+                    }
+                    _ => None,
+                },
+                text_color: theme::PARCHMENT,
+                border: iced::Border {
+                    radius: theme::RADIUS.into(),
+                    ..iced::Border::default()
+                },
+                ..iced::widget::button::Style::default()
+            }),
+    ]
+    .spacing(0)
     .into()
 }
 
