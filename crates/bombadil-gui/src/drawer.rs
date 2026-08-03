@@ -198,7 +198,20 @@ pub fn view<'a>(drawer: &Drawer) -> iced::Element<'a, Message> {
         // application off the top of the window. `push_line` caps how many are
         // kept; this caps how much of the window they occupy, and the rest
         // scrolls.
-        content = content.push(iced::widget::scrollable(list).height(theme::DRAWER_MAX_HEIGHT));
+        //
+        // `anchor_bottom` is what makes it follow the output: the scroll offset
+        // is measured from the *end*, so appending a line moves the content
+        // rather than the view, and the newest line is always the one on
+        // screen. It also does the right thing when the user scrolls up to read
+        // something -- their offset from the end is what is held, so the view
+        // stays put instead of being yanked back down by every arriving line.
+        // A snap-to-end task on each line would have fought them for the
+        // scrollbar.
+        content = content.push(
+            iced::widget::scrollable(list)
+                .height(theme::DRAWER_MAX_HEIGHT)
+                .anchor_bottom(),
+        );
     }
 
     // Full width, not sized to its own content: the drawer is the base of the
