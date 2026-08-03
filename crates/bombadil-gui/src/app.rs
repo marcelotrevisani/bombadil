@@ -15,6 +15,7 @@ use crate::settings_editor;
 use crate::shell;
 use crate::sidebar;
 use crate::theme;
+use crate::tray;
 use bombadil_core::envspec::{self, EnvInputs};
 use bombadil_core::ide;
 use bombadil_core::model::{
@@ -88,6 +89,13 @@ impl ConfigPersist for NullPersist {
 /// Everything the window shows. Deliberately plain data: `update` is the only
 /// place it changes, which is what makes the logic testable without a display.
 pub struct App {
+    /// Whether a tray icon is actually on screen.
+    ///
+    /// The close button hides the window only when this is true. False means
+    /// no StatusNotifierItem host, no tray, and therefore nothing that could
+    /// bring a hidden window back -- so it closes instead. Defaults to false
+    /// so the safe behaviour is the one you get by forgetting to set it.
+    pub tray_is_running: bool,
     /// The whole config, and the *only* copy of the project list.
     ///
     /// There was once an `App::projects` beside this, a clone taken in
@@ -464,6 +472,13 @@ pub enum Message {
     /// carries text `terminal::open::open` has already redacted of any
     /// secret the composed environment resolved.
     OpenTerminalFinished(Result<(), String>),
+    /// The window's close button was pressed, or a tray menu asked for one
+    /// of the three things a tray can ask for.
+    ///
+    /// `exit_on_close_request(false)` is what routes the close button here
+    /// instead of straight to the window manager, so `update` gets to decide
+    /// between hiding and quitting.
+    Tray(tray::TrayCommand),
     /// The PyCharm button was pressed for `projects[usize]`: find the
     /// launcher and open the project folder in it, carrying the same composed
     /// environment `OpenTerminalHereRequested` delivers.
@@ -803,6 +818,9 @@ impl App {
             _ => String::new(),
         };
         Self {
+            // False until `main` says otherwise: without a tray, hiding the
+            // window would be a one-way trip.
+            tray_is_running: false,
             config,
             selected,
             entries,
@@ -841,6 +859,17 @@ impl App {
 /// Takes the whole `Loaded`, not just its `Config`: a corrupt or too-new
 /// file yields a *default* config, so dropping the variant here would leave
 /// the user staring at an empty project list with nothing to explain it.
+/// Everything the application listens to that is not a widget press.
+///
+/// The close button arrives here rather than closing the window, because
+/// `main` sets `exit_on_close_request(false)`. It maps to `Hide`, and the
+/// `Tray` arm in `update` turns that into a real close when no tray is
+/// running -- so the decision lives in one place rather than being split
+/// between this function, which cannot see `App`, and that one, which can.
+pub fn subscription(_app: &App) -> iced::Subscription<Message> {
+    iced::window::close_requests().map(|_| Message::Tray(tray::TrayCommand::Hide))
+}
+
 pub fn boot(loaded: Loaded) -> (App, Task<Message>) {
     let mut app = App::new(loaded.config().clone());
     app.load_problems = banner::load_problems(&loaded);
@@ -1677,6 +1706,23 @@ pub fn update(app: &mut App, message: Message, runner: Arc<dyn CommandRunner>) -
             // same discipline `SyncFinished` follows for `run_sync`.
             drawer::push_line(&mut app.drawer, &message, &[]);
             drawer::set_idle(&mut app.drawer, "open terminal failed".to_string());
+        }
+        // The whole minimise-to-tray behaviour. `hide` is only ever reached
+        // when a tray is actually running -- see `tray_is_running` and the
+        // rule in `tray`'s module doc: hiding with nothing to un-hide from
+        // leaves a process with no window, no icon and no way back.
+        Message::Tray(command) => {
+            return match tray::window_action(command, app.tray_is_running) {
+                tray::WindowAction::Show => iced::window::latest().and_then(|id| {
+                    // Focus as well as show: a window restored behind three
+                    // others has technically obeyed and practically not.
+                    iced::window::set_mode(id, iced::window::Mode::Windowed)
+                        .chain(iced::window::gain_focus(id))
+                }),
+                tray::WindowAction::Hide => iced::window::latest()
+                    .and_then(|id| iced::window::set_mode(id, iced::window::Mode::Hidden)),
+                tray::WindowAction::Close => iced::window::latest().and_then(iced::window::close),
+            };
         }
         Message::OpenPycharmRequested(i) => {
             let Some(project) = app.config.projects.get(i).cloned() else {

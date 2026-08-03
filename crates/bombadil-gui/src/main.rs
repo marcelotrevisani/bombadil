@@ -39,6 +39,7 @@ mod settings_editor;
 mod shell;
 mod sidebar;
 mod theme;
+mod tray;
 
 use bombadil_core::model::Config;
 use bombadil_core::process::{CommandRunner, SystemCommandRunner};
@@ -104,11 +105,63 @@ fn window_settings() -> iced::window::Settings {
     settings
 }
 
+/// The tray's command channel, parked where a plain `fn` can reach it.
+///
+/// `Subscription::run_with` takes a function *pointer*, not a closure, so the
+/// receiver cannot be captured and has to live somewhere global. `Option`
+/// because a `Receiver` can only be consumed once: the first subscription
+/// takes it, and any later one gets an empty stream rather than a panic --
+/// a tray that stops working beats an application that stops running.
+static TRAY_COMMANDS: std::sync::OnceLock<
+    std::sync::Mutex<Option<std::sync::mpsc::Receiver<tray::TrayCommand>>>,
+> = std::sync::OnceLock::new();
+
+/// Turns the tray's commands into application messages.
+///
+/// A `std::sync::mpsc::Receiver` is not a `Stream`, and blocking on one would
+/// stall the executor -- the same problem `job::stream` already has, solved
+/// the same way: a thread blocks on the receiver and forwards into a channel
+/// iced can await.
+fn tray_subscription() -> iced::Subscription<app::Message> {
+    iced::Subscription::run_with((), |()| {
+        let (mut sender, receiver) = futures::channel::mpsc::channel(8);
+        let taken = TRAY_COMMANDS
+            .get()
+            .and_then(|slot| slot.lock().ok()?.take());
+        if let Some(commands) = taken {
+            std::thread::spawn(move || {
+                while let Ok(command) = commands.recv() {
+                    if sender.try_send(app::Message::Tray(command)).is_err() {
+                        break;
+                    }
+                }
+            });
+        }
+        receiver
+    })
+}
+
 fn main() -> iced::Result {
     let (loaded, persist) = load_config();
     // `update` takes the runner as a parameter rather than storing it on
     // `App` so a test can substitute a `FakeCommandRunner`; here it is real.
     let runner: Arc<dyn CommandRunner> = Arc::new(SystemCommandRunner);
+
+    // Started here, before the event loop, and held for the whole of `main`:
+    // `TrayIcon` must be built on the thread that owns the event loop, and
+    // dropping either handle removes the icon.
+    //
+    // `None` is an ordinary answer -- a desktop with no StatusNotifierItem
+    // host has no tray, which is not a failure and not worth a message. What
+    // it must do is reach `App::tray_is_running`, because that is what decides
+    // whether the close button hides the window or closes it. Hiding with no
+    // tray to restore from leaves a process the user cannot reach.
+    let tray = tray::start(ICON_RGBA, ICON_SIDE);
+    let tray_is_running = tray.is_some();
+    let _tray = tray.map(|(handle, commands)| {
+        let _ = TRAY_COMMANDS.set(std::sync::Mutex::new(Some(commands)));
+        handle
+    });
 
     iced::application(
         move || {
@@ -117,6 +170,7 @@ fn main() -> iced::Result {
             // need a `Store`; the real one, opened alongside `loaded` below,
             // replaces it here for the actual app.
             state.persist = persist.clone();
+            state.tray_is_running = tray_is_running;
             (state, task)
         },
         move |state: &mut app::App, message: app::Message| {
@@ -126,6 +180,13 @@ fn main() -> iced::Result {
     )
     .title("Bombadil")
     .window(window_settings())
+    // The close button becomes a message instead of an exit, so `update` can
+    // choose between hiding and quitting. Without this, minimise-to-tray is
+    // unreachable: the window is gone before the application hears about it.
+    .exit_on_close_request(false)
+    .subscription(|state: &app::App| {
+        iced::Subscription::batch([app::subscription(state), tray_subscription()])
+    })
     // Both weights of Atkinson Hyperlegible Next share one font family, so
     // the renderer picks the right face by `Font::weight`; Plex Mono is
     // registered separately for the data typeface. Licences for both ship
