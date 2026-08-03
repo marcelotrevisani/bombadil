@@ -16,6 +16,7 @@ use crate::shell;
 use crate::sidebar;
 use crate::theme;
 use bombadil_core::envspec::{self, EnvInputs};
+use bombadil_core::ide;
 use bombadil_core::model::{
     Config, DefaultVenvLocation, Override, Project, PythonPin, Settings, TerminalChoice, UvSource,
     VenvLocation,
@@ -463,6 +464,14 @@ pub enum Message {
     /// carries text `terminal::open::open` has already redacted of any
     /// secret the composed environment resolved.
     OpenTerminalFinished(Result<(), String>),
+    /// The PyCharm button was pressed for `projects[usize]`: find the
+    /// launcher and open the project folder in it, carrying the same composed
+    /// environment `OpenTerminalHereRequested` delivers.
+    OpenPycharmRequested(usize),
+    /// The background open finished. Same redaction guarantee as
+    /// `OpenTerminalFinished`, and for the same reason -- `ide::open` composes
+    /// an environment that can hold keychain values.
+    OpenPycharmFinished(Result<(), String>),
     /// "Remove from list" was picked for `projects[usize]`. Criterion 4:
     /// removes the project from `config.projects`/`entries` in memory,
     /// synchronously, and dispatches a background persist -- the same
@@ -1668,6 +1677,26 @@ pub fn update(app: &mut App, message: Message, runner: Arc<dyn CommandRunner>) -
             // same discipline `SyncFinished` follows for `run_sync`.
             drawer::push_line(&mut app.drawer, &message, &[]);
             drawer::set_idle(&mut app.drawer, "open terminal failed".to_string());
+        }
+        Message::OpenPycharmRequested(i) => {
+            let Some(project) = app.config.projects.get(i).cloned() else {
+                return Task::none();
+            };
+            let config = app.config.clone();
+            return Task::perform(
+                open_pycharm(project, config, runner),
+                Message::OpenPycharmFinished,
+            );
+        }
+        Message::OpenPycharmFinished(Ok(())) => {}
+        Message::OpenPycharmFinished(Err(message)) => {
+            // Already redacted on the job thread, same as the terminal path.
+            drawer::push_line(&mut app.drawer, &message, &[]);
+            drawer::set_idle(&mut app.drawer, "open PyCharm failed".to_string());
+            // Opened, unlike a failed terminal open: "PyCharm was not found"
+            // is the likely message and it names something the user can act
+            // on, but only if they can see it.
+            app.drawer.expanded = true;
         }
         Message::RemoveProjectRequested(i) if i < app.config.projects.len() => {
             // In-memory first, synchronously -- the same discipline
@@ -3634,6 +3663,90 @@ fn run_open_terminal(
         scratch_dir,
     )
     .map_err(|err| err.to_string())
+}
+
+/// The blocking half of Open in PyCharm: find the launcher, then hand it the
+/// project directory with the composed environment.
+///
+/// The venv comes from the project's *active* environment, exactly as
+/// `run_open_terminal` resolves it -- a project with several environments
+/// must open PyCharm on the same one the terminal button and Sync act on, or
+/// the two buttons beside each other silently mean different things.
+fn run_open_pycharm(
+    project: &Project,
+    config: &Config,
+    home: &Path,
+    store: &dyn SecretStore,
+    runner: &dyn CommandRunner,
+) -> Result<(), String> {
+    let launcher = ide::detect(Os::host(), home, &|p| p.exists(), runner).ok_or_else(|| {
+        // Names where it looked. "PyCharm was not found" alone leaves a user
+        // with a working install nothing to check.
+        let looked: Vec<String> = ide::candidates(Os::host(), home)
+            .iter()
+            .map(|p| p.display().to_string())
+            .collect();
+        format!(
+            "PyCharm was not found. Looked in:\n  {}\nand for `pycharm` on PATH.",
+            looked.join("\n  ")
+        )
+    })?;
+    let environment = project
+        .active_environment()
+        .cloned()
+        .ok_or_else(|| "this project has no environment".to_string())?;
+    let venv_path =
+        venv_path::resolve(project, &environment, &config.settings).map_err(|e| e.to_string())?;
+    let inputs = EnvInputs {
+        parent: std::env::vars().collect(),
+        config: config.clone(),
+        project: project.clone(),
+        venv_path,
+    };
+    ide::open(&launcher, &inputs, store, runner).map_err(|err| err.to_string())
+}
+
+/// Runs Open in PyCharm off the render thread. `VENV_PROBE_TIMEOUT`, like
+/// `open_terminal`: this launches and returns, so a wait measured in seconds
+/// already means something is wrong.
+async fn open_pycharm(
+    project: Project,
+    config: Config,
+    runner: Arc<dyn CommandRunner>,
+) -> Result<(), String> {
+    match job::run(
+        move || {
+            // Read here, at the boundary, so no test reaches the real home
+            // directory -- the same discipline `KeyringSecretStore::new()`
+            // follows one line down.
+            let home = home_dir();
+            run_open_pycharm(
+                &project,
+                &config,
+                &home,
+                &KeyringSecretStore::new(),
+                runner.as_ref(),
+            )
+        },
+        VENV_PROBE_TIMEOUT,
+    )
+    .await
+    {
+        job::JobResult::Done(result) => result,
+        job::JobResult::TimedOut => Err("opening PyCharm timed out".to_string()),
+        job::JobResult::Failed => Err("opening PyCharm failed unexpectedly".to_string()),
+    }
+}
+
+/// This user's home directory, or an empty path when the platform will not
+/// say. An empty path makes every `home`-relative candidate a relative path
+/// that will not exist, so detection falls through to `PATH` rather than
+/// probing nonsense.
+fn home_dir() -> PathBuf {
+    std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(PathBuf::from)
+        .unwrap_or_default()
 }
 
 /// Says in the drawer that there is no terminal to open.
@@ -11027,6 +11140,173 @@ mod tests {
         assert_eq!(app.config.settings.default_venv_location, before);
         assert!(fake.calls().is_empty());
         assert!(task.units() > 0, "must open the async folder picker");
+    }
+
+    // --- Open in PyCharm ---
+
+    /// A runner that answers the PATH probe and lets the launcher spawn
+    /// through. Detection's filesystem half is exercised in
+    /// `bombadil_core::ide`'s own tests against a described filesystem; here
+    /// the real `Path::exists` runs against a home directory that has no
+    /// PyCharm in it, so it always falls through to this.
+    fn pycharm_on_path() -> FakeCommandRunner {
+        let runner = FakeCommandRunner::new();
+        let found = bombadil_core::process::CommandOutcome {
+            status: Some(0),
+            stdout: "/opt/pycharm\n".into(),
+            stderr: String::new(),
+        };
+        runner.expect("which", &["pycharm"], found.clone());
+        runner.expect("where", &["pycharm"], found.clone());
+        runner.expect("pycharm", &[], found);
+        runner
+    }
+
+    #[test]
+    fn pycharm_opens_on_the_environment_the_other_two_buttons_act_on() {
+        // The bug this exists to prevent: a project with several environments
+        // whose PyCharm button opens a *different* one from the terminal
+        // button sitting next to it and the Sync button next to that. Both
+        // read `active_environment`, so both have to be asked here, and the
+        // one that is NOT default has to be the wrong answer.
+        let mut project = project("api");
+        let elsewhere = bombadil_core::model::VenvLocation::Custom {
+            path: std::path::PathBuf::from("/envs/api-312"),
+        };
+        project
+            .environments
+            .push(bombadil_core::model::Environment {
+                location: elsewhere.clone(),
+                python: PythonPin::Unpinned,
+            });
+        project.active = elsewhere;
+
+        let runner = pycharm_on_path();
+        run_open_pycharm(
+            &project,
+            &Config::default(),
+            std::path::Path::new("/nonexistent-home"),
+            &bombadil_core::secrets::InMemorySecretStore::new(),
+            &runner,
+        )
+        .expect("a programmed spawn must succeed");
+
+        let calls = runner.calls();
+        let launch = calls
+            .iter()
+            .find(|c| c.program == *std::path::Path::new("/opt/pycharm"))
+            .expect("PyCharm must be launched");
+        assert_eq!(
+            launch.env.get("VIRTUAL_ENV").map(String::as_str),
+            Some("/envs/api-312"),
+            "PyCharm must get the project's default environment, not its first"
+        );
+    }
+
+    #[test]
+    fn pycharm_opens_the_project_folder() {
+        let runner = pycharm_on_path();
+        run_open_pycharm(
+            &project("api"),
+            &Config::default(),
+            std::path::Path::new("/nonexistent-home"),
+            &bombadil_core::secrets::InMemorySecretStore::new(),
+            &runner,
+        )
+        .unwrap();
+
+        let calls = runner.calls();
+        let launch = calls
+            .iter()
+            .find(|c| c.program == *std::path::Path::new("/opt/pycharm"))
+            .expect("PyCharm must be launched");
+        assert_eq!(launch.args, vec!["/p/api".to_string()]);
+    }
+
+    #[test]
+    fn no_pycharm_says_where_it_looked() {
+        // "PyCharm was not found" on its own leaves a user who has PyCharm
+        // installed with nothing to check. The paths are the whole message.
+        let runner = FakeCommandRunner::new();
+
+        let err = run_open_pycharm(
+            &project("api"),
+            &Config::default(),
+            std::path::Path::new("/nonexistent-home"),
+            &bombadil_core::secrets::InMemorySecretStore::new(),
+            &runner,
+        )
+        .expect_err("nothing is installed, so this cannot succeed");
+
+        assert!(err.contains("not found"), "got {err}");
+        assert!(
+            err.contains("Toolbox"),
+            "the message must name the places that were tried; got {err}"
+        );
+        assert!(
+            runner
+                .calls()
+                .iter()
+                .all(|c| !c.program.to_string_lossy().contains("/opt/pycharm")),
+            "a failed detection must not spawn a guessed path"
+        );
+    }
+
+    #[test]
+    fn pressing_the_pycharm_button_dispatches_background_work() {
+        // Launching an IDE from `update` would block the render thread on a
+        // process spawn -- the same rule every other launch in this file
+        // follows.
+        let mut app = App::new(Config {
+            projects: vec![project("api")],
+            ..Config::default()
+        });
+        let fake = Arc::new(FakeCommandRunner::new());
+
+        let task = update(&mut app, Message::OpenPycharmRequested(0), fake.clone());
+
+        assert!(task.units() > 0, "the launch must be background work");
+        assert!(
+            fake.calls().is_empty(),
+            "nothing may be spawned synchronously inside update"
+        );
+    }
+
+    #[test]
+    fn a_pycharm_button_press_for_a_project_that_is_gone_does_nothing() {
+        let mut app = App::new(Config::default());
+        let fake = Arc::new(FakeCommandRunner::new());
+
+        let task = update(&mut app, Message::OpenPycharmRequested(7), fake.clone());
+
+        assert_eq!(task.units(), 0);
+        assert!(fake.calls().is_empty());
+    }
+
+    #[test]
+    fn a_failed_pycharm_open_is_shown_rather_than_swallowed() {
+        // The likely failure is "not found", which names something the user
+        // can act on -- but only if the drawer is open to show it.
+        let mut app = App::new(Config::default());
+        app.drawer.expanded = false;
+
+        let _ = update(
+            &mut app,
+            Message::OpenPycharmFinished(Err("PyCharm was not found. Looked in: ...".into())),
+            unused_runner(),
+        );
+
+        assert!(app.drawer.expanded, "the user has to be able to read it");
+        assert!(
+            app.drawer.status.contains("failed"),
+            "{:?}",
+            app.drawer.status
+        );
+        assert!(
+            app.drawer.lines.iter().any(|l| l.contains("not found")),
+            "the transcript must carry the reason; got {:?}",
+            app.drawer.lines
+        );
     }
 
     fn project(label: &str) -> bombadil_core::model::Project {

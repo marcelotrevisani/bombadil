@@ -166,12 +166,39 @@ pub fn view<'a>(header: &Header, index: usize) -> iced::Element<'a, Message> {
         iced::widget::tooltip::Position::Left,
     );
 
+    // "PC", set in the same data face as the terminal's `>_` beside it, for
+    // the same reason: two typefaces already ship, an icon set does not, and
+    // a JetBrains mark is not ours to draw. The tooltip carries the meaning,
+    // and says what the launch actually does -- the interpreter is the part a
+    // user would otherwise assume was handled (see `bombadil_core::ide`'s
+    // module doc for why it cannot be).
+    let pycharm = iced::widget::tooltip(
+        iced::widget::button(
+            iced::widget::text("PC")
+                .font(theme::FONT_DATA)
+                .size(theme::BODY),
+        )
+        .on_press(Message::OpenPycharmRequested(index))
+        .padding([theme::SPACE_1, theme::SPACE_2])
+        .style(theme::button_quiet),
+        iced::widget::container(
+            iced::widget::text(
+                "Open in PyCharm, in this folder, with the environment's variables and PATH",
+            )
+            .size(theme::LABEL),
+        )
+        .padding(theme::SPACE_1)
+        .style(theme::panel),
+        iced::widget::tooltip::Position::Left,
+    );
+
     let path_row = iced::widget::row![
         iced::widget::text(header.path.display().to_string())
             .font(theme::FONT_DATA)
             .size(theme::DATA)
             .color(theme::SLATE),
         iced::widget::Space::new().width(iced::Length::Fill),
+        pycharm,
         terminal,
         sync,
     ]
