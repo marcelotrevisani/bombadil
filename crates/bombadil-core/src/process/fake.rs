@@ -1,6 +1,8 @@
 #![cfg(any(test, feature = "test-support"))]
 
-use super::{CommandError, CommandOutcome, CommandRunner, CommandSpec, program_matches};
+use super::{
+    CommandError, CommandOutcome, CommandRunner, CommandSpec, OutputLine, program_matches,
+};
 use std::sync::Mutex;
 
 struct Rule {
@@ -18,6 +20,7 @@ pub struct FakeCommandRunner {
     rules: Mutex<Vec<Rule>>,
     calls: Mutex<Vec<CommandSpec>>,
     blocking: Mutex<usize>,
+    streaming: Mutex<usize>,
 }
 
 impl FakeCommandRunner {
@@ -52,6 +55,18 @@ impl FakeCommandRunner {
         *self.blocking.lock().unwrap()
     }
 
+    /// How many calls arrived through `stream` -- which delivers output as it
+    /// is produced -- rather than through `run`, which delivers it only after
+    /// the child exits.
+    ///
+    /// Exists for the same reason `blocking_calls` does, and learned from the
+    /// same mistake: `CommandRunner::stream`'s default delegates to `run`, so
+    /// without this counter no test could tell a caller that streams from one
+    /// that buffers, and the whole point of streaming would be unprovable.
+    pub fn streaming_calls(&self) -> usize {
+        *self.streaming.lock().unwrap()
+    }
+
     /// Record the call and answer it from the programmed rules. Shared by
     /// `run` and `spawn` so both are recorded identically; only the blocking
     /// counter tells them apart.
@@ -84,5 +99,29 @@ impl CommandRunner for FakeCommandRunner {
 
     fn spawn(&self, spec: &CommandSpec) -> Result<(), CommandError> {
         self.record(spec).map(|_| ())
+    }
+
+    /// Hands the programmed outcome to `on_line` a line at a time, stdout
+    /// then stderr -- a fake has no real child to interleave with, and the
+    /// only thing a test can meaningfully assert is that every line arrived
+    /// through the callback rather than only in the returned outcome.
+    ///
+    /// Counted separately from `run` and deliberately not counted as
+    /// blocking: that is what makes "this caller streams" an assertion rather
+    /// than a hope.
+    fn stream(
+        &self,
+        spec: &CommandSpec,
+        on_line: &mut dyn FnMut(OutputLine),
+    ) -> Result<CommandOutcome, CommandError> {
+        *self.streaming.lock().unwrap() += 1;
+        let outcome = self.record(spec)?;
+        for line in outcome.stdout.lines() {
+            on_line(OutputLine::Stdout(line.to_string()));
+        }
+        for line in outcome.stderr.lines() {
+            on_line(OutputLine::Stderr(line.to_string()));
+        }
+        Ok(outcome)
     }
 }

@@ -104,6 +104,27 @@ impl CommandOutcome {
     }
 }
 
+/// One line of a running child's output, tagged with the pipe it came from.
+///
+/// `stream` delivers stdout and stderr interleaved, in arrival order, which is
+/// the only order that reflects what actually happened -- uv writes its
+/// progress to stderr and its results to stdout, and a transcript that showed
+/// all of one and then all of the other would be a transcript of neither. The
+/// tag is what lets a receiver still tell them apart afterwards.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OutputLine {
+    Stdout(String),
+    Stderr(String),
+}
+
+impl OutputLine {
+    pub fn text(&self) -> &str {
+        match self {
+            Self::Stdout(text) | Self::Stderr(text) => text,
+        }
+    }
+}
+
 /// The single seam through which Bombadil launches processes.
 ///
 /// Nothing above this trait spawns anything directly, which is what lets the
@@ -119,6 +140,29 @@ pub trait CommandRunner: Send + Sync {
     /// which lives for as long as the user keeps the window open.
     fn spawn(&self, spec: &CommandSpec) -> Result<(), CommandError> {
         self.run(spec).map(|_| ())
+    }
+
+    /// Wait for the child, but hand each line of its output to `on_line` as
+    /// it arrives instead of only after it exits. The returned outcome still
+    /// carries the exit status and the whole output, so a caller that only
+    /// checks `success()` needs no change.
+    ///
+    /// The default delegates to `run` and replays the buffered output line by
+    /// line -- the same shape `spawn`'s default takes, so every existing
+    /// implementation stays correct, just not incremental.
+    fn stream(
+        &self,
+        spec: &CommandSpec,
+        on_line: &mut dyn FnMut(OutputLine),
+    ) -> Result<CommandOutcome, CommandError> {
+        let outcome = self.run(spec)?;
+        for line in outcome.stdout.lines() {
+            on_line(OutputLine::Stdout(line.to_string()));
+        }
+        for line in outcome.stderr.lines() {
+            on_line(OutputLine::Stderr(line.to_string()));
+        }
+        Ok(outcome)
     }
 }
 
@@ -264,6 +308,110 @@ mod tests {
         fake.run(&spec).unwrap();
         assert_eq!(fake.blocking_calls(), 1, "run waits for the child");
         assert_eq!(fake.calls().len(), 2);
+    }
+
+    #[test]
+    fn the_fake_tells_a_stream_apart_from_a_run() {
+        // The counterpart of the test above, for the same reason: the default
+        // `CommandRunner::stream` delegates to `run`, so a caller switched
+        // back to the buffered path would look identical to a test asserting
+        // only on `calls()`. Without this counter "the drawer streams" is
+        // unprovable, which is exactly how "spawn, never run" went unproven
+        // for two plans.
+        let fake = FakeCommandRunner::new();
+        fake.expect(
+            "uv",
+            &["sync"],
+            CommandOutcome {
+                status: Some(0),
+                stdout: String::new(),
+                stderr: String::new(),
+            },
+        );
+        let spec = CommandSpec::new("uv").arg("sync");
+
+        fake.stream(&spec, &mut |_| {}).unwrap();
+        assert_eq!(fake.streaming_calls(), 1);
+        assert_eq!(
+            fake.blocking_calls(),
+            0,
+            "a stream must not count as a buffered run"
+        );
+
+        fake.run(&spec).unwrap();
+        assert_eq!(fake.blocking_calls(), 1);
+        assert_eq!(
+            fake.streaming_calls(),
+            1,
+            "a run must not count as a stream"
+        );
+        assert_eq!(fake.calls().len(), 2, "both are still recorded calls");
+    }
+
+    #[test]
+    fn the_fake_delivers_the_programmed_output_through_the_callback() {
+        // A `stream` that returned the outcome but never called `on_line`
+        // would satisfy every assertion about exit status while delivering
+        // nothing to the drawer at all.
+        let fake = FakeCommandRunner::new();
+        fake.expect(
+            "uv",
+            &["sync"],
+            CommandOutcome {
+                status: Some(0),
+                stdout: "resolved 3 packages\ninstalled 3 packages".into(),
+                stderr: "warning: no interpreter pin".into(),
+            },
+        );
+
+        let mut seen = Vec::new();
+        let outcome = fake
+            .stream(&CommandSpec::new("uv").arg("sync"), &mut |line| {
+                seen.push(line)
+            })
+            .unwrap();
+
+        assert_eq!(
+            seen,
+            vec![
+                OutputLine::Stdout("resolved 3 packages".into()),
+                OutputLine::Stdout("installed 3 packages".into()),
+                OutputLine::Stderr("warning: no interpreter pin".into()),
+            ]
+        );
+        assert!(outcome.success(), "the exit status still comes back");
+    }
+
+    #[test]
+    fn the_default_stream_replays_a_runners_whole_output_and_keeps_its_status() {
+        // The default exists so an implementation that has not overridden
+        // `stream` stays correct -- non-incremental, but complete. A default
+        // that dropped stderr, or lost the exit code, would break every
+        // caller that switched to `stream`.
+        struct RunOnly;
+        impl CommandRunner for RunOnly {
+            fn run(&self, _spec: &CommandSpec) -> Result<CommandOutcome, CommandError> {
+                Ok(CommandOutcome {
+                    status: Some(2),
+                    stdout: "out-1\nout-2".into(),
+                    stderr: "err-1".into(),
+                })
+            }
+        }
+
+        let mut seen = Vec::new();
+        let outcome = RunOnly
+            .stream(&CommandSpec::new("uv"), &mut |line| {
+                seen.push(line.text().to_string())
+            })
+            .unwrap();
+
+        assert_eq!(seen, vec!["out-1", "out-2", "err-1"]);
+        assert_eq!(
+            outcome.status,
+            Some(2),
+            "the exit status must survive the default `stream`"
+        );
     }
 
     #[test]
