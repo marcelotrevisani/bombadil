@@ -1235,6 +1235,19 @@ pub fn update(app: &mut App, message: Message, runner: Arc<dyn CommandRunner>) -
             if !success && !app.drawer.lines.is_empty() {
                 app.drawer.expanded = true;
             }
+            // A sync is the one action that changes what every read-only
+            // surface describes: it installs and removes packages, and it
+            // creates the environment when there was none. Without re-reading
+            // here the Dependencies tab goes on listing what was installed
+            // *before* the sync, and the sidebar goes on showing "no env" for
+            // an environment that now exists -- both correct only until the
+            // first Sync, and only fixed by restarting.
+            //
+            // Re-read on failure too: a failed sync is not an unchanged one.
+            // uv installs what it can resolve before it hits the package it
+            // cannot, and the tab has to describe the environment as it now
+            // is, not as it was before an attempt that partly landed.
+            return refresh_after_sync(app, runner);
         }
         Message::AddProjectPickManifestRequested => {
             return Task::perform(pick_pyproject(), Message::AddProjectManifestPicked);
@@ -2203,6 +2216,39 @@ pub fn update(app: &mut App, message: Message, runner: Arc<dyn CommandRunner>) -
         }
     }
     Task::none()
+}
+
+/// Re-read everything a finished sync has just invalidated.
+///
+/// The Dependencies and Members tabs are built from `uv pip list` output
+/// captured when they were last fetched, and the sidebar's glyph from a
+/// `pyvenv.cfg` read at the same time. A sync changes all three, so all three
+/// are re-read -- there is no cheaper subset, because a sync that installs a
+/// package, removes another and creates the environment does all of it at
+/// once.
+///
+/// Only for the selected project's tabs, since those are the only ones
+/// rendered; the venv probe covers every project, because a sync can move an
+/// environment into existence and the sidebar shows them all.
+fn refresh_after_sync(app: &App, runner: Arc<dyn CommandRunner>) -> Task<Message> {
+    let mut tasks = vec![probe_every_venv(app)];
+    if let Some(i) = app.selected
+        && let Some(project) = app.config.projects.get(i)
+    {
+        tasks.push(fetch_deps_task(
+            i,
+            project.clone(),
+            app.config.clone(),
+            runner.clone(),
+        ));
+        tasks.push(fetch_members_task(
+            i,
+            project.clone(),
+            app.config.clone(),
+            runner,
+        ));
+    }
+    Task::batch(tasks)
 }
 
 /// The project a Sync press for `projects[i]` acts on.
@@ -4935,6 +4981,87 @@ mod tests {
         assert!(
             streamed.iter().any(|l| l.contains("***")),
             "the line must still be shown, redacted; got {streamed:?}"
+        );
+    }
+
+    #[test]
+    fn a_finished_sync_refreshes_what_it_just_changed() {
+        // A sync installs and removes packages and can create the environment
+        // itself. Without a re-read the Dependencies tab goes on listing what
+        // was installed *before* it, and the sidebar goes on saying "no env"
+        // for an environment that now exists -- both wrong until restart.
+        let mut app = App::new(Config {
+            projects: vec![project("api")],
+            settings: fake_uv_settings(),
+            ..Config::default()
+        });
+        app.selected = Some(0);
+        app.deps = Some((0, Err("stale".to_string())));
+
+        let task = update(
+            &mut app,
+            Message::SyncFinished {
+                success: true,
+                lines: Vec::new(),
+            },
+            unused_runner(),
+        );
+
+        assert!(
+            task.units() > 0,
+            "a finished sync must dispatch the re-reads it invalidated"
+        );
+        assert!(app.syncing.is_none(), "the slot must still be released");
+    }
+
+    #[test]
+    fn a_failed_sync_refreshes_too() {
+        // A failed sync is not an unchanged one: uv installs what it can
+        // resolve before it hits the package it cannot, so the tab has to
+        // describe the environment as it now is rather than as it was before
+        // an attempt that partly landed.
+        let mut app = App::new(Config {
+            projects: vec![project("api")],
+            settings: fake_uv_settings(),
+            ..Config::default()
+        });
+        app.selected = Some(0);
+
+        let task = update(
+            &mut app,
+            Message::SyncFinished {
+                success: false,
+                lines: vec!["error: no solution found".to_string()],
+            },
+            unused_runner(),
+        );
+
+        assert!(task.units() > 0, "a failed sync must refresh as well");
+    }
+
+    #[test]
+    fn a_finished_sync_with_nothing_selected_still_reprobes_the_sidebar() {
+        // No selection means no tab to refresh, but the sidebar shows every
+        // project and a sync can have created one of their environments.
+        let mut app = App::new(Config {
+            projects: vec![project("api")],
+            settings: fake_uv_settings(),
+            ..Config::default()
+        });
+        app.selected = None;
+
+        let task = update(
+            &mut app,
+            Message::SyncFinished {
+                success: true,
+                lines: Vec::new(),
+            },
+            unused_runner(),
+        );
+
+        assert!(
+            task.units() > 0,
+            "the venv probe covers every project, selected or not"
         );
     }
 
