@@ -111,12 +111,48 @@ pub fn terminal_name(kind: TerminalKind) -> &'static str {
     }
 }
 
-/// The label the submenu row shows for a detected kind: its name plus
-/// `activation_warning`, so a degraded terminal reads as degraded right in
-/// the menu, not only after the user has already opened it and found an
-/// unactivated shell.
-pub fn menu_label(kind: TerminalKind) -> String {
-    format!("{}{}", terminal_name(kind), activation_warning(kind))
+/// What the detail header's one-press terminal button should do next.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OpenPlan {
+    /// Open this terminal now.
+    Open(TerminalChoice),
+    /// Nothing is configured, so find out what is installed and ask again.
+    Detect,
+    /// Nothing configured and nothing installed. There is no terminal to
+    /// open, and the caller says so rather than spawning something arbitrary.
+    Nothing,
+}
+
+/// Decides [`OpenPlan`] from what is configured and, once it is known, what
+/// is installed.
+///
+/// `detected` is `None` before any probe has run and `Some` afterwards --
+/// which is what separates "we have not looked yet" from "we looked and found
+/// nothing", two states an empty slice alone cannot tell apart.
+///
+/// A configured default wins whatever it is, without probing at all: the user
+/// said so, substituting another terminal because theirs is not on the
+/// detected list would be the application overruling a setting, and seven
+/// `which` calls the answer does not depend on are seven the user waits
+/// through before their window appears.
+///
+/// A function rather than a `match` inside `update`, and the reason is a test
+/// that lied: both branches of that `match` returned a `Task`, and no
+/// assertion available to a test could tell one from the other -- so "opens
+/// without probing" passed just as happily against an implementation that
+/// always probed.
+pub fn one_press_plan(
+    default: Option<&TerminalChoice>,
+    detected: Option<&[TerminalKind]>,
+) -> OpenPlan {
+    if let Some(choice) = default {
+        return OpenPlan::Open(choice.clone());
+    }
+    match detected {
+        None => OpenPlan::Detect,
+        Some([]) => OpenPlan::Nothing,
+        Some(kinds) => OpenPlan::Open(TerminalChoice::Detected(kinds[0])),
+    }
 }
 
 /// The context menu's live state while it is open. `terminals` starts empty
@@ -214,20 +250,39 @@ pub fn confirm_view<'a>(confirm: &ConfirmRecreate) -> iced::Element<'a, Message>
 /// testing lives in `ordered`, `activation_warning` and `submenu`.
 pub fn view<'a>(
     menu: &ContextMenu,
+    label: &str,
     default: Option<&TerminalChoice>,
 ) -> iced::Element<'a, Message> {
     let index = menu.project_index;
-    let mut column = iced::widget::column![iced::widget::text("Open terminal").size(theme::BODY)]
-        .spacing(theme::SPACE_1);
+
+    let mut column = iced::widget::column![
+        // Which project this menu acts on. It is opened by a right-press that
+        // deliberately does not move the selection, so without this the menu
+        // is a list of destructive actions with no subject named.
+        iced::widget::container(
+            iced::widget::text(label.to_string())
+                .font(theme::FONT_PROSE_SEMIBOLD)
+                .size(theme::LABEL)
+                .color(theme::SLATE)
+        )
+        .padding([theme::SPACE_1, theme::SPACE_3]),
+        theme::hairline_row(),
+        section_heading("Open terminal"),
+    ]
+    .spacing(0);
 
     for option in submenu(menu.terminals.clone(), default) {
         match option {
             TerminalOption::Detected(kind) => {
-                column = column.push(
-                    iced::widget::button(iced::widget::text(menu_label(kind))).on_press(
-                        Message::OpenTerminalRequested(index, TerminalChoice::Detected(kind)),
-                    ),
-                );
+                column = column.push(entry(
+                    terminal_name(kind),
+                    // The warning is a second line in `slate` rather than a
+                    // suffix on the label: appended, it made every row as
+                    // wide as the longest sentence in the file and turned the
+                    // menu into a paragraph.
+                    Some(activation_warning(kind)),
+                    Message::OpenTerminalRequested(index, TerminalChoice::Detected(kind)),
+                ));
             }
             // Only offered as a live choice once the user has actually
             // configured a custom template -- an empty one is refused by
@@ -235,42 +290,87 @@ pub fn view<'a>(
             // dispatch without it.
             TerminalOption::Custom => {
                 if let Some(TerminalChoice::Custom { template }) = default {
-                    column =
-                        column.push(iced::widget::button(iced::widget::text("Custom")).on_press(
-                            Message::OpenTerminalRequested(
-                                index,
-                                TerminalChoice::Custom {
-                                    template: template.clone(),
-                                },
-                            ),
-                        ));
+                    column = column.push(entry(
+                        "Custom",
+                        None,
+                        Message::OpenTerminalRequested(
+                            index,
+                            TerminalChoice::Custom {
+                                template: template.clone(),
+                            },
+                        ),
+                    ));
                 }
             }
         }
     }
 
     column
-        .push(
-            iced::widget::button(iced::widget::text("Sync"))
-                .on_press(Message::SyncRequested(index)),
-        )
-        .push(
-            iced::widget::button(iced::widget::text("Open folder"))
-                .on_press(Message::OpenFolderRequested(index)),
-        )
+        .push(theme::hairline_row())
+        .push(entry("Sync", None, Message::SyncRequested(index)))
+        .push(entry(
+            "Open folder",
+            None,
+            Message::OpenFolderRequested(index),
+        ))
+        .push(theme::hairline_row())
+        // The two below the second line are the ones that take something
+        // away. Grouped, not coloured: `boot` belongs to the confirm button
+        // that actually destroys, and spending it on a menu entry that only
+        // opens a confirmation would spend the ration twice for one action.
+        //
         // Opens the confirmation, never the deletion -- see
         // `Message::RecreateVenvRequested`.
-        .push(
-            iced::widget::button(iced::widget::text("Recreate venv"))
-                .on_press(Message::RecreateVenvRequested(index)),
-        )
-        .push(
-            iced::widget::button(iced::widget::text("Remove from list"))
-                .on_press(Message::RemoveProjectRequested(index)),
-        )
-        .push(
-            iced::widget::button(iced::widget::text("Close")).on_press(Message::ContextMenuClosed),
-        )
+        .push(entry(
+            "Recreate venv",
+            None,
+            Message::RecreateVenvRequested(index),
+        ))
+        .push(entry(
+            "Remove from list",
+            None,
+            Message::RemoveProjectRequested(index),
+        ))
+        .into()
+}
+
+/// A heading above a group of entries. Not itself pressable.
+fn section_heading<'a>(text: &'static str) -> iced::Element<'a, Message> {
+    iced::widget::container(
+        iced::widget::text(text)
+            .size(theme::LABEL)
+            .color(theme::SLATE),
+    )
+    .padding([theme::SPACE_1, theme::SPACE_3])
+    .into()
+}
+
+/// One pressable row: a full-width bare button, left-aligned, with an
+/// optional second line of detail beneath the label.
+///
+/// The whole menu used to be a column of default-styled buttons, each sized
+/// to its own text, stacked in a centred card -- a bunch of buttons rather
+/// than a menu. A menu row fills its panel, reacts on hover, and reads as one
+/// of a list.
+fn entry<'a>(
+    label: &'a str,
+    detail: Option<&'a str>,
+    message: Message,
+) -> iced::Element<'a, Message> {
+    let mut content = iced::widget::column![iced::widget::text(label).size(theme::BODY)];
+    if let Some(detail) = detail.filter(|d| !d.is_empty()) {
+        content = content.push(
+            iced::widget::text(detail.trim())
+                .size(theme::LABEL)
+                .color(theme::SLATE),
+        );
+    }
+
+    iced::widget::button(content)
+        .on_press(message)
+        .width(iced::Length::Fill)
+        .padding([theme::SPACE_1, theme::SPACE_3])
+        .style(theme::button_bare(theme::PARCHMENT))
         .into()
 }
 
@@ -392,11 +492,68 @@ mod tests {
     }
 
     #[test]
-    fn the_menu_label_names_the_terminal_and_appends_its_warning() {
-        assert_eq!(menu_label(TerminalKind::Kitty), "kitty");
-        let label = menu_label(TerminalKind::TerminalApp);
-        assert!(label.starts_with("Terminal.app"), "got {label}");
-        assert!(label.contains("not activated"), "got {label}");
+    fn a_fully_activating_terminal_carries_no_warning_line() {
+        // `entry` renders the warning as a second line only when it is
+        // non-empty, so an empty string here is what keeps a healthy
+        // terminal's row a single line. A warning that was never empty would
+        // put a line of reassurance under every entry and make the real ones
+        // invisible.
+        assert_eq!(activation_warning(TerminalKind::Kitty), "");
+        assert!(
+            activation_warning(TerminalKind::TerminalApp).contains("not activated"),
+            "got {:?}",
+            activation_warning(TerminalKind::TerminalApp)
+        );
+    }
+
+    #[test]
+    fn a_configured_default_opens_immediately_without_probing() {
+        // Two things at once, and the second is the one a `Task`-shaped
+        // assertion could not make: the configured terminal is chosen, *and*
+        // the plan is not `Detect`. An implementation that probed anyway and
+        // then honoured the default would produce the same window a moment
+        // later and fail here, which is the point.
+        let default = TerminalChoice::Detected(TerminalKind::Konsole);
+        assert_eq!(
+            one_press_plan(Some(&default), None),
+            OpenPlan::Open(TerminalChoice::Detected(TerminalKind::Konsole))
+        );
+    }
+
+    #[test]
+    fn a_configured_default_is_not_overruled_by_what_is_installed() {
+        // Konsole configured, Konsole not among the detected: still Konsole.
+        // The user set it; the application does not get to substitute.
+        let default = TerminalChoice::Detected(TerminalKind::Konsole);
+        assert_eq!(
+            one_press_plan(
+                Some(&default),
+                Some(&[TerminalKind::Kitty, TerminalKind::Xterm])
+            ),
+            OpenPlan::Open(TerminalChoice::Detected(TerminalKind::Konsole))
+        );
+    }
+
+    #[test]
+    fn nothing_configured_means_look_before_opening() {
+        assert_eq!(one_press_plan(None, None), OpenPlan::Detect);
+    }
+
+    #[test]
+    fn with_nothing_configured_the_first_detected_is_used() {
+        assert_eq!(
+            one_press_plan(None, Some(&[TerminalKind::Kitty, TerminalKind::Xterm])),
+            OpenPlan::Open(TerminalChoice::Detected(TerminalKind::Kitty))
+        );
+    }
+
+    #[test]
+    fn having_looked_and_found_nothing_is_not_the_same_as_not_having_looked() {
+        // The whole reason `detected` is an `Option<&[_]>`. Collapsed to a
+        // bare slice, "no terminals installed" and "no probe has run yet"
+        // are the same empty list -- and the button would probe forever.
+        assert_eq!(one_press_plan(None, Some(&[])), OpenPlan::Nothing);
+        assert_ne!(one_press_plan(None, Some(&[])), one_press_plan(None, None));
     }
 
     #[test]

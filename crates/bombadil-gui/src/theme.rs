@@ -209,6 +209,9 @@ pub const OVERLAY_MAX_HEIGHT: f32 = 560.0;
 /// transcript scrolls: a thousand-line resolution must not push the
 /// application off the top of the window.
 pub const DRAWER_MAX_HEIGHT: f32 = 220.0;
+/// Width of the project context menu's panel. Wider than the Help menu: its
+/// rows carry a second line naming what a terminal will not activate.
+pub const CONTEXT_MENU_WIDTH: f32 = 320.0;
 /// Width of the drop-down panel the Help menu opens.
 pub const MENU_WIDTH: f32 = 220.0;
 /// Width of the state glyph column, fixed at the left of every row in every

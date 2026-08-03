@@ -400,6 +400,20 @@ pub enum Message {
     /// itself spawns the emulator via `CommandRunner::spawn`, not `run`, so
     /// the window is never held hostage for the terminal's lifetime.
     OpenTerminalRequested(usize, TerminalChoice),
+    /// The detail header's terminal button: open a terminal for
+    /// `projects[usize]` in one press, with no menu in between.
+    ///
+    /// The same composed environment, activated venv and project-directory
+    /// cwd `OpenTerminalRequested` delivers -- it goes through the identical
+    /// `run_open_terminal`. All that differs is who picks the terminal:
+    /// `context_menu::one_press_choice` rather than the user, from the
+    /// configured default or, failing that, whatever is installed.
+    OpenTerminalHereRequested(usize),
+    /// The detection a one-press open had to run first, because nothing was
+    /// configured. Carries the index it started for, since the selection can
+    /// move while a probe is in flight -- the same staleness guard
+    /// `VenvProbed` and `DepsLoaded` use.
+    OpenTerminalHereDetected(usize, Vec<TerminalKind>),
     /// The background open finished. `Ok(())` on a successful spawn; `Err`
     /// carries text `terminal::open::open` has already redacted of any
     /// secret the composed environment resolved.
@@ -1353,6 +1367,56 @@ pub fn update(app: &mut App, message: Message, runner: Arc<dyn CommandRunner>) -
             }
         }
         Message::OpenTerminalRequested(_, _) => {}
+        Message::OpenTerminalHereRequested(i) if i < app.config.projects.len() => {
+            let default = app.config.terminal_defaults.get(&Os::host()).cloned();
+            let Some(project) = app.config.projects.get(i).cloned() else {
+                return Task::none();
+            };
+            // `None` for `detected`: no probe has run. The decision itself
+            // lives in `one_press_plan`, tested there -- this arm only carries
+            // it out.
+            match context_menu::one_press_plan(default.as_ref(), None) {
+                context_menu::OpenPlan::Open(choice) => {
+                    let config = app.config.clone();
+                    return Task::perform(
+                        open_terminal(choice, project, config, runner),
+                        Message::OpenTerminalFinished,
+                    );
+                }
+                context_menu::OpenPlan::Detect => {
+                    return Task::perform(detect_terminals(Os::host(), runner), move |kinds| {
+                        Message::OpenTerminalHereDetected(i, kinds)
+                    });
+                }
+                // Unreachable before a probe has run -- `one_press_plan`
+                // answers `Nothing` only for `Some([])` -- and matched rather
+                // than `unreachable!()` so a future third caller cannot turn
+                // a wrong plan into a panic in the user's window.
+                context_menu::OpenPlan::Nothing => report_no_terminal(app),
+            }
+        }
+        Message::OpenTerminalHereRequested(_) => {}
+        Message::OpenTerminalHereDetected(i, detected) => {
+            let Some(project) = app.config.projects.get(i).cloned() else {
+                return Task::none();
+            };
+            // `None` for the default: this arm is only reached because there
+            // was not one. Passing it again would re-ask a question already
+            // answered.
+            match context_menu::one_press_plan(None, Some(&detected)) {
+                context_menu::OpenPlan::Open(choice) => {
+                    let config = app.config.clone();
+                    return Task::perform(
+                        open_terminal(choice, project, config, runner),
+                        Message::OpenTerminalFinished,
+                    );
+                }
+                context_menu::OpenPlan::Nothing => report_no_terminal(app),
+                // Cannot happen: `detected` is `Some`, so the plan is never
+                // "look again". Matched rather than panicked, as above.
+                context_menu::OpenPlan::Detect => {}
+            }
+        }
         Message::OpenTerminalFinished(Ok(())) => {}
         Message::OpenTerminalFinished(Err(message)) => {
             // Redacted already, on the job thread inside `terminal::open::open`
@@ -2831,6 +2895,21 @@ fn run_open_terminal(
     .map_err(|err| err.to_string())
 }
 
+/// Says in the drawer that there is no terminal to open.
+///
+/// Reported, not silent: a button that does nothing at all reads as broken,
+/// and "nothing installed" is something the user can act on by installing or
+/// configuring one.
+fn report_no_terminal(app: &mut App) {
+    drawer::push_line(
+        &mut app.drawer,
+        "no terminal emulator was found on this machine",
+        &[],
+    );
+    drawer::set_idle(&mut app.drawer, "open terminal failed".to_string());
+    app.drawer.expanded = true;
+}
+
 /// Runs off the render thread via `job::run` -- same shape as `sync_project`.
 async fn open_terminal(
     choice: TerminalChoice,
@@ -3355,7 +3434,13 @@ pub fn view(app: &App) -> iced::Element<'_, Message> {
     let context_menu_view: iced::Element<'_, Message> = match &app.context_menu {
         Some(menu) => {
             let default = app.config.terminal_defaults.get(&Os::host());
-            context_menu::view(menu, default)
+            let label = app
+                .config
+                .projects
+                .get(menu.project_index)
+                .map(|project| project.label.as_str())
+                .unwrap_or_default();
+            context_menu::view(menu, label, default)
         }
         None => iced::widget::text("").into(),
     };
@@ -3408,7 +3493,12 @@ pub fn view(app: &App) -> iced::Element<'_, Message> {
         layers = layers.push(shell::overlay_layer(add_project_dialog));
     }
     if app.context_menu.is_some() {
-        layers = layers.push(shell::overlay_layer(context_menu_view));
+        // Anchored beside the sidebar, not centred over a scrim: a right-click
+        // menu belongs next to what it acts on.
+        layers = layers.push(shell::anchored_layer(
+            context_menu_view,
+            Message::ContextMenuClosed,
+        ));
     }
     if app.confirm_recreate.is_some() {
         layers = layers.push(shell::overlay_layer(confirm_recreate_view));
@@ -5188,6 +5278,115 @@ mod tests {
             }
             std::thread::yield_now();
         }
+    }
+
+    // --- The detail header's one-press terminal button ---
+
+    #[test]
+    fn the_header_terminal_button_dispatches_without_spawning_inline() {
+        // That a configured default skips the probe entirely is
+        // `context_menu::one_press_plan`'s claim, and its own tests are the
+        // only place it can be proven -- both arms here return a `Task` and no
+        // assertion available to this test can tell them apart. What this
+        // covers is the part that is visible from here: the press dispatches,
+        // and it does not spawn anything on the render thread.
+        let mut app = App::new(Config {
+            projects: vec![project("api")],
+            terminal_defaults: std::collections::BTreeMap::from([(
+                Os::host(),
+                TerminalChoice::Detected(TerminalKind::Xterm),
+            )]),
+            ..Config::default()
+        });
+        let fake = Arc::new(FakeCommandRunner::new());
+
+        let task = update(
+            &mut app,
+            Message::OpenTerminalHereRequested(0),
+            fake.clone(),
+        );
+
+        assert!(task.units() > 0, "the press must dispatch real work");
+        assert!(
+            fake.calls().is_empty(),
+            "nothing may be spawned synchronously inside update; got {:?}",
+            fake.calls()
+        );
+        assert!(
+            !app.drawer.status.contains("failed"),
+            "a configured default is not a failure; got {:?}",
+            app.drawer.status
+        );
+    }
+
+    #[test]
+    fn the_header_terminal_button_reports_when_no_terminal_exists() {
+        // The button has no menu to fall back to, so "nothing installed" has
+        // to be said out loud. A press that silently did nothing would read as
+        // a broken control, and this is something the user can act on.
+        let mut app = App::new(Config {
+            projects: vec![project("api")],
+            ..Config::default()
+        });
+
+        let _ = update(
+            &mut app,
+            Message::OpenTerminalHereDetected(0, Vec::new()),
+            unused_runner(),
+        );
+
+        assert!(
+            app.drawer.lines.iter().any(|l| l.contains("no terminal")),
+            "the drawer must say why nothing opened; got {:?}",
+            app.drawer.lines
+        );
+        assert_eq!(app.drawer.status, "open terminal failed");
+        assert!(app.drawer.expanded, "the reason must be on screen");
+    }
+
+    #[test]
+    fn the_header_terminal_button_opens_the_first_detected_when_none_is_configured() {
+        // The other half: something was found, so it opens rather than
+        // complaining. Asserted on the drawer staying quiet, because a
+        // dispatched `Task` cannot say which of the two arms produced it.
+        let mut app = App::new(Config {
+            projects: vec![project("api")],
+            ..Config::default()
+        });
+
+        let task = update(
+            &mut app,
+            Message::OpenTerminalHereDetected(0, vec![TerminalKind::Kitty]),
+            unused_runner(),
+        );
+
+        assert!(task.units() > 0, "a detected terminal must be opened");
+        assert!(
+            app.drawer.lines.is_empty(),
+            "nothing failed, so nothing belongs in the transcript; got {:?}",
+            app.drawer.lines
+        );
+    }
+
+    #[test]
+    fn a_header_terminal_press_for_a_project_that_is_gone_does_nothing() {
+        // Same staleness guard every indexed message here carries: the list
+        // can shrink between the press and the probe landing.
+        let mut app = App::new(Config::default());
+
+        let task = update(
+            &mut app,
+            Message::OpenTerminalHereRequested(7),
+            unused_runner(),
+        );
+        assert_eq!(task.units(), 0);
+
+        let task = update(
+            &mut app,
+            Message::OpenTerminalHereDetected(7, vec![TerminalKind::Kitty]),
+            unused_runner(),
+        );
+        assert_eq!(task.units(), 0);
     }
 
     // --- Criterion 1: only detected terminals are offered ---

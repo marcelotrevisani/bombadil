@@ -125,14 +125,43 @@ pub fn view<'a>(header: &Header, index: usize) -> iced::Element<'a, Message> {
         .padding([theme::SPACE_1, theme::SPACE_3])
         .style(theme::button_primary);
 
+    // A shell prompt, set in the data face -- the same `>_` a terminal shows.
+    // Drawn from the two typefaces already shipped rather than adding an icon
+    // asset for one control, and deliberately not one of `theme::state_glyph`'s
+    // shapes: those are the state vocabulary, and this is an action.
+    //
+    // A tooltip, not a bare glyph: an icon-only control with no icon set
+    // behind it is something the user has to guess at, and this one opens a
+    // process.
+    let terminal = iced::widget::tooltip(
+        iced::widget::button(
+            iced::widget::text(">_")
+                .font(theme::FONT_DATA)
+                .size(theme::BODY),
+        )
+        .on_press(Message::OpenTerminalHereRequested(index))
+        .padding([theme::SPACE_1, theme::SPACE_2])
+        .style(theme::button_quiet),
+        iced::widget::container(
+            iced::widget::text("Open a terminal here, with the environment activated")
+                .size(theme::LABEL),
+        )
+        .padding(theme::SPACE_1)
+        .style(theme::panel),
+        iced::widget::tooltip::Position::Left,
+    );
+
     let path_row = iced::widget::row![
         iced::widget::text(header.path.display().to_string())
             .font(theme::FONT_DATA)
             .size(theme::DATA)
             .color(theme::SLATE),
         iced::widget::Space::new().width(iced::Length::Fill),
+        terminal,
         sync,
-    ];
+    ]
+    .spacing(theme::SPACE_2)
+    .align_y(iced::Alignment::Center);
 
     iced::widget::column![title_row, path_row]
         .spacing(theme::SPACE_2)
