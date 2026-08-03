@@ -332,36 +332,50 @@ mod tests {
         //
         // The fixture with the new tables stripped out, which is exactly what
         // an older build wrote.
-        let older: String = GOLDEN_FIXTURE
-            .split("\n\n")
-            // `contains`, not `starts_with`: every table in the fixture is
-            // introduced by a comment, so the block starts with the comment.
-            .filter(|block| {
-                ![
-                    "[settings.python]",
-                    "[projects.python]",
-                    "[projects.python.value]",
-                    "[projects.uv_source]",
-                    "[projects.uv_source.value]",
-                    "[projects.terminals.",
-                ]
-                .iter()
-                .any(|header| block.contains(header))
-            })
-            .collect::<Vec<_>>()
-            .join("\n\n");
-        for header in [
+        //
+        // Line by line through `str::lines`, never by splitting on `"\n\n"`:
+        // git checks this file out with CRLF on Windows, so a blank-line split
+        // matched nothing there, the whole fixture came back as one block, that
+        // block contained every header, and the filter deleted all of it. The
+        // test then failed with "missing field `schema_version`" against an
+        // empty string. `lines` handles `\r\n` and `\n` alike.
+        //
+        // The same shape of mistake this crate's GUI docs already warn about
+        // for `display()`ed paths: a platform assumption hiding in a test
+        // rather than in the code, invisible on Linux and macOS.
+        const STRIPPED: [&str; 4] = [
             "[settings.python]",
-            "[projects.python]",
-            "[projects.uv_source]",
+            "[projects.python",
+            "[projects.uv_source",
             "[projects.terminals.",
-        ] {
+        ];
+        let mut older = String::new();
+        let mut skipping = false;
+        for line in GOLDEN_FIXTURE.lines() {
+            let trimmed = line.trim_start();
+            // A table header ends whatever was being skipped and decides
+            // whether the next one starts.
+            if trimmed.starts_with('[') {
+                skipping = STRIPPED.iter().any(|header| trimmed.starts_with(header));
+            }
+            if !skipping {
+                older.push_str(line);
+                older.push('\n');
+            }
+        }
+        for header in STRIPPED {
             assert!(
                 !older.contains(header),
                 "the stripped fixture still carries {header}, so this test would \
                  prove nothing about a config that lacks it"
             );
         }
+        assert!(
+            older.contains("schema_version"),
+            "the stripped fixture must still be a config -- if the filter ate \
+             everything, `from_str` fails for a reason that has nothing to do \
+             with the fields this test is about"
+        );
 
         let got: Config = toml::from_str(&older).expect("an older config must still parse");
 
