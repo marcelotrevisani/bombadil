@@ -1452,6 +1452,7 @@ pub fn update(app: &mut App, message: Message, runner: Arc<dyn CommandRunner>) -
                 // this file.
                 app.config.projects.push(project.clone());
                 app.entries.push(sidebar::Entry {
+                    id: project.id,
                     label: project.label.clone(),
                     // Free: the dialog already parsed the manifest into
                     // `draft`, so there is no read to wait on here the way

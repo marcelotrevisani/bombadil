@@ -50,6 +50,10 @@ pub struct EnvironmentRow {
 
 /// One project in the sidebar, with its environments beneath it.
 pub struct Entry {
+    /// The project this row is for. Carried because the environment controls
+    /// beneath it act by id, not by position -- the list is edited while the
+    /// application is running.
+    pub id: uuid::Uuid,
     pub label: String,
     /// The project's `requires-python`, re-read alongside the venv probe
     /// (`app::probe_every_venv`) rather than stored on `Project` -- see that
@@ -77,6 +81,7 @@ pub fn entries(config: &Config) -> Vec<Entry> {
         .projects
         .iter()
         .map(|project| Entry {
+            id: project.id,
             label: project.label.clone(),
             requires_python: None,
             environments: project
@@ -306,10 +311,14 @@ pub fn view<'a>(entries: &[Entry], selected: Option<usize>) -> iced::Element<'a,
             for environment in &entry.environments {
                 list = list.push(environment_row(
                     i,
+                    entry.id,
                     environment,
+                    entry.environments.len() > 1,
                     entry.requires_python.as_deref(),
                 ));
             }
+            // The add control sits with the environments it adds to.
+            list = list.push(add_environment_row(entry.id));
         }
     }
     list.into()
@@ -322,7 +331,9 @@ pub fn view<'a>(entries: &[Entry], selected: Option<usize>) -> iced::Element<'a,
 /// Recreate and remove are the destructive ones, and both ask first.
 fn environment_row<'a>(
     project: usize,
+    project_id: uuid::Uuid,
     row: &EnvironmentRow,
+    removable: bool,
     requires_python: Option<&str>,
 ) -> iced::Element<'a, Message> {
     let glyph = theme::state_glyph(row_state(row, requires_python));
@@ -372,19 +383,24 @@ fn environment_row<'a>(
         .spacing(0),
     ]
     .spacing(theme::SPACE_1)
+    .height(iced::Length::Fill)
     .align_y(iced::Alignment::Center);
 
     // Indented past the disclosure control, so a child starts where its
     // parent's glyph does rather than to the left of it. The row itself is
     // built exactly like a project's -- same marker, same glyph column -- so
     // the two read as one list at two depths.
-    iced::widget::row![
-        iced::widget::Space::new().width(theme::DISCLOSURE_WIDTH + theme::SPACE_2),
+    let location = row.location.clone();
+    let pressable = iced::widget::row![
+        iced::widget::Space::new()
+            .width(theme::DISCLOSURE_WIDTH + theme::SPACE_2)
+            .height(theme::TREE_ROW_HEIGHT),
         iced::widget::button(content)
             .on_press_maybe(
                 (!active).then_some(Message::EnvironmentActivated(project, row.location.clone())),
             )
             .width(iced::Length::Fill)
+            .height(theme::TREE_ROW_HEIGHT)
             .padding(theme::SPACE_1)
             .style(move |_theme, status| iced::widget::button::Style {
                 background: match (active, status) {
@@ -403,6 +419,48 @@ fn environment_row<'a>(
             }),
     ]
     .spacing(0)
+    .height(theme::TREE_ROW_HEIGHT);
+
+    // Right-press removes, the same gesture the project rows already use for
+    // their own menu -- and it opens the confirmation rather than removing,
+    // so an accidental right-click costs nothing. Never offered for the last
+    // one: a project with no environments has nothing to sync.
+    if removable {
+        iced::widget::mouse_area(pressable)
+            .on_right_press(Message::EnvironmentRemoveRequested(project_id, location))
+            .into()
+    } else {
+        pressable.into()
+    }
+}
+
+/// The "add an environment" control beneath a project's environments.
+///
+/// Indented like an environment row so it reads as belonging to the same
+/// list, and labelled rather than a bare `+`: an icon-only control with no
+/// icon set behind it is one the user has to guess at.
+///
+/// Here rather than only in Preferences because "I need a way to add more
+/// virtual environments" was reported *after* that editor shipped -- a
+/// surface nobody can find is a surface that does not exist.
+fn add_environment_row<'a>(project_id: uuid::Uuid) -> iced::Element<'a, Message> {
+    iced::widget::row![
+        iced::widget::Space::new()
+            .width(theme::DISCLOSURE_WIDTH + theme::SPACE_2)
+            .height(theme::TREE_ROW_HEIGHT),
+        iced::widget::button(
+            iced::widget::text("+ add environment")
+                .size(theme::DATA)
+                .color(theme::SLATE),
+        )
+        .on_press(Message::EnvironmentAdded(project_id))
+        .width(iced::Length::Fill)
+        .height(theme::TREE_ROW_HEIGHT)
+        .padding(theme::SPACE_1)
+        .style(theme::button_bare(theme::SLATE)),
+    ]
+    .spacing(0)
+    .height(theme::TREE_ROW_HEIGHT)
     .into()
 }
 
@@ -424,6 +482,7 @@ mod tests {
 
     fn entry(python_version: Option<&str>, requires_python: Option<&str>) -> Entry {
         Entry {
+            id: uuid::Uuid::nil(),
             label: "api".into(),
             requires_python: requires_python.map(String::from),
             environments: vec![EnvironmentRow {

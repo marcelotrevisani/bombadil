@@ -225,6 +225,14 @@ pub const PREFS_SECTION_WIDTH: f32 = 150.0;
 pub const CONTEXT_MENU_WIDTH: f32 = 320.0;
 /// Width of the drop-down panel the Help menu opens.
 pub const MENU_WIDTH: f32 = 220.0;
+/// Height of one environment row in the sidebar tree.
+///
+/// Explicit, not derived from its content: the row carries a `Fill`-height
+/// marker down its leading edge, and a `Fill` child inside a `Shrink` row
+/// promotes the whole row to `Fill` -- several of those in one column then
+/// divide the space between them and collapse to nothing. A fixed height
+/// gives the marker something real to fill.
+pub const TREE_ROW_HEIGHT: f32 = 38.0;
 /// Width of the sidebar's disclosure triangle, so every project's glyph and
 /// label start at the same x whether it is open or closed.
 pub const DISCLOSURE_WIDTH: f32 = 16.0;
