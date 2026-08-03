@@ -1,0 +1,149 @@
+<p align="center">
+  <img src="assets/banner.png" alt="Bombadil — a desktop keeper for uv virtual environments" width="820">
+</p>
+
+<p align="center">
+  <a href="https://github.com/marcelotrevisani/bombadil/actions"><img alt="CI" src="https://github.com/marcelotrevisani/bombadil/actions/workflows/ci.yml/badge.svg"></a>
+  <img alt="Rust 1.88+" src="https://img.shields.io/badge/rust-1.88%2B-B7410E">
+  <img alt="uv 0.12.1" src="https://img.shields.io/badge/uv-0.12.1-5E94D6">
+  <img alt="Apache 2.0" src="https://img.shields.io/badge/licence-Apache--2.0-8B9187">
+</p>
+
+---
+
+A desktop application for the Python virtual environments you already have.
+Bombadil keeps an account of them — which exist, which have drifted from what
+their manifest declares, what is installed in each — and gives you one place to
+sync, inspect and open them.
+
+It never owns an environment. `uv` creates them, `uv` resolves them, and
+Bombadil is the thing that tells you the truth about them and gets out of the
+way. Delete Bombadil and every environment it showed you is still there,
+untouched.
+
+> *"Bright blue his jacket was, and his boots were yellow."*
+> Tom Bombadil is the keeper of a bounded domain who owns nothing he tends.
+> That is the whole design brief, and it is where the palette comes from.
+
+## What it does
+
+**Projects and environments.** Register a project by its `pyproject.toml`. A
+project can carry several environments — a 3.11 and a 3.12, say — shown as a
+tree beneath it, with one marked default: the one Sync, the terminal and the
+dependency view act on. An environment can live beside the project or anywhere
+else on disk, including one another project already uses.
+
+**One glyph vocabulary, everywhere.** Every row in every pane — projects,
+dependencies, workspace members, indexes — reports state the same way, and no
+two states ever look alike:
+
+| | | |
+|---|---|---|
+| ● | **present** | it exists and matches |
+| ○ | **absent** | declared, not installed |
+| ◍ | **drifted** | installed, but not what was asked for |
+
+**Sync, with the output.** `uv sync` streams into a drawer that follows the
+output and stays where you put it. A failure shows the transcript rather than a
+shrug.
+
+**Dependencies and workspace members.** What the manifest declares against what
+is actually installed, joined on PEP 503-canonical names so `calc_service` and
+`calc-service` are one row. Monorepo members are listed with what a sync would
+add or remove before you run it.
+
+**Environment variables and secrets.** Global variables and per-project ones,
+with the project's overriding. Mark a variable secret and its value moves to the
+OS keychain — it is never written to `config.toml`, never carried in a message,
+and never read back to be redisplayed.
+
+**Private indexes.** Name, URL, and credentials in the keychain, injected as
+`UV_INDEX_*` at sync time. Global by default, selectable per project.
+
+**Pre-activate scripts.** Shell scripts run before an environment is used, in an
+order you control, with their exported variables composed into everything
+Bombadil launches.
+
+**Terminals and PyCharm.** Open a terminal in the project directory with the
+environment activated — every emulator's argv is built for the platform, and the
+app knows which ones cannot carry an environment rather than pretending. The
+PyCharm button opens the project folder with the same composed environment.
+(PyCharm's *interpreter* cannot be set from outside the IDE; `bombadil_core::ide`
+documents exactly why.)
+
+**Pinned interpreters, safely.** `uv sync -p X` against an environment built on
+another version **deletes it**. Bombadil compares pins segment-wise against what
+`pyvenv.cfg` actually records, so `3.12.13` and `3.12` are not treated as a
+conflict, and a genuinely destructive pin change asks first.
+
+## Install
+
+Bombadil bundles `uv 0.12.1`, so there is nothing else to install. By default it
+uses `uv` from `PATH` when that is at least `0.12.1` and falls back to the
+bundled copy; you can force either.
+
+```sh
+git clone https://github.com/marcelotrevisani/bombadil
+cd bombadil
+just run-release          # or: cargo run --release -p bombadil-gui
+```
+
+Rust 1.88 or newer, edition 2024. The build downloads the pinned `uv` release
+for your platform.
+
+Configuration lives at `~/.config/bombadil/config.toml` on Linux,
+`~/Library/Application Support/bombadil/` on macOS, and
+`%APPDATA%\bombadil\config\` on Windows. Secrets live in the OS keychain, never
+in that file.
+
+## Development
+
+```sh
+just            # list every recipe
+just run        # debug build
+just test       # workspace tests
+just ci         # fmt-check, clippy, test, cargo-deny, msrv -- what CI runs
+just icon       # regenerate assets/ from assets/icon.svg (needs cairosvg)
+```
+
+808 tests across three crates, green on Linux, macOS and Windows.
+
+### Conventions worth knowing before you patch it
+
+- **`view` is dumb and untested.** Logic worth a test lives in a free function
+  that `view` calls. A change that only exists inside `view` ships without a
+  test, and its commit says so.
+- **A fix needs a mutation proof.** Break the fix on purpose and watch a test
+  fail. Seventeen tests in this repo's history passed for the wrong reason; one
+  was in a *test double* that could not tell `spawn` from `run`, so every test
+  on that seam inherited the blind spot.
+- **Never compare a `display()`ed path to a string literal.** `PathBuf::join`
+  uses `\` on Windows. Three CI failures here came from a platform assumption
+  hiding in an assertion rather than in the code.
+- **Secrets never enter a `Message`** — it derives `Debug` — and never reach a
+  `ConfigPersist`.
+- **Runners, secret stores, persisters and filesystem probes are parameters**,
+  never constructed inline, so tests stay hermetic and no test can reach the
+  real keychain.
+- **`BOOT` is rationed.** The attention colour appears only where the user must
+  look. If it starts appearing elsewhere it stops meaning anything, and the
+  test that guards this is the most important one in `theme`.
+- **Never edit `deny.toml` to dodge a licence or advisory failure.** Escalate.
+
+Specs and implementation plans live in `docs/superpowers/`.
+
+## Crates
+
+| Crate | What it is |
+|---|---|
+| `bombadil-core` | Model, config store, uv invocation, environment composition, keychain, terminals, IDE launch. No GUI. |
+| `bombadil-gui` | The iced front end. |
+| `bombadil-uv-bin` | Fetches and embeds the pinned `uv` binary at build time. |
+
+## Licence
+
+Apache-2.0. See [LICENSE](LICENSE).
+
+Bombadil ships `uv` (Apache-2.0 / MIT), Atkinson Hyperlegible Next and IBM Plex
+Mono (both SIL OFL 1.1). Every licence text is in the application itself, under
+**Help → Bundled licences**, as those licences require.

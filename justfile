@@ -87,3 +87,7 @@ tree:
     @cargo tree --workspace --depth 1
     @printf 'crates in tree: '
     @cargo tree --prefix none | awk '{print $1}' | sort -u | wc -l
+
+# Regenerate every image asset from the SVGs in assets/. Needs `pip install cairosvg`.
+icon:
+    python3 scripts/render_assets.py

@@ -45,6 +45,25 @@ use bombadil_core::process::{CommandRunner, SystemCommandRunner};
 use bombadil_core::store::{Loaded, Store, paths};
 use std::sync::Arc;
 
+/// The icon's raw pixels, 64x64 sRGB RGBA.
+///
+/// Raw rather than a PNG because `iced::window::icon::from_rgba` wants exactly
+/// this, and decoding a PNG for it would mean pulling an image decoder into a
+/// binary that otherwise renders every pixel itself. `just icon` regenerates
+/// this and every PNG beside it from `assets/icon.svg`, which is the file to
+/// edit -- this one is a build product that happens to be committed.
+const ICON_RGBA: &[u8] = include_bytes!("../../../assets/icon-64.rgba");
+const ICON_SIDE: u32 = 64;
+
+/// The window icon, or `None` if the bytes will not make one.
+///
+/// A missing icon is not worth refusing to start over: the window manager
+/// falls back to its own placeholder and everything else works. `expect` here
+/// would turn a bad asset into an application that cannot open at all.
+fn window_icon() -> Option<iced::window::Icon> {
+    iced::window::icon::from_rgba(ICON_RGBA.to_vec(), ICON_SIDE, ICON_SIDE).ok()
+}
+
 fn main() -> iced::Result {
     let (loaded, persist) = load_config();
     // `update` takes the runner as a parameter rather than storing it on
@@ -66,6 +85,10 @@ fn main() -> iced::Result {
         app::view,
     )
     .title("Bombadil")
+    .window(iced::window::Settings {
+        icon: window_icon(),
+        ..Default::default()
+    })
     // Both weights of Atkinson Hyperlegible Next share one font family, so
     // the renderer picks the right face by `Font::weight`; Plex Mono is
     // registered separately for the data typeface. Licences for both ship
