@@ -9,6 +9,16 @@
 //! footer telling the user to go read that file pointed at nothing. An
 //! expandable region here is the whole of the fix -- the obligation is that
 //! the text is reachable, not that it is beautiful.
+//!
+//! # The two bundled fonts
+//!
+//! `theme.rs` embeds Atkinson Hyperlegible Next and IBM Plex Mono directly
+//! into the executable with `include_bytes!`. Both are SIL Open Font
+//! License, Version 1.1, which -- like Apache-2.0 -- requires the licence to
+//! accompany the font it covers. Shipping the font without it is the same
+//! class of problem as shipping uv without its notice, so this module
+//! carries both OFL texts the same way it carries uv's: compiled in with
+//! `include_str!`, reachable from the same expandable footer.
 
 use crate::app::Message;
 
@@ -40,6 +50,25 @@ pub fn license() -> &'static str {
     bombadil_uv_bin::UV_LICENSE
 }
 
+/// A short notice naming both bundled fonts and their licence, mirroring
+/// [`attribution`] for uv.
+pub fn font_attribution() -> &'static str {
+    "Uses Atkinson Hyperlegible Next and IBM Plex Mono, both licensed under \
+     the SIL Open Font License, Version 1.1 (OFL-1.1)."
+}
+
+/// Atkinson Hyperlegible Next's full OFL 1.1 text, compiled into this
+/// executable from the same file `theme.rs` ships the font bytes alongside.
+pub fn atkinson_license() -> &'static str {
+    include_str!("../fonts/OFL-AtkinsonHyperlegibleNext.txt")
+}
+
+/// IBM Plex Mono's full OFL 1.1 text, compiled into this executable from the
+/// same file `theme.rs` ships the font bytes alongside.
+pub fn plex_license() -> &'static str {
+    include_str!("../fonts/OFL-IBMPlexMono.txt")
+}
+
 /// The footer: the attribution line, a control to reveal the bundled
 /// licence, and the licence itself while `expanded`.
 ///
@@ -49,18 +78,25 @@ pub fn license() -> &'static str {
 /// window.
 pub fn view<'a>(expanded: bool) -> iced::Element<'a, Message> {
     let label = if expanded {
-        "Hide bundled licence"
+        "Hide bundled licences"
     } else {
-        "Bundled licence (uv, Apache-2.0)"
+        "Bundled licences (uv, Apache-2.0 · fonts, OFL-1.1)"
     };
     let mut column = iced::widget::column![
         iced::widget::text(attribution()).size(11),
+        iced::widget::text(font_attribution()).size(11),
         iced::widget::button(iced::widget::text(label).size(11))
             .on_press(Message::AboutLicenseToggled),
     ]
     .spacing(4);
 
     if expanded {
+        column = column.push(iced::widget::scrollable(
+            iced::widget::text(atkinson_license()).size(11),
+        ));
+        column = column.push(iced::widget::scrollable(
+            iced::widget::text(plex_license()).size(11),
+        ));
         column = column.push(iced::widget::scrollable(
             iced::widget::text(license()).size(11),
         ));
@@ -119,5 +155,41 @@ mod tests {
             text.contains("TERMS AND CONDITIONS"),
             "the full text must ship, not just a title line"
         );
+    }
+
+    #[test]
+    fn the_font_attribution_names_both_fonts_and_ofl() {
+        // OFL 1.1, like Apache-2.0 section 4, obliges the notice to
+        // accompany the font. Embedding the bytes without this is the same
+        // class of violation as the uv case above.
+        let text = font_attribution();
+        assert!(text.contains("Atkinson Hyperlegible Next"), "got {text}");
+        assert!(text.contains("IBM Plex Mono"), "got {text}");
+        assert!(
+            text.contains("OFL-1.1") || text.contains("Open Font License"),
+            "got {text}"
+        );
+    }
+
+    #[test]
+    fn both_font_licence_texts_are_reachable_from_the_ui() {
+        // Mirrors `the_full_licence_text_is_reachable_from_the_ui`: `view`
+        // renders exactly what these return, so a font shipped without a
+        // consumer for its licence text would be caught the same way uv's
+        // was.
+        let atkinson = atkinson_license();
+        assert!(atkinson.contains("SIL OPEN FONT LICENSE"), "got {atkinson}");
+        assert!(atkinson.contains("Version 1.1"), "got {atkinson}");
+
+        let plex = plex_license();
+        assert!(plex.contains("SIL OPEN FONT LICENSE"), "got {plex}");
+        assert!(plex.contains("Version 1.1"), "got {plex}");
+    }
+
+    #[test]
+    fn the_font_licences_are_not_the_same_text_twice() {
+        // Each font has its own copyright holder in the preamble; shipping
+        // one file twice under two names would misattribute the other.
+        assert_ne!(atkinson_license(), plex_license());
     }
 }
