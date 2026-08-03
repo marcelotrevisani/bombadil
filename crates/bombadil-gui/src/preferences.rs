@@ -18,7 +18,7 @@
 use crate::app::Message;
 use crate::theme;
 use crate::{env_editor, index_editor, settings_editor};
-use bombadil_core::model::{Config, PythonPin, TerminalChoice, UvSource};
+use bombadil_core::model::{Config, PythonPin, TerminalChoice, UvSource, VenvLocation};
 use bombadil_core::terminal::Os;
 use uuid::Uuid;
 
@@ -231,7 +231,8 @@ pub fn view<'a>(
         (Section::EnvVars, Some(i)) => env_editor::project_view(config, i, env_drafts),
         (Section::Indexes, None) => index_editor::global_view(config, credential_drafts),
         (Section::Indexes, Some(i)) => index_editor::project_view(config, i),
-        (Section::Environments, _) => settings_editor::global_view(
+        (Section::Environments, Some(i)) => environments_panel(config, i),
+        (Section::Environments, None) => settings_editor::global_view(
             &config.settings,
             &config.projects,
             uv_custom_path_draft,
@@ -289,6 +290,67 @@ pub fn view<'a>(
         });
 
     iced::widget::opaque(iced::widget::mouse_area(positioner).on_press(Message::PreferencesClosed))
+}
+
+/// The Environments section, project scope: where this project's virtual
+/// environment lives.
+///
+/// No "Inherit from global" control, unlike Python, uv and Terminal:
+/// `VenvLocation::Default` *is* the inherit state and predates
+/// `Override<T>`, so the choice already has three options rather than a
+/// checkbox plus two.
+fn environments_panel<'a>(config: &Config, project_index: usize) -> iced::Element<'a, Message> {
+    let Some(project) = config.projects.get(project_index) else {
+        return iced::widget::text("").into();
+    };
+    let id = project.id;
+
+    let choice = |label: &'static str, selected: bool, message: Message| {
+        iced::widget::button(iced::widget::text(label).size(theme::BODY))
+            .on_press(message)
+            .padding([theme::SPACE_1, theme::SPACE_3])
+            .style(theme::button_choice(selected))
+    };
+
+    // Recomputed every render from the choice above, the same "recompute,
+    // don't cache" trick the add-project dialog uses, so it tracks a change
+    // the instant it lands rather than at the next open.
+    let resolved = bombadil_core::venv_path::resolve(project, &config.settings)
+        .map(|path| path.display().to_string())
+        .unwrap_or_else(|err| err.to_string());
+
+    iced::widget::column![
+        iced::widget::text("Where this project's virtual environment lives.")
+            .size(theme::BODY)
+            .color(theme::SLATE),
+        iced::widget::row![
+            choice(
+                "Follow the global default",
+                project.venv == VenvLocation::Default,
+                Message::PreferencesProjectVenvSelected(id, VenvLocation::Default),
+            ),
+            choice(
+                "Alongside the manifest",
+                project.venv == VenvLocation::Alongside,
+                Message::PreferencesProjectVenvSelected(id, VenvLocation::Alongside),
+            ),
+            choice(
+                "Chosen folder...",
+                matches!(project.venv, VenvLocation::Custom { .. }),
+                Message::PreferencesProjectVenvPickFolderRequested(id),
+            ),
+        ]
+        .spacing(theme::SPACE_1),
+        theme::labeled_value("resolves to", resolved),
+        iced::widget::text(
+            "Moving this does not move the environment already on disk. Sync builds a new \
+             one at the new location, and the old one is left where it is."
+        )
+        .size(theme::LABEL)
+        .color(theme::SLATE),
+    ]
+    .spacing(theme::SPACE_3)
+    .into()
 }
 
 /// The Scripts section. Global only: a project's own pre-activate hooks stay

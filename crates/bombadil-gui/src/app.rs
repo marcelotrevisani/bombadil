@@ -18,6 +18,7 @@ use crate::theme;
 use bombadil_core::envspec::{self, EnvInputs};
 use bombadil_core::model::{
     Config, DefaultVenvLocation, Override, Project, PythonPin, Settings, TerminalChoice, UvSource,
+    VenvLocation,
 };
 use bombadil_core::process::CommandRunner;
 use bombadil_core::pyproject::PyProject;
@@ -497,6 +498,17 @@ pub enum Message {
     PreferencesUvSourceOverridden(preferences::Scope, UvSource),
     /// The Terminal section's choice, in `scope`.
     PreferencesTerminalOverridden(preferences::Scope, TerminalChoice),
+    /// The Environments section, project scope: where this project's venv
+    /// lives. Carries a `Uuid` rather than a `Scope`, because this setting
+    /// only exists for a project -- `VenvLocation::Default` is already its
+    /// inherit state, which is why this section has no separate inherit
+    /// control.
+    PreferencesProjectVenvSelected(uuid::Uuid, VenvLocation),
+    /// The Environments section, project scope: choose a folder for it.
+    PreferencesProjectVenvPickFolderRequested(uuid::Uuid),
+    /// That picker finished. `None` when cancelled, which leaves the previous
+    /// location untouched.
+    PreferencesProjectVenvFolderPicked(uuid::Uuid, Option<PathBuf>),
     /// The Env vars tab's "Add variable" button was pressed for `scope`
     /// (spec §5, Task 2).
     EnvVarAdded(env_editor::EnvScope),
@@ -1728,6 +1740,31 @@ pub fn update(app: &mut App, message: Message, runner: Arc<dyn CommandRunner>) -
                 }
             }
             return persist_env_edit(app);
+        }
+        Message::PreferencesProjectVenvSelected(id, location) => {
+            let Some(project) = app.config.projects.iter_mut().find(|p| p.id == id) else {
+                return Task::none();
+            };
+            project.venv = location;
+            // Re-probed, not just persisted: the sidebar's venv status
+            // describes wherever each project resolved when it was last
+            // probed, and this just moved that. The same reasoning the global
+            // default location already follows.
+            return Task::batch([persist_env_edit(app), probe_every_venv(app)]);
+        }
+        Message::PreferencesProjectVenvPickFolderRequested(id) => {
+            return Task::perform(pick_folder(), move |path| {
+                Message::PreferencesProjectVenvFolderPicked(id, path)
+            });
+        }
+        // Cancelled -- leave the previous location untouched.
+        Message::PreferencesProjectVenvFolderPicked(_, None) => {}
+        Message::PreferencesProjectVenvFolderPicked(id, Some(path)) => {
+            let Some(project) = app.config.projects.iter_mut().find(|p| p.id == id) else {
+                return Task::none();
+            };
+            project.venv = VenvLocation::Custom { path };
+            return Task::batch([persist_env_edit(app), probe_every_venv(app)]);
         }
         Message::PreferencesInheritToggled(scope, section) => {
             // Only a project can inherit. Global has nothing above it, and a
@@ -6915,6 +6952,90 @@ mod tests {
 
         assert_eq!(app.config.projects[0].python, Override::Inherit);
         assert_eq!(app.config.settings.python, PythonPin::Unpinned);
+    }
+
+    #[test]
+    fn a_project_venv_location_writes_through_and_reprobes() {
+        // Moving where an environment lives changes what the sidebar's venv
+        // status describes, so the probe has to run again -- persisting alone
+        // would leave the glyph describing the old location until restart.
+        let mut app = App::new(Config {
+            projects: vec![project("api")],
+            ..Config::default()
+        });
+        let id = app.config.projects[0].id;
+
+        let task = update(
+            &mut app,
+            Message::PreferencesProjectVenvSelected(
+                id,
+                VenvLocation::Custom {
+                    path: std::path::PathBuf::from("/envs/api"),
+                },
+            ),
+            unused_runner(),
+        );
+
+        assert_eq!(
+            app.config.projects[0].venv,
+            VenvLocation::Custom {
+                path: std::path::PathBuf::from("/envs/api")
+            }
+        );
+        assert!(
+            task.units() > 0,
+            "the change must dispatch a persist and a re-probe"
+        );
+    }
+
+    #[test]
+    fn a_cancelled_venv_folder_pick_leaves_the_location_alone() {
+        // The picker returning `None` is a user who changed their mind. It
+        // must not be read as "no folder", which would move the environment
+        // to an empty path.
+        let mut app = App::new(Config {
+            projects: vec![Project {
+                venv: VenvLocation::Alongside,
+                ..project("api")
+            }],
+            ..Config::default()
+        });
+        let id = app.config.projects[0].id;
+
+        let task = update(
+            &mut app,
+            Message::PreferencesProjectVenvFolderPicked(id, None),
+            unused_runner(),
+        );
+
+        assert_eq!(app.config.projects[0].venv, VenvLocation::Alongside);
+        assert_eq!(task.units(), 0, "cancelling must change nothing");
+    }
+
+    #[test]
+    fn a_venv_edit_for_a_project_that_is_gone_writes_nothing() {
+        let mut app = App::new(Config {
+            projects: vec![project("api")],
+            ..Config::default()
+        });
+
+        // Captured rather than hardcoded: the `project` helper picks a
+        // location of its own, and asserting a literal here tests the helper
+        // instead of the behaviour.
+        let before = app.config.projects[0].venv.clone();
+        let task = update(
+            &mut app,
+            Message::PreferencesProjectVenvSelected(
+                uuid::Uuid::from_u128(99),
+                VenvLocation::Custom {
+                    path: std::path::PathBuf::from("/elsewhere"),
+                },
+            ),
+            unused_runner(),
+        );
+
+        assert_eq!(app.config.projects[0].venv, before);
+        assert_eq!(task.units(), 0);
     }
 
     #[test]
