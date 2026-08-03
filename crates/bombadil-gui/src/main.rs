@@ -35,6 +35,7 @@ mod job;
 mod members_editor;
 mod scripts_editor;
 mod settings_editor;
+mod shell;
 mod sidebar;
 mod theme;
 

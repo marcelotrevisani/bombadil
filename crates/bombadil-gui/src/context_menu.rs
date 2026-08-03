@@ -187,19 +187,26 @@ pub fn recreate_confirmation(label: &str, venv_path: &Path) -> String {
 /// own -- an unstyled button already paints from the theme's primary colour
 /// (`jacket`), the same reasoning `detail::view` gives for the Sync button.
 pub fn confirm_view<'a>(confirm: &ConfirmRecreate) -> iced::Element<'a, Message> {
-    iced::widget::column![
-        iced::widget::text(recreate_confirmation(&confirm.label, &confirm.venv_path))
-            .size(theme::BODY),
-        iced::widget::button(iced::widget::text("Delete and recreate"))
-            .on_press(Message::RecreateVenvConfirmed)
-            .style(|_theme, _status| iced::widget::button::Style {
-                background: Some(iced::Background::Color(theme::BOOT)),
-                text_color: theme::INK,
-                ..iced::widget::button::Style::default()
-            }),
-        iced::widget::button(iced::widget::text("Cancel")).on_press(Message::RecreateVenvCancelled),
-    ]
-    .spacing(theme::SPACE_2)
+    iced::widget::container(
+        iced::widget::column![
+            iced::widget::text(recreate_confirmation(&confirm.label, &confirm.venv_path))
+                .size(theme::BODY),
+            iced::widget::row![
+                iced::widget::button(iced::widget::text("Delete and recreate").size(theme::BODY))
+                    .on_press(Message::RecreateVenvConfirmed)
+                    .padding([theme::SPACE_1, theme::SPACE_3])
+                    .style(theme::button_danger),
+                iced::widget::button(iced::widget::text("Cancel").size(theme::BODY))
+                    .on_press(Message::RecreateVenvCancelled)
+                    .padding([theme::SPACE_1, theme::SPACE_3])
+                    .style(theme::button_quiet),
+            ]
+            .spacing(theme::SPACE_2),
+        ]
+        .spacing(theme::SPACE_3),
+    )
+    .padding(theme::SPACE_3)
+    .style(theme::panel)
     .into()
 }
 

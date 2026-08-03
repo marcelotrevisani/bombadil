@@ -128,28 +128,61 @@ pub fn view<'a>(entries: &[Entry], selected: Option<usize>) -> iced::Element<'a,
                 .into(),
         };
 
-        let content = iced::widget::column![
-            iced::widget::row![
-                iced::widget::text(glyph.glyph.to_string())
-                    .size(theme::BODY)
-                    .color(glyph.colour)
-                    .width(theme::GLYPH_COLUMN_WIDTH),
-                iced::widget::text(entry.label.clone())
-                    .font(label_font)
-                    .size(theme::BODY),
+        // The selection marker: a `jacket` bar down the row's leading edge,
+        // and the row's fill becomes the `ink` of the pane it opens, so the
+        // selected project reads as continuous with what it is showing.
+        //
+        // It used to be a `jacket` *fill* under parchment text, which is
+        // 3.1:1 -- below WCAG AA at every size in this application. An edge
+        // marker is both legible and the vocabulary the tab bar already uses
+        // for the same job; see `theme`'s contrast tests.
+        let marker = iced::widget::container(
+            iced::widget::Space::new()
+                .width(theme::SELECTED_MARKER)
+                .height(iced::Length::Fill),
+        )
+        .height(iced::Length::Fill)
+        .style(move |_theme| iced::widget::container::Style {
+            background: is_selected.then_some(iced::Background::Color(theme::JACKET)),
+            ..iced::widget::container::Style::default()
+        });
+
+        let content = iced::widget::row![
+            marker,
+            iced::widget::column![
+                iced::widget::row![
+                    iced::widget::text(glyph.glyph.to_string())
+                        .size(theme::BODY)
+                        .color(glyph.colour)
+                        .width(theme::GLYPH_COLUMN_WIDTH),
+                    iced::widget::text(entry.label.clone())
+                        .font(label_font)
+                        .size(theme::BODY),
+                ]
+                .spacing(theme::SPACE_1),
+                version_line,
             ]
             .spacing(theme::SPACE_1),
-            version_line,
         ]
-        .spacing(theme::SPACE_1);
+        .spacing(theme::SPACE_2);
 
         let row = iced::widget::button(content)
             .on_press(Message::ProjectSelected(i))
             .padding(theme::SPACE_1)
             .width(iced::Length::Fill)
-            .style(move |_theme, _status| iced::widget::button::Style {
-                background: is_selected.then_some(iced::Background::Color(theme::JACKET)),
+            .style(move |_theme, status| iced::widget::button::Style {
+                background: match (is_selected, status) {
+                    (true, _) => Some(iced::Background::Color(theme::INK)),
+                    (false, iced::widget::button::Status::Hovered) => {
+                        Some(iced::Background::Color(theme::INK))
+                    }
+                    _ => None,
+                },
                 text_color: theme::PARCHMENT,
+                border: iced::Border {
+                    radius: theme::RADIUS.into(),
+                    ..iced::Border::default()
+                },
                 ..iced::widget::button::Style::default()
             });
         list =

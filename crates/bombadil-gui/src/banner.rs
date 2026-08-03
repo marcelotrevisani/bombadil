@@ -91,11 +91,9 @@ pub fn view<'a>(problems: &Problems) -> iced::Element<'a, crate::app::Message> {
         );
     }
     iced::widget::container(list)
+        .width(iced::Length::Fill)
         .padding(theme::SPACE_2)
-        .style(|_theme| iced::widget::container::Style {
-            background: Some(iced::Background::Color(theme::BARK)),
-            ..iced::widget::container::Style::default()
-        })
+        .style(theme::surface)
         .into()
 }
 
