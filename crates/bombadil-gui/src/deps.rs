@@ -982,8 +982,18 @@ mod tests {
         // `sidebar::state`: a constraint this parser cannot read must never
         // read as "does not satisfy". Marking a working package drifted on a
         // parse failure would be a false alarm.
+        //
+        // The installed version must *violate* the constraint it cannot
+        // parse. `("<3.13", "3.9.18")` -- what this asserted first --
+        // discriminates nothing: 3.9.18 satisfies `<3.13`, so it reads
+        // Present whether the fallback fired or `<` were implemented
+        // tomorrow. `<3.5` can only read Present because the parse failed.
         assert_eq!(
-            state(&row(Some("<3.13"), Some("3.9.18"))),
+            state(&row(Some("<3.5"), Some("3.9.18"))),
+            theme::State::Present
+        );
+        assert_eq!(
+            state(&row(Some("not a specifier"), Some("3.9.18"))),
             theme::State::Present
         );
     }

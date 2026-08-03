@@ -225,7 +225,17 @@ mod tests {
         // The fallback direction matters: a requirement this parser cannot
         // read must never read as "does not satisfy". Marking a working
         // environment drifted on a parse failure would be a false alarm.
-        assert_eq!(state(&entry(Some("3.9.18"), Some("<3.13"))), State::Present);
+        //
+        // The version must *violate* the requirement it cannot parse.
+        // `("3.9.18", "<3.13")` -- what this asserted first -- discriminates
+        // nothing: 3.9.18 satisfies `<3.13`, so it reads Present whether the
+        // fallback fired or `<` were implemented tomorrow. `<3.5` can only
+        // read Present because the parse failed.
+        assert_eq!(state(&entry(Some("3.9.18"), Some("<3.5"))), State::Present);
+        assert_eq!(
+            state(&entry(Some("3.9.18"), Some("not a specifier"))),
+            State::Present
+        );
     }
 
     fn config_with(labels: &[&str]) -> bombadil_core::model::Config {

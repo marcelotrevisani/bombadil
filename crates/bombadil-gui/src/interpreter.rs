@@ -362,8 +362,12 @@ mod tests {
 
     #[test]
     fn an_unparseable_requirement_falls_back_to_offering_everything() {
+        // Both candidates must *violate* the requirement they are offered
+        // against, or the assertion holds whether the fallback fired or `<`
+        // were implemented tomorrow -- the same non-discrimination
+        // `sidebar` and `deps` carried with `<3.13`.
         let all = vec![interp("3.10.13"), interp("3.12.4")];
-        assert_eq!(satisfying(&all, Some("<3.13")).len(), 2);
+        assert_eq!(satisfying(&all, Some("<3.5")).len(), 2);
         assert_eq!(satisfying(&all, Some("not a specifier")).len(), 2);
         assert_eq!(satisfying(&all, Some("")).len(), 2);
     }
@@ -442,7 +446,10 @@ mod tests {
     fn version_satisfies_falls_back_to_true_when_the_requirement_is_unparseable() {
         // Same fallback direction as `satisfying`: a requirement this parser
         // cannot read must never read as "does not satisfy".
-        assert!(version_satisfies("3.9.18", Some("<3.13")));
+        // `<3.5`, not `<3.13`: 3.9.18 satisfies `<3.13`, so that pair would
+        // hold even with `<` implemented and prove nothing about the
+        // fallback.
+        assert!(version_satisfies("3.9.18", Some("<3.5")));
         assert!(version_satisfies("3.9.18", Some("not a specifier")));
         assert!(version_satisfies("3.9.18", None));
     }
