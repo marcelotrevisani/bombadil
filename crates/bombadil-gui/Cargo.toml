@@ -31,3 +31,20 @@ tempfile.workspace = true
 # never reaches a release build. Not a new dependency -- bombadil-core is
 # already depended on above.
 bombadil-core = { path = "../bombadil-core", version = "0.1.0", features = ["test-support"] }
+
+# The tray, split by platform on purpose. `ksni` speaks StatusNotifierItem over
+# D-Bus in pure Rust, which is the protocol GNOME/KDE actually use and costs
+# this build no GTK and no X11 -- `tray-icon`'s default features would add
+# both, and every Linux contributor and CI job would then need libgtk-3-dev,
+# libxdo-dev and libayatana-appindicator3-dev to compile a GUI that otherwise
+# draws every pixel itself.
+[target.'cfg(target_os = "linux")'.dependencies]
+# `blocking` is only the API shape; a reactor still has to be chosen. `async-io`
+# rather than the default `tokio`, so this pulls in no async runtime that the
+# rest of the application does not already use.
+ksni = { version = "0.3.6", default-features = false, features = ["blocking", "async-io"] }
+
+# Off Linux there is no such protocol and no lighter option; `tray-icon` has no
+# GTK dependency on these platforms.
+[target.'cfg(any(target_os = "macos", target_os = "windows"))'.dependencies]
+tray-icon = { version = "0.24.2", default-features = false }

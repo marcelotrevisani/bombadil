@@ -60,6 +60,17 @@ exceptions = [
     # to option-ext's own source files. We link it unmodified, so nothing is
     # triggered. Revisit only if we ever vendor and patch it.
     { allow = ["MPL-2.0"], crate = "option-ext" },
+    # ksni is Unlicense, and is a deliberate choice rather than something a
+    # dependency dragged in: it is the Linux tray, chosen over `tray-icon`
+    # precisely to keep GTK3 and X11 out of this build (see `gui/src/tray.rs`).
+    #
+    # Unlicense is a public-domain dedication -- OSI approved and FSF
+    # Free/Libre -- with a fallback licence grant for jurisdictions that do not
+    # recognise dedication to the public domain. Like CC0 above it grants no
+    # patent rights explicitly, which is why it is scoped to this one crate
+    # rather than added to the global allow list where it would silently cover
+    # every future dependency.
+    { allow = ["Unlicense"], crate = "ksni" },
 ]
 
 [bans]
