@@ -103,8 +103,17 @@ just            # list every recipe
 just run        # debug build
 just test       # workspace tests
 just ci         # fmt-check, clippy, test, cargo-deny, msrv -- what CI runs
-just icon       # regenerate assets/ from assets/icon.svg (needs cairosvg)
+just icon       # regenerate assets/ from the SVGs there (needs cairosvg)
 ```
+
+On Linux, `just install-desktop` puts a desktop entry and the themed icons in
+`~/.local/share` (per-user, no root; `just uninstall-desktop` removes exactly
+those). This is not decoration: **GNOME on Wayland ignores the icon a window
+carries.** It resolves a window's icon by matching its `app_id` to the basename
+of an installed `.desktop` file and reading that file's `Icon=` key out of the
+icon theme, so without the entry the panel shows a generic placeholder no
+matter what the binary holds. X11, Windows and macOS use the compiled-in icon,
+which is why it is set both ways.
 
 808 tests across three crates, green on Linux, macOS and Windows.
 

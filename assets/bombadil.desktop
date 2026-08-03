@@ -1,0 +1,13 @@
+[Desktop Entry]
+Type=Application
+Name=Bombadil
+GenericName=Virtual environment manager
+Comment=A desktop keeper for uv virtual environments
+Exec=@EXEC@
+Icon=bombadil
+Terminal=false
+Categories=Development;IDE;
+Keywords=python;uv;virtualenv;venv;
+# Must equal the `application_id` the binary sets, or the shell treats the
+# running window as a separate, iconless application from this entry.
+StartupWMClass=bombadil
