@@ -344,6 +344,10 @@ pub enum Message {
     /// `uv sync` -- which prunes packages absent from the target's lockfile
     /// -- against an environment the user never named.
     SyncRequested(usize),
+    /// The output drawer's own disclosure control. The only thing that opens
+    /// or closes it -- output arriving no longer does, and neither does a
+    /// command finishing.
+    DrawerToggled,
     /// The sidebar's disclosure control for `projects[usize]`. Persisted, so
     /// a project you collapse stays collapsed across a restart.
     ProjectExpandToggled(usize),
@@ -1212,6 +1216,9 @@ pub fn update(app: &mut App, message: Message, runner: Arc<dyn CommandRunner>) -
         // The menu closes either way, the same as `OpenTerminalRequested`
         // and `RemoveProjectRequested`: an action taken from the menu
         // dismisses it, whether or not the press was swallowed.
+        Message::DrawerToggled => {
+            app.drawer.expanded = !app.drawer.expanded;
+        }
         Message::ProjectExpandToggled(i) => {
             let Some(project) = app.config.projects.get_mut(i) else {
                 return Task::none();
@@ -1337,17 +1344,12 @@ pub fn update(app: &mut App, message: Message, runner: Arc<dyn CommandRunner>) -
                 "sync failed".to_string()
             };
             drawer::set_idle(&mut app.drawer, status);
-            // Collapsing is right on success -- spec §8 asks for exactly that
-            // status line. On failure spec §9 asks for a banner *plus the
-            // full transcript*, and `set_idle` has just collapsed it: without
-            // re-expanding here, iced only ever renders after `update`
-            // returns, so `expanded` is never observably true and the user
-            // sees "sync failed" with no exit code and no reason. Done at
-            // the call site rather than inside `set_idle`, which means one
-            // thing and should keep meaning it.
-            if !success && !app.drawer.lines.is_empty() {
-                app.drawer.expanded = true;
-            }
+            // Nothing re-expands here any more. `set_idle` no longer
+            // collapses, so there is nothing to undo -- and forcing the
+            // drawer open on failure would overrule a user who had closed
+            // it. A failed status renders in `boot` and the header says how
+            // many lines are waiting, which is the signal without the
+            // hijack.
             // A sync is the one action that changes what every read-only
             // surface describes: it installs and removes packages, and it
             // creates the environment when there was none. Without re-reading
@@ -1640,9 +1642,6 @@ pub fn update(app: &mut App, message: Message, runner: Arc<dyn CommandRunner>) -
             // same discipline `SyncFinished` follows for `run_sync`.
             drawer::push_line(&mut app.drawer, &message, &[]);
             drawer::set_idle(&mut app.drawer, "open terminal failed".to_string());
-            if !app.drawer.lines.is_empty() {
-                app.drawer.expanded = true;
-            }
         }
         Message::RemoveProjectRequested(i) if i < app.config.projects.len() => {
             // In-memory first, synchronously -- the same discipline
@@ -1776,9 +1775,6 @@ pub fn update(app: &mut App, message: Message, runner: Arc<dyn CommandRunner>) -
         Message::OpenFolderFinished(Err(message)) => {
             drawer::push_line(&mut app.drawer, &message, &[]);
             drawer::set_idle(&mut app.drawer, "open folder failed".to_string());
-            if !app.drawer.lines.is_empty() {
-                app.drawer.expanded = true;
-            }
         }
         Message::MenuToggled(menu) => {
             app.open_menu = if app.open_menu == Some(menu) {
@@ -4728,9 +4724,53 @@ mod tests {
     }
 
     #[test]
-    fn a_successful_sync_collapses_to_a_status_line() {
-        // The other half: collapsing IS right on success (spec §8), so the
-        // failure fix must not turn into "always expanded".
+    fn the_user_can_close_the_drawer_and_it_stays_closed() {
+        // The whole point of the control: output arriving and a command
+        // finishing both used to drive it, so "closed" lasted until the next
+        // line. Now nothing but this message changes it.
+        let mut app = App::new(Config {
+            projects: vec![project("api")],
+            ..Config::default()
+        });
+        assert!(app.drawer.expanded, "it starts open");
+
+        let _ = update(&mut app, Message::DrawerToggled, unused_runner());
+        assert!(!app.drawer.expanded);
+
+        let _ = update(
+            &mut app,
+            Message::SyncLine("Resolved 12 packages".to_string()),
+            unused_runner(),
+        );
+        let _ = update(
+            &mut app,
+            Message::SyncFinished {
+                success: false,
+                lines: Vec::new(),
+            },
+            unused_runner(),
+        );
+
+        assert!(
+            !app.drawer.expanded,
+            "neither output nor a failure may reopen a drawer the user closed"
+        );
+        assert!(
+            !app.drawer.lines.is_empty(),
+            "the transcript is still collected, ready for when they open it"
+        );
+
+        let _ = update(&mut app, Message::DrawerToggled, unused_runner());
+        assert!(app.drawer.expanded, "and reopening shows it");
+    }
+
+    #[test]
+    fn a_successful_sync_leaves_its_transcript_on_screen() {
+        // Supersedes spec §8's "reduces to a single status line once idle",
+        // at the user's request: the output of a command they just ran is
+        // what they asked for, and collapsing it on success meant a
+        // successful sync's transcript existed only while it was running.
+        // Closing it is now a press, and it stays closed.
         let mut app = App::new(Config {
             projects: vec![project("api")],
             ..Config::default()
@@ -4745,8 +4785,12 @@ mod tests {
             unused_runner(),
         );
 
-        assert!(!app.drawer.expanded, "a successful sync must collapse");
+        assert!(
+            app.drawer.expanded,
+            "a successful sync must leave its output readable"
+        );
         assert_eq!(app.drawer.status, "sync succeeded");
+        assert!(!app.drawer.lines.is_empty(), "and its lines with it");
     }
 
     #[test]

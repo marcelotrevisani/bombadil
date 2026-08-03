@@ -43,10 +43,13 @@ pub struct Drawer {
     /// (as a failure transcript does) is exactly as safe as going through
     /// `view`.
     pub lines: Vec<String>,
-    /// True while a command is streaming output; false once it is idle. Only
-    /// `view` is expected to read this to decide what to render -- it is
-    /// public so `update` can drive it directly, the same way `app.entries`
-    /// is mutated in place elsewhere in this crate.
+    /// Whether the transcript is on screen.
+    ///
+    /// **Only the user changes this.** It used to be driven by the output
+    /// itself -- a line arriving opened the drawer, a command finishing
+    /// closed it -- which threw the transcript away at the exact moment
+    /// there was something worth reading, and re-opened it under a user who
+    /// had deliberately closed it.
     pub expanded: bool,
     /// The single line `view` shows once `expanded` is false.
     pub status: String,
@@ -60,7 +63,9 @@ impl Default for Drawer {
     fn default() -> Self {
         Self {
             lines: Vec::new(),
-            expanded: false,
+            // Open, because the output of a command you just ran is the thing
+            // you asked for. Closing it is one press and stays closed.
+            expanded: true,
             status: "idle".to_string(),
         }
     }
@@ -76,7 +81,9 @@ impl Default for Drawer {
 /// `compose` uses to keep a keychain secret out of a failing script's error,
 /// rather than a second implementation that could drift from it.
 pub fn push_line(drawer: &mut Drawer, line: &str, secrets: &[String]) {
-    drawer.expanded = true;
+    // Deliberately does *not* open the drawer. A user who closed it meant it,
+    // and output arriving is not a reason to overrule them -- the status line
+    // still shows a command is running.
     drawer.lines.push(redact(line.to_string(), secrets));
     if drawer.lines.len() > MAX_LINES {
         let overflow = drawer.lines.len() - MAX_LINES;
@@ -86,11 +93,14 @@ pub fn push_line(drawer: &mut Drawer, line: &str, secrets: &[String]) {
     }
 }
 
-/// Mark the drawer idle: collapse it and set the single status line `view`
-/// shows in its place. Called once a uv invocation finishes, whether it
+/// Set the status line. Called once a uv invocation finishes, whether it
 /// succeeded or not -- `status` is the caller's summary either way.
+///
+/// Deliberately does *not* collapse the drawer. It used to, which meant a
+/// successful sync's transcript vanished the instant it finished -- the one
+/// moment the user had a reason to read it. Whether the transcript is on
+/// screen is the user's choice now, and nothing but their press changes it.
 pub fn set_idle(drawer: &mut Drawer, status: impl Into<String>) {
-    drawer.expanded = false;
     drawer.status = status.into();
 }
 
@@ -120,17 +130,61 @@ fn is_failure(status: &str) -> bool {
 }
 
 /// Renders the drawer: a `bark` surface, collapsed to one status line while
-/// idle, the full transcript in Plex at `DATA` while expanded. A failed
-/// command's status renders in `boot` either way -- the collapsed line for a
-/// persist failure with no transcript to show, and a banner above the
-/// transcript for a failed command, per spec §9. Deliberately dumb beyond
-/// that: all the logic worth testing lives in `push_line`, `set_idle` and
-/// `is_failure`.
+/// A header that is always present -- the status, a line count, and the
+/// control that opens or closes the transcript -- with the transcript itself
+/// in Plex at `DATA` beneath it while open. A failed command's status renders
+/// in `boot` either way, per spec §9. Deliberately dumb beyond that: all the
+/// logic worth testing lives in `push_line`, `set_idle` and `is_failure`.
 pub fn view<'a>(drawer: &Drawer) -> iced::Element<'a, Message> {
     let failed = is_failure(&drawer.status);
     let status_colour = if failed { theme::BOOT } else { theme::SLATE };
 
-    let content: iced::Element<'a, Message> = if drawer.expanded {
+    // The header is always there: the status, how many lines are behind it,
+    // and the one control that opens or closes them. A drawer whose only
+    // affordance was appearing on its own gave the user no way to say "not
+    // now" -- or, once it had closed itself, "actually, show me".
+    let toggle = iced::widget::button(
+        iced::widget::row![
+            iced::widget::text(if drawer.expanded {
+                "\u{25be}"
+            } else {
+                "\u{25b8}"
+            })
+            .size(theme::BODY),
+            iced::widget::text(drawer.status.clone())
+                .size(theme::BODY)
+                .color(status_colour),
+        ]
+        .spacing(theme::SPACE_1)
+        .align_y(iced::Alignment::Center),
+    )
+    .on_press(Message::DrawerToggled)
+    .padding(0.0)
+    .style(theme::button_bare(status_colour));
+
+    let count: iced::Element<'a, Message> = if drawer.lines.is_empty() {
+        iced::widget::Space::new().into()
+    } else {
+        // So a closed drawer still says there is something to open. Without
+        // it, "sync succeeded" and "sync succeeded, and here are 400 lines
+        // explaining what it did" look identical.
+        iced::widget::text(format!("{} lines", drawer.lines.len()))
+            .size(theme::LABEL)
+            .color(theme::SLATE)
+            .into()
+    };
+
+    let header = iced::widget::row![
+        toggle,
+        iced::widget::Space::new().width(iced::Length::Fill),
+        count,
+    ]
+    .spacing(theme::SPACE_2)
+    .align_y(iced::Alignment::Center);
+
+    let mut content = iced::widget::column![header].spacing(theme::SPACE_1);
+
+    if drawer.expanded {
         let mut list = iced::widget::column![].spacing(theme::SPACE_1);
         for line in &drawer.lines {
             list = list.push(
@@ -139,24 +193,13 @@ pub fn view<'a>(drawer: &Drawer) -> iced::Element<'a, Message> {
                     .size(theme::DATA),
             );
         }
-        iced::widget::column![
-            iced::widget::text(drawer.status.clone())
-                .size(theme::BODY)
-                .color(status_colour),
-            // Bounded: a large resolution prints thousands of lines, and an
-            // unbounded transcript would push the whole application off the
-            // top of the window. `push_line` already caps how many are kept;
-            // this caps how much of the window they may occupy.
-            iced::widget::scrollable(list).height(theme::DRAWER_MAX_HEIGHT),
-        ]
-        .spacing(theme::SPACE_1)
-        .into()
-    } else {
-        iced::widget::text(drawer.status.clone())
-            .size(theme::BODY)
-            .color(status_colour)
-            .into()
-    };
+        // Bounded in height, not in content: a large resolution prints
+        // thousands of lines, and an unbounded transcript would push the whole
+        // application off the top of the window. `push_line` caps how many are
+        // kept; this caps how much of the window they occupy, and the rest
+        // scrolls.
+        content = content.push(iced::widget::scrollable(list).height(theme::DRAWER_MAX_HEIGHT));
+    }
 
     // Full width, not sized to its own content: the drawer is the base of the
     // window, and a status line shrunk to the word "idle" read as a stray
@@ -210,22 +253,48 @@ mod tests {
     }
 
     #[test]
-    fn idle_collapses_to_a_single_status_line() {
+    fn finishing_a_command_keeps_its_transcript_on_screen() {
+        // It used to collapse here, which threw the output away at the exact
+        // moment the user had a reason to read it -- a successful sync's
+        // transcript existed only while it was still running.
         let mut drawer = Drawer::default();
         push_line(&mut drawer, "resolving dependencies...", &[]);
-        assert!(
-            drawer.expanded,
-            "streaming output must expand the drawer before it can collapse"
-        );
 
         set_idle(&mut drawer, "sync succeeded");
 
-        assert!(!drawer.expanded, "an idle drawer must collapse");
-        assert_eq!(drawer.status, "sync succeeded");
         assert!(
-            !drawer.status.is_empty(),
-            "the collapsed drawer must show a real status, not an empty line"
+            drawer.expanded,
+            "a finished command must leave its output where the user can read it"
         );
+        assert_eq!(drawer.status, "sync succeeded");
+        assert_eq!(drawer.lines.len(), 1, "and the transcript must survive");
+    }
+
+    #[test]
+    fn output_arriving_does_not_reopen_a_drawer_the_user_closed() {
+        // The other half of "the user decides". A closed drawer that reopened
+        // itself the moment a line arrived would be a control that does not
+        // hold, and the status line already says a command is running.
+        let mut drawer = Drawer {
+            expanded: false,
+            ..Drawer::default()
+        };
+
+        push_line(&mut drawer, "resolving dependencies...", &[]);
+        set_idle(&mut drawer, "sync succeeded");
+
+        assert!(!drawer.expanded, "only the user opens it");
+        assert_eq!(
+            drawer.lines.len(),
+            1,
+            "the transcript is still collected while closed, ready to show"
+        );
+    }
+
+    #[test]
+    fn a_new_drawer_starts_open() {
+        // The output of a command you just ran is the thing you asked for.
+        assert!(Drawer::default().expanded);
     }
 
     #[test]
