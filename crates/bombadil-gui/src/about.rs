@@ -21,6 +21,7 @@
 //! `include_str!`, reachable from the same expandable footer.
 
 use crate::app::Message;
+use crate::theme;
 
 /// A short notice naming uv, its licence and the exact version bundled in
 /// this build. Rendered as a footer line by [`view`], above the control that
@@ -83,22 +84,22 @@ pub fn view<'a>(expanded: bool) -> iced::Element<'a, Message> {
         "Bundled licences (uv, Apache-2.0 · fonts, OFL-1.1)"
     };
     let mut column = iced::widget::column![
-        iced::widget::text(attribution()).size(11),
-        iced::widget::text(font_attribution()).size(11),
-        iced::widget::button(iced::widget::text(label).size(11))
+        iced::widget::text(attribution()).size(theme::LABEL),
+        iced::widget::text(font_attribution()).size(theme::LABEL),
+        iced::widget::button(iced::widget::text(label).size(theme::LABEL))
             .on_press(Message::AboutLicenseToggled),
     ]
-    .spacing(4);
+    .spacing(theme::SPACE_1);
 
     if expanded {
         column = column.push(iced::widget::scrollable(
-            iced::widget::text(atkinson_license()).size(11),
+            iced::widget::text(atkinson_license()).size(theme::LABEL),
         ));
         column = column.push(iced::widget::scrollable(
-            iced::widget::text(plex_license()).size(11),
+            iced::widget::text(plex_license()).size(theme::LABEL),
         ));
         column = column.push(iced::widget::scrollable(
-            iced::widget::text(license()).size(11),
+            iced::widget::text(license()).size(theme::LABEL),
         ));
     }
 

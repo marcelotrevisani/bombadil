@@ -12,6 +12,13 @@
 //! satisfy the project's `requires-python` rendered exactly like a healthy
 //! one. `state` below is what tells those apart, mapping to `theme::State`'s
 //! third state, `Drifted`.
+//!
+//! `theme::GLYPH_COLUMN_WIDTH` was not retrofitted onto this row when it was
+//! written -- every other pane's glyph column (dependency, member and index
+//! rows) is fixed-width, but the sidebar's own glyph sized itself to its
+//! content, so the label following it did not start at the offset the rest
+//! of the application already trained the eye to expect. Fixed alongside
+//! Task 5.
 
 use bombadil_core::model::Config;
 
@@ -125,7 +132,8 @@ pub fn view<'a>(entries: &[Entry], selected: Option<usize>) -> iced::Element<'a,
             iced::widget::row![
                 iced::widget::text(glyph.glyph.to_string())
                     .size(theme::BODY)
-                    .color(glyph.colour),
+                    .color(glyph.colour)
+                    .width(theme::GLYPH_COLUMN_WIDTH),
                 iced::widget::text(entry.label.clone())
                     .font(label_font)
                     .size(theme::BODY),

@@ -4,8 +4,19 @@
 //! single status line once idle. Spec §9: a non-zero exit shows a banner plus
 //! the full transcript -- which means the transcript stored here must already
 //! be safe to show, since nothing downstream re-checks it.
+//!
+//! # How `view` knows a command failed
+//!
+//! `Drawer` carries no `failed: bool` -- every failure status `app::update`
+//! ever sets (`"sync failed"`, `"open terminal failed"`, `"env var change
+//! failed to persist"`, ...) already contains the word "failed", and every
+//! success or in-progress status (`"sync succeeded"`, `"project added"`,
+//! `"syncing api..."`, `"idle"`) never does. [`is_failure`] reads that
+//! existing convention rather than adding a field every one of those call
+//! sites in `app.rs` would then have to set explicitly.
 
 use crate::app::Message;
+use crate::theme;
 use bombadil_core::envspec::redact;
 
 /// How many lines the drawer keeps. A `uv sync` with a large resolution can
@@ -75,18 +86,59 @@ pub fn set_idle(drawer: &mut Drawer, status: impl Into<String>) {
     drawer.status = status.into();
 }
 
-/// Renders the drawer. Deliberately dumb: all the logic worth testing lives
-/// in `push_line` and `set_idle`.
+/// Whether `status` names a failure -- see the module doc for the convention
+/// this reads rather than re-derives.
+///
+/// ponytail: a string convention, not a typed flag. A future status that
+/// fails without the word "failed" would silently miss the banner; upgrade to
+/// a `Drawer::failed: bool` set at each `app::update` call site if that ever
+/// bites.
+fn is_failure(status: &str) -> bool {
+    status.contains("failed")
+}
+
+/// Renders the drawer: a `bark` surface, collapsed to one status line while
+/// idle, the full transcript in Plex at `DATA` while expanded. A failed
+/// command's status renders in `boot` either way -- the collapsed line for a
+/// persist failure with no transcript to show, and a banner above the
+/// transcript for a failed command, per spec §9. Deliberately dumb beyond
+/// that: all the logic worth testing lives in `push_line`, `set_idle` and
+/// `is_failure`.
 pub fn view<'a>(drawer: &Drawer) -> iced::Element<'a, Message> {
-    if drawer.expanded {
-        let mut list = iced::widget::column![].spacing(2);
+    let failed = is_failure(&drawer.status);
+    let status_colour = if failed { theme::BOOT } else { theme::SLATE };
+
+    let content: iced::Element<'a, Message> = if drawer.expanded {
+        let mut list = iced::widget::column![].spacing(theme::SPACE_1);
         for line in &drawer.lines {
-            list = list.push(iced::widget::text(line.clone()));
+            list = list.push(
+                iced::widget::text(line.clone())
+                    .font(theme::FONT_DATA)
+                    .size(theme::DATA),
+            );
         }
-        iced::widget::scrollable(list).into()
+        iced::widget::column![
+            iced::widget::text(drawer.status.clone())
+                .size(theme::BODY)
+                .color(status_colour),
+            iced::widget::scrollable(list),
+        ]
+        .spacing(theme::SPACE_1)
+        .into()
     } else {
-        iced::widget::text(drawer.status.clone()).into()
-    }
+        iced::widget::text(drawer.status.clone())
+            .size(theme::BODY)
+            .color(status_colour)
+            .into()
+    };
+
+    iced::widget::container(content)
+        .padding(theme::SPACE_2)
+        .style(|_theme| iced::widget::container::Style {
+            background: Some(iced::Background::Color(theme::BARK)),
+            ..iced::widget::container::Style::default()
+        })
+        .into()
 }
 
 #[cfg(test)]
@@ -170,5 +222,38 @@ mod tests {
             drawer.lines
         );
         assert!(drawer.lines[0].contains("***"), "got {:?}", drawer.lines[0]);
+    }
+
+    // --- is_failure: the convention `boot` rationing on the drawer depends on ---
+
+    #[test]
+    fn every_failure_status_app_update_sets_is_recognised() {
+        for status in [
+            "sync failed",
+            "add project failed",
+            "open terminal failed",
+            "open folder failed",
+            "remove failed to persist",
+            "env var change failed to persist",
+            "script change failed to persist",
+            "index change failed to persist",
+            "member selection failed to persist",
+            "settings change failed to persist",
+        ] {
+            assert!(is_failure(status), "{status:?} must read as a failure");
+        }
+    }
+
+    #[test]
+    fn a_success_or_in_progress_status_is_not_a_failure() {
+        for status in [
+            "idle",
+            "sync succeeded",
+            "project added",
+            "syncing api...",
+            "recreating api...",
+        ] {
+            assert!(!is_failure(status), "{status:?} must not read as a failure");
+        }
     }
 }

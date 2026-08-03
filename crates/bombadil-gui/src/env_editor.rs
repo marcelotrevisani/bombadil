@@ -63,14 +63,31 @@
 //! site remembering to check `secret` itself.
 
 use crate::app::Message;
+use crate::theme;
 use bombadil_core::model::{Config, EnvVar};
 use bombadil_core::secrets::SecretKey;
 use std::collections::HashMap;
 use uuid::Uuid;
 
-/// The text shown in place of a secret's real value -- never rendered,
-/// anywhere, per criterion 4.
-const REDACTED: &str = "(secret -- stored in the keychain)";
+/// How many `slate` dots a secret's value renders as -- never the value,
+/// and never a placeholder that could be mistaken for one, per criterion 4.
+///
+/// Fixed, regardless of the real value's length (which is empty in `Config`
+/// anyway by the time a row is secret -- see `mark_secret`) or emptiness, so
+/// an empty secret and any other secret render identically. A run of dots
+/// whose length tracked the real value would leak exactly the shape of
+/// information a secret exists to hide; text like `"(secret)"` is still a
+/// value-shaped placeholder someone glancing at the screen could mistake for
+/// what was actually typed a moment before.
+const SECRET_DOT_COUNT: usize = 8;
+
+/// The dots a secret's value renders as. Callers colour it `theme::SLATE` --
+/// this returns only the text, since some call sites (the value textbox's
+/// stand-in) render it alone and others (an override row's sentence) render
+/// it inline with prose that must not share its colour.
+fn secret_dots() -> String {
+    "\u{2022}".repeat(SECRET_DOT_COUNT)
+}
 
 /// Which list of variables a row edits: `Config::global_env`, or one
 /// project's `Project::env` addressed by its position in
@@ -126,7 +143,7 @@ pub fn secret_key(scope: EnvScope, project_id: Option<Uuid>, key: &str) -> Secre
 /// it inherits the guarantee rather than having to reimplement the check.
 pub fn display_value(var: &EnvVar) -> String {
     if var.secret {
-        REDACTED.to_string()
+        secret_dots()
     } else {
         var.value.clone()
     }
@@ -341,25 +358,43 @@ pub fn overrides(global: &[EnvVar], project_env: &[EnvVar]) -> Vec<Override> {
 
 /// Renders one scope's rows. Deliberately dumb, like every other `view` in
 /// this crate: all the logic worth testing lives in the functions above.
+///
+/// Key and value are data -- compared character by character, per the plan's
+/// own rule -- so both render in Plex; the buttons and the "secret" checkbox
+/// label are prose, left in the default face. Each row sits on a `bark`
+/// surface, the same treatment every row in every pane gets, so the tab reads
+/// as the same kind of list as Dependencies/Members/Indexes even though it
+/// carries no state glyph of its own -- an environment variable has no
+/// present/absent/drifted state to report.
 fn rows<'a>(scope: EnvScope, vars: &[EnvVar], drafts: &ValueDrafts) -> iced::Element<'a, Message> {
-    let mut column = iced::widget::column![].spacing(4);
+    let mut column = iced::widget::column![].spacing(theme::SPACE_2);
     for (index, var) in vars.iter().enumerate() {
         // Read-only once the row is secret: the keychain account is named
         // after the key, and nothing here can move an entry -- see `set_key`.
-        let key_input = iced::widget::text_input("KEY", &var.key).on_input_maybe(
-            (!var.secret).then_some(move |key| Message::EnvVarKeyChanged(scope, index, key)),
-        );
+        let key_input = iced::widget::text_input("KEY", &var.key)
+            .font(theme::FONT_DATA)
+            .size(theme::DATA)
+            .on_input_maybe(
+                (!var.secret).then_some(move |key| Message::EnvVarKeyChanged(scope, index, key)),
+            );
 
         // The one place criterion 4 is enforced at the widget level: a
         // secret row gets no textbox bound to `var.value` at all, so there
         // is nothing for the widget itself to leak even if `display_value`
-        // were somehow bypassed elsewhere.
+        // were somehow bypassed elsewhere. The dots render in `slate`,
+        // never the value's own colour.
         let value_widget: iced::Element<'_, Message> = if var.secret {
-            iced::widget::text(display_value(var)).into()
+            iced::widget::text(display_value(var))
+                .font(theme::FONT_DATA)
+                .size(theme::DATA)
+                .color(theme::SLATE)
+                .into()
         } else {
             // Bound to the draft, never straight to `Config` -- see the module
             // doc. Enter commits, the same as the save button below.
             iced::widget::text_input("value", value_box_text(drafts, scope, index, var))
+                .font(theme::FONT_DATA)
+                .size(theme::DATA)
                 .on_input(move |value| Message::EnvVarValueChanged(scope, index, value))
                 .on_submit(Message::EnvVarValueCommitted(scope, index))
                 .into()
@@ -380,10 +415,15 @@ fn rows<'a>(scope: EnvScope, vars: &[EnvVar], drafts: &ValueDrafts) -> iced::Ele
         let remove = iced::widget::button(iced::widget::text("remove"))
             .on_press(Message::EnvVarRemoved(scope, index));
 
-        column = column.push(
-            iced::widget::row![key_input, value_widget, save_value, secret_toggle, remove]
-                .spacing(6),
-        );
+        let row = iced::widget::row![key_input, value_widget, save_value, secret_toggle, remove]
+            .spacing(theme::SPACE_2);
+
+        column = column.push(iced::widget::container(row).padding(theme::SPACE_1).style(
+            |_theme| iced::widget::container::Style {
+                background: Some(iced::Background::Color(theme::BARK)),
+                ..iced::widget::container::Style::default()
+            },
+        ));
     }
     column.into()
 }
@@ -396,17 +436,23 @@ pub fn view<'a>(
     drafts: &ValueDrafts,
 ) -> iced::Element<'a, Message> {
     let mut column = iced::widget::column![
-        iced::widget::text("Global variables").size(16),
+        iced::widget::text("Global variables")
+            .font(theme::FONT_PROSE_SEMIBOLD)
+            .size(theme::TITLE),
         rows(EnvScope::Global, &config.global_env, drafts),
         iced::widget::button(iced::widget::text("Add global variable"))
             .on_press(Message::EnvVarAdded(EnvScope::Global)),
     ]
-    .spacing(8);
+    .spacing(theme::SPACE_3);
 
     if let Some(i) = selected_project
         && let Some(project) = config.projects.get(i)
     {
-        column = column.push(iced::widget::text("Project variables").size(16));
+        column = column.push(
+            iced::widget::text("Project variables")
+                .font(theme::FONT_PROSE_SEMIBOLD)
+                .size(theme::TITLE),
+        );
         column = column.push(rows(EnvScope::Project(i), &project.env, drafts));
         column = column.push(
             iced::widget::button(iced::widget::text("Add project variable"))
@@ -414,10 +460,30 @@ pub fn view<'a>(
         );
 
         for over in overrides(&config.global_env, &project.env) {
-            column = column.push(iced::widget::text(format!(
-                "{} overrides the global value ({})",
-                over.key, over.global_display
-            )));
+            // Key and the global's own value are both data; the sentence
+            // around them is prose. Kept as separate `text` widgets rather
+            // than one formatted string so the value -- a secret global's
+            // dots included -- can carry its own colour without recolouring
+            // the words around it.
+            column = column.push(
+                iced::widget::row![
+                    iced::widget::text(over.key.clone())
+                        .font(theme::FONT_DATA)
+                        .size(theme::DATA)
+                        .color(theme::SLATE),
+                    iced::widget::text("overrides the global value (")
+                        .size(theme::BODY)
+                        .color(theme::SLATE),
+                    iced::widget::text(over.global_display.clone())
+                        .font(theme::FONT_DATA)
+                        .size(theme::DATA)
+                        .color(theme::SLATE),
+                    iced::widget::text(")")
+                        .size(theme::BODY)
+                        .color(theme::SLATE),
+                ]
+                .spacing(theme::SPACE_1),
+            );
         }
     }
 
@@ -619,6 +685,32 @@ mod tests {
         // useless for ordinary variables.
         let plain = var("HTTP_PROXY", "http://proxy:8080", false);
         assert_eq!(display_value(&plain), "http://proxy:8080");
+    }
+
+    #[test]
+    fn a_secret_renders_as_dots_not_a_word_shaped_placeholder() {
+        // "Never a placeholder that could be mistaken for it" rules out text
+        // like "(secret)" as much as it rules out the real value -- both are
+        // value-shaped strings someone glancing at the screen could take for
+        // what was typed. A run of a fixed punctuation character is neither.
+        let secret = var("TOKEN", "hunter2", true);
+        let shown = display_value(&secret);
+        assert!(
+            shown.chars().all(|c| c == '\u{2022}'),
+            "a secret's display must be made of dots only; got {shown:?}"
+        );
+    }
+
+    #[test]
+    fn an_empty_secret_renders_identically_to_any_other_secret() {
+        // The decision this glyph carries: dot count is fixed, not the real
+        // value's length. If it tracked length, an empty secret would render
+        // as zero dots -- indistinguishable from nothing rendered at all,
+        // and a non-empty one would leak its length one dot at a time.
+        let empty = var("TOKEN", "", true);
+        let long = var("TOKEN", "a-much-longer-secret-value", true);
+        assert_eq!(display_value(&empty), display_value(&long));
+        assert!(!display_value(&empty).is_empty());
     }
 
     // --- vars_mut / secret_key scope wiring ---

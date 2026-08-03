@@ -63,8 +63,13 @@
 //! panes) pulled in `BARK` (every dependency/member/index row is a raised
 //! surface over the pane's `INK` ground), `LABEL` (the "main"/"group: x"/
 //! "extra: x" section headings), `GLYPH_COLUMN_WIDTH`,
-//! `DEP_NAME_COLUMN_WIDTH` and `DEP_CONSTRAINT_COLUMN_WIDTH`. Nothing in
-//! this module remains unused as of Task 4.
+//! `DEP_NAME_COLUMN_WIDTH` and `DEP_CONSTRAINT_COLUMN_WIDTH`. Task 5 (the
+//! editors, drawer and destructive states) added no new token -- every
+//! constant it needed already existed -- but did give `INK` its first
+//! consumer outside this module: `context_menu::confirm_view`'s "Delete and
+//! recreate" button paints its own text in `INK`, since `PARCHMENT` reads
+//! poorly against `BOOT`'s yellow. Nothing in this module remains unused as
+//! of Task 5.
 
 use iced::font::Weight;
 use iced::{Color, Font, Theme, color};
