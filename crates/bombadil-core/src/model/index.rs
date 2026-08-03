@@ -34,3 +34,49 @@ pub struct Index {
     pub default_for_new_projects: bool,
     pub auth: IndexAuth,
 }
+
+impl Index {
+    /// Whether this index has not been filled in yet: no name and no URL.
+    ///
+    /// Pressing "Add index" has to create a row to type into, and that row
+    /// starts empty. Reporting it as two configuration errors before the user
+    /// has typed a character trains them to ignore the banner -- which is the
+    /// one thing the banner cannot afford, since it is also how a real
+    /// misconfiguration is reported.
+    ///
+    /// Deliberately *both* fields, not either. A half-filled index -- a name
+    /// with no URL, or a URL with no name -- is a real problem that would
+    /// break a sync, and still reports as one.
+    pub fn is_blank(&self) -> bool {
+        self.name.trim().is_empty() && self.url.trim().is_empty()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn index(name: &str, url: &str) -> Index {
+        Index {
+            name: name.into(),
+            url: url.into(),
+            kind: IndexKind::Extra,
+            default_for_new_projects: false,
+            auth: IndexAuth::None,
+        }
+    }
+
+    #[test]
+    fn a_freshly_added_index_is_blank() {
+        assert!(index("", "").is_blank());
+        assert!(index("  ", "\t").is_blank(), "whitespace is not content");
+    }
+
+    #[test]
+    fn a_half_filled_index_is_not_blank() {
+        // The distinction that matters. A name with no URL is not "not
+        // started", it is broken, and it must still be reported.
+        assert!(!index("internal", "").is_blank());
+        assert!(!index("", "https://nexus.example/simple").is_blank());
+    }
+}

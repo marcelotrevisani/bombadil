@@ -200,7 +200,11 @@ pub fn compose(
         .config
         .indexes
         .iter()
-        .filter(|i| inputs.project.index_names.contains(&i.name))
+        // Blank indexes excluded, so "not filled in yet" means the same
+        // thing here as it does to `validate`: one meaning, two call sites.
+        // A blank index's name is empty, so it would otherwise compose
+        // `UV_INDEX__USERNAME` -- a variable uv cannot attribute to anything.
+        .filter(|i| !i.is_blank() && inputs.project.index_names.contains(&i.name))
         .collect();
     inject(&selected, store, &mut env)?;
     for index in &selected {
