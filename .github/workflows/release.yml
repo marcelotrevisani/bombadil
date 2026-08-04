@@ -161,8 +161,74 @@ jobs:
             echo "::endgroup::"
           done
 
+
+  # The same application, delivered where the people who need it already are:
+  # `pip install bombadil`. The wheel carries the compiled binary and a console
+  # entry point and contains no Python at all -- the route uv itself takes to
+  # PyPI.
+  #
+  # One wheel per platform, because the payload is a native binary. The matrix
+  # is bounded by `uv-manifest.toml`: `bombadil-uv-bin`'s build script refuses a
+  # target it has no pinned uv checksum for, which is the behaviour that keeps
+  # an unverified binary from ever being embedded.
+  #
+  # manylinux is achievable here only because the binary links nothing but
+  # libc, libgcc and libm -- iced loads Wayland and X11 at runtime rather than
+  # linking them. A GUI binary that linked them would need auditwheel to bundle
+  # system libraries, which is a different and much worse problem.
+  wheels:
+    needs: [version, verify]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-latest, target: x86_64, manylinux: auto }
+          - { os: ubuntu-24.04-arm, target: aarch64, manylinux: auto }
+          - { os: macos-latest, target: aarch64, manylinux: "off" }
+          - { os: macos-13, target: x86_64, manylinux: "off" }
+          - { os: windows-latest, target: x64, manylinux: "off" }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: PyO3/maturin-action@v1
+        with:
+          target: ${{ matrix.target }}
+          manylinux: ${{ matrix.manylinux }}
+          args: --release --out dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheel-${{ matrix.os }}-${{ matrix.target }}
+          path: dist/*.whl
+          if-no-files-found: error
+
+  # Separate from `publish` on purpose: PyPI and crates.io are independent
+  # registries with independent tokens, and a failure to reach one must not
+  # leave the other half-done and unexplained.
+  pypi:
+    needs: [version, wheels, package, deny]
+    if: github.event_name == 'push' || !inputs.dry_run
+    runs-on: ubuntu-latest
+    environment: crates_deploy
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: wheel-*
+          merge-multiple: true
+          path: dist
+      - run: ls -la dist
+      - name: Upload to PyPI
+        env:
+          MATURIN_PYPI_TOKEN: ${{ secrets.PYPI_BOMBADIL }}
+        run: |
+          set -euo pipefail
+          pipx install maturin || pip install maturin
+          # `--skip-existing`, for the same reason `cargo publish` tolerates an
+          # already-published crate: a re-run after a partial failure should be
+          # able to finish rather than refuse from the first file.
+          maturin upload --skip-existing dist/*.whl
+
   release:
-    needs: [version, publish]
+    needs: [version, publish, pypi]
     if: github.event_name == 'push'
     runs-on: ubuntu-latest
     steps:

@@ -83,10 +83,13 @@ uses `uv` from `PATH` when that is at least `0.12.1` and falls back to the
 bundled copy; you can force either.
 
 ```sh
+pip install bombadil     # or: uv tool install bombadil
 cargo install bombadil
 ```
 
-One crate, the whole application. `bombadil` is a meta crate: it owns the name
+Either gets you the same application. The wheel carries the compiled binary and
+a console entry point and contains no Python at all — the route `uv` itself
+takes to PyPI — so `bombadil` lands on your PATH the same way. `bombadil` is a meta crate: it owns the name
 worth typing and pulls in `bombadil-gui`, `bombadil-core` and `bombadil-uv-bin`
 behind it. It has to be a real binary rather than an alias, because
 `cargo install` installs binaries defined *in* the package being installed and
@@ -168,7 +171,11 @@ can be rehearsed:
 3. Push the tag. It re-runs the full CI set against that exact commit, builds
    each crate from its own packaged tarball, then publishes
    `bombadil-core` → `bombadil-uv-bin` → `bombadil-gui` → `bombadil` in dependency
-   order and opens a GitHub release.
+   order, uploads one wheel per platform to PyPI, and opens a GitHub release.
+
+crates.io and PyPI are published by separate jobs with separate tokens
+(`RELEASE_TOKEN`, `PYPI_BOMBADIL`), so failing to reach one never leaves the
+other half-done.
 
 The crates.io token is `RELEASE_TOKEN` on the `crates_deploy` environment, so
 nothing outside the publish job can read it.
