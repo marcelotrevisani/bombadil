@@ -197,12 +197,17 @@ pub fn run() -> iced::Result {
     )
     .title("Bombadil")
     .window(window_settings())
-    // The close button becomes a message instead of an exit, so `update` can
-    // choose between hiding and quitting. Without this, minimise-to-tray is
-    // unreachable: the window is gone before the application hears about it.
+    // The close button quits. It is intercepted rather than left to iced's
+    // default only so the decision lives in one place: this once mapped to
+    // `Hide`, and the first report back was that the exit did nothing --
+    // which was exactly right. Minimising is something the user asks for now,
+    // from the tray's own "Hide", not something the X does to them.
     .exit_on_close_request(false)
-    .subscription(|state: &app::App| {
-        iced::Subscription::batch([app::subscription(state), tray_subscription()])
+    .subscription(|_: &app::App| {
+        iced::Subscription::batch([
+            iced::window::close_requests().map(|_| app::Message::Tray(tray::TrayCommand::Quit)),
+            tray_subscription(),
+        ])
     })
     // Both weights of Atkinson Hyperlegible Next share one font family, so
     // the renderer picks the right face by `Font::weight`; Plex Mono is
