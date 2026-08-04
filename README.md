@@ -89,7 +89,11 @@ cargo install bombadil
 
 Either gets you the same application. The wheel carries the compiled binary and
 a console entry point and contains no Python at all — the route `uv` itself
-takes to PyPI — so `bombadil` lands on your PATH the same way. `bombadil` is a meta crate: it owns the name
+takes to PyPI — so `bombadil` lands on your PATH the same way.
+
+Wheels are built for Linux (x86-64 and ARM), macOS on Apple Silicon, and
+Windows. An Intel Mac has no prebuilt wheel; `cargo install bombadil` builds
+there from source. `bombadil` is a meta crate: it owns the name
 worth typing and pulls in `bombadil-gui`, `bombadil-core` and `bombadil-uv-bin`
 behind it. It has to be a real binary rather than an alias, because
 `cargo install` installs binaries defined *in* the package being installed and

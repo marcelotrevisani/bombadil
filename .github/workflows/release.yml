@@ -184,8 +184,11 @@ jobs:
         include:
           - { os: ubuntu-latest, target: x86_64, manylinux: auto }
           - { os: ubuntu-24.04-arm, target: aarch64, manylinux: auto }
+          # Apple Silicon only. No Intel Mac wheel is built -- `cargo install
+          # bombadil` still works there, because `uv-manifest.toml` keeps its
+          # pinned x86_64-apple-darwin checksum; it is the prebuilt wheel that
+          # is dropped, not the platform.
           - { os: macos-latest, target: aarch64, manylinux: "off" }
-          - { os: macos-13, target: x86_64, manylinux: "off" }
           - { os: windows-latest, target: x64, manylinux: "off" }
     runs-on: ${{ matrix.os }}
     steps:
