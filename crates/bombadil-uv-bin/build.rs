@@ -72,12 +72,35 @@ fn hex(bytes: &[u8]) -> String {
 /// otherwise hang the build (and CI) indefinitely.
 const DOWNLOAD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 
+/// Downloads `url`, trusting the certificate authorities *this machine*
+/// trusts.
+///
+/// ureq's default root store is a compiled-in copy of Mozilla's CA list, which
+/// never consults the OS trust store. On any machine behind a TLS-inspecting
+/// proxy -- corporate laptops, most commonly -- the proxy re-signs every
+/// certificate with a private CA that is installed in the system keychain and
+/// is, by construction, not in Mozilla's list. rustls then reports
+/// `UnknownIssuer` and the build fails with a certificate error on a URL that
+/// works fine in a browser on the same machine. That is a real report from a
+/// macOS install, not a hypothetical.
+///
+/// Trusting the platform is safe here specifically because it is not what
+/// makes the download trustworthy: the archive is checked against a SHA-256
+/// pinned in `uv-manifest.toml`, so a proxy -- or anything else in the path --
+/// cannot substitute a different binary without failing that check. TLS is
+/// transport, the hash is the integrity guarantee, and they are independent.
 fn download(url: &str) -> Vec<u8> {
     let mut body = Vec::new();
-    ureq::get(url)
-        .config()
+    ureq::Agent::config_builder()
         .timeout_global(Some(DOWNLOAD_TIMEOUT))
+        .tls_config(
+            ureq::tls::TlsConfig::builder()
+                .root_certs(ureq::tls::RootCerts::PlatformVerifier)
+                .build(),
+        )
         .build()
+        .new_agent()
+        .get(url)
         .call()
         .unwrap_or_else(|e| panic!("could not download {url}: {e}"))
         .into_body()
