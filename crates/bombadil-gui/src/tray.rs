@@ -1,17 +1,28 @@
 //! The system tray, and the one rule that keeps it from stranding the user.
 //!
+//! # The close button is not a minimise button
+//!
+//! The X closes the window and ends the application. Minimising to the tray is
+//! something the user asks for, from this menu's own "Hide".
+//!
+//! It was the other way round first, and the first report back was that the
+//! exit did nothing -- which was exactly right. A control that has meant
+//! "quit" on every desktop for thirty years does not get to mean "hide"
+//! because the application would prefer to stay resident.
+//!
 //! # Never hide without somewhere to come back from
 //!
-//! Hiding the window is only reversible if something can un-hide it. If the
-//! tray failed to start -- no StatusNotifierItem host on the bus, a desktop
-//! with no tray at all -- and the close button hid the window anyway, the
-//! result is a process with no window, no tray icon and no way back short of
-//! `kill`. So [`start`] returns `None` when there is no tray, and the caller
-//! must treat `None` as "the close button closes, as it always did".
+//! Hiding is only reversible if something can un-hide it: a process with no
+//! window and no tray icon has no way back short of `kill`. [`start`] returns
+//! `None` when there is no tray, rather than a `Tray` that quietly does
+//! nothing, because a silent no-op tray is exactly the shape that produces
+//! that state.
 //!
-//! That is why this returns an `Option` rather than a `Tray` that quietly does
-//! nothing: a silent no-op tray is exactly the shape that produces the
-//! stranded process.
+//! With the X closing rather than hiding, `Hide` can only arrive from a menu
+//! that exists only when the tray does, so [`window_action`]'s guard now
+//! defends a path nothing reaches. It stays anyway: it costs three lines, it
+//! is what makes the rule explicit rather than incidental, and the last time
+//! this was left implicit the X was wired to it.
 //!
 //! # Why two implementations
 //!
@@ -64,11 +75,9 @@ pub enum WindowAction {
 
 /// The rule that keeps a hidden window reachable.
 ///
-/// `Hide` becomes `Close` when no tray is running. That is the whole safety
-/// property of this module: hiding is only reversible if something can
-/// un-hide it, and with no tray icon there is nothing to click. A user who
-/// pressed the close button on a trayless desktop gets what every close button
-/// has always done, rather than a process with no window and no way back.
+/// `Hide` becomes `Close` when no tray is running: hiding is only reversible
+/// if something can un-hide it, and with no tray icon there is nothing to
+/// click.
 ///
 /// A free function rather than a `match` inside `update` because `update`
 /// returns an opaque `Task` -- there is no way to assert from outside it

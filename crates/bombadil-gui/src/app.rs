@@ -859,17 +859,6 @@ impl App {
 /// Takes the whole `Loaded`, not just its `Config`: a corrupt or too-new
 /// file yields a *default* config, so dropping the variant here would leave
 /// the user staring at an empty project list with nothing to explain it.
-/// Everything the application listens to that is not a widget press.
-///
-/// The close button arrives here rather than closing the window, because
-/// `main` sets `exit_on_close_request(false)`. It maps to `Hide`, and the
-/// `Tray` arm in `update` turns that into a real close when no tray is
-/// running -- so the decision lives in one place rather than being split
-/// between this function, which cannot see `App`, and that one, which can.
-pub fn subscription(_app: &App) -> iced::Subscription<Message> {
-    iced::window::close_requests().map(|_| Message::Tray(tray::TrayCommand::Hide))
-}
-
 pub fn boot(loaded: Loaded) -> (App, Task<Message>) {
     let mut app = App::new(loaded.config().clone());
     app.load_problems = banner::load_problems(&loaded);
