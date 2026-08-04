@@ -21,5 +21,8 @@ flate2 = "1.1.9"
 sha2.workspace = true
 tar = "0.4.46"
 toml.workspace = true
-ureq = "3.3.0"
+# `platform-verifier` so TLS trusts what the machine trusts. ureq's default is
+# a compiled-in copy of Mozilla's roots, which never consults the OS store --
+# see `download` in build.rs for why that broke real installs.
+ureq = { version = "3.3.0", features = ["platform-verifier"] }
 zip = { version = "8.6.0", default-features = false, features = ["deflate-flate2"] }
