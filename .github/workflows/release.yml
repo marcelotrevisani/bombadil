@@ -87,10 +87,11 @@ jobs:
   # but does not ship: `include_bytes!` reaching outside the crate root
   # packages cleanly and then fails to compile for whoever installs it.
   #
-  # `bombadil-gui` cannot be verified this way until `bombadil-core` exists on
-  # crates.io, because packaging resolves its dependencies against the real
-  # index. `--no-verify` for that one, with `--list` proving its assets are in
-  # the tarball, which is the half that would otherwise go unchecked.
+  # `bombadil-gui` and `bombadil` cannot be verified this way until the crates
+  # they depend on exist on crates.io at the version being released, because
+  # packaging resolves against the real index. `--no-verify` for those, with
+  # `--list` proving the GUI's assets are in the tarball -- the half that would
+  # otherwise go unchecked.
   package:
     needs: version
     runs-on: ubuntu-latest
@@ -144,7 +145,7 @@ jobs:
           VERSION: ${{ needs.version.outputs.version }}
         run: |
           set -euo pipefail
-          for crate in bombadil-core bombadil-uv-bin bombadil-gui; do
+          for crate in bombadil-core bombadil-uv-bin bombadil-gui bombadil; do
             echo "::group::$crate"
             # An already-published version is not a failure worth stopping on:
             # it means an earlier attempt got this far, and the run should be
@@ -184,10 +185,10 @@ jobs:
           set -euo pipefail
           if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
             echo "a release for $GITHUB_REF_NAME already exists -- leaving its notes untouched"
-            echo "published to crates.io: bombadil-core, bombadil-uv-bin, bombadil-gui $VERSION"
+            echo "published to crates.io: bombadil, bombadil-gui, bombadil-core, bombadil-uv-bin $VERSION"
             exit 0
           fi
           gh release create "$GITHUB_REF_NAME" \
             --title "Bombadil $GITHUB_REF_NAME" \
             --generate-notes \
-            --notes "Published to crates.io: \`bombadil-core\`, \`bombadil-uv-bin\`, \`bombadil-gui\` $VERSION."
+            --notes "Published to crates.io: \`bombadil\`, \`bombadil-gui\`, \`bombadil-core\`, \`bombadil-uv-bin\` $VERSION."

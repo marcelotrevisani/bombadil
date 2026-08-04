@@ -83,9 +83,21 @@ uses `uv` from `PATH` when that is at least `0.12.1` and falls back to the
 bundled copy; you can force either.
 
 ```sh
+cargo install bombadil
+```
+
+One crate, the whole application. `bombadil` is a meta crate: it owns the name
+worth typing and pulls in `bombadil-gui`, `bombadil-core` and `bombadil-uv-bin`
+behind it. It has to be a real binary rather than an alias, because
+`cargo install` installs binaries defined *in* the package being installed and
+never in its dependencies.
+
+From a checkout instead:
+
+```sh
 git clone https://github.com/marcelotrevisani/bombadil
 cd bombadil
-just run-release          # or: cargo run --release -p bombadil-gui
+just run-release          # or: cargo run --release -p bombadil
 ```
 
 Rust 1.88 or newer, edition 2024. The build downloads the pinned `uv` release
@@ -155,8 +167,8 @@ can be rehearsed:
    a mismatch is silent and neither half can be taken back.
 3. Push the tag. It re-runs the full CI set against that exact commit, builds
    each crate from its own packaged tarball, then publishes
-   `bombadil-core` → `bombadil-uv-bin` → `bombadil-gui` in dependency order and
-   opens a GitHub release.
+   `bombadil-core` → `bombadil-uv-bin` → `bombadil-gui` → `bombadil` in dependency
+   order and opens a GitHub release.
 
 The crates.io token is `RELEASE_TOKEN` on the `crates_deploy` environment, so
 nothing outside the publish job can read it.
@@ -165,8 +177,9 @@ nothing outside the publish job can read it.
 
 | Crate | What it is |
 |---|---|
+| `bombadil` | The binary. Install this one; it brings the rest. |
+| `bombadil-gui` | The iced front end, as a library with one public function. |
 | `bombadil-core` | Model, config store, uv invocation, environment composition, keychain, terminals, IDE launch. No GUI. |
-| `bombadil-gui` | The iced front end. |
 | `bombadil-uv-bin` | Fetches and embeds the pinned `uv` binary at build time. |
 
 ## Licence

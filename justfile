@@ -22,11 +22,11 @@ build-release:
 
 # Run the GUI.
 run:
-    cargo run -p bombadil-gui
+    cargo run -p bombadil
 
 # Run the GUI optimised.
 run-release:
-    cargo run -p bombadil-gui --release
+    cargo run -p bombadil --release
 
 # Run the hermetic test suite: no processes, no network, no keychain, no display.
 test:
