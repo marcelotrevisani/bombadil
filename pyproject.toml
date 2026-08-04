@@ -1,0 +1,48 @@
+# Bombadil as a Python wheel. The same route uv itself takes to PyPI: the
+# wheel carries a compiled binary and a console entry point, and there is no
+# Python in it at all.
+#
+# `pip install bombadil` and `cargo install bombadil` install the same
+# application; this exists because "my project manager is a Python tool" is
+# where the people who need this already are.
+[build-system]
+requires = ["maturin>=1.7,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "bombadil"
+description = "A desktop keeper for uv virtual environments: track, sync and open the environments you already have."
+readme = "README.md"
+requires-python = ">=3.9"
+license = "Apache-2.0"
+license-files = [
+    "LICENSE",
+    "crates/bombadil-uv-bin/UV-LICENSE-APACHE",
+    "crates/bombadil-gui/fonts/OFL-*.txt",
+]
+authors = [{ name = "Marcelo Duarte Trevisani" }]
+keywords = ["uv", "python", "virtualenv", "venv", "gui"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: X11 Applications",
+    "Environment :: Win32 (MS Windows)",
+    "Environment :: MacOS X",
+    "Intended Audience :: Developers",
+    "Operating System :: OS Independent",
+    "Programming Language :: Rust",
+    "Topic :: Software Development :: Build Tools",
+]
+# Read from the workspace Cargo.toml, so the crates.io version and the PyPI
+# version cannot drift apart.
+dynamic = ["version"]
+
+[project.urls]
+Homepage = "https://github.com/marcelotrevisani/bombadil"
+Repository = "https://github.com/marcelotrevisani/bombadil"
+
+[tool.maturin]
+# No Python bindings: the wheel ships the binary and a console script.
+bindings = "bin"
+manifest-path = "crates/bombadil/Cargo.toml"
+# 135 MB unstripped, and every byte of it travels to every user.
+strip = true
