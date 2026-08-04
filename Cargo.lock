@@ -383,14 +383,14 @@ dependencies = [
 
 [[package]]
 name = "bombadil"
-version = "0.2.0"
+version = "0.2.2"
 dependencies = [
  "bombadil-gui",
 ]
 
 [[package]]
 name = "bombadil-core"
-version = "0.2.0"
+version = "0.2.2"
 dependencies = [
  "directories",
  "keyring",
@@ -405,7 +405,7 @@ dependencies = [
 
 [[package]]
 name = "bombadil-gui"
-version = "0.2.0"
+version = "0.2.2"
 dependencies = [
  "bombadil-core",
  "bombadil-uv-bin",
@@ -420,7 +420,7 @@ dependencies = [
 
 [[package]]
 name = "bombadil-uv-bin"
-version = "0.2.0"
+version = "0.2.2"
 dependencies = [
  "flate2",
  "sha2 0.11.0",
