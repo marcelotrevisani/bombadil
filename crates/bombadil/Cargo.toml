@@ -1,0 +1,16 @@
+[package]
+name = "bombadil"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "A desktop keeper for uv virtual environments. Install this one: it brings the whole application."
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+keywords.workspace = true
+categories.workspace = true
+readme = "../../README.md"
+
+[dependencies]
+bombadil-gui = { path = "../bombadil-gui", version = "0.2.0" }

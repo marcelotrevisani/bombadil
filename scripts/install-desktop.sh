@@ -32,11 +32,11 @@ fi
 # this works during development, and say which was chosen rather than leaving
 # a .desktop file silently pointing at a binary that is not there.
 BIN=""
-for candidate in "$ROOT/target/release/bombadil-gui" "$ROOT/target/debug/bombadil-gui"; do
+for candidate in "$ROOT/target/release/$NAME" "$ROOT/target/debug/$NAME"; do
     [[ -x "$candidate" ]] && { BIN="$candidate"; break; }
 done
 if [[ -z "$BIN" ]]; then
-    echo "no bombadil-gui binary found. run 'just build-release' first." >&2
+    echo "no $NAME binary found. run 'just build-release' first." >&2
     exit 1
 fi
 

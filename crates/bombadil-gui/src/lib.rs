@@ -1,5 +1,11 @@
 //! Bombadil's iced front end.
 //!
+//! A library with one public item, [`run`]. The binary users install is the
+//! `bombadil` crate, which exists to be a name worth typing and does nothing
+//! but call it: `cargo install` only installs binaries defined *in* the
+//! package being installed, never in its dependencies, so a meta crate has to
+//! carry its own `main` and something to put in it.
+//!
 //! # Conventions these modules follow
 //!
 //! - `view` is deliberately dumb and untested. Logic worth a test lives in a
@@ -147,7 +153,12 @@ fn tray_subscription() -> iced::Subscription<app::Message> {
     })
 }
 
-fn main() -> iced::Result {
+/// Runs the application. Returns when the last window closes.
+///
+/// Everything this needs -- the config, the persister, the runner, the tray --
+/// is built in here rather than taken as a parameter, because there is exactly
+/// one caller and it is a `main` that should hold no opinions.
+pub fn run() -> iced::Result {
     let (loaded, persist) = load_config();
     // `update` takes the runner as a parameter rather than storing it on
     // `App` so a test can substitute a `FakeCommandRunner`; here it is real.
