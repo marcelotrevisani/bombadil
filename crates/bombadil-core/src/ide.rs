@@ -929,7 +929,14 @@ mod tests {
   </component>
 </application>
 "#,
-                api.join(".venv/bin/python").display()
+                // `Scripts\python.exe` on Windows: built as the code builds it.
+                crate::envspec::venv_bin_dir(&api.join(".venv"))
+                    .join(if cfg!(windows) {
+                        "python.exe"
+                    } else {
+                        "python"
+                    })
+                    .display()
             ),
         )
         .unwrap();
