@@ -374,6 +374,17 @@ fn set_project_sdk(misc: &Path, sdk: &str) -> Result<(), String> {
         xml_escape(sdk)
     );
 
+    // `.idea` comes from the repository, so either it or `misc.xml` may be a
+    // committed symlink; writing through one would rewrite a file outside
+    // the project. Refused rather than followed.
+    // ponytail: checked then written, not atomic -- a race needs a local
+    // attacker already able to write the project.
+    for path in [misc.parent(), Some(misc)].into_iter().flatten() {
+        if std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink()) {
+            return Err(format!("{} is a symlink", path.display()));
+        }
+    }
+
     let updated = match std::fs::read_to_string(misc) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => format!(
             "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<project version=\"4\">\n  {line}\n</project>\n"
@@ -736,6 +747,35 @@ mod tests {
             misc.contains(r#"project-jdk-name="Bombadil (api)""#),
             "{misc}"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_idea_file_is_never_written_through() {
+        // A cloned repo can commit `.idea/misc.xml` (or `.idea`) as a symlink
+        // to another file of the user's; following it would rewrite that
+        // file instead.
+        let (dir, jetbrains, inputs) = scratch();
+        let victim = dir.path().join("victim.xml");
+        let original = "<project version=\"4\">\n</project>\n";
+        std::fs::write(&victim, original).unwrap();
+        std::fs::create_dir_all(dir.path().join("api/.idea")).unwrap();
+        std::os::unix::fs::symlink(&victim, dir.path().join("api/.idea/misc.xml")).unwrap();
+
+        let err = configure_interpreter(&inputs, &jetbrains, Path::new(HOME), false)
+            .expect_err("a symlinked misc.xml is refused");
+        assert!(err.contains("by hand"), "{err}");
+        assert_eq!(std::fs::read_to_string(&victim).unwrap(), original);
+
+        // The same through a symlinked `.idea` directory.
+        let (dir, jetbrains, inputs) = scratch();
+        let elsewhere = dir.path().join("elsewhere");
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        std::fs::create_dir_all(dir.path().join("api")).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, dir.path().join("api/.idea")).unwrap();
+        configure_interpreter(&inputs, &jetbrains, Path::new(HOME), false)
+            .expect_err("a symlinked .idea is refused");
+        assert!(!elsewhere.join("misc.xml").exists());
     }
 
     #[test]

@@ -36,7 +36,11 @@ impl GitStatus {
 /// same way, by showing nothing.
 pub fn status(dir: &Path, runner: &dyn CommandRunner) -> Option<GitStatus> {
     let spec = CommandSpec::new("git")
+        // A repository's own config can name an fsmonitor program, which
+        // `git status` would run; the repository is not trusted.
         .args([
+            "-c",
+            "core.fsmonitor=false",
             "--no-optional-locks",
             "status",
             "--porcelain=v2",
@@ -151,6 +155,8 @@ u UU N... 100644 100644 100644 100644 a b c conflict.py
         runner.expect(
             "git",
             &[
+                "-c",
+                "core.fsmonitor=false",
                 "--no-optional-locks",
                 "status",
                 "--porcelain=v2",
@@ -165,5 +171,32 @@ u UU N... 100644 100644 100644 100644 a b c conflict.py
         assert_eq!(status(Path::new("/tmp"), &runner), None);
         // And with no git at all, the probe fails rather than the app.
         assert_eq!(status(Path::new("/tmp"), &FakeCommandRunner::new()), None);
+    }
+
+    #[test]
+    fn a_repositorys_fsmonitor_command_is_never_run() {
+        // `core.fsmonitor` in a repo's own config names a program `git
+        // status` runs; Bombadil runs status on every project it lists.
+        let runner = FakeCommandRunner::new();
+        runner.expect(
+            "git",
+            &[
+                "-c",
+                "core.fsmonitor=false",
+                "--no-optional-locks",
+                "status",
+                "--porcelain=v2",
+                "--branch",
+            ],
+            CommandOutcome {
+                status: Some(0),
+                stdout: "# branch.head main\n".into(),
+                stderr: String::new(),
+            },
+        );
+        assert_eq!(
+            status(Path::new("/tmp"), &runner).map(|s| s.branch),
+            Some("main".to_string())
+        );
     }
 }
