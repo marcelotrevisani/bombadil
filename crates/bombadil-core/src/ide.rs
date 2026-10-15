@@ -252,8 +252,96 @@ pub fn configure_interpreter(
         ensure_sdk(&table, &base, &python, home).map_err(|e| format!("{e}; {manual}"))?
     };
 
-    let misc = project_dir(inputs).join(".idea").join("misc.xml");
-    set_project_sdk(&misc, &sdk).map_err(|e| format!("{e}; {manual}"))
+    let idea = project_dir(inputs).join(".idea");
+    set_project_sdk(&idea.join("misc.xml"), &sdk).map_err(|e| format!("{e}; {manual}"))?;
+
+    // A module may name its own interpreter, overriding the project's. The
+    // root module, and one pinned to another of *this project's*
+    // environments (a uv workspace member left on `.venv`, say), are moved
+    // to follow the project; one on any other interpreter is the user's
+    // choice and is left alone.
+    let content = std::fs::read_to_string(&table).unwrap_or_default();
+    let ours: Vec<String> = inputs
+        .project
+        .environments
+        .iter()
+        .filter_map(|e| crate::venv_path::resolve(&inputs.project, e, &inputs.config.settings).ok())
+        .flat_map(|venv| {
+            sdks_at(
+                &content,
+                &crate::envspec::venv_bin_dir(&venv).join(exe),
+                home,
+            )
+        })
+        .collect();
+    inherit_module_sdks(&idea, &ours).map_err(|e| format!("{e}; {manual}"))
+}
+
+/// Points every module file in `idea` that names one of `sdks` at the
+/// project's interpreter instead.
+///
+/// ponytail: only `.iml` files directly in `.idea`, where PyCharm puts them
+/// by default; read `modules.xml` if modules kept elsewhere need it too.
+fn inherit_module_sdks(idea: &Path, sdks: &[String]) -> Result<(), String> {
+    let Ok(entries) = std::fs::read_dir(idea) else {
+        return Ok(());
+    };
+    for path in entries.flatten().map(|e| e.path()) {
+        // Committed with the repository, so possibly a symlink elsewhere;
+        // see `set_project_sdk`.
+        let plain = std::fs::symlink_metadata(&path).is_ok_and(|m| m.file_type().is_file());
+        if !plain || path.extension().is_none_or(|ext| ext != "iml") {
+            continue;
+        }
+        let Ok(content) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        if let Some(updated) = inherit_sdk(&content, sdks) {
+            std::fs::write(&path, updated)
+                .map_err(|e| format!("cannot write {}: {e}", path.display()))?;
+        }
+    }
+    Ok(())
+}
+
+/// `iml` with each `jdk` order entry naming one of `sdks` replaced by
+/// `inheritedJdk`, or `None` when there is none to replace.
+///
+/// The root module -- content rooted at the project folder itself -- has
+/// every pin replaced: it *is* the project, so its interpreter is the one
+/// just chosen. PyCharm's pyproject import has been seen pinning it to a
+/// nested member's `.venv`.
+fn inherit_sdk(iml: &str, sdks: &[String]) -> Option<String> {
+    const OPEN: &str = "<orderEntry type=\"jdk\"";
+    let root = [
+        "<content url=\"file://$MODULE_DIR$\">",
+        "<content url=\"file://$MODULE_DIR$\" />",
+    ]
+    .iter()
+    .any(|tag| iml.contains(tag));
+    let mut out = String::with_capacity(iml.len());
+    let mut rest = iml;
+    let mut changed = false;
+    while let Some(start) = rest.find(OPEN) {
+        let Some(len) = rest[start..].find("/>").map(|end| end + 2) else {
+            break;
+        };
+        let tag = &rest[start..start + len];
+        let name = tag
+            .split_once("jdkName=\"")
+            .and_then(|(_, after)| after.split_once('"'))
+            .map(|(name, _)| xml_unescape(name));
+        out.push_str(&rest[..start]);
+        if root || name.is_some_and(|name| sdks.contains(&name)) {
+            out.push_str("<orderEntry type=\"inheritedJdk\" />");
+            changed = true;
+        } else {
+            out.push_str(tag);
+        }
+        rest = &rest[start + len..];
+    }
+    out.push_str(rest);
+    changed.then_some(out)
 }
 
 /// The newest `PyCharm<version>` / `PyCharmCE<version>` folder.
@@ -296,14 +384,21 @@ fn jdk_blocks(content: &str) -> impl Iterator<Item = &str> {
 
 /// The name of an existing SDK whose interpreter is `python`.
 fn find_sdk(content: &str, python: &Path, home: &Path) -> Option<String> {
+    sdks_at(content, python, home).into_iter().next()
+}
+
+/// The name of every SDK in `content` whose interpreter is `python`.
+fn sdks_at(content: &str, python: &Path, home: &Path) -> Vec<String> {
     // PyCharm writes '/' on Windows too, and abbreviates the home directory.
     let norm = |p: &str| p.replace('\\', "/");
     let python = norm(&python.to_string_lossy());
     let home = norm(&home.to_string_lossy());
-    jdk_blocks(content).find_map(|b| {
-        let path = norm(&xml_unescape(tag_value(b, "homePath")?)).replace("$USER_HOME$", &home);
-        (path == python).then(|| tag_value(b, "name").map(xml_unescape))?
-    })
+    jdk_blocks(content)
+        .filter_map(|b| {
+            let path = norm(&xml_unescape(tag_value(b, "homePath")?)).replace("$USER_HOME$", &home);
+            (path == python).then(|| tag_value(b, "name").map(xml_unescape))?
+        })
+        .collect()
 }
 
 /// The SDK name for `python`, adding an entry to the table if there is none.
@@ -746,6 +841,114 @@ mod tests {
         assert!(
             misc.contains(r#"project-jdk-name="Bombadil (api)""#),
             "{misc}"
+        );
+    }
+
+    #[test]
+    fn a_module_pinned_to_one_of_the_projects_environments_follows_the_project() {
+        // PyCharm lets each module name its own interpreter, and that beats
+        // the project's: selecting an environment in misc.xml alone left
+        // every module of a uv workspace on the old one.
+        let iml = r#"<module type="PYTHON_MODULE" version="4">
+  <component name="NewModuleRootManager">
+    <orderEntry type="jdk" jdkName="uv (api)" jdkType="Python SDK" />
+    <orderEntry type="sourceFolder" forTests="false" />
+  </component>
+</module>
+"#;
+        let updated = inherit_sdk(iml, &["uv (api)".to_string()]).expect("rewritten");
+        assert!(
+            updated.contains(r#"<orderEntry type="inheritedJdk" />"#),
+            "{updated}"
+        );
+        assert!(!updated.contains("uv (api)"), "{updated}");
+        assert!(updated.contains(r#"<orderEntry type="sourceFolder""#));
+
+        // A module on an interpreter of its own is the user's choice.
+        assert_eq!(inherit_sdk(iml, &["Other".to_string()]), None);
+    }
+
+    #[test]
+    fn the_root_module_always_follows_the_project() {
+        // PyCharm's pyproject import pinned thorn's root module to a nested
+        // member's `.venv`; the root module *is* the project, whose
+        // interpreter is the one just chosen.
+        let root = r#"<module external.system.id="pyproject.toml" type="PYTHON_MODULE" version="4">
+  <component name="NewModuleRootManager">
+    <content url="file://$MODULE_DIR$">
+      <excludeFolder url="file://$MODULE_DIR$/.venv" />
+    </content>
+    <orderEntry type="jdk" jdkName="~/work/api/lib/zema/.venv" jdkType="Python SDK" />
+  </component>
+</module>
+"#;
+        let updated = inherit_sdk(root, &[]).expect("the root module is rewritten");
+        assert!(
+            updated.contains(r#"<orderEntry type="inheritedJdk" />"#),
+            "{updated}"
+        );
+
+        // A member, rooted below the project, keeps its own.
+        let member = root.replace(
+            r#"<content url="file://$MODULE_DIR$">"#,
+            r#"<content url="file://$MODULE_DIR$/lib/zema">"#,
+        );
+        assert_eq!(inherit_sdk(&member, &[]), None);
+    }
+
+    #[test]
+    fn selecting_an_environment_moves_modules_off_the_projects_other_environment() {
+        let (dir, jetbrains, mut inputs) = scratch();
+        let api = dir.path().join("api");
+        let chosen = dir.path().join("envs/api-312");
+        inputs.project.environments = vec![
+            Environment {
+                location: VenvLocation::Alongside,
+                ..Environment::default()
+            },
+            Environment {
+                location: VenvLocation::Custom {
+                    path: chosen.clone(),
+                },
+                ..Environment::default()
+            },
+        ];
+        inputs.venv_path = chosen;
+        let options = jetbrains.join("PyCharm2026.2/options");
+        std::fs::create_dir_all(&options).unwrap();
+        std::fs::write(
+            options.join("jdk.table.xml"),
+            format!(
+                r#"<application>
+  <component name="ProjectJdkTable">
+    <jdk version="2">
+      <name value="uv (api)" />
+      <type value="Python SDK" />
+      <homePath value="{}" />
+    </jdk>
+  </component>
+</application>
+"#,
+                api.join(".venv/bin/python").display()
+            ),
+        )
+        .unwrap();
+        std::fs::create_dir_all(api.join(".idea")).unwrap();
+        let pinned = |sdk: &str| {
+            format!(
+                "<module>\n  <component name=\"NewModuleRootManager\">\n    <orderEntry type=\"jdk\" jdkName=\"{sdk}\" jdkType=\"Python SDK\" />\n  </component>\n</module>\n"
+            )
+        };
+        std::fs::write(api.join(".idea/api.iml"), pinned("uv (api)")).unwrap();
+        std::fs::write(api.join(".idea/zema.iml"), pinned("zema's own")).unwrap();
+
+        configure_interpreter(&inputs, &jetbrains, Path::new(HOME), false).unwrap();
+
+        let api_iml = std::fs::read_to_string(api.join(".idea/api.iml")).unwrap();
+        assert!(api_iml.contains(r#"type="inheritedJdk""#), "{api_iml}");
+        assert_eq!(
+            std::fs::read_to_string(api.join(".idea/zema.iml")).unwrap(),
+            pinned("zema's own")
         );
     }
 

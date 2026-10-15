@@ -336,6 +336,9 @@ pub const DEP_NAME_COLUMN_WIDTH: f32 = 200.0;
 /// after the name column -- the version that follows is what a user
 /// compares character by character, and this is what keeps it aligned.
 pub const DEP_CONSTRAINT_COLUMN_WIDTH: f32 = 100.0;
+/// Width of the installed-version column: the version, then the slot its
+/// change and upgrade buttons appear in on hover.
+pub const DEP_VERSION_COLUMN_WIDTH: f32 = 220.0;
 
 // ---------------------------------------------------------------------------
 // Fonts

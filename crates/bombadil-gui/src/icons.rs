@@ -19,6 +19,9 @@
 //!   U+E04A,U+E0D7
 //! ```
 //!
+//! The terminal and code glyphs (U+E181, U+E093) are still in the file but
+//! unused: the terminal and PyCharm buttons are drawn as [`Tile`]s.
+//!
 //! A new icon means adding its codepoint (from `font/info.json`) here and to
 //! that list, then regenerating the file.
 
@@ -34,8 +37,6 @@ const FONT: iced::Font = iced::Font::with_name("lucide");
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Icon {
-    Terminal,
-    Code,
     Refresh,
     Rotate,
     Trash,
@@ -54,9 +55,7 @@ pub enum Icon {
 
 impl Icon {
     #[cfg(test)]
-    const ALL: [Icon; 16] = [
-        Icon::Terminal,
-        Icon::Code,
+    const ALL: [Icon; 14] = [
         Icon::Refresh,
         Icon::Rotate,
         Icon::Trash,
@@ -76,8 +75,6 @@ impl Icon {
     /// The glyph's codepoint in Lucide's font (its `font/info.json`).
     fn codepoint(self) -> char {
         match self {
-            Icon::Terminal => '\u{e181}',
-            Icon::Code => '\u{e093}',
             Icon::Refresh => '\u{e145}',
             Icon::Rotate => '\u{e148}',
             Icon::Trash => '\u{e18e}',
@@ -171,7 +168,102 @@ pub fn icon_button<'a>(
     on_press: Option<Message>,
 ) -> iced::Element<'a, Message> {
     theme::tip(
-        iced::widget::button(icon(which, 16.0, tint(on_press.is_some())))
+        // 18, not 16: Lucide's strokes thin with size, and at 16 they were
+        // hard to make out on the dark ground.
+        iced::widget::button(icon(which, 18.0, tint(on_press.is_some())))
+            .on_press_maybe(on_press)
+            .padding([theme::SPACE_1, theme::SPACE_2])
+            .style(theme::button_quiet),
+        tip,
+        iced::widget::tooltip::Position::Bottom,
+    )
+}
+
+/// Which app a [`tile_button`] opens.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Tile {
+    /// A filled square with "PC" and a short bar beneath it, after the
+    /// JetBrains product-icon layout, without drawing their logo.
+    Pycharm,
+    /// An outlined square with a prompt in it.
+    Terminal,
+}
+
+/// Side of a [`Tile`], in points. Larger than a glyph icon: a tile's
+/// lettering has to stay legible inside it.
+const TILE: f32 = 20.0;
+
+/// The tile itself. `enabled` picks the tint as [`tint`] does, and in each
+/// palette the tile is drawn in the text colour, so it inverts with the
+/// theme instead of a dark square vanishing into the dark ground.
+fn tile<'a, M: 'a>(which: Tile, enabled: bool) -> iced::Element<'a, M> {
+    let swatch = tint(enabled);
+    let filled = which == Tile::Pycharm;
+    let (label, font, size) = match which {
+        Tile::Pycharm => ("PC", theme::FONT_PROSE_SEMIBOLD, 9.0),
+        Tile::Terminal => (">_", theme::FONT_DATA, 11.0),
+    };
+    let letters = iced::widget::text(label)
+        .font(font)
+        .size(size)
+        .line_height(1.0)
+        .style(move |t: &iced::Theme| iced::widget::text::Style {
+            color: Some(if filled {
+                theme::palette(t).ink
+            } else {
+                theme::palette(t).get(swatch)
+            }),
+        });
+    let mut body = iced::widget::column![letters].spacing(2.0);
+    if filled {
+        body = body.push(
+            iced::widget::container(iced::widget::Space::new().width(7.0).height(1.5)).style(
+                |t: &iced::Theme| iced::widget::container::Style {
+                    background: Some(iced::Background::Color(theme::palette(t).ink)),
+                    ..iced::widget::container::Style::default()
+                },
+            ),
+        );
+    }
+    iced::widget::container(body)
+        .width(TILE)
+        .height(TILE)
+        .padding([2.0, 3.0])
+        // "PC" sits low over its bar, as on JetBrains tiles; the prompt
+        // is centred.
+        .align_x(if filled {
+            iced::alignment::Horizontal::Left
+        } else {
+            iced::alignment::Horizontal::Center
+        })
+        .align_y(if filled {
+            iced::alignment::Vertical::Bottom
+        } else {
+            iced::alignment::Vertical::Center
+        })
+        .style(move |t: &iced::Theme| {
+            let colour = theme::palette(t).get(swatch);
+            iced::widget::container::Style {
+                background: filled.then_some(iced::Background::Color(colour)),
+                border: iced::Border {
+                    color: colour,
+                    width: 1.5,
+                    radius: 3.0.into(),
+                },
+                ..iced::widget::container::Style::default()
+            }
+        })
+        .into()
+}
+
+/// [`icon_button`] for a [`Tile`]: same quiet button, same required tip.
+pub fn tile_button<'a>(
+    which: Tile,
+    tip: impl Into<String>,
+    on_press: Option<Message>,
+) -> iced::Element<'a, Message> {
+    theme::tip(
+        iced::widget::button(tile(which, on_press.is_some()))
             .on_press_maybe(on_press)
             .padding([theme::SPACE_1, theme::SPACE_2])
             .style(theme::button_quiet),

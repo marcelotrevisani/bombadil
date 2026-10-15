@@ -290,11 +290,12 @@ pub fn view<'a>(
         .into(),
     };
 
-    // Lucide icons with tooltips. PyCharm gets a generic "code" mark: a
-    // JetBrains logo is not ours to draw. Its tooltip names the interpreter
-    // because that is the part a user would otherwise go and set by hand.
-    let terminal = icons::icon_button(
-        Icon::Terminal,
+    // Tiles for the two apps these open, with tooltips: "PC" in the
+    // JetBrains product-icon layout (their logo is not ours to draw), and a
+    // prompt. PyCharm's tooltip names the interpreter because that is the
+    // part a user would otherwise go and set by hand.
+    let terminal = icons::tile_button(
+        icons::Tile::Terminal,
         format!(
             "Open a terminal here, with the environment activated ({})",
             shortcuts::keys(Shortcut::Terminal)
@@ -306,8 +307,8 @@ pub fn view<'a>(
         "Open the project folder",
         Some(Message::OpenFolderRequested(index)),
     );
-    let pycharm = icons::icon_button(
-        Icon::Code,
+    let pycharm = icons::tile_button(
+        icons::Tile::Pycharm,
         "Open in PyCharm, in this folder, with this environment as the interpreter",
         Some(Message::OpenPycharmRequested(index)),
     );

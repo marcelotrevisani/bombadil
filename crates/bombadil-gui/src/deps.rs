@@ -527,6 +527,7 @@ fn dep_row<'a>(
     editing: Option<&DepEdit>,
     enabled: bool,
     project: usize,
+    note: Option<String>,
 ) -> iced::Element<'a, crate::app::Message> {
     let glyph = theme::state_glyph(state(row));
 
@@ -628,9 +629,17 @@ fn dep_row<'a>(
             .width(theme::GLYPH_COLUMN_WIDTH),
         name,
         constraint,
-        version,
+        // A fixed column, so a note after it starts at the same place on
+        // every row instead of wherever the version text happened to end.
+        iced::widget::container(version).width(theme::DEP_VERSION_COLUMN_WIDTH),
     ]
-    .spacing(theme::SPACE_1);
+    .push(note.map(|note| {
+        iced::widget::text(note)
+            .size(theme::LABEL)
+            .style(theme::text_muted)
+    }))
+    .spacing(theme::SPACE_1)
+    .align_y(iced::Alignment::Center);
 
     if !row.declared {
         line = line.push(
@@ -751,7 +760,7 @@ pub fn view<'a>(
     };
     let headed = fetched.is_ok();
     iced::widget::column![toolbar]
-        .push(headed.then(column_headings))
+        .push(headed.then(|| column_headings(mode)))
         .push(body)
         .spacing(theme::SPACE_3)
         .into()
@@ -778,25 +787,22 @@ fn all_view<'a>(
         .into_iter()
         .filter(|flat| name_matches(&flat.row.name, filter))
     {
-        let mut line =
-            iced::widget::row![dep_row(&flat.row, &flat.group, editing, enabled, project)]
-                .spacing(theme::SPACE_2)
-                .align_y(iced::Alignment::Center);
+        // Inside the row, beside the version: outside it, the full-width row
+        // pushed it to the pane's far edge, under the scroll bar.
         let label = match &flat.group {
             GroupKind::Group(name) => Some(format!("group: {name}")),
             GroupKind::Extra(name) => Some(format!("extra: {name}")),
             GroupKind::Main => None,
-        };
-        if flat.row.declared
-            && let Some(label) = label
-        {
-            line = line.push(
-                iced::widget::text(label)
-                    .size(theme::LABEL)
-                    .style(theme::text_muted),
-            );
         }
-        rows = rows.push(line);
+        .filter(|_| flat.row.declared);
+        rows = rows.push(dep_row(
+            &flat.row,
+            &flat.group,
+            editing,
+            enabled,
+            project,
+            label,
+        ));
     }
     rows.into()
 }
@@ -804,7 +810,7 @@ fn all_view<'a>(
 /// Names the three columns once, above the rows, so `-` reads as "no
 /// constraint" rather than as a glitch, and which number is which needs no
 /// guessing.
-fn column_headings<'a>() -> iced::Element<'a, crate::app::Message> {
+fn column_headings<'a>(mode: DepsView) -> iced::Element<'a, crate::app::Message> {
     let heading = |label: &'a str| {
         iced::widget::text(label)
             .size(theme::LABEL)
@@ -815,8 +821,11 @@ fn column_headings<'a>() -> iced::Element<'a, crate::app::Message> {
             iced::widget::Space::new().width(theme::GLYPH_COLUMN_WIDTH),
             heading("Package").width(theme::DEP_NAME_COLUMN_WIDTH),
             heading("Constraint").width(theme::DEP_CONSTRAINT_COLUMN_WIDTH),
-            heading("Installed"),
+            heading("Installed").width(theme::DEP_VERSION_COLUMN_WIDTH),
         ]
+        // Only the All view has a fourth column: where each package is
+        // declared.
+        .push((mode == DepsView::All).then(|| heading("Declared in")))
         .spacing(theme::SPACE_1),
     )
     .padding([0.0, theme::SPACE_1])
@@ -865,7 +874,7 @@ fn tree_view<'a>(
         ]
         .spacing(theme::SPACE_1);
         for row in &group.rows {
-            rows = rows.push(dep_row(row, &group.kind, editing, enabled, project));
+            rows = rows.push(dep_row(row, &group.kind, editing, enabled, project, None));
             if !row.declared {
                 // A leftover's place is the All view; the tree is what the
                 // manifest asks for.

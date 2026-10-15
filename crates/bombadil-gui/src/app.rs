@@ -5797,9 +5797,12 @@ pub fn view(app: &App) -> iced::Element<'_, Message> {
             detail,
             theme::hairline_row(),
             tab_bar,
-            iced::widget::scrollable(pane)
-                .width(iced::Length::Fill)
-                .height(iced::Length::Fill),
+            // Right padding keeps the scroll bar off the content's edge.
+            iced::widget::scrollable(
+                iced::widget::container(pane).padding(iced::Padding::ZERO.right(theme::SPACE_4))
+            )
+            .width(iced::Length::Fill)
+            .height(iced::Length::Fill),
         ]
         .spacing(theme::SPACE_3)
         .into()
