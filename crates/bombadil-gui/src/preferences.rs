@@ -45,6 +45,7 @@ pub enum Section {
     Python,
     Uv,
     Terminal,
+    Pycharm,
     Scripts,
     EnvVars,
     Indexes,
@@ -53,12 +54,13 @@ pub enum Section {
 impl Section {
     /// Every section, in the order the list renders them: the four that decide
     /// how an environment is built and opened first, then the two lists.
-    pub const ALL: [Section; 8] = [
+    pub const ALL: [Section; 9] = [
         Section::Appearance,
         Section::Environments,
         Section::Python,
         Section::Uv,
         Section::Terminal,
+        Section::Pycharm,
         Section::Scripts,
         Section::EnvVars,
         Section::Indexes,
@@ -74,6 +76,7 @@ impl Section {
             Section::Python => "Python version",
             Section::Uv => "uv",
             Section::Terminal => "Terminal",
+            Section::Pycharm => "PyCharm",
             Section::Scripts => "Scripts",
             Section::EnvVars => "Environment variables",
             Section::Indexes => "Package indexes and auth",
@@ -87,6 +90,7 @@ impl Section {
             Section::Python => "Python",
             Section::Uv => "uv",
             Section::Terminal => "Terminal",
+            Section::Pycharm => "PyCharm",
             Section::Scripts => "Scripts",
             Section::EnvVars => "Env vars",
             Section::Indexes => "Indexes",
@@ -170,8 +174,10 @@ pub fn inherited_label(section: Section, config: &Config, os: Os) -> String {
             None => "none set".to_string(),
         },
         // These merge rather than override, so "what you would inherit" is
-        // not a single value and the panel says so in prose instead.
+        // not a single value and the panel says so in prose instead. Appearance
+        // and PyCharm are global only.
         Section::Appearance
+        | Section::Pycharm
         | Section::Environments
         | Section::Scripts
         | Section::EnvVars
@@ -198,6 +204,7 @@ pub fn view<'a>(
     credential_drafts: &[String],
     uv_custom_path_draft: &str,
     uv_custom_validation: Option<&Result<String, String>>,
+    pycharm_detected: Option<&Option<std::path::PathBuf>>,
 ) -> iced::Element<'a, Message> {
     let selected_project = match scope {
         Scope::Global => None,
@@ -257,6 +264,9 @@ pub fn view<'a>(
         (Section::Scripts, _) => settings_scripts_panel(config, selected_project),
         (Section::Python, _) => python_panel(config, scope, selected_project),
         (Section::Terminal, _) => terminal_panel(config, scope, selected_project),
+        (Section::Pycharm, _) => {
+            pycharm_panel(config, pycharm_detected, selected_project.is_some())
+        }
     };
 
     let card = iced::widget::container(
@@ -744,6 +754,90 @@ fn appearance_panel<'a>(config: &Config, for_project: bool) -> iced::Element<'a,
     ]
     .push(for_project.then(|| {
         iced::widget::text("These apply to every project, not just this one.")
+            .size(theme::DATA)
+            .style(theme::text_muted)
+    }))
+    .spacing(theme::SPACE_3)
+    .into()
+}
+
+/// Which PyCharm "Open in PyCharm" launches: detected each time, or one
+/// chosen by hand. One setting for every project, like Appearance.
+fn pycharm_panel<'a>(
+    config: &Config,
+    detected: Option<&Option<std::path::PathBuf>>,
+    for_project: bool,
+) -> iced::Element<'a, Message> {
+    let chosen = config.settings.pycharm.clone();
+    let choice = |label: &'static str, selected: bool, message: Message| {
+        iced::widget::button(iced::widget::text(label).size(theme::BODY))
+            .on_press(message)
+            .padding([theme::SPACE_1, theme::SPACE_3])
+            .style(theme::button_choice(selected))
+    };
+    let path = |text: String| {
+        iced::widget::text(text)
+            .font(theme::FONT_DATA)
+            .size(theme::DATA)
+    };
+    let found = match detected {
+        None => iced::widget::text("Looking for PyCharm\u{2026}")
+            .size(theme::DATA)
+            .style(theme::text_muted)
+            .into(),
+        Some(Some(found)) => iced::Element::from(
+            iced::widget::column![
+                iced::widget::text("Detected")
+                    .size(theme::LABEL)
+                    .style(theme::text_muted),
+                path(found.display().to_string()),
+            ]
+            .spacing(theme::SPACE_1),
+        ),
+        Some(None) => iced::widget::text(
+            "Not found in the usual install locations or on PATH. Choose it below.",
+        )
+        .size(theme::DATA)
+        .style(theme::text_warning)
+        .into(),
+    };
+    iced::widget::column![
+        iced::widget::text("PyCharm").size(theme::TITLE),
+        iced::widget::row![
+            choice(
+                "Detect automatically",
+                chosen.is_none(),
+                Message::PycharmAutomatic
+            ),
+            choice(
+                "Choose executable\u{2026}",
+                chosen.is_some(),
+                Message::PycharmBrowse
+            ),
+        ]
+        .spacing(theme::SPACE_1),
+    ]
+    .push(chosen.map(|chosen| {
+        iced::widget::column![
+            iced::widget::text("Using")
+                .size(theme::LABEL)
+                .style(theme::text_muted),
+            path(chosen.display().to_string()),
+        ]
+        .spacing(theme::SPACE_1)
+    }))
+    .push(found)
+    .push(
+        iced::widget::text(
+            "Open in PyCharm launches this, on the project folder, with the selected \
+             environment as its interpreter. The Toolbox script, the PyCharm app, or \
+             pycharm.sh / pycharm64.exe all work.",
+        )
+        .size(theme::DATA)
+        .style(theme::text_muted),
+    )
+    .push(for_project.then(|| {
+        iced::widget::text("This applies to every project, not just this one.")
             .size(theme::DATA)
             .style(theme::text_muted)
     }))

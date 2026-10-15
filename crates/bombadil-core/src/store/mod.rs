@@ -360,6 +360,7 @@ mod tests {
                     tab_order: vec!["members".into(), "deps".into()],
                 },
                 close_to_tray: false,
+                pycharm: None,
             },
             indexes: vec![
                 Index {

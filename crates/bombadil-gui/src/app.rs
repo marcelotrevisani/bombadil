@@ -290,6 +290,9 @@ pub struct App {
     /// `UvResolveError::TooOld` -- and in that case `Settings::uv_source` was
     /// never touched.
     pub uv_custom_validation: Option<Result<String, String>>,
+    /// What detection found, for Settings > PyCharm: `None` until it has
+    /// looked, `Some(None)` when it found nothing.
+    pub pycharm_detected: Option<Option<PathBuf>>,
     /// Which pane the detail area is showing (spec §8). See [`Tab`].
     pub tab: Tab,
 }
@@ -479,6 +482,15 @@ pub enum Message {
     CloseRequested,
     /// Preferences > Appearance: whether closing keeps Bombadil in the tray.
     CloseToTraySelected(bool),
+    /// Where PyCharm was found, for the Settings panel to show. `None`:
+    /// nowhere it looks.
+    PycharmDetected(Option<PathBuf>),
+    /// "Choose…" in Settings > PyCharm: opens the file picker.
+    PycharmBrowse,
+    /// The picker's answer; `None` when it was cancelled.
+    PycharmPicked(Option<PathBuf>),
+    /// Back to detecting PyCharm on every open.
+    PycharmAutomatic,
     /// Preferences > Appearance: System, Light or Dark.
     ThemeChoiceSelected(bombadil_core::model::ThemeChoice),
     /// The OS reported its light/dark preference, at boot or on a change.
@@ -806,7 +818,7 @@ pub enum Message {
     },
     /// The Scripts tab's "Add script" button was pressed for `scope` (spec
     /// §6, Task 3): open the async file picker for the script to run.
-    /// Dispatches `pick_script` through `Task::perform` rather than adding a
+    /// Dispatches `pick_file` through `Task::perform` rather than adding a
     /// row synchronously -- there is no path to add until the picker
     /// resolves, and `rfd::AsyncFileDialog` never blocks `update`.
     ScriptAddRequested(scripts_editor::ScriptScope),
@@ -1044,6 +1056,7 @@ impl App {
             confirm_member_sync: None,
             uv_custom_path_draft,
             uv_custom_validation: None,
+            pycharm_detected: None,
             tab: Tab::default(),
         }
     }
@@ -2667,6 +2680,9 @@ pub fn update(app: &mut App, message: Message, runner: Arc<dyn CommandRunner>) -
             // `ModalOpened`: two layers claiming the pointer at once is how a
             // press both dismisses and activates.
             app.open_menu = None;
+            if section == preferences::Section::Pycharm {
+                return detect_pycharm(runner);
+            }
         }
         Message::PreferencesClosed => {
             // No undo: every control in there has already written through to
@@ -2700,6 +2716,24 @@ pub fn update(app: &mut App, message: Message, runner: Arc<dyn CommandRunner>) -
             if let Some(state) = &mut app.preferences {
                 state.section = section;
             }
+            // Looked up afresh each time the panel shows: an install or an
+            // upgrade since the last look should show up.
+            if section == preferences::Section::Pycharm {
+                return detect_pycharm(runner);
+            }
+        }
+        Message::PycharmDetected(found) => app.pycharm_detected = Some(found),
+        Message::PycharmBrowse => {
+            return Task::perform(pick_file(), Message::PycharmPicked);
+        }
+        Message::PycharmPicked(None) => {}
+        Message::PycharmPicked(Some(path)) => {
+            app.config.settings.pycharm = Some(path);
+            return persist_settings_edit(app);
+        }
+        Message::PycharmAutomatic => {
+            app.config.settings.pycharm = None;
+            return persist_settings_edit(app);
         }
         Message::PreferencesPythonPinChanged(scope, version) => {
             let pin = preferences::pin_from_input(&version);
@@ -2945,6 +2979,7 @@ pub fn update(app: &mut App, message: Message, runner: Arc<dyn CommandRunner>) -
                 // The list sections merge rather than override, so there is
                 // nothing here to hand back. See `preferences`'s module doc.
                 preferences::Section::Appearance
+                | preferences::Section::Pycharm
                 | preferences::Section::Environments
                 | preferences::Section::Scripts
                 | preferences::Section::EnvVars
@@ -3098,7 +3133,7 @@ pub fn update(app: &mut App, message: Message, runner: Arc<dyn CommandRunner>) -
             }
         }
         Message::ScriptAddRequested(scope) => {
-            return Task::perform(pick_script(), move |path| {
+            return Task::perform(pick_file(), move |path| {
                 Message::ScriptFilePicked(scope, path)
             });
         }
@@ -4270,11 +4305,12 @@ async fn pick_folder() -> Option<PathBuf> {
         .map(|handle| handle.path().to_path_buf())
 }
 
-/// Opens the async file picker for a pre-activate script (criterion 3). Same
+/// Opens the async file picker: a pre-activate script (criterion 3), or the
+/// PyCharm launcher in Settings. Same
 /// reasoning as `pick_pyproject`: the blocking `rfd::FileDialog` must never
 /// be used, since a modal dialog on the render thread would freeze the
 /// window for as long as the user takes to answer it.
-async fn pick_script() -> Option<PathBuf> {
+async fn pick_file() -> Option<PathBuf> {
     rfd::AsyncFileDialog::new()
         .pick_file()
         .await
@@ -5136,18 +5172,32 @@ fn run_open_pycharm(
     store: &dyn SecretStore,
     runner: &dyn CommandRunner,
 ) -> Result<Option<String>, String> {
-    let launcher = ide::detect(Os::host(), home, &|p| p.exists(), runner).ok_or_else(|| {
-        // Names where it looked. "PyCharm was not found" alone leaves a user
-        // with a working install nothing to check.
-        let looked: Vec<String> = ide::candidates(Os::host(), home)
-            .iter()
-            .map(|p| p.display().to_string())
-            .collect();
-        format!(
-            "PyCharm was not found. Looked in:\n  {}\nand for `pycharm` on PATH.",
-            looked.join("\n  ")
-        )
-    })?;
+    // A launcher chosen in Settings is used as is, never second-guessed by
+    // detection; one that has gone says so rather than quietly opening
+    // whichever PyCharm detection would find instead.
+    let launcher = match &config.settings.pycharm {
+        Some(chosen) if chosen.exists() => chosen.clone(),
+        Some(chosen) => {
+            return Err(format!(
+                "The PyCharm chosen in Settings > PyCharm, {}, no longer exists. \
+                 Choose it again, or switch back to detecting it.",
+                chosen.display()
+            ));
+        }
+        None => ide::detect(Os::host(), home, &|p| p.exists(), runner).ok_or_else(|| {
+            // Names where it looked. "PyCharm was not found" alone leaves a
+            // user with a working install nothing to check.
+            let looked: Vec<String> = ide::candidates(Os::host(), home)
+                .iter()
+                .map(|p| p.display().to_string())
+                .collect();
+            format!(
+                "PyCharm was not found. Looked in:\n  {}\nand for `pycharm` on PATH. \
+                 Choose it in Settings > PyCharm.",
+                looked.join("\n  ")
+            )
+        })?,
+    };
     let environment = project
         .active_environment()
         .cloned()
@@ -5210,6 +5260,25 @@ async fn open_pycharm(
 /// say. An empty path makes every `home`-relative candidate a relative path
 /// that will not exist, so detection falls through to `PATH` rather than
 /// probing nonsense.
+/// Looks for PyCharm off the render thread, for Settings > PyCharm. A
+/// timeout or a failure reads as "not found", as it would on open.
+fn detect_pycharm(runner: Arc<dyn CommandRunner>) -> Task<Message> {
+    Task::perform(
+        async move {
+            match job::run(
+                move || ide::detect(Os::host(), &home_dir(), &|p| p.exists(), runner.as_ref()),
+                VENV_PROBE_TIMEOUT,
+            )
+            .await
+            {
+                job::JobResult::Done(found) => found,
+                job::JobResult::TimedOut | job::JobResult::Failed => None,
+            }
+        },
+        Message::PycharmDetected,
+    )
+}
+
 fn home_dir() -> PathBuf {
     std::env::var_os("HOME")
         .or_else(|| std::env::var_os("USERPROFILE"))
@@ -6098,6 +6167,7 @@ pub fn view(app: &App) -> iced::Element<'_, Message> {
             &app.index_credential_drafts,
             &app.uv_custom_path_draft,
             app.uv_custom_validation.as_ref(),
+            app.pycharm_detected.as_ref(),
         ));
     }
     if let Some(modal) = app.modal {
@@ -7335,6 +7405,40 @@ mod tests {
         );
         assert!(!app.config.settings.close_to_tray);
         assert!(task.units() > 0);
+    }
+
+    #[test]
+    fn a_chosen_pycharm_is_saved_and_automatic_clears_it() {
+        let mut app = App::new(Config::default());
+        let chosen = std::path::PathBuf::from("/opt/pycharm/bin/pycharm.sh");
+        let task = update(
+            &mut app,
+            Message::PycharmPicked(Some(chosen.clone())),
+            unused_runner(),
+        );
+        assert_eq!(app.config.settings.pycharm, Some(chosen.clone()));
+        assert!(task.units() > 0, "the choice is persisted");
+
+        // Cancelling the picker changes nothing.
+        let _ = update(&mut app, Message::PycharmPicked(None), unused_runner());
+        assert_eq!(app.config.settings.pycharm, Some(chosen));
+
+        let task = update(&mut app, Message::PycharmAutomatic, unused_runner());
+        assert_eq!(app.config.settings.pycharm, None);
+        assert!(task.units() > 0);
+    }
+
+    #[test]
+    fn the_detected_pycharm_is_kept_for_the_settings_panel() {
+        let mut app = App::new(Config::default());
+        assert_eq!(app.pycharm_detected, None, "not looked for yet");
+        let found = std::path::PathBuf::from("/snap/bin/pycharm-professional");
+        let _ = update(
+            &mut app,
+            Message::PycharmDetected(Some(found.clone())),
+            unused_runner(),
+        );
+        assert_eq!(app.pycharm_detected, Some(Some(found)));
     }
 
     fn two_environments() -> App {
@@ -12692,7 +12796,7 @@ mod tests {
 
     #[test]
     fn requesting_to_add_a_script_dispatches_work_without_touching_config_synchronously() {
-        // Criterion 3: the whole point of going through `pick_script`
+        // Criterion 3: the whole point of going through `pick_file`
         // (`rfd::AsyncFileDialog`) instead of adding a row inline is that
         // nothing about the new script is known -- there is no path -- until
         // the async picker resolves. A synchronous add here would mean the
@@ -14442,6 +14546,60 @@ mod tests {
             Some("/envs/api-312"),
             "PyCharm must get the project's default environment, not its first"
         );
+    }
+
+    #[test]
+    fn a_pycharm_chosen_in_settings_is_launched_without_detecting() {
+        let dir = tempfile::tempdir().unwrap();
+        let chosen = dir.path().join("pycharm.sh");
+        std::fs::write(&chosen, "").unwrap();
+        let mut config = Config::default();
+        config.settings.pycharm = Some(chosen.clone());
+        // Only the launch is programmed: detection would find no PyCharm.
+        let runner = FakeCommandRunner::new();
+        // Matched by file stem: `pycharm.sh` is `pycharm`.
+        runner.expect(
+            "pycharm",
+            &["/p/api"],
+            bombadil_core::process::CommandOutcome {
+                status: Some(0),
+                stdout: String::new(),
+                stderr: String::new(),
+            },
+        );
+        run_open_pycharm(
+            &project("api"),
+            &config,
+            std::path::Path::new("/nonexistent-home"),
+            None,
+            &bombadil_core::secrets::InMemorySecretStore::new(),
+            &runner,
+        )
+        .expect("the chosen launcher opens");
+        let calls = runner.calls();
+        assert!(calls.iter().any(|c| c.program == chosen), "{calls:?}");
+        assert!(
+            !calls
+                .iter()
+                .any(|c| c.program == *std::path::Path::new("which")),
+            "a choice is not second-guessed by detection"
+        );
+    }
+
+    #[test]
+    fn a_chosen_pycharm_that_is_gone_says_where_to_fix_it() {
+        let mut config = Config::default();
+        config.settings.pycharm = Some("/nonexistent/pycharm.sh".into());
+        let err = run_open_pycharm(
+            &project("api"),
+            &config,
+            std::path::Path::new("/nonexistent-home"),
+            None,
+            &bombadil_core::secrets::InMemorySecretStore::new(),
+            &pycharm_on_path(),
+        )
+        .expect_err("a missing choice is not silently replaced");
+        assert!(err.contains("Settings"), "{err}");
     }
 
     #[test]

@@ -89,6 +89,10 @@ pub struct Settings {
     /// The GUI still quits when there is no tray to come back from.
     #[serde(default = "yes")]
     pub close_to_tray: bool,
+    /// The PyCharm launcher chosen by hand. `None` detects it each time it
+    /// is opened, which also follows an upgrade to a new install.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pycharm: Option<std::path::PathBuf>,
 }
 
 fn yes() -> bool {
@@ -104,6 +108,7 @@ impl Default for Settings {
             theme: ThemeChoice::default(),
             layout: Layout::default(),
             close_to_tray: true,
+            pycharm: None,
         }
     }
 }
@@ -111,6 +116,25 @@ impl Default for Settings {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pycharm_is_detected_unless_one_was_chosen() {
+        // Configs written before the setting existed must keep detecting.
+        let settings: Settings = toml::from_str("theme = \"dark\"\n").unwrap();
+        assert_eq!(settings.pycharm, None);
+        let chosen: Settings =
+            toml::from_str("pycharm = \"/opt/pycharm/bin/pycharm.sh\"\n").unwrap();
+        assert_eq!(
+            chosen.pycharm,
+            Some(std::path::PathBuf::from("/opt/pycharm/bin/pycharm.sh"))
+        );
+        // And "detect" writes nothing, so the file stays as it was.
+        assert!(
+            !toml::to_string(&Settings::default())
+                .unwrap()
+                .contains("pycharm")
+        );
+    }
 
     #[test]
     fn a_config_written_before_layout_existed_loads_the_defaults() {
