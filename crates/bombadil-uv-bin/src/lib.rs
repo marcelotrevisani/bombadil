@@ -73,7 +73,14 @@ pub fn ensure_extracted(data_dir: &Path) -> Result<PathBuf, ExtractError> {
         return Ok(path);
     }
 
-    let parent = path.parent().expect("extraction path always has a parent");
+    // `extraction_path` always joins a file name onto a directory, so there
+    // is a parent; an error rather than a panic if that ever stops being so.
+    let Some(parent) = path.parent() else {
+        return Err(ExtractError::Io {
+            path: path.clone(),
+            source: std::io::Error::other("the extraction path has no parent directory"),
+        });
+    };
     std::fs::create_dir_all(parent).map_err(|source| ExtractError::Io {
         path: parent.to_path_buf(),
         source,

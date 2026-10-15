@@ -27,14 +27,19 @@
 //! assertion rather than in the code, invisible on Linux and macOS both times.
 
 mod about;
+mod add_local;
 mod add_project;
 mod app;
 mod banner;
+mod busy;
 mod context_menu;
 mod deps;
+#[cfg(target_os = "linux")]
+mod desktop_entry;
 mod detail;
 mod drawer;
 mod env_editor;
+mod icons;
 mod index_editor;
 mod interpreter;
 mod job;
@@ -43,6 +48,7 @@ mod preferences;
 mod scripts_editor;
 mod settings_editor;
 mod shell;
+mod shortcuts;
 mod sidebar;
 mod theme;
 mod tray;
@@ -97,15 +103,21 @@ const APP_ID: &str = "bombadil";
 /// "here is my icon" that it honours; the shell resolves a window's icon by
 /// matching its `app_id` against the basename of an installed `.desktop` file
 /// and reading that file's `Icon=` key. So a Wayland session shows the
-/// generic placeholder no matter what bytes this binary holds, until
-/// `just install-desktop` puts the entry and the themed PNGs in place. Setting
-/// `application_id` is the half that has to live in the binary; the other half
-/// cannot.
-fn window_settings() -> iced::window::Settings {
+/// generic placeholder no matter what bytes this binary holds, until a
+/// matching entry exists -- which `run` writes through `desktop_entry` on
+/// every start.
+fn window_settings(layout: &bombadil_core::model::Layout) -> iced::window::Settings {
+    let defaults = iced::window::Settings::default();
     #[allow(unused_mut)]
     let mut settings = iced::window::Settings {
         icon: window_icon(),
-        ..Default::default()
+        // Where the user left it, never smaller than a usable window.
+        size: app::initial_size(layout).unwrap_or(defaults.size),
+        // The close button is intercepted so the decision lives in `update`:
+        // to the tray or quit, per Preferences (`close_to_tray`), and quit
+        // regardless when there is no tray to come back from.
+        exit_on_close_request: false,
+        ..defaults
     };
     // Linux-only because `platform_specific` is a different type per platform.
     // winit maps this to the Wayland `app_id` and to the X11 `WM_CLASS`, which
@@ -159,7 +171,10 @@ fn tray_subscription() -> iced::Subscription<app::Message> {
 /// is built in here rather than taken as a parameter, because there is exactly
 /// one caller and it is a `main` that should hold no opinions.
 pub fn run() -> iced::Result {
+    #[cfg(target_os = "linux")]
+    desktop_entry::install(APP_ID);
     let (loaded, persist) = load_config();
+    let window = window_settings(&loaded.config().settings.layout);
     // `update` takes the runner as a parameter rather than storing it on
     // `App` so a test can substitute a `FakeCommandRunner`; here it is real.
     let runner: Arc<dyn CommandRunner> = Arc::new(SystemCommandRunner);
@@ -175,38 +190,68 @@ pub fn run() -> iced::Result {
     // tray to restore from leaves a process the user cannot reach.
     let tray = tray::start(ICON_RGBA, ICON_SIDE);
     let tray_is_running = tray.is_some();
-    let _tray = tray.map(|(handle, commands)| {
+    // Owned by the update closure below, which lives as long as the event
+    // loop -- so the icon does too.
+    let tray = std::rc::Rc::new(tray.map(|(handle, commands)| {
         let _ = TRAY_COMMANDS.set(std::sync::Mutex::new(Some(commands)));
         handle
-    });
+    }));
 
-    iced::application(
+    // A daemon, not an application: an application exits when its last
+    // window closes, and "to the tray" has to close the window -- Wayland
+    // cannot hide one. The window is opened here, and again from the tray.
+    iced::daemon(
         move || {
             let (mut state, task) = app::boot(loaded.clone());
+            state.window_settings = window.clone();
             // `App::new` defaults `persist` to `NullPersist` so tests never
             // need a `Store`; the real one, opened alongside `loaded` below,
             // replaces it here for the actual app.
             state.persist = persist.clone();
             state.tray_is_running = tray_is_running;
-            (state, task)
+            let open = app::open_window(&state);
+            (state, iced::Task::batch([task, open]))
         },
         move |state: &mut app::App, message: app::Message| {
-            app::update(state, message, runner.clone())
+            // Animation frames and pointer moves change no project, and come
+            // sixty times a second; the menu is not rebuilt for them.
+            let moves_nothing = matches!(
+                message,
+                app::Message::Tick(_) | app::Message::SidebarDragged(_)
+            );
+            let task = app::update(state, message, runner.clone());
+            // The tray menu follows the projects; sent only when it changed.
+            if !moves_nothing && let Some(tray) = tray.as_ref() {
+                let model = tray::menu_entries(&state.entries);
+                if model != state.tray_menu {
+                    tray.set_menu(model.clone());
+                    state.tray_menu = model;
+                }
+            }
+            task
         },
-        app::view,
+        view,
     )
     .title("Bombadil")
-    .window(window_settings())
-    // The close button quits. It is intercepted rather than left to iced's
-    // default only so the decision lives in one place: this once mapped to
-    // `Hide`, and the first report back was that the exit did nothing --
-    // which was exactly right. Minimising is something the user asks for now,
-    // from the tray's own "Hide", not something the X does to them.
-    .exit_on_close_request(false)
-    .subscription(|_: &app::App| {
+    .subscription(|state: &app::App| {
         iced::Subscription::batch([
-            iced::window::close_requests().map(|_| app::Message::Tray(tray::TrayCommand::Quit)),
+            iced::window::close_requests().map(|_| app::Message::CloseRequested),
             tray_subscription(),
+            iced::system::theme_changes().map(app::Message::SystemThemeChanged),
+            iced::window::events().filter_map(window_event),
+            iced::event::listen_with(key_event),
+            // The pointer only while something is being dragged.
+            if app::dragging(state) {
+                iced::event::listen_with(drag_event)
+            } else {
+                iced::Subscription::none()
+            },
+            // Frames only while something moves; idle, nothing redraws.
+            if app::animating(state) {
+                iced::window::frames().map(app::Message::Tick)
+            } else {
+                iced::Subscription::none()
+            },
         ])
     })
     // Both weights of Atkinson Hyperlegible Next share one font family, so
@@ -216,8 +261,10 @@ pub fn run() -> iced::Result {
     .font(theme::ATKINSON_REGULAR)
     .font(theme::ATKINSON_SEMIBOLD)
     .font(theme::PLEX_MONO_REGULAR)
+    // Lucide's icon font, subset to the glyphs in `icons`.
+    .font(icons::FONT_BYTES)
     .default_font(theme::FONT_PROSE)
-    .theme(theme::theme())
+    .theme(|state: &app::App, _window| theme::theme(state.theme_mode()))
     .run()
 }
 
@@ -254,5 +301,88 @@ fn load_config() -> (Loaded, Arc<dyn app::ConfigPersist>) {
             },
             Arc::new(app::NullPersist),
         ),
+    }
+}
+
+/// A key press as a shortcut, if it is one. `status` says whether a widget
+/// (a focused field) already handled it; `shortcuts::shortcut` decides.
+fn key_event(
+    event: iced::Event,
+    status: iced::event::Status,
+    _window: iced::window::Id,
+) -> Option<app::Message> {
+    match event {
+        // `repeat: false`: a held key fires once -- holding Ctrl+T must
+        // open one terminal, and holding Esc close one layer.
+        iced::Event::Keyboard(iced::keyboard::Event::KeyPressed {
+            key,
+            physical_key,
+            modifiers,
+            repeat: false,
+            ..
+        }) => {
+            shortcuts::shortcut(&key, physical_key, modifiers, status).map(app::Message::Shortcut)
+        }
+        _ => None,
+    }
+}
+
+/// The pointer during a drag: where it is, and the release that ends it --
+/// wherever that lands, so a drag can never be left stuck on.
+fn drag_event(
+    event: iced::Event,
+    _status: iced::event::Status,
+    _window: iced::window::Id,
+) -> Option<app::Message> {
+    match event {
+        iced::Event::Mouse(iced::mouse::Event::CursorMoved { position }) => {
+            Some(app::Message::SidebarDragged(position.x))
+        }
+        iced::Event::Mouse(iced::mouse::Event::ButtonReleased(iced::mouse::Button::Left)) => {
+            Some(app::Message::DragEnded)
+        }
+        _ => None,
+    }
+}
+
+/// The one window's view. A named `fn` because a closure cannot state that
+/// the element borrows from `state`.
+fn view(state: &app::App, _window: iced::window::Id) -> iced::Element<'_, app::Message> {
+    app::view(state)
+}
+
+/// The window events the app acts on: regaining focus, and a new size.
+fn window_event((_id, event): (iced::window::Id, iced::window::Event)) -> Option<app::Message> {
+    match event {
+        iced::window::Event::Focused => Some(app::Message::WindowFocused),
+        iced::window::Event::Resized(size) => Some(app::Message::WindowResized(size)),
+        iced::window::Event::FileDropped(path) => Some(app::Message::FileDropped(path)),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use iced::keyboard::{Event, Key, Location, Modifiers, key};
+
+    fn ctrl_t(repeat: bool) -> iced::Event {
+        iced::Event::Keyboard(Event::KeyPressed {
+            key: Key::Character("t".into()),
+            modified_key: Key::Character("t".into()),
+            physical_key: key::Physical::Code(key::Code::KeyT),
+            location: Location::Standard,
+            modifiers: Modifiers::COMMAND,
+            text: None,
+            repeat,
+        })
+    }
+
+    #[test]
+    fn a_held_key_fires_once() {
+        // Auto-repeat would open a terminal per repeat, or peel every layer.
+        let window = iced::window::Id::unique();
+        assert!(key_event(ctrl_t(false), iced::event::Status::Ignored, window).is_some());
+        assert!(key_event(ctrl_t(true), iced::event::Status::Ignored, window).is_none());
     }
 }

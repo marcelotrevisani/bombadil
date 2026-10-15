@@ -63,6 +63,7 @@
 //! site remembering to check `secret` itself.
 
 use crate::app::Message;
+use crate::icons::{self, Icon};
 use crate::theme;
 use bombadil_core::model::{Config, EnvVar};
 use bombadil_core::secrets::SecretKey;
@@ -81,7 +82,7 @@ use uuid::Uuid;
 /// what was actually typed a moment before.
 const SECRET_DOT_COUNT: usize = 8;
 
-/// The dots a secret's value renders as. Callers colour it `theme::SLATE` --
+/// The dots a secret's value renders as. Callers colour it `theme::text_muted` --
 /// this returns only the text, since some call sites (the value textbox's
 /// stand-in) render it alone and others (an override row's sentence) render
 /// it inline with prose that must not share its colour.
@@ -136,15 +137,16 @@ pub fn vars(config: &Config, scope: EnvScope) -> Option<&Vec<EnvVar>> {
 /// resolved by the caller (`app::update`, which reads it from
 /// `App::config.projects`); `None` for a `Global` scope is fine, since that
 /// branch never reads it.
-pub fn secret_key(scope: EnvScope, project_id: Option<Uuid>, key: &str) -> SecretKey {
+/// `None` for a project scope without its id: nothing to address.
+pub fn secret_key(scope: EnvScope, project_id: Option<Uuid>, key: &str) -> Option<SecretKey> {
     match scope {
-        EnvScope::Global => SecretKey::GlobalEnv {
+        EnvScope::Global => Some(SecretKey::GlobalEnv {
             key: key.to_string(),
-        },
-        EnvScope::Project(_) => SecretKey::ProjectEnv {
-            project_id: project_id.expect("a project scope always carries a project id"),
+        }),
+        EnvScope::Project(_) => Some(SecretKey::ProjectEnv {
+            project_id: project_id?,
             key: key.to_string(),
-        },
+        }),
     }
 }
 
@@ -230,6 +232,27 @@ pub fn value_box_text<'a>(
 /// uncommitted rather than silently waiting to be lost.
 pub fn is_uncommitted(drafts: &ValueDrafts, scope: EnvScope, index: usize, var: &EnvVar) -> bool {
     matches!(drafts.get(&(scope, index)), Some(draft) if *draft != var.value)
+}
+
+/// The rows of `scope` with a value typed and not saved.
+pub fn unsaved(drafts: &ValueDrafts, scope: EnvScope, vars: &[EnvVar]) -> Vec<usize> {
+    vars.iter()
+        .enumerate()
+        .filter(|(i, var)| !var.secret && is_uncommitted(drafts, scope, *i, var))
+        .map(|(i, _)| i)
+        .collect()
+}
+
+/// Every unsaved value, in any scope that still exists.
+pub fn unsaved_count(config: &Config, drafts: &ValueDrafts) -> usize {
+    drafts
+        .keys()
+        .filter(|(scope, index)| {
+            vars(config, *scope)
+                .and_then(|vars| vars.get(*index))
+                .is_some_and(|var| !var.secret && is_uncommitted(drafts, *scope, *index, var))
+        })
+        .count()
 }
 
 /// Moves this row's draft into `Config` (plaintext, deliberately: the user
@@ -384,6 +407,7 @@ fn rows<'a>(scope: EnvScope, vars: &[EnvVar], drafts: &ValueDrafts) -> iced::Ele
         // Read-only once the row is secret: the keychain account is named
         // after the key, and nothing here can move an entry -- see `set_key`.
         let key_input = iced::widget::text_input("KEY", &var.key)
+            .style(crate::theme::text_field)
             .font(theme::FONT_DATA)
             .size(theme::DATA)
             .on_input_maybe(
@@ -399,12 +423,13 @@ fn rows<'a>(scope: EnvScope, vars: &[EnvVar], drafts: &ValueDrafts) -> iced::Ele
             iced::widget::text(display_value(var))
                 .font(theme::FONT_DATA)
                 .size(theme::DATA)
-                .color(theme::SLATE)
+                .style(theme::text_muted)
                 .into()
         } else {
             // Bound to the draft, never straight to `Config` -- see the module
             // doc. Enter commits, the same as the save button below.
             iced::widget::text_input("value", value_box_text(drafts, scope, index, var))
+                .style(crate::theme::text_field)
                 .font(theme::FONT_DATA)
                 .size(theme::DATA)
                 .on_input(move |value| Message::EnvVarValueChanged(scope, index, value))
@@ -415,7 +440,9 @@ fn rows<'a>(scope: EnvScope, vars: &[EnvVar], drafts: &ValueDrafts) -> iced::Ele
         // Enabled only while this row has typing `Config` has not seen, the
         // same "no press needed, no press possible" treatment `index_editor`'s
         // auth buttons give a control whose action is already the state.
-        let save_value = iced::widget::button(iced::widget::text("save value")).on_press_maybe(
+        let save_value = icons::icon_button(
+            Icon::Check,
+            "Save value",
             (!var.secret && is_uncommitted(drafts, scope, index, var))
                 .then_some(Message::EnvVarValueCommitted(scope, index)),
         );
@@ -424,18 +451,31 @@ fn rows<'a>(scope: EnvScope, vars: &[EnvVar], drafts: &ValueDrafts) -> iced::Ele
             .label("secret")
             .on_toggle(move |_| Message::EnvVarSecretToggled(scope, index));
 
-        let remove = iced::widget::button(iced::widget::text("remove"))
-            .on_press(Message::EnvVarRemoved(scope, index));
+        let remove = icons::icon_button(
+            Icon::Trash,
+            "Remove",
+            Some(Message::EnvVarRemoved(scope, index)),
+        );
 
-        let row = iced::widget::row![key_input, value_widget, save_value, secret_toggle, remove]
-            .spacing(theme::SPACE_2);
+        // Typed but not saved must not look saved.
+        let unsaved_mark = (!var.secret && is_uncommitted(drafts, scope, index, var)).then(|| {
+            iced::widget::text("unsaved")
+                .size(theme::LABEL)
+                .style(theme::text_warning)
+        });
+        let row = iced::widget::row![key_input, value_widget]
+            .push(unsaved_mark)
+            .push(save_value)
+            .push(secret_toggle)
+            .push(remove)
+            .spacing(theme::SPACE_2)
+            .align_y(iced::Alignment::Center);
 
-        column = column.push(iced::widget::container(row).padding(theme::SPACE_1).style(
-            |_theme| iced::widget::container::Style {
-                background: Some(iced::Background::Color(theme::BARK)),
-                ..iced::widget::container::Style::default()
-            },
-        ));
+        column = column.push(
+            iced::widget::container(row)
+                .padding(theme::SPACE_1)
+                .style(theme::fill(theme::Swatch::Bark)),
+        );
     }
     column.into()
 }
@@ -452,7 +492,8 @@ pub fn global_view<'a>(config: &Config, drafts: &ValueDrafts) -> iced::Element<'
     iced::widget::column![
         iced::widget::text("Every project sees these, unless it sets its own with the same key.")
             .size(theme::BODY)
-            .color(theme::SLATE),
+            .style(theme::text_muted),
+        unsaved_line(drafts, EnvScope::Global, &config.global_env),
         rows(EnvScope::Global, &config.global_env, drafts),
         iced::widget::button(iced::widget::text("Add global variable").size(theme::BODY))
             .on_press(Message::EnvVarAdded(EnvScope::Global))
@@ -461,6 +502,21 @@ pub fn global_view<'a>(config: &Config, drafts: &ValueDrafts) -> iced::Element<'
     ]
     .spacing(theme::SPACE_3)
     .into()
+}
+
+/// "2 unsaved -- press Enter or ✓ on each", or nothing.
+fn unsaved_line<'a>(
+    drafts: &ValueDrafts,
+    scope: EnvScope,
+    vars: &[EnvVar],
+) -> iced::Element<'a, Message> {
+    match unsaved(drafts, scope, vars).len() {
+        0 => iced::widget::Space::new().into(),
+        n => iced::widget::text(format!("{n} unsaved: press Enter or \u{2713} on each"))
+            .size(theme::LABEL)
+            .style(theme::text_warning)
+            .into(),
+    }
 }
 
 /// One project's own variables, and which global ones they shadow.
@@ -479,7 +535,8 @@ pub fn project_view<'a>(
     let mut column = iced::widget::column![
         iced::widget::text("These layer over the global variables. A key set here wins.")
             .size(theme::BODY)
-            .color(theme::SLATE),
+            .style(theme::text_muted),
+        unsaved_line(drafts, EnvScope::Project(project_index), &project.env),
         rows(EnvScope::Project(project_index), &project.env, drafts),
         iced::widget::button(iced::widget::text("Add project variable").size(theme::BODY))
             .on_press(Message::EnvVarAdded(EnvScope::Project(project_index)))
@@ -506,7 +563,7 @@ pub fn project_view<'a>(
             iced::widget::text("Inherited from global")
                 .font(theme::FONT_PROSE_SEMIBOLD)
                 .size(theme::LABEL)
-                .color(theme::SLATE),
+                .style(theme::text_muted),
         );
         for var in &config.global_env {
             let overridden = shadowed.contains(&var.key);
@@ -514,18 +571,18 @@ pub fn project_view<'a>(
                 iced::widget::text(var.key.clone())
                     .font(theme::FONT_DATA)
                     .size(theme::DATA)
-                    .color(theme::SLATE),
+                    .style(theme::text_muted),
                 iced::widget::text(display_value(var))
                     .font(theme::FONT_DATA)
                     .size(theme::DATA)
-                    .color(theme::SLATE),
+                    .style(theme::text_muted),
             ]
             .spacing(theme::SPACE_2);
             if overridden {
                 line = line.push(
                     iced::widget::text("(overridden above)")
                         .size(theme::LABEL)
-                        .color(theme::SLATE),
+                        .style(theme::text_muted),
                 );
             }
             column = column.push(
@@ -546,17 +603,17 @@ pub fn project_view<'a>(
                 iced::widget::text(over.key.clone())
                     .font(theme::FONT_DATA)
                     .size(theme::DATA)
-                    .color(theme::SLATE),
+                    .style(theme::text_muted),
                 iced::widget::text("overrides the global value (")
                     .size(theme::BODY)
-                    .color(theme::SLATE),
+                    .style(theme::text_muted),
                 iced::widget::text(over.global_display.clone())
                     .font(theme::FONT_DATA)
                     .size(theme::DATA)
-                    .color(theme::SLATE),
+                    .style(theme::text_muted),
                 iced::widget::text(")")
                     .size(theme::BODY)
-                    .color(theme::SLATE),
+                    .style(theme::text_muted),
             ]
             .spacing(theme::SPACE_1),
         );
@@ -570,6 +627,25 @@ mod tests {
     use super::*;
     use bombadil_core::model::Project;
     use std::path::PathBuf;
+
+    #[test]
+    fn unsaved_values_are_counted_wherever_they_are() {
+        let config = Config {
+            global_env: vec![var("A", "1", false), var("B", "2", false)],
+            ..Config::default()
+        };
+        let mut drafts = ValueDrafts::new();
+        drafts.insert((EnvScope::Global, 0), "1".into()); // same as saved
+        drafts.insert((EnvScope::Global, 1), "3".into()); // changed
+        assert_eq!(unsaved(&drafts, EnvScope::Global, &config.global_env), [1]);
+        assert_eq!(unsaved_count(&config, &drafts), 1);
+        drafts.insert((EnvScope::Project(7), 0), "x".into()); // stale scope
+        assert_eq!(
+            unsaved_count(&config, &drafts),
+            1,
+            "a gone project counts nothing"
+        );
+    }
 
     fn var(key: &str, value: &str, secret: bool) -> EnvVar {
         EnvVar {
@@ -828,9 +904,9 @@ mod tests {
     fn the_global_secret_key_names_no_project() {
         assert_eq!(
             secret_key(EnvScope::Global, None, "TOKEN"),
-            SecretKey::GlobalEnv {
+            Some(SecretKey::GlobalEnv {
                 key: "TOKEN".into()
-            }
+            })
         );
     }
 
@@ -839,11 +915,17 @@ mod tests {
         let id = Uuid::from_u128(42);
         assert_eq!(
             secret_key(EnvScope::Project(0), Some(id), "TOKEN"),
-            SecretKey::ProjectEnv {
+            Some(SecretKey::ProjectEnv {
                 project_id: id,
                 key: "TOKEN".into(),
-            }
+            })
         );
+    }
+
+    #[test]
+    fn a_project_scope_without_its_id_addresses_no_secret() {
+        // Was an `expect`: a caller that lost the id took the window down.
+        assert_eq!(secret_key(EnvScope::Project(0), None, "TOKEN"), None);
     }
 
     // --- add / remove / set_key / set_value ---

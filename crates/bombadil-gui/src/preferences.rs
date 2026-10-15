@@ -37,7 +37,10 @@ pub enum Scope {
 /// Which group of settings is on screen.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Section {
+    /// Light, dark, or the desktop's. First: it is the setting people look
+    /// for in a Settings menu before anything Bombadil-specific.
     #[default]
+    Appearance,
     Environments,
     Python,
     Uv,
@@ -50,7 +53,8 @@ pub enum Section {
 impl Section {
     /// Every section, in the order the list renders them: the four that decide
     /// how an environment is built and opened first, then the two lists.
-    pub const ALL: [Section; 7] = [
+    pub const ALL: [Section; 8] = [
+        Section::Appearance,
         Section::Environments,
         Section::Python,
         Section::Uv,
@@ -65,6 +69,7 @@ impl Section {
     /// shorter [`label`](Self::label).
     pub fn menu_label(self) -> &'static str {
         match self {
+            Section::Appearance => "Appearance",
             Section::Environments => "Virtual environments",
             Section::Python => "Python version",
             Section::Uv => "uv",
@@ -77,6 +82,7 @@ impl Section {
 
     pub fn label(self) -> &'static str {
         match self {
+            Section::Appearance => "Appearance",
             Section::Environments => "Environments",
             Section::Python => "Python",
             Section::Uv => "uv",
@@ -165,9 +171,11 @@ pub fn inherited_label(section: Section, config: &Config, os: Os) -> String {
         },
         // These merge rather than override, so "what you would inherit" is
         // not a single value and the panel says so in prose instead.
-        Section::Environments | Section::Scripts | Section::EnvVars | Section::Indexes => {
-            String::new()
-        }
+        Section::Appearance
+        | Section::Environments
+        | Section::Scripts
+        | Section::EnvVars
+        | Section::Indexes => String::new(),
     }
 }
 
@@ -218,9 +226,9 @@ pub fn view<'a>(
                 .width(iced::Length::Fill)
                 .padding([theme::SPACE_1, theme::SPACE_2])
                 .style(theme::button_bare(if selected {
-                    theme::PARCHMENT
+                    theme::Swatch::Parchment
                 } else {
-                    theme::SLATE
+                    theme::Swatch::Slate
                 })),
         );
     }
@@ -245,6 +253,7 @@ pub fn view<'a>(
             uv_custom_validation,
         ),
         (Section::Uv, Some(i)) => uv_panel(config, scope, i),
+        (Section::Appearance, _) => appearance_panel(config, selected_project.is_some()),
         (Section::Scripts, _) => settings_scripts_panel(config, selected_project),
         (Section::Python, _) => python_panel(config, scope, selected_project),
         (Section::Terminal, _) => terminal_panel(config, scope, selected_project),
@@ -284,10 +293,7 @@ pub fn view<'a>(
     let positioner = iced::widget::container(iced::widget::center(iced::widget::opaque(card)))
         .width(iced::Length::Fill)
         .height(iced::Length::Fill)
-        .style(|_theme| iced::widget::container::Style {
-            background: Some(iced::Background::Color(theme::SCRIM)),
-            ..iced::widget::container::Style::default()
-        });
+        .style(theme::fill(theme::Swatch::Scrim));
 
     iced::widget::opaque(iced::widget::mouse_area(positioner).on_press(Message::PreferencesClosed))
 }
@@ -313,7 +319,7 @@ fn environments_panel<'a>(config: &Config, project_index: usize) -> iced::Elemen
              them all."
         )
         .size(theme::BODY)
-        .color(theme::SLATE),
+        .style(theme::text_muted),
     ]
     .spacing(theme::SPACE_3);
 
@@ -378,7 +384,7 @@ fn environments_panel<'a>(config: &Config, project_index: usize) -> iced::Elemen
             iced::widget::row![
                 iced::widget::text("where")
                     .size(theme::LABEL)
-                    .color(theme::SLATE)
+                    .style(theme::text_muted)
                     .width(theme::INDEX_LABEL_WIDTH),
                 place(
                     "follow global location",
@@ -407,9 +413,10 @@ fn environments_panel<'a>(config: &Config, project_index: usize) -> iced::Elemen
             iced::widget::row![
                 iced::widget::text("python")
                     .size(theme::LABEL)
-                    .color(theme::SLATE)
+                    .style(theme::text_muted)
                     .width(theme::INDEX_LABEL_WIDTH),
                 iced::widget::text_input("3.12, or empty to let uv choose", &pin)
+                    .style(crate::theme::text_field)
                     .on_input(move |version| Message::EnvironmentPinChanged(
                         id,
                         for_input.clone(),
@@ -443,7 +450,7 @@ fn environments_panel<'a>(config: &Config, project_index: usize) -> iced::Elemen
                  which asks first. Removing one here leaves the directory on disk.",
             )
             .size(theme::LABEL)
-            .color(theme::SLATE),
+            .style(theme::text_muted),
         )
         .into()
 }
@@ -463,7 +470,7 @@ fn settings_scripts_panel<'a>(
                  a setting. Switch scope to Global to edit the scripts every project runs."
             )
             .size(theme::BODY)
-            .color(theme::SLATE),
+            .style(theme::text_muted),
         ]
         .into();
     }
@@ -495,7 +502,7 @@ fn python_panel<'a>(
              choose, subject to the manifest's requires-python."
         )
         .size(theme::BODY)
-        .color(theme::SLATE),
+        .style(theme::text_muted),
     ]
     .spacing(theme::SPACE_3);
 
@@ -505,6 +512,7 @@ fn python_panel<'a>(
 
     column = column.push(
         iced::widget::text_input("3.12, or 3.12.13", &current)
+            .style(crate::theme::text_field)
             .on_input(move |version| Message::PreferencesPythonPinChanged(scope, version))
             .font(theme::FONT_DATA)
             .size(theme::DATA)
@@ -522,7 +530,7 @@ fn python_panel<'a>(
                  installed in it that is not in the lock file is lost. Sync asks first.",
             )
             .size(theme::LABEL)
-            .color(theme::SLATE),
+            .style(theme::text_muted),
         )
         .into()
 }
@@ -548,7 +556,7 @@ fn uv_panel<'a>(config: &Config, scope: Scope, project_index: usize) -> iced::El
     let mut column = iced::widget::column![
         iced::widget::text("Which uv runs this project's commands.")
             .size(theme::BODY)
-            .color(theme::SLATE),
+            .style(theme::text_muted),
         inherit_row(Section::Uv, config, scope, inheriting),
     ]
     .spacing(theme::SPACE_2);
@@ -574,7 +582,7 @@ fn uv_panel<'a>(config: &Config, scope: Scope, project_index: usize) -> iced::El
                  scope, because it is probed for its version before it is trusted.",
             )
             .size(theme::LABEL)
-            .color(theme::SLATE),
+            .style(theme::text_muted),
         )
         .into()
 }
@@ -603,7 +611,7 @@ fn terminal_panel<'a>(
              because the terminals that exist differ between them."
         )
         .size(theme::BODY)
-        .color(theme::SLATE),
+        .style(theme::text_muted),
     ]
     .spacing(theme::SPACE_2);
 
@@ -621,7 +629,7 @@ fn terminal_panel<'a>(
             label = label.push(
                 iced::widget::text(warning.trim())
                     .size(theme::LABEL)
-                    .color(theme::SLATE),
+                    .style(theme::text_muted),
             );
         }
         column = column.push(
@@ -643,7 +651,7 @@ fn terminal_panel<'a>(
                  when opened rather than being hidden here.",
             )
             .size(theme::LABEL)
-            .color(theme::SLATE),
+            .style(theme::text_muted),
         )
         .into()
 }
@@ -667,7 +675,7 @@ fn inherit_row<'a>(
             ),
         iced::widget::text(format!("({inherited})"))
             .size(theme::DATA)
-            .color(theme::SLATE),
+            .style(theme::text_muted),
     ]
     .spacing(theme::SPACE_2)
     .align_y(iced::Alignment::Center)
@@ -690,6 +698,59 @@ fn scope_button<'a>(
         .into()
 }
 
+/// Light, dark, or the desktop's. Global only: one window, one appearance.
+/// `for_project`: Preferences is open on a project, so say this is not one
+/// of that project's settings.
+fn appearance_panel<'a>(config: &Config, for_project: bool) -> iced::Element<'a, Message> {
+    use bombadil_core::model::ThemeChoice;
+    let current = config.settings.theme;
+    let choice = |label: &'static str, value: ThemeChoice| {
+        iced::widget::button(iced::widget::text(label).size(theme::BODY))
+            .on_press(Message::ThemeChoiceSelected(value))
+            .padding([theme::SPACE_1, theme::SPACE_3])
+            .style(theme::button_choice(current == value))
+    };
+    iced::widget::column![
+        iced::widget::text("Appearance").size(theme::TITLE),
+        iced::widget::row![
+            choice("System", ThemeChoice::System),
+            choice("Light", ThemeChoice::Light),
+            choice("Dark", ThemeChoice::Dark),
+        ]
+        .spacing(theme::SPACE_1),
+        iced::widget::text("System follows your desktop's light or dark setting as it changes.")
+            .size(theme::DATA)
+            .style(theme::text_muted),
+        iced::widget::text("Closing the window").size(theme::TITLE),
+        iced::widget::row![
+            iced::widget::button(
+                iced::widget::text("Keeps Bombadil in the tray").size(theme::BODY)
+            )
+            .on_press(Message::CloseToTraySelected(true))
+            .padding([theme::SPACE_1, theme::SPACE_3])
+            .style(theme::button_choice(config.settings.close_to_tray)),
+            iced::widget::button(iced::widget::text("Quits").size(theme::BODY))
+                .on_press(Message::CloseToTraySelected(false))
+                .padding([theme::SPACE_1, theme::SPACE_3])
+                .style(theme::button_choice(!config.settings.close_to_tray)),
+        ]
+        .spacing(theme::SPACE_1),
+        iced::widget::text(
+            "Without a tray (some desktops have none), closing always quits: \
+             a hidden window would have no way back."
+        )
+        .size(theme::DATA)
+        .style(theme::text_muted),
+    ]
+    .push(for_project.then(|| {
+        iced::widget::text("These apply to every project, not just this one.")
+            .size(theme::DATA)
+            .style(theme::text_muted)
+    }))
+    .spacing(theme::SPACE_3)
+    .into()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -700,6 +761,16 @@ mod tests {
             projects,
             ..Config::default()
         }
+    }
+
+    #[test]
+    fn appearance_is_global_only_and_first() {
+        assert_eq!(Section::ALL[0], Section::Appearance);
+        // Nothing to inherit: there is no per-project appearance.
+        assert_eq!(
+            inherited_label(Section::Appearance, &Config::default(), Os::Linux),
+            String::new()
+        );
     }
 
     #[test]

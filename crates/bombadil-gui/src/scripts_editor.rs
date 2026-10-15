@@ -25,6 +25,7 @@
 //! in `view` happen to read in the right order.
 
 use crate::app::Message;
+use crate::icons::{self, Icon};
 use crate::theme;
 use bombadil_core::model::{Config, Script};
 use std::path::PathBuf;
@@ -126,14 +127,21 @@ fn rows<'a>(scope: ScriptScope, scripts: &[Script]) -> iced::Element<'a, Message
             .label("enabled")
             .on_toggle(move |_| Message::ScriptEnabledToggled(scope, index));
 
-        let move_up_button = iced::widget::button(iced::widget::text("up"))
-            .on_press_maybe((index != 0).then_some(Message::ScriptMovedUp(scope, index)));
-        let move_down_button = iced::widget::button(iced::widget::text("down")).on_press_maybe(
+        let move_up_button = icons::icon_button(
+            Icon::ChevronUp,
+            "Move up",
+            (index != 0).then_some(Message::ScriptMovedUp(scope, index)),
+        );
+        let move_down_button = icons::icon_button(
+            Icon::ChevronDown,
+            "Move down",
             (index != last_index).then_some(Message::ScriptMovedDown(scope, index)),
         );
-
-        let remove = iced::widget::button(iced::widget::text("remove"))
-            .on_press(Message::ScriptRemoved(scope, index));
+        let remove = icons::icon_button(
+            Icon::Trash,
+            "Remove",
+            Some(Message::ScriptRemoved(scope, index)),
+        );
 
         let row = iced::widget::row![
             path_text,
@@ -144,12 +152,11 @@ fn rows<'a>(scope: ScriptScope, scripts: &[Script]) -> iced::Element<'a, Message
         ]
         .spacing(theme::SPACE_2);
 
-        column = column.push(iced::widget::container(row).padding(theme::SPACE_1).style(
-            |_theme| iced::widget::container::Style {
-                background: Some(iced::Background::Color(theme::BARK)),
-                ..iced::widget::container::Style::default()
-            },
-        ));
+        column = column.push(
+            iced::widget::container(row)
+                .padding(theme::SPACE_1)
+                .style(theme::fill(theme::Swatch::Bark)),
+        );
     }
     column.into()
 }
@@ -164,7 +171,7 @@ pub fn global_view<'a>(config: &Config) -> iced::Element<'a, Message> {
     iced::widget::column![
         iced::widget::text(ORDER_NOTE)
             .size(theme::BODY)
-            .color(theme::SLATE),
+            .style(theme::text_muted),
         rows(ScriptScope::Global, &config.global_scripts),
         iced::widget::button(iced::widget::text("Add global script").size(theme::BODY))
             .on_press(Message::ScriptAddRequested(ScriptScope::Global))
@@ -182,14 +189,15 @@ pub fn view<'a>(config: &Config, selected_project: Option<usize>) -> iced::Eleme
             .size(theme::TITLE),
         iced::widget::text(ORDER_NOTE)
             .size(theme::BODY)
-            .color(theme::SLATE),
+            .style(theme::text_muted),
         iced::widget::text("Global (runs first)")
             .font(theme::FONT_PROSE)
             .size(theme::LABEL)
-            .color(theme::SLATE),
+            .style(theme::text_muted),
         rows(ScriptScope::Global, &config.global_scripts),
         iced::widget::button(iced::widget::text("Add global script"))
-            .on_press(Message::ScriptAddRequested(ScriptScope::Global)),
+            .on_press(Message::ScriptAddRequested(ScriptScope::Global))
+            .style(theme::button_secondary),
     ]
     .spacing(theme::SPACE_3);
 
@@ -200,12 +208,13 @@ pub fn view<'a>(config: &Config, selected_project: Option<usize>) -> iced::Eleme
             iced::widget::text("Project (runs after global)")
                 .font(theme::FONT_PROSE)
                 .size(theme::LABEL)
-                .color(theme::SLATE),
+                .style(theme::text_muted),
         );
         column = column.push(rows(ScriptScope::Project(i), &project.scripts));
         column = column.push(
             iced::widget::button(iced::widget::text("Add project script"))
-                .on_press(Message::ScriptAddRequested(ScriptScope::Project(i))),
+                .on_press(Message::ScriptAddRequested(ScriptScope::Project(i)))
+                .style(theme::button_secondary),
         );
 
         // The concrete order this project's own run would follow, spelling
@@ -217,7 +226,7 @@ pub fn view<'a>(config: &Config, selected_project: Option<usize>) -> iced::Eleme
                 "{total} script(s) will run for this project, in the order above"
             ))
             .size(theme::BODY)
-            .color(theme::SLATE),
+            .style(theme::text_muted),
         );
     }
 

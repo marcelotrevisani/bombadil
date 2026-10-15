@@ -283,7 +283,13 @@ fn venv_outcome_status(draft: &Draft) -> Option<String> {
 /// path as [`theme::labeled_value`] pairs -- prose label, Plex value -- since
 /// all three are values the user compares character by character. The
 /// interpreter and adopt-or-create lines are sentences, so they stay prose.
-pub fn view<'a>(draft: &Draft, resolved: &str) -> iced::Element<'a, Message> {
+/// `waiting` is the running uv command's label, if any: adding a project
+/// runs its first `uv sync`, which has to wait for that one.
+pub fn view<'a>(
+    draft: &Draft,
+    resolved: &str,
+    waiting: Option<&str>,
+) -> iced::Element<'a, Message> {
     let name = draft
         .name
         .clone()
@@ -298,7 +304,7 @@ pub fn view<'a>(draft: &Draft, resolved: &str) -> iced::Element<'a, Message> {
         iced::widget::text(draft.pyproject_path.display().to_string())
             .font(theme::FONT_DATA)
             .size(theme::DATA)
-            .color(theme::SLATE),
+            .style(theme::text_muted),
         theme::labeled_value("name", name),
         theme::labeled_value("requires-python", requires_python),
     ]
@@ -318,21 +324,21 @@ pub fn view<'a>(draft: &Draft, resolved: &str) -> iced::Element<'a, Message> {
             interpreter_section = interpreter_section.push(
                 iced::widget::text("Checking which interpreters are available...")
                     .size(theme::BODY)
-                    .color(theme::SLATE),
+                    .style(theme::text_muted),
             );
         }
         InterpreterLine::Failed(why) => {
             interpreter_section = interpreter_section.push(
                 iced::widget::text(format!("Could not list interpreters: {why}"))
                     .size(theme::BODY)
-                    .color(theme::SLATE),
+                    .style(theme::text_muted),
             );
         }
         InterpreterLine::NoneCompatible => {
             interpreter_section = interpreter_section.push(
                 iced::widget::text("No installed interpreter satisfies requires-python.")
                     .size(theme::BODY)
-                    .color(theme::SLATE),
+                    .style(theme::text_muted),
             );
         }
     }
@@ -385,14 +391,14 @@ pub fn view<'a>(draft: &Draft, resolved: &str) -> iced::Element<'a, Message> {
         iced::widget::text(resolved.to_string())
             .font(theme::FONT_DATA)
             .size(theme::DATA)
-            .color(theme::SLATE),
+            .style(theme::text_muted),
     ]
     .spacing(theme::SPACE_2);
     if let Some(outcome) = venv_outcome_status(draft) {
         environment = environment.push(
             iced::widget::text(outcome)
                 .size(theme::BODY)
-                .color(theme::SLATE),
+                .style(theme::text_muted),
         );
     }
 
@@ -404,10 +410,13 @@ pub fn view<'a>(draft: &Draft, resolved: &str) -> iced::Element<'a, Message> {
             .on_press(Message::AddProjectCancelled)
             .padding([theme::SPACE_1, theme::SPACE_3])
             .style(theme::button_quiet),
-        iced::widget::button(iced::widget::text("Add project").size(theme::BODY))
-            .on_press(Message::AddProjectConfirmed)
-            .padding([theme::SPACE_1, theme::SPACE_3])
-            .style(theme::button_primary),
+        theme::wait_tip(
+            iced::widget::button(iced::widget::text("Add project").size(theme::BODY))
+                .on_press_maybe(waiting.is_none().then_some(Message::AddProjectConfirmed))
+                .padding([theme::SPACE_1, theme::SPACE_3])
+                .style(theme::button_primary),
+            waiting,
+        ),
     ]
     .spacing(theme::SPACE_2);
 
@@ -441,16 +450,130 @@ fn section<'a>(
         iced::widget::text(title)
             .font(theme::FONT_PROSE_SEMIBOLD)
             .size(theme::LABEL)
-            .color(theme::SLATE),
+            .style(theme::text_muted),
         content,
     ]
     .spacing(theme::SPACE_2)
     .into()
 }
 
+/// The manifests to offer for a picked or dropped folder, and how many were
+/// found before registered ones were left out: the folder's own
+/// `pyproject.toml`, or else each immediate subfolder's, sorted. `exists` and
+/// `subdirs` are the filesystem, kept at the caller's edge.
+pub fn manifests_in(
+    dir: &Path,
+    registered: &[PathBuf],
+    exists: &dyn Fn(&Path) -> bool,
+    subdirs: &dyn Fn(&Path) -> Vec<PathBuf>,
+) -> (usize, Vec<PathBuf>) {
+    let own = dir.join("pyproject.toml");
+    let mut found = if exists(&own) {
+        vec![own]
+    } else {
+        subdirs(dir)
+            .into_iter()
+            .map(|sub| sub.join("pyproject.toml"))
+            .filter(|manifest| exists(manifest))
+            .collect()
+    };
+    found.sort();
+    let total = found.len();
+    found.retain(|manifest| !registered.contains(manifest));
+    (total, found)
+}
+
+/// The chooser for a folder holding several projects: one button each,
+/// named by its folder.
+pub fn chooser_view<'a>(manifests: &[PathBuf]) -> iced::Element<'a, Message> {
+    let mut list = iced::widget::column![
+        iced::widget::text("This folder holds several projects").size(theme::TITLE),
+        iced::widget::text("Choose one to add. Each gets its own interpreter and environment.")
+            .size(theme::BODY)
+            .style(theme::text_muted),
+    ]
+    .spacing(theme::SPACE_2);
+    for manifest in manifests {
+        let dir = manifest.parent().unwrap_or(manifest);
+        let name = dir
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| dir.display().to_string());
+        list = list.push(
+            iced::widget::button(
+                iced::widget::column![
+                    iced::widget::text(name).size(theme::BODY),
+                    iced::widget::text(dir.display().to_string())
+                        .font(theme::FONT_DATA)
+                        .size(theme::DATA)
+                        .style(theme::text_muted),
+                ]
+                .spacing(0),
+            )
+            .on_press(Message::ProjectChosen(manifest.clone()))
+            .width(iced::Length::Fill)
+            .padding([theme::SPACE_1, theme::SPACE_2])
+            .style(theme::button_quiet),
+        );
+    }
+    list = list.push(iced::widget::row![
+        iced::widget::Space::new().width(iced::Length::Fill),
+        iced::widget::button(iced::widget::text("Cancel").size(theme::BODY))
+            .on_press(Message::ProjectChooserCancelled)
+            .padding([theme::SPACE_1, theme::SPACE_3])
+            .style(theme::button_quiet),
+    ]);
+    iced::widget::container(iced::widget::scrollable(list))
+        .width(theme::MODAL_WIDTH)
+        .max_height(480)
+        .padding(theme::SPACE_4)
+        .style(theme::panel)
+        .into()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_folder_finds_its_own_manifest_or_its_subfolders() {
+        use std::path::{Path, PathBuf};
+        let root = Path::new("/code");
+        let present = |files: &'static [&'static str]| {
+            move |p: &Path| files.iter().any(|f| p == Path::new(f))
+        };
+        let subdirs = |_: &Path| vec![PathBuf::from("/code/web"), PathBuf::from("/code/api")];
+
+        // Its own manifest wins.
+        let own = present(&["/code/pyproject.toml", "/code/api/pyproject.toml"]);
+        assert_eq!(
+            manifests_in(root, &[], &own, &subdirs),
+            (1, vec![PathBuf::from("/code/pyproject.toml")])
+        );
+        // Otherwise each subfolder's, sorted.
+        let subs = present(&["/code/web/pyproject.toml", "/code/api/pyproject.toml"]);
+        assert_eq!(
+            manifests_in(root, &[], &subs, &subdirs),
+            (
+                2,
+                vec![
+                    PathBuf::from("/code/api/pyproject.toml"),
+                    PathBuf::from("/code/web/pyproject.toml")
+                ]
+            )
+        );
+        // Registered ones are left out, but still counted as found.
+        let registered = [PathBuf::from("/code/api/pyproject.toml")];
+        assert_eq!(
+            manifests_in(root, &registered, &subs, &subdirs),
+            (2, vec![PathBuf::from("/code/web/pyproject.toml")])
+        );
+        assert_eq!(
+            manifests_in(root, &[], &present(&[]), &subdirs),
+            (0, vec![])
+        );
+    }
+
     use bombadil_core::model::DefaultVenvLocation;
 
     const MANIFEST: &str = r#"

@@ -40,6 +40,8 @@ pub enum Modal {
     About,
     /// The bundled licences in full: uv's Apache-2.0 and both fonts' OFL 1.1.
     Licences,
+    /// Every keyboard shortcut, from `shortcuts::SHORTCUTS`.
+    Shortcuts,
 }
 
 impl Modal {
@@ -49,6 +51,7 @@ impl Modal {
         match self {
             Modal::About => "About Bombadil",
             Modal::Licences => "Bundled licences",
+            Modal::Shortcuts => "Keyboard shortcuts",
         }
     }
 }
@@ -94,6 +97,7 @@ impl TopMenu {
                 })
                 .collect(),
             TopMenu::Help => vec![
+                ("Keyboard shortcuts", Message::ModalOpened(Modal::Shortcuts)),
                 ("About Bombadil", Message::ModalOpened(Modal::About)),
                 ("Bundled licences", Message::ModalOpened(Modal::Licences)),
             ],
@@ -103,6 +107,32 @@ impl TopMenu {
 
 /// Both top-bar menus, left to right.
 pub const TOP_MENUS: [TopMenu; 2] = [TopMenu::Settings, TopMenu::Help];
+
+/// The author's GitHub Sponsors page, also linked from the README.
+pub const SPONSOR_URL: &str = "https://github.com/sponsors/marcelotrevisani";
+
+/// At the foot of the sidebar, out of the way of the work above it: quiet,
+/// full width, never `button_primary`, which belongs to Sync.
+pub fn sponsor_button<'a>() -> iced::Element<'a, Message> {
+    iced::widget::button(
+        iced::widget::container(
+            iced::widget::row![
+                // Parchment, not `boot`: boot is rationed for attention and
+                // danger, and a sponsor link is neither.
+                crate::icons::icon(crate::icons::Icon::Heart, 14.0, theme::Swatch::Parchment),
+                iced::widget::text("Sponsor Bombadil").size(theme::LABEL),
+            ]
+            .spacing(theme::SPACE_1)
+            .align_y(iced::Alignment::Center),
+        )
+        .center_x(iced::Length::Fill),
+    )
+    .on_press(Message::SponsorRequested)
+    .width(iced::Length::Fill)
+    .padding([theme::SPACE_1, theme::SPACE_2])
+    .style(theme::button_quiet)
+    .into()
+}
 
 /// This build's version, for the About modal.
 pub fn version() -> &'static str {
@@ -127,9 +157,9 @@ pub fn topbar<'a>(open_menu: Option<TopMenu>) -> iced::Element<'a, Message> {
                 .on_press(Message::MenuToggled(menu))
                 .padding([theme::SPACE_1, theme::SPACE_2])
                 .style(theme::button_bare(if open {
-                    theme::PARCHMENT
+                    theme::Swatch::Parchment
                 } else {
-                    theme::SLATE
+                    theme::Swatch::Slate
                 })),
         );
     }
@@ -164,7 +194,7 @@ pub fn menu_layer<'a>(menu: TopMenu) -> iced::Element<'a, Message> {
                 .on_press(message)
                 .width(iced::Length::Fill)
                 .padding([theme::SPACE_2, theme::SPACE_3])
-                .style(theme::button_bare(theme::PARCHMENT)),
+                .style(theme::button_bare(theme::Swatch::Parchment)),
         );
     }
 
@@ -217,6 +247,7 @@ pub fn modal_layer<'a>(modal: Modal) -> iced::Element<'a, Message> {
     let body: iced::Element<'a, Message> = match modal {
         Modal::About => about_body(),
         Modal::Licences => licences_body(),
+        Modal::Shortcuts => shortcuts_body(),
     };
 
     let card = iced::widget::container(
@@ -244,10 +275,7 @@ pub fn modal_layer<'a>(modal: Modal) -> iced::Element<'a, Message> {
     let positioner = iced::widget::container(iced::widget::center(iced::widget::opaque(card)))
         .width(iced::Length::Fill)
         .height(iced::Length::Fill)
-        .style(|_theme| iced::widget::container::Style {
-            background: Some(iced::Background::Color(theme::SCRIM)),
-            ..iced::widget::container::Style::default()
-        });
+        .style(theme::fill(theme::Swatch::Scrim));
 
     iced::widget::opaque(iced::widget::mouse_area(positioner).on_press(Message::ModalClosed))
 }
@@ -264,8 +292,10 @@ pub fn modal_layer<'a>(modal: Modal) -> iced::Element<'a, Message> {
 /// placing it under the cursor would mean tracking every mouse move through
 /// `update` to keep a position nothing else needs. The menu names the project
 /// it acts on instead. Track the cursor if that stops being enough.
+/// `left` is the sidebar's current width.
 pub fn anchored_layer<'a>(
     content: iced::Element<'a, Message>,
+    left: f32,
     dismiss: Message,
 ) -> iced::Element<'a, Message> {
     dismissable(
@@ -273,10 +303,7 @@ pub fn anchored_layer<'a>(
             .width(theme::CONTEXT_MENU_WIDTH)
             .style(theme::panel)
             .into(),
-        [
-            theme::TOPBAR_HEIGHT + theme::SPACE_3,
-            theme::SIDEBAR_WIDTH + theme::SPACE_2,
-        ],
+        [theme::TOPBAR_HEIGHT + theme::SPACE_3, left + theme::SPACE_2],
         iced::alignment::Horizontal::Left,
         dismiss,
     )
@@ -305,10 +332,7 @@ pub fn overlay_layer<'a>(content: iced::Element<'a, Message>) -> iced::Element<'
         iced::widget::container(iced::widget::center(card))
             .width(iced::Length::Fill)
             .height(iced::Length::Fill)
-            .style(|_theme| iced::widget::container::Style {
-                background: Some(iced::Background::Color(theme::SCRIM)),
-                ..iced::widget::container::Style::default()
-            }),
+            .style(theme::fill(theme::Swatch::Scrim)),
     )
 }
 
@@ -320,10 +344,10 @@ fn about_body<'a>() -> iced::Element<'a, Message> {
         theme::labeled_value("version", version().to_string()),
         iced::widget::text(about::attribution())
             .size(theme::LABEL)
-            .color(theme::SLATE),
+            .style(theme::text_muted),
         iced::widget::text(about::font_attribution())
             .size(theme::LABEL)
-            .color(theme::SLATE),
+            .style(theme::text_muted),
         iced::widget::button(iced::widget::text("Read the bundled licences").size(theme::BODY))
             .on_press(Message::ModalOpened(Modal::Licences))
             .padding([theme::SPACE_1, theme::SPACE_3])
@@ -333,7 +357,26 @@ fn about_body<'a>() -> iced::Element<'a, Message> {
     .into()
 }
 
-/// The Licences body: all three texts in one scrollable, each under its own
+/// The shortcuts card: keys in the data face, what they do in prose.
+fn shortcuts_body<'a>() -> iced::Element<'a, Message> {
+    let mut column = iced::widget::column![].spacing(theme::SPACE_2);
+    for (_, keys, what) in crate::shortcuts::SHORTCUTS {
+        column = column.push(
+            iced::widget::row![
+                iced::widget::text(keys)
+                    .font(theme::FONT_DATA)
+                    .size(theme::DATA)
+                    .width(120),
+                iced::widget::text(what).size(theme::BODY),
+            ]
+            .spacing(theme::SPACE_3)
+            .align_y(iced::Alignment::Center),
+        );
+    }
+    column.into()
+}
+
+/// The Licences body: every bundled licence text in one scrollable, each under its own
 /// heading, in the mono face they were written in.
 fn licences_body<'a>() -> iced::Element<'a, Message> {
     let mut column = iced::widget::column![].spacing(theme::SPACE_3);
@@ -347,6 +390,10 @@ fn licences_body<'a>() -> iced::Element<'a, Message> {
             "IBM Plex Mono - SIL Open Font License 1.1",
             about::plex_license(),
         ),
+        (
+            "Lucide icons - ISC License (MIT for Feather-derived icons)",
+            about::lucide_license(),
+        ),
     ] {
         column = column.push(
             iced::widget::column![
@@ -356,7 +403,7 @@ fn licences_body<'a>() -> iced::Element<'a, Message> {
                 iced::widget::text(text)
                     .font(theme::FONT_DATA)
                     .size(theme::LABEL)
-                    .color(theme::SLATE),
+                    .style(theme::text_muted),
             ]
             .spacing(theme::SPACE_2),
         );
@@ -376,17 +423,24 @@ pub fn empty_state<'a>() -> iced::Element<'a, Message> {
         iced::widget::column![
             iced::widget::text("No projects yet").size(theme::DISPLAY),
             iced::widget::text(
-                "Choose a project's pyproject.toml. Bombadil keeps the account of its \
+                "Choose a project folder. Bombadil keeps the account of its \
                  environment: which interpreter it runs, what is installed, and what \
                  has drifted from the manifest."
             )
             .size(theme::BODY)
-            .color(theme::SLATE)
+            .style(theme::text_muted)
             .width(420.0),
-            iced::widget::button(iced::widget::text("Add project").size(theme::BODY))
-                .on_press(Message::AddProjectPickManifestRequested)
-                .padding([theme::SPACE_2, theme::SPACE_3])
-                .style(theme::button_primary),
+            theme::tip(
+                iced::widget::button(iced::widget::text("Add project").size(theme::BODY))
+                    .on_press(Message::AddProjectPickManifestRequested)
+                    .padding([theme::SPACE_2, theme::SPACE_3])
+                    .style(theme::button_primary),
+                format!(
+                    "Choose a project folder ({})",
+                    crate::shortcuts::keys(crate::shortcuts::Shortcut::AddProject)
+                ),
+                iced::widget::tooltip::Position::Bottom,
+            ),
         ]
         .spacing(theme::SPACE_3)
         .align_x(iced::Alignment::Start),
@@ -410,6 +464,17 @@ mod tests {
                 .iter()
                 .any(|(_, message)| matches!(message, Message::ModalOpened(Modal::Licences))),
             "no menu entry opens the licences"
+        );
+    }
+
+    #[test]
+    fn help_lists_the_keyboard_shortcuts() {
+        assert!(
+            TopMenu::Help
+                .entries()
+                .iter()
+                .any(|(_, message)| matches!(message, Message::ModalOpened(Modal::Shortcuts))),
+            "no menu entry opens the shortcuts card"
         );
     }
 
@@ -492,7 +557,7 @@ mod tests {
 
     #[test]
     fn every_modal_has_a_title() {
-        for modal in [Modal::About, Modal::Licences] {
+        for modal in [Modal::About, Modal::Licences, Modal::Shortcuts] {
             assert!(!modal.title().trim().is_empty(), "{modal:?} has no title");
         }
         assert_ne!(

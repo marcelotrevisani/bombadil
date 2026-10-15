@@ -31,25 +31,30 @@ pub fn available(os: Os, runner: &dyn CommandRunner) -> Vec<TerminalKind> {
 }
 
 fn probe(kind: TerminalKind, os: Os, runner: &dyn CommandRunner) -> bool {
-    runner
-        .run(&probe_spec(kind, os))
-        .map(|outcome| outcome.success())
-        .unwrap_or(false)
+    // A terminal that does not belong to `os` is simply not there.
+    probe_spec(kind, os).is_some_and(|spec| {
+        runner
+            .run(&spec)
+            .map(|outcome| outcome.success())
+            .unwrap_or(false)
+    })
 }
 
-fn probe_spec(kind: TerminalKind, os: Os) -> CommandSpec {
+/// The probe for `kind` on `os`, or `None` when `kind` is not one of that
+/// platform's terminals.
+fn probe_spec(kind: TerminalKind, os: Os) -> Option<CommandSpec> {
     use TerminalKind::*;
     match os {
-        Os::Linux => CommandSpec::new("which").arg(linux_binary_name(kind)),
-        Os::Windows => CommandSpec::new("where").arg(windows_binary_name(kind)),
+        Os::Linux => Some(CommandSpec::new("which").arg(linux_binary_name(kind)?)),
+        Os::Windows => Some(CommandSpec::new("where").arg(windows_binary_name(kind)?)),
         Os::MacOs => {
             let bundle = match kind {
                 TerminalApp => "Terminal",
                 ITerm2 => "iTerm",
-                _ => unreachable!("{kind:?} is not a macOS terminal"),
+                _ => return None,
             };
             // -R: register/resolve only, never launches the app.
-            CommandSpec::new("open").arg("-Ra").arg(bundle)
+            Some(CommandSpec::new("open").arg("-Ra").arg(bundle))
         }
     }
 }
@@ -57,9 +62,9 @@ fn probe_spec(kind: TerminalKind, os: Os) -> CommandSpec {
 /// The binary name each Linux [`TerminalKind`] is probed for. Matches the
 /// program `argv::build` spawns, so a found probe and the argv it enables
 /// always agree on what "found" means.
-fn linux_binary_name(kind: TerminalKind) -> &'static str {
+fn linux_binary_name(kind: TerminalKind) -> Option<&'static str> {
     use TerminalKind::*;
-    match kind {
+    Some(match kind {
         GnomeTerminal => "gnome-terminal",
         Konsole => "konsole",
         Kitty => "kitty",
@@ -67,14 +72,14 @@ fn linux_binary_name(kind: TerminalKind) -> &'static str {
         WezTerm => "wezterm",
         Foot => "foot",
         Xterm => "xterm",
-        _ => unreachable!("{kind:?} is not a Linux terminal"),
-    }
+        _ => return None,
+    })
 }
 
 /// The binary name each Windows [`TerminalKind`] is probed for.
-fn windows_binary_name(kind: TerminalKind) -> &'static str {
+fn windows_binary_name(kind: TerminalKind) -> Option<&'static str> {
     use TerminalKind::*;
-    match kind {
+    Some(match kind {
         WindowsTerminal => "wt",
         PowerShell => "powershell",
         Cmd => "cmd",
@@ -89,14 +94,28 @@ fn windows_binary_name(kind: TerminalKind) -> &'static str {
         // bash.exe path from it.
         GitBash => "bash",
         Wsl => "wsl",
-        _ => unreachable!("{kind:?} is not a Windows terminal"),
-    }
+        _ => return None,
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::process::{CommandOutcome, FakeCommandRunner};
+
+    #[test]
+    fn a_terminal_from_another_platform_probes_as_absent() {
+        // Was `unreachable!`: a mismatched pair panicked instead of saying
+        // "not here".
+        let runner = FakeCommandRunner::new();
+        assert!(!probe(TerminalKind::Konsole, Os::Windows, &runner));
+        assert!(!probe(TerminalKind::ITerm2, Os::Linux, &runner));
+        assert!(!probe(TerminalKind::Kitty, Os::MacOs, &runner));
+        assert!(
+            runner.calls().is_empty(),
+            "nothing is run for an impossible pair"
+        );
+    }
 
     fn found(program: &str) -> CommandOutcome {
         CommandOutcome {

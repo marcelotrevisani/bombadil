@@ -71,9 +71,27 @@ pub fn plex_license() -> &'static str {
     include_str!("../fonts/OFL-IBMPlexMono.txt")
 }
 
+/// Lucide's licence, as published: ISC for Lucide, MIT for the icons it
+/// derives from Feather. Both halves bind, so the whole file ships.
+pub fn lucide_license() -> &'static str {
+    include_str!("../LUCIDE-LICENSE")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_lucide_notice_carries_both_its_licences() {
+        // ISC for Lucide, and MIT for the Feather icons it derives from --
+        // several of which (terminal, check, trash-2) ship here.
+        let text = lucide_license();
+        assert!(text.contains("ISC License"), "the ISC notice is missing");
+        assert!(
+            text.contains("Cole Bemis"),
+            "the Feather MIT notice is missing"
+        );
+    }
 
     #[test]
     fn the_attribution_names_uv_and_its_licence() {

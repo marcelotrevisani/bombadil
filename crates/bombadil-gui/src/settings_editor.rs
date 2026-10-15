@@ -153,6 +153,7 @@ fn uv_source_button<'a>(
         .on_press_maybe(
             (current != Some(choice)).then_some(Message::SettingsUvSourceChoiceChanged(choice)),
         )
+        .style(theme::button_choice(current == Some(choice)))
         .into()
 }
 
@@ -188,6 +189,7 @@ pub fn global_view<'a>(
     };
 
     let custom_path_input = iced::widget::text_input("path to a uv binary", uv_custom_path_draft)
+        .style(crate::theme::text_field)
         .font(theme::FONT_DATA)
         .size(theme::DATA)
         .on_input(Message::SettingsUvCustomPathChanged);
@@ -195,7 +197,8 @@ pub fn global_view<'a>(
         .on_press_maybe(
             (!uv_custom_path_draft.trim().is_empty())
                 .then_some(Message::SettingsUvCustomValidateRequested),
-        );
+        )
+        .style(theme::button_secondary);
 
     let mut column = iced::widget::column![
         iced::widget::text("Settings")
@@ -204,7 +207,7 @@ pub fn global_view<'a>(
         iced::widget::text("uv binary")
             .font(theme::FONT_PROSE)
             .size(theme::LABEL)
-            .color(theme::SLATE),
+            .style(theme::text_muted),
         current_source,
         uv_source_buttons,
         iced::widget::row![custom_path_input, validate_button].spacing(theme::SPACE_2),
@@ -239,17 +242,22 @@ pub fn global_view<'a>(
                 DefaultVenvLocation::Alongside
             ))
             .then_some(Message::SettingsDefaultVenvLocationAlongsideSelected),
-        );
+        )
+        .style(theme::button_choice(matches!(
+            settings.default_venv_location,
+            DefaultVenvLocation::Alongside
+        )));
     let choose_folder_button =
         iced::widget::button(iced::widget::text("choose a central folder..."))
-            .on_press(Message::SettingsDefaultVenvLocationPickFolderRequested);
+            .on_press(Message::SettingsDefaultVenvLocationPickFolderRequested)
+            .style(theme::button_secondary);
 
     column = column
         .push(
             iced::widget::text("default venv location")
                 .font(theme::FONT_PROSE)
                 .size(theme::LABEL)
-                .color(theme::SLATE),
+                .style(theme::text_muted),
         )
         .push(default_venv)
         .push(iced::widget::row![alongside_button, choose_folder_button].spacing(theme::SPACE_2));
@@ -259,18 +267,18 @@ pub fn global_view<'a>(
             Ok(path) => iced::widget::text(path.display().to_string())
                 .font(theme::FONT_DATA)
                 .size(theme::DATA)
-                .color(theme::SLATE)
+                .style(theme::text_muted)
                 .into(),
             Err(message) => iced::widget::text(message)
                 .size(theme::DATA)
-                .color(theme::SLATE)
+                .style(theme::text_muted)
                 .into(),
         };
         column = column.push(
             iced::widget::row![
                 iced::widget::text(format!("{label}:"))
                     .size(theme::BODY)
-                    .color(theme::SLATE),
+                    .style(theme::text_muted),
                 value,
             ]
             .spacing(theme::SPACE_1),

@@ -136,6 +136,12 @@ def main() -> None:
     target.write_bytes(rgba)
     print(f"wrote {target.relative_to(ROOT)} ({len(rgba)} bytes)")
 
+    # The desktop entry Bombadil writes for itself at startup embeds this one;
+    # it has to sit under the crate for the same `cargo package` reason.
+    themed = ROOT / "crates" / "bombadil-gui" / "assets" / "icon-256.png"
+    themed.write_bytes((ASSETS / "icon-256.png").read_bytes())
+    print(f"wrote {themed.relative_to(ROOT)}")
+
 
 if __name__ == "__main__":
     main()

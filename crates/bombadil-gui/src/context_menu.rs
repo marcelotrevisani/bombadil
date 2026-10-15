@@ -378,8 +378,10 @@ pub fn view<'a>(
     menu: &ContextMenu,
     label: &str,
     default: Option<&TerminalChoice>,
+    waiting: Option<&str>,
 ) -> iced::Element<'a, Message> {
     let index = menu.project_index;
+    let enabled = waiting.is_none();
 
     let mut column = iced::widget::column![
         // Which project this menu acts on. It is opened by a right-press that
@@ -389,7 +391,7 @@ pub fn view<'a>(
             iced::widget::text(label.to_string())
                 .font(theme::FONT_PROSE_SEMIBOLD)
                 .size(theme::LABEL)
-                .color(theme::SLATE)
+                .style(theme::text_muted)
         )
         .padding([theme::SPACE_1, theme::SPACE_3]),
         theme::hairline_row(),
@@ -433,7 +435,14 @@ pub fn view<'a>(
 
     column
         .push(theme::hairline_row())
-        .push(entry("Sync", None, Message::SyncRequested(index)))
+        .push(theme::wait_tip(
+            entry(
+                "Sync",
+                None,
+                enabled.then_some(Message::SyncRequested(index)),
+            ),
+            waiting,
+        ))
         .push(entry(
             "Open folder",
             None,
@@ -447,10 +456,13 @@ pub fn view<'a>(
         //
         // Opens the confirmation, never the deletion -- see
         // `Message::RecreateVenvRequested`.
-        .push(entry(
-            "Recreate venv",
-            None,
-            Message::RecreateVenvRequested(index),
+        .push(theme::wait_tip(
+            entry(
+                "Recreate venv",
+                None,
+                enabled.then_some(Message::RecreateVenvRequested(index)),
+            ),
+            waiting,
         ))
         .push(entry(
             "Remove from list",
@@ -465,7 +477,7 @@ fn section_heading<'a>(text: &'static str) -> iced::Element<'a, Message> {
     iced::widget::container(
         iced::widget::text(text)
             .size(theme::LABEL)
-            .color(theme::SLATE),
+            .style(theme::text_muted),
     )
     .padding([theme::SPACE_1, theme::SPACE_3])
     .into()
@@ -481,22 +493,22 @@ fn section_heading<'a>(text: &'static str) -> iced::Element<'a, Message> {
 fn entry<'a>(
     label: &'a str,
     detail: Option<&'a str>,
-    message: Message,
+    message: impl Into<Option<Message>>,
 ) -> iced::Element<'a, Message> {
     let mut content = iced::widget::column![iced::widget::text(label).size(theme::BODY)];
     if let Some(detail) = detail.filter(|d| !d.is_empty()) {
         content = content.push(
             iced::widget::text(detail.trim())
                 .size(theme::LABEL)
-                .color(theme::SLATE),
+                .style(theme::text_muted),
         );
     }
 
     iced::widget::button(content)
-        .on_press(message)
+        .on_press_maybe(message.into())
         .width(iced::Length::Fill)
         .padding([theme::SPACE_1, theme::SPACE_3])
-        .style(theme::button_bare(theme::PARCHMENT))
+        .style(theme::button_bare(theme::Swatch::Parchment))
         .into()
 }
 

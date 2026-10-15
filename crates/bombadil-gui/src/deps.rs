@@ -61,7 +61,7 @@ pub struct DepGroup {
 pub struct DepsTab {
     pub groups: Vec<DepGroup>,
     /// The resolved graph, when `uv tree` produced one this build understands
-    /// -- `transitive_dependencies` below walks it to expand a direct
+    /// -- `tree_lines` below walks it to expand a direct
     /// dependency's row. `None` both when uv emitted a schema this build was
     /// not tested against and when the tree could not be read at all; either
     /// way the tab still shows every row above, direct dependencies only
@@ -73,6 +73,127 @@ pub struct DepsTab {
     /// rendering an unexplained empty expand affordance (criterion 4).
     /// `None` only when there is a graph, which needs no explanation.
     pub tree_note: Option<String>,
+}
+
+/// A version being typed into one row's version cell. Opened by a double
+/// click on a declared row, submitted with Enter.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DepEdit {
+    /// The project index the row belongs to, so an edit never follows the
+    /// selection onto a different project's tab.
+    pub project: usize,
+    pub name: String,
+    pub group: GroupKind,
+    pub draft: String,
+}
+
+/// Which of the tab's two layouts is showing.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum DepsView {
+    /// Declared dependencies by group, each with its resolved tree beneath.
+    #[default]
+    Tree,
+    /// Every package, declared or not, once each, alphabetically.
+    All,
+}
+
+/// One package in the All view.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FlatRow {
+    pub row: DepRow,
+    /// Where it is declared, which is where a version change is written.
+    /// `Main` for a package declared nowhere: pinning a transitive package
+    /// in uv means declaring it.
+    pub group: GroupKind,
+}
+
+/// Every package the tab knows of, once each: the declared row wins over a
+/// leftover, and the first group that declares it over later ones.
+pub fn all_packages(tab: &DepsTab) -> Vec<FlatRow> {
+    let mut seen: std::collections::BTreeMap<String, FlatRow> = Default::default();
+    for group in &tab.groups {
+        for row in &group.rows {
+            let key = canonical_name(&row.name);
+            let better = seen
+                .get(&key)
+                .is_none_or(|existing| row.declared && !existing.row.declared);
+            if better {
+                seen.insert(
+                    key,
+                    FlatRow {
+                        row: row.clone(),
+                        group: group.kind.clone(),
+                    },
+                );
+            }
+        }
+    }
+    seen.into_values().collect()
+}
+
+/// A package's subtree, depth first, as `(depth, package, repeated)`.
+/// `repeated` marks a package already shown higher in this subtree; its
+/// children are not listed again, which is also what ends a cycle.
+pub fn tree_lines<'a>(
+    graph: &'a DependencyGraph,
+    start_id: &str,
+) -> Vec<(usize, &'a TreePackage, bool)> {
+    fn walk<'a>(
+        graph: &'a DependencyGraph,
+        id: &str,
+        depth: usize,
+        seen: &mut BTreeSet<String>,
+        out: &mut Vec<(usize, &'a TreePackage, bool)>,
+    ) {
+        for dep in graph.dependencies_of(id) {
+            let repeated = !seen.insert(dep.id.clone());
+            out.push((depth, dep, repeated));
+            if !repeated {
+                walk(graph, &dep.id, depth + 1, seen, out);
+            }
+        }
+    }
+    let mut seen = BTreeSet::from([start_id.to_string()]);
+    let mut out = Vec::new();
+    walk(graph, start_id, 0, &mut seen, &mut out);
+    out
+}
+
+/// The id of the version cell's input, for focusing it when an edit opens.
+pub const VERSION_INPUT: &str = "dep-version";
+/// The filter field's id, for Ctrl+F.
+pub const FILTER_INPUT: &str = "dep-filter";
+
+/// The `name==version` requirement `uv add` gets for `draft`, or why not.
+///
+/// A leading `==` is accepted because people type it. Anything that is not a
+/// single PEP 440 version is refused here instead of being handed to uv:
+/// `uv add` takes a whole requirement, so `1.0; os_name == 'nt'` or `>=1,<2`
+/// would land in `pyproject.toml` as something the user never asked for.
+pub fn pinned_requirement(name: &str, draft: &str) -> Result<String, String> {
+    let version = draft.trim();
+    let version = version.strip_prefix("==").unwrap_or(version).trim();
+    if version.is_empty() {
+        return Err(format!("type a version for {name}"));
+    }
+    let allowed =
+        |c: char| c.is_ascii_alphanumeric() || matches!(c, '.' | '*' | '+' | '!' | '-' | '_');
+    if !version.chars().all(allowed) || !version.starts_with(|c: char| c.is_ascii_digit()) {
+        return Err(format!(
+            "\"{version}\" is not a version; type one like 2.31.0"
+        ));
+    }
+    Ok(format!("{name}=={version}"))
+}
+
+/// The `uv add` flags that keep a requirement in the group its row came from.
+pub fn uv_group(kind: &GroupKind) -> bombadil_core::uv::command::DependencyGroup {
+    use bombadil_core::uv::command::DependencyGroup;
+    match kind {
+        GroupKind::Main => DependencyGroup::Main,
+        GroupKind::Group(name) => DependencyGroup::Named(name.clone()),
+        GroupKind::Extra(name) => DependencyGroup::Optional(name.clone()),
+    }
 }
 
 /// Splits a PEP 508 requirement into its package name and declared
@@ -288,33 +409,8 @@ pub fn build(
     }
 }
 
-/// Every package transitively reachable from `start_id` in `graph`, each
-/// appearing once even under a diamond dependency. This is what a direct
-/// dependency's row expands to (spec §8).
-///
-/// Walks `DependencyGraph::dependencies_of` with its own visited set, per
-/// that method's own warning: Python dependency graphs contain cycles.
-pub fn transitive_dependencies<'a>(
-    graph: &'a DependencyGraph,
-    start_id: &str,
-) -> Vec<&'a TreePackage> {
-    let mut visited: BTreeSet<&str> = BTreeSet::new();
-    let mut out = Vec::new();
-    let mut stack = vec![start_id];
-    visited.insert(start_id);
-    while let Some(id) = stack.pop() {
-        for dep in graph.dependencies_of(id) {
-            if visited.insert(dep.id.as_str()) {
-                out.push(dep);
-                stack.push(&dep.id);
-            }
-        }
-    }
-    out
-}
-
 /// Finds a package's id in the graph by name, so a row (which only carries a
-/// name) can be expanded through [`transitive_dependencies`]. `None` when the
+/// name) can be expanded through [`tree_lines`]. `None` when the
 /// package is not in the graph at all -- e.g. an extra that was not included
 /// in the `uv tree` invocation that produced it.
 pub fn find_id_by_name<'a>(graph: &'a DependencyGraph, name: &str) -> Option<&'a str> {
@@ -323,6 +419,42 @@ pub fn find_id_by_name<'a>(graph: &'a DependencyGraph, name: &str) -> Option<&'a
         .values()
         .find(|pkg| pkg.name.eq_ignore_ascii_case(name))
         .map(|pkg| pkg.id.as_str())
+}
+
+/// Whether `name` passes the filter: a case-insensitive substring; an empty
+/// filter passes everything.
+pub fn name_matches(name: &str, filter: &str) -> bool {
+    let filter = filter.trim();
+    filter.is_empty() || name.to_lowercase().contains(&filter.to_lowercase())
+}
+
+/// The tree view's rows under `filter`: a declared row stays when it, or
+/// anything beneath it in the resolved graph, matches -- otherwise a match
+/// three levels down would have nowhere to show. Groups left empty go.
+pub fn filter_tree(tab: &DepsTab, filter: &str) -> DepsTab {
+    let keep = |row: &DepRow| {
+        name_matches(&row.name, filter)
+            || tab.graph.as_ref().is_some_and(|graph| {
+                find_id_by_name(graph, &row.name).is_some_and(|id| {
+                    tree_lines(graph, id)
+                        .iter()
+                        .any(|(_, dep, _)| name_matches(&dep.name, filter))
+                })
+            })
+    };
+    DepsTab {
+        groups: tab
+            .groups
+            .iter()
+            .map(|group| DepGroup {
+                kind: group.kind.clone(),
+                rows: group.rows.iter().filter(|r| keep(r)).cloned().collect(),
+            })
+            .filter(|group| !group.rows.is_empty())
+            .collect(),
+        graph: tab.graph.clone(),
+        tree_note: tab.tree_note.clone(),
+    }
 }
 
 /// What the tab shows instead of rows when the fetch itself failed: no venv
@@ -389,7 +521,13 @@ pub fn state(row: &DepRow) -> theme::State {
 /// is missing -- `"not installed"`, `"(not declared)"` -- switch to the
 /// prose face, the same exception `sidebar::view` already makes for
 /// `"no env"`.
-fn dep_row<'a>(row: &DepRow) -> iced::Element<'a, crate::app::Message> {
+fn dep_row<'a>(
+    row: &DepRow,
+    group: &GroupKind,
+    editing: Option<&DepEdit>,
+    enabled: bool,
+    project: usize,
+) -> iced::Element<'a, crate::app::Message> {
     let glyph = theme::state_glyph(state(row));
 
     let name = iced::widget::text(row.name.clone())
@@ -401,12 +539,12 @@ fn dep_row<'a>(row: &DepRow) -> iced::Element<'a, crate::app::Message> {
         Some(constraint) => iced::widget::text(constraint.clone())
             .font(theme::FONT_DATA)
             .size(theme::DATA)
-            .color(theme::SLATE)
+            .style(theme::text_muted)
             .into(),
         None => iced::widget::text("-")
             .font(theme::FONT_PROSE)
             .size(theme::DATA)
-            .color(theme::SLATE)
+            .style(theme::text_muted)
             .into(),
     };
     let constraint = iced::widget::container(constraint).width(theme::DEP_CONSTRAINT_COLUMN_WIDTH);
@@ -419,14 +557,74 @@ fn dep_row<'a>(row: &DepRow) -> iced::Element<'a, crate::app::Message> {
         None => iced::widget::text("not installed")
             .font(theme::FONT_PROSE)
             .size(theme::DATA)
-            .color(theme::SLATE)
+            .style(theme::text_muted)
             .into(),
+    };
+    // Any row: on a package declared nowhere, `uv add` declares it in
+    // `main`, which is how uv pins a transitive version.
+    let version: iced::Element<'_, crate::app::Message> = match editing {
+        Some(edit) if edit.name == row.name && edit.group == *group => iced::widget::row![
+            iced::widget::text_input("version", &edit.draft)
+                .style(crate::theme::text_field)
+                .id(VERSION_INPUT)
+                .on_input(crate::app::Message::DepVersionDraftChanged)
+                .on_submit_maybe(enabled.then_some(crate::app::Message::DepVersionSubmitted))
+                .font(theme::FONT_DATA)
+                .size(theme::DATA)
+                .width(140),
+            iced::widget::button(iced::widget::text("cancel").size(theme::LABEL))
+                .on_press(crate::app::Message::DepVersionEditCancelled)
+                .padding([0.0, theme::SPACE_1])
+                .style(theme::button_quiet),
+        ]
+        .spacing(theme::SPACE_1)
+        .align_y(iced::Alignment::Center)
+        .into(),
+        _ => {
+            let start = crate::app::Message::DepVersionEditStarted {
+                name: row.name.clone(),
+                group: group.clone(),
+                current: row.version.clone().unwrap_or_default(),
+            };
+            let cell = iced::widget::mouse_area(version).on_double_click(start.clone());
+            if enabled {
+                // The pencil is the visible way in; double-click stays.
+                // A slot is kept beside the version so the pencil never
+                // covers it.
+                // Upgrade only where something is installed to upgrade.
+                let upgrade = row.version.is_some().then(|| {
+                    crate::icons::icon_button(
+                        crate::icons::Icon::ArrowUp,
+                        format!("Upgrade {} within its constraint", row.name),
+                        Some(crate::app::Message::DepUpgradeRequested(
+                            project,
+                            row.name.clone(),
+                        )),
+                    )
+                });
+                iced::widget::hover(
+                    iced::widget::row![cell, iced::widget::Space::new().width(64)],
+                    iced::widget::container(
+                        iced::widget::row![crate::icons::icon_button(
+                            crate::icons::Icon::Pencil,
+                            "Change version (or double-click)",
+                            Some(start),
+                        )]
+                        .push(upgrade),
+                    )
+                    .width(iced::Length::Fill)
+                    .align_x(iced::alignment::Horizontal::Right),
+                )
+            } else {
+                cell.into()
+            }
+        }
     };
 
     let mut line = iced::widget::row![
         iced::widget::text(glyph.glyph.to_string())
             .size(theme::BODY)
-            .color(glyph.colour)
+            .style(theme::tinted(glyph.swatch))
             .width(theme::GLYPH_COLUMN_WIDTH),
         name,
         constraint,
@@ -439,15 +637,21 @@ fn dep_row<'a>(row: &DepRow) -> iced::Element<'a, crate::app::Message> {
             iced::widget::text("(not declared)")
                 .font(theme::FONT_PROSE)
                 .size(theme::DATA)
-                .color(theme::SLATE),
+                .style(theme::text_muted),
         );
     }
 
+    // Full width: hugging its content, each row's band ended wherever its
+    // version text did, a ragged edge down the list.
     iced::widget::container(line)
         .padding(theme::SPACE_1)
-        .style(|_theme| iced::widget::container::Style {
-            background: Some(iced::Background::Color(theme::BARK)),
-            ..iced::widget::container::Style::default()
+        .width(iced::Length::Fill)
+        .style(|t| iced::widget::container::Style {
+            border: iced::Border {
+                radius: theme::RADIUS.into(),
+                ..iced::Border::default()
+            },
+            ..theme::surface(t)
         })
         .into()
 }
@@ -458,20 +662,180 @@ fn dep_row<'a>(row: &DepRow) -> iced::Element<'a, crate::app::Message> {
 ///
 /// Deliberately dumb, like every other `view` in this crate: all the logic
 /// worth testing lives in `build`, `state`, `unavailable_message`,
-/// `transitive_dependencies` and `find_id_by_name`. A direct dependency's
+/// `tree_lines`, `all_packages` and `find_id_by_name`. A direct dependency's
 /// transitive tree, when `tab.graph` has one, is shown beneath it
 /// unconditionally rather than behind a click -- `App` carries no per-row
 /// expand state, so "expand" here means "the tree is rendered," not an
 /// interaction to wire up later.
-pub fn view<'a>(fetched: &Result<DepsTab, String>) -> iced::Element<'a, crate::app::Message> {
-    let tab = match fetched {
-        Ok(tab) => tab,
-        Err(cause) => {
-            return iced::widget::text(unavailable_message(cause))
-                .size(theme::BODY)
-                .into();
-        }
+pub fn view<'a>(
+    fetched: &Result<DepsTab, String>,
+    editing: Option<&DepEdit>,
+    mode: DepsView,
+    filter: &str,
+    project: usize,
+    waiting: Option<&str>,
+    no_environment: bool,
+) -> iced::Element<'a, crate::app::Message> {
+    use crate::app::Message;
+    let enabled = waiting.is_none();
+    use crate::icons::{self, Icon};
+    let labelled = |which: Icon, label: &'static str| {
+        iced::widget::row![
+            icons::icon(which, 14.0, theme::Swatch::Parchment),
+            iced::widget::text(label).size(theme::BODY),
+        ]
+        .spacing(theme::SPACE_1)
+        .align_y(iced::Alignment::Center)
     };
+    let switch = |label: &'static str, this: DepsView| {
+        iced::widget::button(iced::widget::text(label).size(theme::BODY))
+            .on_press(Message::DepsViewSelected(this))
+            .padding([theme::SPACE_1, theme::SPACE_2])
+            .style(theme::button_choice(mode == this))
+    };
+    // Recreate here, beside the drift it answers; Sync is the header's primary
+    // action and the Dependencies tile's, so a third copy here only crowded
+    // the toolbar onto two lines. Recreate keeps its confirmation.
+    let toolbar = iced::widget::row![
+        switch("Tree", DepsView::Tree),
+        switch("All packages", DepsView::All),
+        iced::widget::text_input("Filter packages", filter)
+            .style(crate::theme::text_field)
+            .id(FILTER_INPUT)
+            .on_input(Message::DepFilterChanged)
+            .size(theme::BODY)
+            .width(180),
+        iced::widget::button(labelled(Icon::Folder, "Add local package\u{2026}"))
+            .on_press(Message::AddLocalRequested(project))
+            .padding([theme::SPACE_1, theme::SPACE_2])
+            .style(theme::button_secondary),
+        theme::wait_tip(
+            iced::widget::button(labelled(Icon::ArrowUp, "Upgrade all"))
+                .on_press_maybe(enabled.then_some(Message::DepUpgradeAllRequested(project)))
+                .padding([theme::SPACE_1, theme::SPACE_2])
+                .style(theme::button_secondary),
+            waiting,
+        ),
+        theme::wait_tip(
+            iced::widget::button(labelled(Icon::Rotate, "Recreate venv"))
+                .on_press_maybe(enabled.then_some(Message::RecreateVenvRequested(project)))
+                .padding([theme::SPACE_1, theme::SPACE_2])
+                .style(theme::button_secondary),
+            waiting,
+        ),
+    ]
+    .spacing(theme::SPACE_1)
+    .align_y(iced::Alignment::Center)
+    // Wraps rather than clipping: with the filter and the add/upgrade
+    // actions it is wider than a narrow window, and the last button used to
+    // be cut off at the edge.
+    .wrap()
+    .vertical_spacing(theme::SPACE_1);
+
+    let body: iced::Element<'a, Message> = match (fetched, mode) {
+        // Not a failure to report but a step not taken yet; the header's
+        // Sync takes it.
+        (Err(_), _) if no_environment => {
+            iced::widget::text("No environment yet. Sync creates it from pyproject.toml.")
+                .size(theme::BODY)
+                .style(theme::text_muted)
+                .into()
+        }
+        (Err(cause), _) => iced::widget::text(unavailable_message(cause))
+            .size(theme::BODY)
+            .into(),
+        (Ok(tab), DepsView::Tree) => {
+            tree_view(&filter_tree(tab, filter), editing, enabled, project)
+        }
+        (Ok(tab), DepsView::All) => all_view(tab, filter, editing, enabled, project),
+    };
+    let headed = fetched.is_ok();
+    iced::widget::column![toolbar]
+        .push(headed.then(column_headings))
+        .push(body)
+        .spacing(theme::SPACE_3)
+        .into()
+}
+
+/// Every package once, with where it is declared. Double-click a version to
+/// change it.
+fn all_view<'a>(
+    tab: &DepsTab,
+    filter: &str,
+    editing: Option<&DepEdit>,
+    enabled: bool,
+    project: usize,
+) -> iced::Element<'a, crate::app::Message> {
+    let mut rows = iced::widget::column![
+        iced::widget::text(
+            "hover a version to change or upgrade it; a package declared nowhere is pinned in main"
+        )
+        .size(theme::LABEL)
+        .style(theme::text_muted)
+    ]
+    .spacing(theme::SPACE_1);
+    for flat in all_packages(tab)
+        .into_iter()
+        .filter(|flat| name_matches(&flat.row.name, filter))
+    {
+        let mut line =
+            iced::widget::row![dep_row(&flat.row, &flat.group, editing, enabled, project)]
+                .spacing(theme::SPACE_2)
+                .align_y(iced::Alignment::Center);
+        let label = match &flat.group {
+            GroupKind::Group(name) => Some(format!("group: {name}")),
+            GroupKind::Extra(name) => Some(format!("extra: {name}")),
+            GroupKind::Main => None,
+        };
+        if flat.row.declared
+            && let Some(label) = label
+        {
+            line = line.push(
+                iced::widget::text(label)
+                    .size(theme::LABEL)
+                    .style(theme::text_muted),
+            );
+        }
+        rows = rows.push(line);
+    }
+    rows.into()
+}
+
+/// Names the three columns once, above the rows, so `-` reads as "no
+/// constraint" rather than as a glitch, and which number is which needs no
+/// guessing.
+fn column_headings<'a>() -> iced::Element<'a, crate::app::Message> {
+    let heading = |label: &'a str| {
+        iced::widget::text(label)
+            .size(theme::LABEL)
+            .style(theme::text_muted)
+    };
+    iced::widget::container(
+        iced::widget::row![
+            iced::widget::Space::new().width(theme::GLYPH_COLUMN_WIDTH),
+            heading("Package").width(theme::DEP_NAME_COLUMN_WIDTH),
+            heading("Constraint").width(theme::DEP_CONSTRAINT_COLUMN_WIDTH),
+            heading("Installed"),
+        ]
+        .spacing(theme::SPACE_1),
+    )
+    .padding([0.0, theme::SPACE_1])
+    .into()
+}
+
+/// How far a transitive line at `depth` sits right of its parent row.
+fn indent(depth: usize) -> f32 {
+    16.0 * depth as f32
+}
+
+/// Declared dependencies by group, each with its resolved tree indented
+/// beneath it.
+fn tree_view<'a>(
+    tab: &DepsTab,
+    editing: Option<&DepEdit>,
+    enabled: bool,
+    project: usize,
+) -> iced::Element<'a, crate::app::Message> {
     let mut column = iced::widget::column![].spacing(theme::SPACE_3);
 
     if let Some(note) = &tab.tree_note {
@@ -483,7 +847,7 @@ pub fn view<'a>(fetched: &Result<DepsTab, String>) -> iced::Element<'a, crate::a
         column = column.push(
             iced::widget::text(note.clone())
                 .size(theme::BODY)
-                .color(theme::SLATE),
+                .style(theme::text_muted),
         );
     }
 
@@ -497,16 +861,21 @@ pub fn view<'a>(fetched: &Result<DepsTab, String>) -> iced::Element<'a, crate::a
             iced::widget::text(title)
                 .font(theme::FONT_PROSE)
                 .size(theme::LABEL)
-                .color(theme::SLATE)
+                .style(theme::text_muted)
         ]
         .spacing(theme::SPACE_1);
         for row in &group.rows {
-            rows = rows.push(dep_row(row));
+            rows = rows.push(dep_row(row, &group.kind, editing, enabled, project));
+            if !row.declared {
+                // A leftover's place is the All view; the tree is what the
+                // manifest asks for.
+                continue;
+            }
 
             if let Some(graph) = &tab.graph
                 && let Some(id) = find_id_by_name(graph, &row.name)
             {
-                for dep in transitive_dependencies(graph, id) {
+                for (depth, dep, repeated) in tree_lines(graph, id) {
                     // Wrapped in the same `padding(SPACE_1)` container
                     // `dep_row` uses (minus its `bark` fill -- a transitive
                     // row is not a surface of its own). Without it the tree
@@ -515,16 +884,30 @@ pub fn view<'a>(fetched: &Result<DepsTab, String>) -> iced::Element<'a, crate::a
                     rows = rows.push(
                         iced::widget::container(
                             iced::widget::row![
-                                iced::widget::Space::new().width(theme::GLYPH_COLUMN_WIDTH),
+                                iced::widget::Space::new()
+                                    .width(theme::GLYPH_COLUMN_WIDTH + indent(depth)),
+                                // Narrowed by the indent, so every version
+                                // lands in the installed column at any depth
+                                // instead of stepping right with the tree.
                                 iced::widget::text(format!("\u{2514} {}", dep.name))
                                     .font(theme::FONT_DATA)
                                     .size(theme::LABEL)
-                                    .color(theme::SLATE)
-                                    .width(theme::DEP_NAME_COLUMN_WIDTH),
-                                iced::widget::text(dep.version.clone())
-                                    .font(theme::FONT_DATA)
-                                    .size(theme::LABEL)
-                                    .color(theme::SLATE),
+                                    .style(theme::text_muted)
+                                    .width(
+                                        (theme::DEP_NAME_COLUMN_WIDTH
+                                            + theme::SPACE_1
+                                            + theme::DEP_CONSTRAINT_COLUMN_WIDTH
+                                            - indent(depth))
+                                        .max(theme::DEP_CONSTRAINT_COLUMN_WIDTH),
+                                    ),
+                                iced::widget::text(if repeated {
+                                    format!("{} (shown above)", dep.version)
+                                } else {
+                                    dep.version.clone()
+                                })
+                                .font(theme::FONT_DATA)
+                                .size(theme::LABEL)
+                                .style(theme::text_muted),
                             ]
                             .spacing(theme::SPACE_1),
                         )
@@ -539,9 +922,74 @@ pub fn view<'a>(fetched: &Result<DepsTab, String>) -> iced::Element<'a, crate::a
     column.into()
 }
 
+/// The "Upgrade all" confirmation: it rewrites much of `uv.lock`, so it is
+/// asked, not done.
+pub fn confirm_upgrade_all_view<'a>(label: &str) -> iced::Element<'a, crate::app::Message> {
+    use crate::app::Message;
+    iced::widget::container(
+        iced::widget::column![
+            iced::widget::text(format!(
+                "Upgrade every package of {label} to the newest versions its \
+                 constraints allow?\n\nThis rewrites uv.lock."
+            ))
+            .size(theme::BODY),
+            iced::widget::row![
+                iced::widget::button(iced::widget::text("Upgrade all").size(theme::BODY))
+                    .on_press(Message::DepUpgradeAllConfirmed)
+                    .padding([theme::SPACE_1, theme::SPACE_3])
+                    .style(theme::button_primary),
+                iced::widget::button(iced::widget::text("Cancel").size(theme::BODY))
+                    .on_press(Message::DepUpgradeAllCancelled)
+                    .padding([theme::SPACE_1, theme::SPACE_3])
+                    .style(theme::button_quiet),
+            ]
+            .spacing(theme::SPACE_2),
+        ]
+        .spacing(theme::SPACE_3),
+    )
+    .width(theme::MODAL_WIDTH)
+    .padding(theme::SPACE_4)
+    .style(theme::panel)
+    .into()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_typed_version_becomes_an_exact_pin() {
+        assert_eq!(
+            pinned_requirement("fastapi", " 0.110.0 ").unwrap(),
+            "fastapi==0.110.0"
+        );
+        assert_eq!(
+            pinned_requirement("fastapi", "==0.110.0").unwrap(),
+            "fastapi==0.110.0"
+        );
+        assert_eq!(
+            pinned_requirement("torch", "2.3.0+cpu").unwrap(),
+            "torch==2.3.0+cpu"
+        );
+    }
+
+    #[test]
+    fn anything_but_one_version_is_refused_before_uv_sees_it() {
+        // Each of these would otherwise be written into pyproject.toml.
+        for draft in [
+            "",
+            "  ",
+            ">=1,<2",
+            "1.0; os_name == 'nt'",
+            "1.0 --dev",
+            "latest",
+        ] {
+            assert!(
+                pinned_requirement("x", draft).is_err(),
+                "{draft:?} was accepted"
+            );
+        }
+    }
 
     #[test]
     fn a_member_declared_with_underscores_matches_the_hyphenated_install() {
@@ -945,7 +1393,52 @@ mod tests {
         assert!(tab.tree_note.is_none());
     }
 
-    // --- transitive_dependencies ---
+    // --- tree_lines ---
+
+    fn declared(name: &str) -> DepRow {
+        DepRow {
+            name: name.into(),
+            constraint: None,
+            version: Some("1.0".into()),
+            declared: true,
+        }
+    }
+
+    #[test]
+    fn a_filter_matches_names_regardless_of_case() {
+        assert!(name_matches("HTTPX", "tpx"));
+        assert!(name_matches("httpx", ""));
+        assert!(!name_matches("httpx", "core"));
+    }
+
+    #[test]
+    fn the_tree_filter_keeps_a_parent_for_a_matching_descendant() {
+        let tab = DepsTab {
+            groups: vec![DepGroup {
+                kind: GroupKind::Main,
+                rows: vec![declared("httpx"), declared("rich")],
+            }],
+            graph: Some(graph_with_chain()),
+            tree_note: None,
+        };
+        let names = |t: &DepsTab| {
+            t.groups
+                .iter()
+                .flat_map(|g| g.rows.iter().map(|r| r.name.clone()))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            names(&filter_tree(&tab, "h11")),
+            ["httpx"],
+            "h11 is under httpx"
+        );
+        assert_eq!(names(&filter_tree(&tab, "ric")), ["rich"]);
+        assert!(
+            filter_tree(&tab, "zzz").groups.is_empty(),
+            "empty groups go"
+        );
+        assert_eq!(names(&filter_tree(&tab, "")), ["httpx", "rich"]);
+    }
 
     fn graph_with_chain() -> DependencyGraph {
         // root -> httpx -> httpcore -> h11
@@ -1003,49 +1496,93 @@ mod tests {
         }
     }
 
-    #[test]
-    fn transitive_dependencies_walks_the_whole_chain() {
-        let graph = graph_with_chain();
-        let names: BTreeSet<&str> = transitive_dependencies(&graph, "httpx")
+    fn lines(graph: &DependencyGraph, id: &str) -> Vec<(usize, String, bool)> {
+        tree_lines(graph, id)
             .into_iter()
-            .map(|p| p.name.as_str())
-            .collect();
+            .map(|(depth, p, repeated)| (depth, p.name.clone(), repeated))
+            .collect()
+    }
+
+    #[test]
+    fn the_tree_is_nested_by_depth_and_excludes_its_root() {
         assert_eq!(
-            names,
-            BTreeSet::from(["httpcore", "h11", "certifi"]),
-            "httpx's whole transitive tree must be reachable, not just its direct dependency"
+            lines(&graph_with_chain(), "httpx"),
+            vec![
+                (0, "httpcore".into(), false),
+                (1, "h11".into(), false),
+                (1, "certifi".into(), false),
+            ]
         );
     }
 
     #[test]
-    fn transitive_dependencies_does_not_include_the_start_node_itself() {
-        let graph = graph_with_chain();
-        let ids: Vec<&str> = transitive_dependencies(&graph, "httpx")
-            .into_iter()
-            .map(|p| p.id.as_str())
-            .collect();
-        assert!(!ids.contains(&"httpx"));
-    }
-
-    #[test]
-    fn a_diamond_dependency_is_not_duplicated() {
+    fn a_diamond_is_expanded_once_and_marked_where_it_repeats() {
         let mut graph = graph_with_chain();
-        // Add a second edge from root straight to certifi, so certifi is
-        // reachable two ways -- via httpcore and directly.
         graph
             .packages
             .get_mut("root")
             .unwrap()
             .dependencies
-            .push("certifi".to_string());
-
-        let certifi_count = transitive_dependencies(&graph, "root")
-            .into_iter()
-            .filter(|p| p.name == "certifi")
-            .count();
+            .push("certifi".into());
+        let got = lines(&graph, "root");
+        let certifi: Vec<_> = got.iter().filter(|(_, n, _)| n == "certifi").collect();
+        assert_eq!(certifi.len(), 2, "shown on both paths: {got:?}");
         assert_eq!(
-            certifi_count, 1,
-            "a diamond dependency must appear once, not once per path"
+            certifi.iter().filter(|(_, _, repeated)| !repeated).count(),
+            1
+        );
+    }
+
+    #[test]
+    fn a_cycle_ends_instead_of_recursing_forever() {
+        let mut graph = graph_with_chain();
+        graph
+            .packages
+            .get_mut("h11")
+            .unwrap()
+            .dependencies
+            .push("httpx".into());
+        let got = lines(&graph, "httpx");
+        assert!(got.contains(&(2, "httpx".into(), true)), "{got:?}");
+    }
+
+    #[test]
+    fn all_packages_lists_each_once_preferring_where_it_is_declared() {
+        let row = |name: &str, declared: bool| DepRow {
+            name: name.into(),
+            constraint: None,
+            version: Some("1".into()),
+            declared,
+        };
+        let tab = DepsTab {
+            groups: vec![
+                DepGroup {
+                    kind: GroupKind::Main,
+                    rows: vec![
+                        row("requests", true),
+                        row("pytest", false),
+                        row("idna", false),
+                    ],
+                },
+                DepGroup {
+                    kind: GroupKind::Group("test".into()),
+                    rows: vec![row("pytest", true)],
+                },
+            ],
+            graph: None,
+            tree_note: None,
+        };
+        let got: Vec<(String, GroupKind, bool)> = all_packages(&tab)
+            .into_iter()
+            .map(|f| (f.row.name, f.group, f.row.declared))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                ("idna".into(), GroupKind::Main, false),
+                ("pytest".into(), GroupKind::Group("test".into()), true),
+                ("requests".into(), GroupKind::Main, true),
+            ]
         );
     }
 

@@ -63,9 +63,10 @@ impl Default for Drawer {
     fn default() -> Self {
         Self {
             lines: Vec::new(),
-            // Open, because the output of a command you just ran is the thing
-            // you asked for. Closing it is one press and stays closed.
-            expanded: true,
+            // Closed: a success says so in its toast; a failure opens the
+            // drawer itself (`set_idle`). Opening it is one press and stays
+            // open.
+            expanded: false,
             status: "idle".to_string(),
         }
     }
@@ -102,6 +103,11 @@ pub fn push_line(drawer: &mut Drawer, line: &str, secrets: &[String]) {
 /// screen is the user's choice now, and nothing but their press changes it.
 pub fn set_idle(drawer: &mut Drawer, status: impl Into<String>) {
     drawer.status = status.into();
+    // A failure opens the drawer: its reason is the transcript. A success
+    // leaves it open or closed as it was.
+    if is_failure(&drawer.status) {
+        drawer.expanded = true;
+    }
 }
 
 /// Whether `status` names a failure -- see the module doc for the convention
@@ -126,7 +132,14 @@ pub fn set_idle(drawer: &mut Drawer, status: impl Into<String>) {
 /// `Drawer::failed: bool` set at each `app::update` call site if either
 /// bites -- the second one first.
 fn is_failure(status: &str) -> bool {
-    !status.ends_with("...") && status.contains("failed")
+    // Matched where Bombadil's own wording puts the marker, never anywhere
+    // in the string: a finished success names its project ("Synced
+    // failed-jobs"), and a label must not be able to spend `boot`.
+    !status.ends_with("...")
+        && (status.starts_with("Could not")
+            || status.ends_with(" failed")
+            || status.contains(" failed to persist")
+            || status.ends_with(" failed unexpectedly"))
 }
 
 /// Renders the drawer: a `bark` surface, collapsed to one status line while
@@ -135,9 +148,16 @@ fn is_failure(status: &str) -> bool {
 /// in Plex at `DATA` beneath it while open. A failed command's status renders
 /// in `boot` either way, per spec §9. Deliberately dumb beyond that: all the
 /// logic worth testing lives in `push_line`, `set_idle` and `is_failure`.
-pub fn view<'a>(drawer: &Drawer) -> iced::Element<'a, Message> {
-    let failed = is_failure(&drawer.status);
-    let status_colour = if failed { theme::BOOT } else { theme::SLATE };
+/// `busy_label`, while a command runs, replaces the status line: it is the
+/// live "Syncing api… 12s", which no stored status could keep current.
+pub fn view<'a>(drawer: &Drawer, busy_label: Option<String>) -> iced::Element<'a, Message> {
+    let failed = busy_label.is_none() && is_failure(&drawer.status);
+    let status = busy_label.unwrap_or_else(|| drawer.status.clone());
+    let status_colour = if failed {
+        theme::Swatch::Boot
+    } else {
+        theme::Swatch::Slate
+    };
 
     // The header is always there: the status, how many lines are behind it,
     // and the one control that opens or closes them. A drawer whose only
@@ -151,9 +171,9 @@ pub fn view<'a>(drawer: &Drawer) -> iced::Element<'a, Message> {
                 "\u{25b8}"
             })
             .size(theme::BODY),
-            iced::widget::text(drawer.status.clone())
+            iced::widget::text(status)
                 .size(theme::BODY)
-                .color(status_colour),
+                .style(theme::tinted(status_colour)),
         ]
         .spacing(theme::SPACE_1)
         .align_y(iced::Alignment::Center),
@@ -170,7 +190,7 @@ pub fn view<'a>(drawer: &Drawer) -> iced::Element<'a, Message> {
         // explaining what it did" look identical.
         iced::widget::text(format!("{} lines", drawer.lines.len()))
             .size(theme::LABEL)
-            .color(theme::SLATE)
+            .style(theme::text_muted)
             .into()
     };
 
@@ -224,6 +244,13 @@ pub fn view<'a>(drawer: &Drawer) -> iced::Element<'a, Message> {
         .into()
 }
 
+/// A fresh transcript for a command starting, with the drawer left open or
+/// closed exactly as the user had it.
+pub fn start(drawer: &mut Drawer, status: String) {
+    drawer.lines.clear();
+    drawer.status = status;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -270,7 +297,11 @@ mod tests {
         // It used to collapse here, which threw the output away at the exact
         // moment the user had a reason to read it -- a successful sync's
         // transcript existed only while it was still running.
-        let mut drawer = Drawer::default();
+        // Open, as a user who wants to watch has it.
+        let mut drawer = Drawer {
+            expanded: true,
+            ..Drawer::default()
+        };
         push_line(&mut drawer, "resolving dependencies...", &[]);
 
         set_idle(&mut drawer, "sync succeeded");
@@ -305,9 +336,43 @@ mod tests {
     }
 
     #[test]
-    fn a_new_drawer_starts_open() {
-        // The output of a command you just ran is the thing you asked for.
-        assert!(Drawer::default().expanded);
+    fn a_new_drawer_starts_collapsed() {
+        // Every finish raises a toast, and a failure's toast opens the output;
+        // an empty transcript open by default only took room from the tab.
+        assert!(!Drawer::default().expanded);
+    }
+
+    #[test]
+    fn a_failure_opens_the_drawer_and_a_success_leaves_it_alone() {
+        // At the user's request: the reason a command failed is shown, not
+        // left behind a toast's button.
+        let mut drawer = Drawer::default();
+        set_idle(&mut drawer, "Synced api");
+        assert!(!drawer.expanded, "a success changes nothing");
+        set_idle(&mut drawer, "Could not sync api");
+        assert!(drawer.expanded, "a failure opens it");
+        let mut open = Drawer {
+            expanded: true,
+            ..Drawer::default()
+        };
+        set_idle(&mut open, "Synced api");
+        assert!(open.expanded, "and a success does not close it either");
+    }
+
+    #[test]
+    fn starting_a_command_keeps_the_drawer_as_the_user_left_it() {
+        let mut drawer = Drawer {
+            lines: vec!["old".into()],
+            expanded: true,
+            status: "idle".into(),
+        };
+        start(&mut drawer, "syncing...".into());
+        assert!(drawer.expanded, "opened by the user, stays open");
+        assert!(drawer.lines.is_empty(), "a fresh transcript");
+        assert_eq!(drawer.status, "syncing...");
+        drawer.expanded = false;
+        start(&mut drawer, "upgrading...".into());
+        assert!(!drawer.expanded, "closed stays closed");
     }
 
     #[test]
@@ -348,6 +413,9 @@ mod tests {
             "index change failed to persist",
             "member selection failed to persist",
             "settings change failed to persist",
+            // `busy::Action::failed`'s wording.
+            "Could not sync api",
+            "Could not install fastapi==0.110",
         ] {
             assert!(is_failure(status), "{status:?} must read as a failure");
         }
@@ -381,6 +449,10 @@ mod tests {
             "syncing members for failed-migrations...",
             // The pathological case: the label is the marker itself.
             "syncing failed...",
+            // Finished successes name the project now (`busy::Action::done`).
+            "Synced failed-migrations",
+            "Recreated failed-migrations",
+            "Installed failed-pkg==1.0",
         ] {
             assert!(
                 !is_failure(status),
