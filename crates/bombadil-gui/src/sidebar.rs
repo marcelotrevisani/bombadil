@@ -21,6 +21,7 @@
 //! Task 5.
 
 use bombadil_core::model::{Config, PythonPin, VenvLocation};
+use iced::widget::canvas;
 use std::path::PathBuf;
 
 use crate::app::Message;
@@ -308,7 +309,10 @@ pub fn view<'a>(
             } else {
                 "\u{25b8}"
             })
-            .size(theme::BODY),
+            .size(theme::BODY)
+            // Centred, so the tree guide drops from its middle.
+            .width(iced::Length::Fill)
+            .align_x(iced::alignment::Horizontal::Center),
         )
         .on_press(Message::ProjectExpandToggled(i))
         .padding(0.0)
@@ -412,18 +416,22 @@ pub fn view<'a>(
         } else {
             iced::widget::hover(row, actions)
         };
-        list = list.push(
+        // A project and its environments share one outlined card, the
+        // environments hung off a tree guide beneath it, so what belongs to
+        // which project reads at a glance. No spacing inside: the guide's
+        // line runs unbroken from row to row.
+        let mut group = iced::widget::column![
             iced::widget::mouse_area(
                 iced::widget::row![disclosure, row]
                     .spacing(theme::SPACE_1)
                     .align_y(iced::Alignment::Center),
             )
             .on_right_press(Message::ContextMenuOpened(i)),
-        );
+        ];
 
         if entry.expanded {
             for environment in &entry.environments {
-                list = list.push(environment_row(
+                group = group.push(environment_row(
                     i,
                     entry.id,
                     environment,
@@ -431,11 +439,75 @@ pub fn view<'a>(
                     entry.requires_python.as_deref(),
                 ));
             }
-            // The add control sits with the environments it adds to.
-            list = list.push(add_environment_row(entry.id));
+            // The add control sits with the environments it adds to, and
+            // ends the guide.
+            group = group.push(add_environment_row(entry.id));
         }
+        list = list.push(
+            iced::widget::container(group)
+                .padding(theme::SPACE_1)
+                .style(move |t| {
+                    let p = theme::palette(t);
+                    iced::widget::container::Style {
+                        border: iced::Border {
+                            color: if is_selected { p.jacket } else { p.edge },
+                            width: theme::HAIRLINE,
+                            radius: theme::RADIUS_SURFACE.into(),
+                        },
+                        ..iced::widget::container::Style::default()
+                    }
+                }),
+        );
     }
     list.into()
+}
+
+/// The tree guide left of an environment row: a line down from the project
+/// with a branch into the row. `last` ends the line at the branch.
+struct Guide {
+    last: bool,
+}
+
+impl canvas::Program<Message> for Guide {
+    type State = ();
+
+    fn draw(
+        &self,
+        _state: &(),
+        renderer: &iced::Renderer,
+        theme: &iced::Theme,
+        bounds: iced::Rectangle,
+        _cursor: iced::mouse::Cursor,
+    ) -> Vec<canvas::Geometry> {
+        let mut frame = canvas::Frame::new(renderer, bounds.size());
+        // Under the disclosure triangle, so the line drops from it.
+        let x = (theme::DISCLOSURE_WIDTH / 2.0).round() + 0.5;
+        let mid = (bounds.height / 2.0).round() + 0.5;
+        let path = canvas::Path::new(|b| {
+            b.move_to(iced::Point::new(x, 0.0));
+            b.line_to(iced::Point::new(
+                x,
+                if self.last { mid } else { bounds.height },
+            ));
+            b.move_to(iced::Point::new(x, mid));
+            b.line_to(iced::Point::new(bounds.width, mid));
+        });
+        frame.stroke(
+            &path,
+            canvas::Stroke::default()
+                .with_color(theme::palette(theme).slate)
+                .with_width(theme::HAIRLINE),
+        );
+        vec![frame.into_geometry()]
+    }
+}
+
+/// The [`Guide`] in the indent an environment row starts with.
+fn guide<'a>(last: bool) -> iced::Element<'a, Message> {
+    iced::widget::canvas(Guide { last })
+        .width(theme::DISCLOSURE_WIDTH + theme::SPACE_2)
+        .height(theme::TREE_ROW_HEIGHT)
+        .into()
 }
 
 /// The collapsed sidebar: the expand button, then one state glyph per
@@ -500,8 +572,8 @@ fn row_actions<'a>(i: usize, selected: bool, waiting: Option<&str>) -> iced::Ele
     };
     let pill = iced::widget::container(iced::widget::row![
         sync,
-        icon_button(
-            Icon::Terminal,
+        crate::icons::tile_button(
+            crate::icons::Tile::Terminal,
             hint("Open a terminal", Shortcut::Terminal, selected),
             Some(Message::OpenTerminalHereRequested(i)),
         ),
@@ -611,9 +683,7 @@ fn environment_row<'a>(
     // the two read as one list at two depths.
     let location = row.location.clone();
     let pressable = iced::widget::row![
-        iced::widget::Space::new()
-            .width(theme::DISCLOSURE_WIDTH + theme::SPACE_2)
-            .height(theme::TREE_ROW_HEIGHT),
+        guide(false),
         iced::widget::button(content)
             .on_press(environment_press(project, row))
             .width(iced::Length::Fill)
@@ -662,13 +732,14 @@ fn environment_row<'a>(
 /// surface nobody can find is a surface that does not exist.
 fn add_environment_row<'a>(project_id: uuid::Uuid) -> iced::Element<'a, Message> {
     iced::widget::row![
-        iced::widget::Space::new()
-            .width(theme::DISCLOSURE_WIDTH + theme::SPACE_2)
-            .height(theme::TREE_ROW_HEIGHT),
+        guide(true),
         iced::widget::button(
             iced::widget::text("+ add environment")
                 .size(theme::DATA)
-                .style(theme::text_muted),
+                .style(theme::text_muted)
+                // Level with the guide's branch into this row.
+                .height(iced::Length::Fill)
+                .align_y(iced::alignment::Vertical::Center),
         )
         .on_press(Message::EnvironmentAdded(project_id))
         .width(iced::Length::Fill)
