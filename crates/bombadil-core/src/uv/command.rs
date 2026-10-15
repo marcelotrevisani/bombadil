@@ -82,6 +82,25 @@ pub fn sync_members(
     spec
 }
 
+/// Add a local package by its folder into `group`. `path` is written
+/// verbatim into `[tool.uv.sources]`; pass it through
+/// `members::path_for_manifest` so it stays relative.
+pub fn add_path(
+    uv: &ResolvedUv,
+    ctx: &ProjectContext,
+    path: &Path,
+    editable: bool,
+    group: DependencyGroup,
+) -> CommandSpec {
+    let spec = project_spec(uv, ctx).arg("add");
+    let spec = if editable {
+        spec.arg("--editable")
+    } else {
+        spec
+    };
+    spec.arg(path.to_string_lossy()).args(group.flags())
+}
+
 /// Add a project as an editable path dependency.
 ///
 /// `path` is written verbatim by uv into `[tool.uv.sources]`, so callers
@@ -222,6 +241,37 @@ mod tests {
         assert_eq!(
             sync_with_python(&uv(), &ctx(), "3.12").args,
             vec!["sync", "-p", "3.12"]
+        );
+    }
+
+    #[test]
+    fn a_local_package_is_added_by_path_into_its_group() {
+        let path = Path::new("../mylib");
+        assert_eq!(
+            add_path(&uv(), &ctx(), path, true, DependencyGroup::Main).args,
+            vec!["add", "--editable", "../mylib"]
+        );
+        assert_eq!(
+            add_path(
+                &uv(),
+                &ctx(),
+                path,
+                false,
+                DependencyGroup::Named("dev".into())
+            )
+            .args,
+            vec!["add", "../mylib", "--group", "dev"]
+        );
+        assert_eq!(
+            add_path(
+                &uv(),
+                &ctx(),
+                path,
+                true,
+                DependencyGroup::Optional("cli".into())
+            )
+            .args,
+            vec!["add", "--editable", "../mylib", "--optional", "cli"]
         );
     }
 

@@ -352,6 +352,14 @@ mod tests {
                     path: PathBuf::from("/home/t/.venvs"),
                 },
                 python: PythonPin::Version("3.12.13".into()),
+                theme: crate::model::ThemeChoice::Light,
+                layout: crate::model::Layout {
+                    sidebar_width: 300,
+                    sidebar_collapsed: true,
+                    window: Some((1280, 800)),
+                    tab_order: vec!["members".into(), "deps".into()],
+                },
+                close_to_tray: false,
             },
             indexes: vec![
                 Index {

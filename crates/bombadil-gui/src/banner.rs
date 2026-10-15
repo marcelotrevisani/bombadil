@@ -80,14 +80,16 @@ pub fn problems(config: &Config) -> Problems {
 /// also paints `boot` on failure.
 pub fn view<'a>(problems: &Problems) -> iced::Element<'a, crate::app::Message> {
     if problems.is_empty() {
-        return iced::widget::text("").into();
+        // Nothing, at no height: an empty `text` still takes a line, which
+        // left a blank band under the top bar.
+        return iced::widget::Space::new().into();
     }
     let mut list = iced::widget::column![].spacing(theme::SPACE_1);
     for problem in problems {
         list = list.push(
             iced::widget::text(problem.message.clone())
                 .size(theme::BODY)
-                .color(theme::BOOT),
+                .style(theme::text_warning),
         );
     }
     iced::widget::container(list)

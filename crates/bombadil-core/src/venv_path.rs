@@ -205,6 +205,7 @@ mod tests {
             uv_source: UvSource::Auto,
             default_venv_location,
             python: PythonPin::default(),
+            ..Settings::default()
         }
     }
 

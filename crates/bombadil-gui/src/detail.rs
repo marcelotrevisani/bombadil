@@ -11,6 +11,8 @@
 //! accidentally remove.
 
 use crate::app::Message;
+use crate::icons::{self, Icon};
+use crate::shortcuts::{self, Shortcut};
 use crate::theme;
 use bombadil_core::model::Project;
 use std::path::{Path, PathBuf};
@@ -37,6 +39,8 @@ pub struct Header {
     /// Open terminal act on -- which the project path alone cannot say. `None`
     /// for a project with no environments at all.
     pub venv_path: Option<PathBuf>,
+    /// Set by the caller from the probed sidebar entry.
+    pub git: Option<bombadil_core::git::GitStatus>,
 }
 
 /// Builds the header for `project`.
@@ -67,7 +71,135 @@ pub fn header(
         venv_status,
         python_version,
         venv_path,
+        git: None,
     }
+}
+
+/// One line for the header: `main · ↑1 ↓2 · 2 modified`, or `main → fork/trunk · clean`
+/// when the upstream has another name.
+pub fn git_summary(git: &bombadil_core::git::GitStatus) -> String {
+    let mut parts = vec![match (&git.upstream, git.detached) {
+        (_, true) => format!("detached at {}", git.branch),
+        // `origin/<same name>` is the usual case; naming the branch twice
+        // only wrapped the tile.
+        (Some(upstream), false)
+            if upstream
+                .split_once('/')
+                .is_some_and(|(_, name)| name == git.branch) =>
+        {
+            git.branch.clone()
+        }
+        (Some(upstream), false) => format!("{} \u{2192} {upstream}", git.branch),
+        (None, false) => format!("{} (no upstream)", git.branch),
+    }];
+    let ahead_behind: Vec<String> = [("\u{2191}", git.ahead), ("\u{2193}", git.behind)]
+        .into_iter()
+        .filter(|(_, n)| *n > 0)
+        .map(|(arrow, n)| format!("{arrow}{n}"))
+        .collect();
+    if !ahead_behind.is_empty() {
+        parts.push(ahead_behind.join(" "));
+    }
+    let changes: Vec<String> = [
+        (git.staged, "staged"),
+        (git.modified, "modified"),
+        (git.untracked, "untracked"),
+        (git.conflicted, "conflicted"),
+    ]
+    .into_iter()
+    .filter(|(n, _)| *n > 0)
+    .map(|(n, kind)| format!("{n} {kind}"))
+    .collect();
+    parts.push(if changes.is_empty() {
+        "clean".to_string()
+    } else {
+        changes.join(", ")
+    });
+    parts.join(" \u{b7} ")
+}
+
+/// One tile of the header's summary card.
+pub struct Tile {
+    pub label: &'static str,
+    pub state: theme::State,
+    pub value: String,
+    /// Where pressing the tile goes, if anywhere.
+    pub press: Option<Message>,
+    /// A Sync button inside the tile, where the drift it fixes is shown.
+    pub sync: Option<Message>,
+}
+
+/// The Environment tile's line. A drifted environment says which
+/// `requires-python` its Python misses, so the fix is in the sentence.
+pub fn env_value(
+    status: VenvStatus,
+    python: Option<&String>,
+    state: theme::State,
+    requires_python: Option<&str>,
+) -> String {
+    match (status, python) {
+        // `header` derives Present from a probed version, so Present always
+        // carries one; the `None` case reads as no environment too.
+        (VenvStatus::Absent, _) | (VenvStatus::Present, None) => "no environment".to_string(),
+        (VenvStatus::Present, Some(version)) => match (state, requires_python) {
+            (theme::State::Drifted, Some(req)) => {
+                format!("Python {version} does not satisfy {req}")
+            }
+            _ => format!("Python {version}"),
+        },
+    }
+}
+
+/// The state that needs the most attention: drifted, then absent, then
+/// present (`State`'s declaration order). Nothing at all is present.
+pub fn worst(states: impl IntoIterator<Item = theme::State>) -> theme::State {
+    states.into_iter().max().unwrap_or(theme::State::Present)
+}
+
+/// The Dependencies tile: counts, zero ones left out, and the worst glyph.
+/// A package declared in two groups is one package.
+pub fn deps_summary(tab: &crate::deps::DepsTab) -> (theme::State, String) {
+    let mut by_name: std::collections::BTreeMap<&str, theme::State> = Default::default();
+    for row in tab.groups.iter().flat_map(|g| &g.rows) {
+        let state = crate::deps::state(row);
+        let slot = by_name.entry(row.name.as_str()).or_insert(state);
+        *slot = worst([*slot, state]);
+    }
+    let count = |want: theme::State| by_name.values().filter(|s| **s == want).count();
+    let installed = by_name.len() - count(theme::State::Absent);
+    let parts: Vec<String> = [
+        (installed, "installed"),
+        (count(theme::State::Drifted), "drifted"),
+        (count(theme::State::Absent), "missing"),
+    ]
+    .into_iter()
+    .enumerate()
+    .filter(|(i, (n, _))| *i == 0 || *n > 0)
+    .map(|(_, (n, what))| format!("{n} {what}"))
+    .collect();
+    (worst(by_name.values().copied()), parts.join(" \u{b7} "))
+}
+
+/// The Members tile, for a project that has members: how many of the wanted
+/// ones are installed. Drifted when a sync would remove one; absent when a
+/// wanted one is missing. A deselected member that is not installed is
+/// exactly as asked.
+pub fn members_summary(
+    rows: &[crate::members_editor::MemberRow],
+) -> Option<(theme::State, String)> {
+    if rows.is_empty() {
+        return None;
+    }
+    let wanted = rows.iter().filter(|r| r.selected).count();
+    let installed = rows.iter().filter(|r| r.selected && r.installed).count();
+    let state = if rows.iter().any(|r| r.installed && !r.selected) {
+        theme::State::Drifted
+    } else if installed < wanted {
+        theme::State::Absent
+    } else {
+        theme::State::Present
+    };
+    Some((state, format!("{installed} of {wanted} installed")))
 }
 
 /// The project's directory: `pyproject_path`'s parent, or the path itself
@@ -105,99 +237,87 @@ fn project_dir(project: &Project) -> PathBuf {
 /// `Message::SyncRequested` so one message shape serves this button and the
 /// context menu's Sync entry -- see that message's own doc for why resolving
 /// against the selection instead is a bug.
-pub fn view<'a>(header: &Header, index: usize) -> iced::Element<'a, Message> {
-    // How a missing version renders is a decision, but it stays inline here
-    // rather than becoming a tested function, matching `sidebar::view`'s own
-    // precedent for the identical choice (its version line, Some vs the
-    // words "no env"): both are a single match producing an `Element`, not
-    // a mapping to a domain state, so there is nothing here for a mutation
-    // test to prove that `header`'s own tests do not already cover.
-    let version: iced::Element<'_, Message> = match (header.venv_status, &header.python_version) {
-        (VenvStatus::Present, Some(version)) => iced::widget::text(version.clone())
-            .font(theme::FONT_DATA)
-            .size(theme::DATA)
-            .into(),
-        (VenvStatus::Present, None) => iced::widget::text("environment ready")
-            .size(theme::DATA)
-            .color(theme::SLATE)
-            .into(),
-        (VenvStatus::Absent, _) => iced::widget::text("no environment")
-            .size(theme::DATA)
-            .color(theme::SLATE)
-            .into(),
+/// `busy` is the running command, if any: its label, the spinner angle, and
+/// whether it is this project's.
+pub fn view<'a>(
+    header: &Header,
+    index: usize,
+    busy: Option<(String, f32, bool)>,
+    tiles: Vec<Tile>,
+) -> iced::Element<'a, Message> {
+    // The one primary on this surface, so it keeps its label beside the icon.
+    // While a command runs it is disabled: the running one shows the spinner
+    // and what it is doing; any other says what it is waiting for. Disabled
+    // primary has no fill, so its icon turns `slate` -- `ink` would vanish.
+    let sync_row = |glyph: iced::Element<'a, Message>, label: String| {
+        iced::widget::row![glyph, iced::widget::text(label).size(theme::BODY)]
+            .spacing(theme::SPACE_1)
+            .align_y(iced::Alignment::Center)
     };
+    let sync: iced::Element<'a, Message> = match busy {
+        None => theme::tip(
+            iced::widget::button(sync_row(
+                icons::icon(Icon::Refresh, 14.0, theme::Swatch::Ink),
+                "Sync".to_string(),
+            ))
+            .on_press(Message::SyncRequested(index))
+            .padding([theme::SPACE_1, theme::SPACE_3])
+            .style(theme::button_primary),
+            format!("Sync ({})", shortcuts::keys(Shortcut::Sync)),
+            iced::widget::tooltip::Position::Left,
+        ),
+        Some((label, angle, true)) => iced::widget::button(sync_row(
+            icons::spinner(angle, 14.0, theme::Swatch::Slate),
+            label,
+        ))
+        .padding([theme::SPACE_1, theme::SPACE_3])
+        .style(theme::button_primary)
+        .into(),
+        Some((label, _, false)) => iced::widget::tooltip(
+            iced::widget::button(sync_row(
+                icons::icon(Icon::Refresh, 14.0, theme::Swatch::Slate),
+                "Sync".to_string(),
+            ))
+            .padding([theme::SPACE_1, theme::SPACE_3])
+            .style(theme::button_primary),
+            iced::widget::container(
+                iced::widget::text(format!("Wait for {label} to finish")).size(theme::LABEL),
+            )
+            .padding(theme::SPACE_1)
+            .style(theme::panel),
+            iced::widget::tooltip::Position::Left,
+        )
+        .into(),
+    };
+
+    // Lucide icons with tooltips. PyCharm gets a generic "code" mark: a
+    // JetBrains logo is not ours to draw. Its tooltip names the interpreter
+    // because that is the part a user would otherwise go and set by hand.
+    let terminal = icons::icon_button(
+        Icon::Terminal,
+        format!(
+            "Open a terminal here, with the environment activated ({})",
+            shortcuts::keys(Shortcut::Terminal)
+        ),
+        Some(Message::OpenTerminalHereRequested(index)),
+    );
+    let folder = icons::icon_button(
+        Icon::Folder,
+        "Open the project folder",
+        Some(Message::OpenFolderRequested(index)),
+    );
+    let pycharm = icons::icon_button(
+        Icon::Code,
+        "Open in PyCharm, in this folder, with this environment as the interpreter",
+        Some(Message::OpenPycharmRequested(index)),
+    );
 
     let title_row = iced::widget::row![
         iced::widget::text(header.label.clone())
             .font(theme::FONT_PROSE_SEMIBOLD)
             .size(theme::DISPLAY),
         iced::widget::Space::new().width(iced::Length::Fill),
-        version,
-    ];
-
-    let sync = iced::widget::button(iced::widget::text("Sync").size(theme::BODY))
-        .on_press(Message::SyncRequested(index))
-        .padding([theme::SPACE_1, theme::SPACE_3])
-        .style(theme::button_primary);
-
-    // A shell prompt, set in the data face -- the same `>_` a terminal shows.
-    // Drawn from the two typefaces already shipped rather than adding an icon
-    // asset for one control, and deliberately not one of `theme::state_glyph`'s
-    // shapes: those are the state vocabulary, and this is an action.
-    //
-    // A tooltip, not a bare glyph: an icon-only control with no icon set
-    // behind it is something the user has to guess at, and this one opens a
-    // process.
-    let terminal = iced::widget::tooltip(
-        iced::widget::button(
-            iced::widget::text(">_")
-                .font(theme::FONT_DATA)
-                .size(theme::BODY),
-        )
-        .on_press(Message::OpenTerminalHereRequested(index))
-        .padding([theme::SPACE_1, theme::SPACE_2])
-        .style(theme::button_quiet),
-        iced::widget::container(
-            iced::widget::text("Open a terminal here, with the environment activated")
-                .size(theme::LABEL),
-        )
-        .padding(theme::SPACE_1)
-        .style(theme::panel),
-        iced::widget::tooltip::Position::Left,
-    );
-
-    // "PC", set in the same data face as the terminal's `>_` beside it, for
-    // the same reason: two typefaces already ship, an icon set does not, and
-    // a JetBrains mark is not ours to draw. The tooltip carries the meaning,
-    // and says what the launch actually does -- the interpreter is the part a
-    // user would otherwise assume was handled (see `bombadil_core::ide`'s
-    // module doc for why it cannot be).
-    let pycharm = iced::widget::tooltip(
-        iced::widget::button(
-            iced::widget::text("PC")
-                .font(theme::FONT_DATA)
-                .size(theme::BODY),
-        )
-        .on_press(Message::OpenPycharmRequested(index))
-        .padding([theme::SPACE_1, theme::SPACE_2])
-        .style(theme::button_quiet),
-        iced::widget::container(
-            iced::widget::text(
-                "Open in PyCharm, in this folder, with the environment's variables and PATH",
-            )
-            .size(theme::LABEL),
-        )
-        .padding(theme::SPACE_1)
-        .style(theme::panel),
-        iced::widget::tooltip::Position::Left,
-    );
-
-    let path_row = iced::widget::row![
-        iced::widget::text(header.path.display().to_string())
-            .font(theme::FONT_DATA)
-            .size(theme::DATA)
-            .color(theme::SLATE),
-        iced::widget::Space::new().width(iced::Length::Fill),
+        folder,
         pycharm,
         terminal,
         sync,
@@ -205,19 +325,71 @@ pub fn view<'a>(header: &Header, index: usize) -> iced::Element<'a, Message> {
     .spacing(theme::SPACE_2)
     .align_y(iced::Alignment::Center);
 
-    // The active environment's path, beneath the project's own. A project can
-    // have several environments, so "which one do Sync and Open terminal act
-    // on" is a question the project path cannot answer -- and it is the one
-    // the two buttons on the row above make urgent.
-    let venv_row: iced::Element<'_, Message> = match &header.venv_path {
-        Some(path) => theme::labeled_value("environment", path.display().to_string()),
-        None => iced::widget::text("no environment configured")
-            .size(theme::DATA)
-            .color(theme::SLATE)
-            .into(),
-    };
+    // Status first, in one card; drift shows here without opening a tab.
+    let mut card = iced::widget::row![].spacing(theme::SPACE_4);
+    for tile in tiles {
+        let glyph = theme::state_glyph(tile.state);
+        let body = iced::widget::column![
+            iced::widget::text(tile.label)
+                .size(theme::LABEL)
+                .style(theme::text_muted),
+            iced::widget::row![
+                theme::tip(
+                    iced::widget::text(glyph.glyph.to_string())
+                        .size(theme::BODY)
+                        .style(theme::tinted(glyph.swatch)),
+                    theme::state_meaning(tile.state),
+                    iced::widget::tooltip::Position::Bottom,
+                ),
+                iced::widget::text(tile.value).size(theme::BODY),
+            ]
+            .spacing(theme::SPACE_1)
+            .align_y(iced::Alignment::Center),
+        ]
+        .spacing(theme::SPACE_1);
+        let body = iced::widget::row![body]
+            .push(tile.sync.map(|message| {
+                iced::widget::button(iced::widget::text("Sync").size(theme::LABEL))
+                    .on_press(message)
+                    .padding([0.0, theme::SPACE_2])
+                    .style(theme::button_primary)
+            }))
+            .spacing(theme::SPACE_2)
+            .align_y(iced::Alignment::End);
+        card = card.push(match tile.press {
+            Some(message) => iced::Element::from(
+                iced::widget::button(body)
+                    .on_press(message)
+                    .padding(0)
+                    .style(theme::button_bare(theme::Swatch::Parchment)),
+            ),
+            None => body.into(),
+        });
+    }
+    let card = iced::widget::container(card)
+        .width(iced::Length::Fill)
+        .padding([theme::SPACE_2, theme::SPACE_3])
+        .style(|t| iced::widget::container::Style {
+            border: iced::Border {
+                radius: theme::RADIUS_SURFACE.into(),
+                ..iced::Border::default()
+            },
+            ..theme::surface(t)
+        });
 
-    iced::widget::column![title_row, path_row, venv_row]
+    // Reference, not status: where the project and its environment live.
+    let path = |text: String| {
+        iced::widget::text(text)
+            .font(theme::FONT_DATA)
+            .size(theme::DATA)
+            .style(theme::text_muted)
+    };
+    let mut paths = iced::widget::column![path(header.path.display().to_string())];
+    if let Some(venv) = &header.venv_path {
+        paths = paths.push(path(format!("environment {}", venv.display())));
+    }
+
+    iced::widget::column![title_row, card, paths.spacing(theme::SPACE_1)]
         .spacing(theme::SPACE_2)
         .into()
 }
@@ -225,6 +397,168 @@ pub fn view<'a>(header: &Header, index: usize) -> iced::Element<'a, Message> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use crate::theme::State;
+
+    fn dep(name: &str, constraint: Option<&str>, version: Option<&str>) -> crate::deps::DepRow {
+        crate::deps::DepRow {
+            name: name.into(),
+            constraint: constraint.map(Into::into),
+            version: version.map(Into::into),
+            declared: true,
+        }
+    }
+
+    fn tab(rows: Vec<crate::deps::DepRow>) -> crate::deps::DepsTab {
+        crate::deps::DepsTab {
+            groups: vec![crate::deps::DepGroup {
+                kind: crate::deps::GroupKind::Main,
+                rows,
+            }],
+            graph: None,
+            tree_note: None,
+        }
+    }
+
+    #[test]
+    fn the_environment_tile_says_why_it_drifted() {
+        let v = Some("3.11.9".to_string());
+        assert_eq!(
+            env_value(
+                VenvStatus::Present,
+                v.as_ref(),
+                State::Present,
+                Some(">=3.11")
+            ),
+            "Python 3.11.9"
+        );
+        assert_eq!(
+            env_value(
+                VenvStatus::Present,
+                v.as_ref(),
+                State::Drifted,
+                Some(">=3.12")
+            ),
+            "Python 3.11.9 does not satisfy >=3.12"
+        );
+        assert_eq!(
+            env_value(VenvStatus::Absent, None, State::Absent, None),
+            "no environment"
+        );
+    }
+
+    #[test]
+    fn the_worst_state_wins() {
+        assert_eq!(worst([]), State::Present);
+        assert_eq!(worst([State::Present, State::Absent]), State::Absent);
+        assert_eq!(
+            worst([State::Absent, State::Drifted, State::Present]),
+            State::Drifted
+        );
+    }
+
+    #[test]
+    fn the_dependencies_tile_counts_what_needs_attention() {
+        let all_good = tab(vec![dep("a", Some(">=1"), Some("1.2"))]);
+        assert_eq!(
+            deps_summary(&all_good),
+            (State::Present, "1 installed".to_string())
+        );
+        let mixed = tab(vec![
+            dep("a", Some(">=1"), Some("1.2")),
+            dep("b", Some(">=2"), Some("1.0")),
+            dep("c", Some(">=1"), None),
+        ]);
+        assert_eq!(
+            deps_summary(&mixed),
+            (
+                State::Drifted,
+                "2 installed \u{b7} 1 drifted \u{b7} 1 missing".to_string()
+            )
+        );
+        let mut twice = mixed.clone();
+        twice.groups.push(twice.groups[0].clone());
+        assert_eq!(
+            deps_summary(&twice),
+            deps_summary(&mixed),
+            "a package in two groups counts once"
+        );
+    }
+
+    fn member(selected: bool, installed: bool) -> crate::members_editor::MemberRow {
+        crate::members_editor::MemberRow {
+            path: "m".into(),
+            name: Some("m".into()),
+            origin: bombadil_core::model::MemberOrigin::Discovered,
+            selected,
+            installed,
+        }
+    }
+
+    #[test]
+    fn the_members_tile_counts_the_wanted_ones() {
+        assert_eq!(members_summary(&[]), None, "no members, no tile");
+        assert_eq!(
+            members_summary(&[member(true, true), member(false, false)]),
+            Some((State::Present, "1 of 1 installed".to_string())),
+            "a deselected, uninstalled member is not a problem"
+        );
+        assert_eq!(
+            members_summary(&[member(true, true), member(true, false)]),
+            Some((State::Absent, "1 of 2 installed".to_string()))
+        );
+        assert_eq!(
+            members_summary(&[member(true, true), member(false, true)]).map(|s| s.0),
+            Some(State::Drifted),
+            "a sync would remove one"
+        );
+    }
+
+    #[test]
+    fn the_git_line_says_branch_divergence_and_changes() {
+        use bombadil_core::git::GitStatus;
+        let git = GitStatus {
+            branch: "main".into(),
+            upstream: Some("origin/trunk".into()),
+            ahead: 1,
+            behind: 2,
+            modified: 3,
+            untracked: 1,
+            ..GitStatus::default()
+        };
+        assert_eq!(
+            git_summary(&git),
+            "main \u{2192} origin/trunk \u{b7} \u{2191}1 \u{2193}2 \u{b7} 3 modified, 1 untracked"
+        );
+        let clean = GitStatus {
+            branch: "abc12345".into(),
+            detached: true,
+            ..GitStatus::default()
+        };
+        assert_eq!(git_summary(&clean), "detached at abc12345 \u{b7} clean");
+    }
+
+    #[test]
+    fn a_branch_tracking_its_namesake_does_not_repeat_the_name() {
+        // `feature/x -> origin/feature/x` spent a second, often wrapping,
+        // copy of a long branch name to say only "it has an upstream".
+        use bombadil_core::git::GitStatus;
+        let git = GitStatus {
+            branch: "feature/long-name".into(),
+            upstream: Some("origin/feature/long-name".into()),
+            ..GitStatus::default()
+        };
+        assert_eq!(git_summary(&git), "feature/long-name \u{b7} clean");
+        let elsewhere = GitStatus {
+            branch: "main".into(),
+            upstream: Some("origin/trunk".into()),
+            ..GitStatus::default()
+        };
+        assert_eq!(
+            git_summary(&elsewhere),
+            "main \u{2192} origin/trunk \u{b7} clean"
+        );
+    }
 
     #[test]
     fn the_header_carries_the_active_environments_path() {

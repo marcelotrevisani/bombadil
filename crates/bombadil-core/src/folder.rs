@@ -29,12 +29,22 @@ use std::path::Path;
 /// -- which would mean handing keychain secrets and index passwords to a
 /// process that has no use for either.
 pub fn open(os: Os, dir: &Path, runner: &dyn CommandRunner) -> Result<(), CommandError> {
+    open_target(os, dir.to_string_lossy().into_owned(), runner)
+}
+
+/// Open `url` in the default browser. The same opener a folder goes through:
+/// each of the three hands a URL to the browser the user chose.
+pub fn open_url(os: Os, url: &str, runner: &dyn CommandRunner) -> Result<(), CommandError> {
+    open_target(os, url.to_string(), runner)
+}
+
+fn open_target(os: Os, target: String, runner: &dyn CommandRunner) -> Result<(), CommandError> {
     let program = match os {
         Os::Linux => "xdg-open",
         Os::MacOs => "open",
         Os::Windows => "explorer",
     };
-    runner.spawn(&CommandSpec::new(program).arg(dir.to_string_lossy().into_owned()))
+    runner.spawn(&CommandSpec::new(program).arg(target))
 }
 
 #[cfg(test)]
@@ -157,5 +167,25 @@ mod tests {
         let runner = FakeCommandRunner::new();
         let err = open(Os::Linux, Path::new("/proj/my-api"), &runner).unwrap_err();
         assert!(err.to_string().contains("xdg-open"), "got {err}");
+    }
+
+    #[test]
+    fn a_url_goes_to_the_same_opener_unchanged() {
+        let runner = FakeCommandRunner::new();
+        runner.expect(
+            "xdg-open",
+            &["https://github.com/sponsors/x"],
+            CommandOutcome {
+                status: Some(0),
+                stdout: String::new(),
+                stderr: String::new(),
+            },
+        );
+        open_url(Os::Linux, "https://github.com/sponsors/x", &runner).unwrap();
+        assert_eq!(
+            runner.blocking_calls(),
+            0,
+            "a browser must not be waited on"
+        );
     }
 }

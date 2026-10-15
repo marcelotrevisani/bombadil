@@ -29,7 +29,7 @@ fn main() {
         .unwrap_or_else(|| {
             panic!(
                 "uv-manifest.toml has no entry for target {target}. \
-                 Add its asset name and sha256 from the uv 0.12.1 release."
+                 Add its asset name and sha256 from the uv release in `version`."
             )
         });
     let asset = entry["asset"].as_str().expect("asset is a string");

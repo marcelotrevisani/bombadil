@@ -1,14 +1,12 @@
 //! The system tray, and the one rule that keeps it from stranding the user.
 //!
-//! # The close button is not a minimise button
+//! # The close button hides, and says so in Preferences
 //!
-//! The X closes the window and ends the application. Minimising to the tray is
-//! something the user asks for, from this menu's own "Hide".
-//!
-//! It was the other way round first, and the first report back was that the
-//! exit did nothing -- which was exactly right. A control that has meant
-//! "quit" on every desktop for thirty years does not get to mean "hide"
-//! because the application would prefer to stay resident.
+//! The X keeps Bombadil in the tray by default, because the tray menu is a
+//! way to use it: open a terminal or PyCharm for any project's environment
+//! without the window. It once did this silently and was reported as "the
+//! exit did nothing", so the behaviour is a visible switch (Preferences >
+//! Appearance, "Closing the window"), and the tray's Quit always quits.
 //!
 //! # Never hide without somewhere to come back from
 //!
@@ -18,11 +16,13 @@
 //! nothing, because a silent no-op tray is exactly the shape that produces
 //! that state.
 //!
-//! With the X closing rather than hiding, `Hide` can only arrive from a menu
-//! that exists only when the tray does, so [`window_action`]'s guard now
-//! defends a path nothing reaches. It stays anyway: it costs three lines, it
-//! is what makes the rule explicit rather than incidental, and the last time
-//! this was left implicit the X was wired to it.
+//! The X sends `Hide`, so [`window_action`]'s guard is load-bearing: with no
+//! tray running, `Hide` becomes a close.
+//!
+//! "Hide" closes the window rather than hiding it: Wayland has no way to hide
+//! a window (winit's `set_visible` is a no-op there), which is how the first
+//! version of this left the X doing nothing at all. The app runs as an iced
+//! daemon, so the process outlives its window, and Show opens a new one.
 //!
 //! # Why two implementations
 //!
@@ -48,7 +48,7 @@
 /// Deliberately not `Toggle`: the tray thread does not know whether the window
 /// is currently hidden, and a toggle computed from a stale answer shows a
 /// window the user just hid. `update` knows, so `update` decides.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TrayCommand {
     /// Bring the window back and focus it.
     Show,
@@ -56,6 +56,103 @@ pub enum TrayCommand {
     Hide,
     /// Quit for real.
     Quit,
+    /// Open a terminal for one environment of one project. By id and
+    /// location, never position: the menu may be older than the list.
+    OpenTerminal {
+        project: uuid::Uuid,
+        environment: bombadil_core::model::VenvLocation,
+    },
+    /// Open PyCharm with one environment of one project as its interpreter.
+    OpenPycharm {
+        project: uuid::Uuid,
+        environment: bombadil_core::model::VenvLocation,
+    },
+}
+
+/// The tray menu, independent of the toolkit that draws it: both
+/// implementations build from this, so both show the same thing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MenuEntry {
+    Item {
+        label: String,
+        command: TrayCommand,
+    },
+    Disabled(String),
+    Separator,
+    Submenu {
+        label: String,
+        children: Vec<MenuEntry>,
+    },
+}
+
+/// Show, then a submenu per project (a submenu per environment, or the
+/// actions directly when there is only one), then Quit. "Hide" is not
+/// here: the window's close button does that. Built from the sidebar's
+/// entries, so it names environments exactly as the window does.
+pub fn menu_entries(entries: &[crate::sidebar::Entry]) -> Vec<MenuEntry> {
+    use crate::sidebar::EnvironmentRow;
+    let actions = |project: uuid::Uuid, row: &EnvironmentRow| {
+        vec![
+            MenuEntry::Item {
+                label: "Open terminal".into(),
+                command: TrayCommand::OpenTerminal {
+                    project,
+                    environment: row.location.clone(),
+                },
+            },
+            MenuEntry::Item {
+                label: "Open in PyCharm".into(),
+                command: TrayCommand::OpenPycharm {
+                    project,
+                    environment: row.location.clone(),
+                },
+            },
+        ]
+    };
+    // Its directory name, its Python, and whether it is the active one.
+    let label = |row: &EnvironmentRow| {
+        let name = row
+            .path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| row.path.display().to_string());
+        let python = match &row.python_version {
+            Some(version) => format!("Python {version}"),
+            None => "not created".to_string(),
+        };
+        let active = if row.active { " (active)" } else { "" };
+        format!("{name} \u{b7} {python}{active}")
+    };
+    let mut menu = vec![
+        MenuEntry::Item {
+            label: "Show Bombadil".into(),
+            command: TrayCommand::Show,
+        },
+        MenuEntry::Separator,
+    ];
+    for entry in entries {
+        let children = match entry.environments.as_slice() {
+            [] => vec![MenuEntry::Disabled("No environment".into())],
+            [only] => actions(entry.id, only),
+            several => several
+                .iter()
+                .map(|row| MenuEntry::Submenu {
+                    label: label(row),
+                    children: actions(entry.id, row),
+                })
+                .collect(),
+        };
+        menu.push(MenuEntry::Submenu {
+            label: entry.label.clone(),
+            children,
+        });
+    }
+    menu.push(MenuEntry::Separator);
+    menu.push(MenuEntry::Item {
+        label: "Quit".into(),
+        command: TrayCommand::Quit,
+    });
+    menu
 }
 
 /// What a [`TrayCommand`] means for the window.
@@ -71,6 +168,8 @@ pub enum WindowAction {
     Hide,
     /// Close the window, which ends the application.
     Close,
+    /// Leave the window as it is: the command opens something else.
+    Stay,
 }
 
 /// The rule that keeps a hidden window reachable.
@@ -89,14 +188,46 @@ pub fn window_action(command: TrayCommand, tray_is_running: bool) -> WindowActio
         TrayCommand::Hide if tray_is_running => WindowAction::Hide,
         // Both the trayless close button and a real Quit.
         TrayCommand::Hide | TrayCommand::Quit => WindowAction::Close,
+        TrayCommand::OpenTerminal { .. } | TrayCommand::OpenPycharm { .. } => WindowAction::Stay,
     }
 }
 
 /// A running tray. **Dropping this removes the icon**, so the caller has to
 /// hold it for as long as the application runs.
 pub struct Tray {
-    #[allow(dead_code)] // Held for its `Drop`, never read.
+    #[cfg_attr(
+        not(any(target_os = "linux", target_os = "macos", target_os = "windows")),
+        allow(dead_code) // Held for its `Drop`.
+    )]
     inner: Inner,
+}
+
+impl Tray {
+    /// Shows `menu`. Called by the update loop only when it changed.
+    #[cfg(target_os = "linux")]
+    pub fn set_menu(&self, entries: Vec<MenuEntry>) {
+        // Thread-safe: ksni re-reads `menu()` on its own thread.
+        self.inner.0.update(|menu| menu.entries = entries);
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    pub fn set_menu(&self, entries: Vec<MenuEntry>) {
+        let (menu, ids) = native::menu(entries);
+        // Extended, not replaced: a menu rebuilt while it is open still has
+        // its old items on screen, and a press on one must still resolve.
+        // Commands carry ids, so an old item can never act on the wrong
+        // project. ponytail: grows by one menu's worth per rebuild; prune if
+        // a session ever rebuilds thousands of times.
+        if let Ok(mut commands) = self.inner.commands.lock() {
+            commands.extend(ids);
+        }
+        self.inner.icon.set_menu(Some(Box::new(menu)));
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+    pub fn set_menu(&self, entries: Vec<MenuEntry>) {
+        let _ = entries;
+    }
 }
 
 /// The icon the tray shows, as ARGB32 in network byte order -- what
@@ -108,21 +239,55 @@ pub struct Tray {
 #[cfg(target_os = "linux")]
 fn argb32(rgba: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(rgba.len());
-    for px in rgba.chunks_exact(4) {
-        out.extend_from_slice(&[px[3], px[0], px[1], px[2]]);
+    for [r, g, b, a] in rgba.as_chunks::<4>().0 {
+        out.extend_from_slice(&[*a, *r, *g, *b]);
     }
     out
 }
 
 #[cfg(target_os = "linux")]
 mod linux {
-    use super::{TrayCommand, argb32};
+    use super::{MenuEntry, TrayCommand, argb32};
+
+    /// StatusNotifierItem menus read `_` as an access-key marker and drop
+    /// it; doubled, it shows as itself. `my_api` must not read `myapi`.
+    pub fn literal(label: &str) -> String {
+        label.replace('_', "__")
+    }
+
+    pub fn item(entry: MenuEntry) -> ksni::MenuItem<Menu> {
+        use ksni::menu::{MenuItem, StandardItem, SubMenu};
+        match entry {
+            MenuEntry::Item { label, command } => StandardItem {
+                label: literal(&label),
+                activate: Box::new(move |this: &mut Menu| {
+                    let _ = this.commands.send(command.clone());
+                }),
+                ..Default::default()
+            }
+            .into(),
+            MenuEntry::Disabled(label) => StandardItem {
+                label: literal(&label),
+                enabled: false,
+                ..Default::default()
+            }
+            .into(),
+            MenuEntry::Separator => MenuItem::Separator,
+            MenuEntry::Submenu { label, children } => SubMenu {
+                label: literal(&label),
+                submenu: children.into_iter().map(item).collect(),
+                ..Default::default()
+            }
+            .into(),
+        }
+    }
     use std::sync::mpsc::Sender;
 
     pub struct Handle(#[allow(dead_code)] pub ksni::blocking::Handle<Menu>);
 
     pub struct Menu {
         pub commands: Sender<TrayCommand>,
+        pub entries: Vec<MenuEntry>,
         pub rgba: &'static [u8],
         pub side: i32,
     }
@@ -158,34 +323,7 @@ mod linux {
         }
 
         fn menu(&self) -> Vec<ksni::MenuItem<Self>> {
-            use ksni::menu::{MenuItem, StandardItem};
-            vec![
-                StandardItem {
-                    label: "Show Bombadil".into(),
-                    activate: Box::new(|this: &mut Self| {
-                        let _ = this.commands.send(TrayCommand::Show);
-                    }),
-                    ..Default::default()
-                }
-                .into(),
-                StandardItem {
-                    label: "Hide".into(),
-                    activate: Box::new(|this: &mut Self| {
-                        let _ = this.commands.send(TrayCommand::Hide);
-                    }),
-                    ..Default::default()
-                }
-                .into(),
-                MenuItem::Separator,
-                StandardItem {
-                    label: "Quit".into(),
-                    activate: Box::new(|this: &mut Self| {
-                        let _ = this.commands.send(TrayCommand::Quit);
-                    }),
-                    ..Default::default()
-                }
-                .into(),
-            ]
+            self.entries.iter().cloned().map(item).collect()
         }
     }
 }
@@ -194,7 +332,7 @@ mod linux {
 type Inner = linux::Handle;
 
 #[cfg(any(target_os = "macos", target_os = "windows"))]
-type Inner = tray_icon::TrayIcon;
+type Inner = native::Handle;
 
 #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
 type Inner = ();
@@ -243,6 +381,7 @@ fn build(
     // whole module is shaped around, not an error worth reporting.
     linux::Menu {
         commands,
+        entries: menu_entries(&[]),
         rgba,
         side: side as i32,
     }
@@ -252,53 +391,117 @@ fn build(
 }
 
 #[cfg(any(target_os = "macos", target_os = "windows"))]
+mod native {
+    use super::{MenuEntry, TrayCommand};
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex};
+    use tray_icon::menu::{IsMenuItem, Menu, MenuId, MenuItem, PredefinedMenuItem, Submenu};
+
+    /// Which command each item of the current menu sends. Replaced on every
+    /// rebuild; read by the menu event handler on whatever thread it runs.
+    pub type Commands = Arc<Mutex<HashMap<MenuId, TrayCommand>>>;
+
+    pub struct Handle {
+        pub icon: tray_icon::TrayIcon,
+        pub commands: Commands,
+    }
+
+    /// Windows reads `&` as an access-key marker; doubled, it is itself.
+    fn literal(label: &str) -> String {
+        if cfg!(target_os = "windows") {
+            label.replace('&', "&&")
+        } else {
+            label.to_string()
+        }
+    }
+
+    fn build(entry: MenuEntry, ids: &mut HashMap<MenuId, TrayCommand>) -> Box<dyn IsMenuItem> {
+        match entry {
+            MenuEntry::Item { label, command } => {
+                let item = MenuItem::new(literal(&label), true, None);
+                ids.insert(item.id().clone(), command);
+                Box::new(item)
+            }
+            MenuEntry::Disabled(label) => Box::new(MenuItem::new(literal(&label), false, None)),
+            MenuEntry::Separator => Box::new(PredefinedMenuItem::separator()),
+            MenuEntry::Submenu { label, children } => {
+                let sub = Submenu::new(literal(&label), true);
+                for child in children {
+                    let _ = sub.append(build(child, ids).as_ref());
+                }
+                Box::new(sub)
+            }
+        }
+    }
+
+    /// The menu for `entries`, and which command each item sends.
+    pub fn menu(entries: Vec<MenuEntry>) -> (Menu, HashMap<MenuId, TrayCommand>) {
+        let menu = Menu::new();
+        let mut ids = HashMap::new();
+        for entry in entries {
+            let _ = menu.append(build(entry, &mut ids).as_ref());
+        }
+        (menu, ids)
+    }
+}
+
+/// macOS and Windows. **Compiled, never run** -- see [`start`].
+///
+/// `tray-icon` objects belong to the main thread. This is called from `run`
+/// before the event loop, and [`Tray::set_menu`] from iced's `update`, which
+/// runs on that same thread.
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 fn build(
     commands: std::sync::mpsc::Sender<TrayCommand>,
     rgba: &'static [u8],
     side: u32,
 ) -> Option<Inner> {
-    use tray_icon::menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem};
+    use tray_icon::menu::MenuEvent;
+    use tray_icon::{MouseButton, TrayIconEvent};
 
     let icon = tray_icon::Icon::from_rgba(rgba.to_vec(), side, side).ok()?;
-
-    let show = MenuItem::new("Show Bombadil", true, None);
-    let hide = MenuItem::new("Hide", true, None);
-    let quit = MenuItem::new("Quit", true, None);
-    let (show_id, hide_id, quit_id) = (show.id().clone(), hide.id().clone(), quit.id().clone());
-
-    let menu = Menu::new();
-    menu.append_items(&[&show, &hide, &PredefinedMenuItem::separator(), &quit])
-        .ok()?;
+    let (menu, ids) = native::menu(menu_entries(&[]));
+    let ids: native::Commands = std::sync::Arc::new(std::sync::Mutex::new(ids));
 
     let tray = tray_icon::TrayIconBuilder::new()
         .with_tooltip("Bombadil")
         .with_icon(icon)
         .with_menu(Box::new(menu))
+        // Windows: a left click does nothing, the right click opens the menu,
+        // and a double click opens the window (below) -- the platform's
+        // convention. macOS opens the menu on any click regardless.
+        .with_menu_on_left_click(cfg!(target_os = "macos"))
         .build()
         .ok()?;
 
-    // `tray-icon` reports menu presses through a process-global channel rather
-    // than a callback on the item, so one thread translates them into the same
-    // `TrayCommand`s the Linux path sends. Ends on its own when the receiver
-    // is dropped at exit.
-    std::thread::spawn(move || {
-        while let Ok(event) = MenuEvent::receiver().recv() {
-            let command = if event.id == show_id {
-                TrayCommand::Show
-            } else if event.id == hide_id {
-                TrayCommand::Hide
-            } else if event.id == quit_id {
-                TrayCommand::Quit
-            } else {
-                continue;
-            };
-            if commands.send(command).is_err() {
-                break;
-            }
+    // `tray-icon` reports presses through process-global handlers rather than
+    // a callback per item; both translate into the same `TrayCommand`s the
+    // Linux path sends.
+    let menu_commands = commands.clone();
+    let menu_ids = ids.clone();
+    MenuEvent::set_event_handler(Some(move |event: MenuEvent| {
+        let command = menu_ids
+            .lock()
+            .ok()
+            .and_then(|ids| ids.get(&event.id).cloned());
+        if let Some(command) = command {
+            let _ = menu_commands.send(command);
         }
-    });
+    }));
+    TrayIconEvent::set_event_handler(Some(move |event: TrayIconEvent| {
+        if let TrayIconEvent::DoubleClick {
+            button: MouseButton::Left,
+            ..
+        } = event
+        {
+            let _ = commands.send(TrayCommand::Show);
+        }
+    }));
 
-    Some(tray)
+    Some(native::Handle {
+        icon: tray,
+        commands: ids,
+    })
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
@@ -313,6 +516,87 @@ fn build(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn project(label: &str, envs: &[&str]) -> crate::sidebar::Entry {
+        crate::sidebar::Entry {
+            id: uuid::Uuid::nil(),
+            label: label.into(),
+            requires_python: None,
+            environments: envs
+                .iter()
+                .map(|e| crate::sidebar::EnvironmentRow {
+                    location: bombadil_core::model::VenvLocation::Custom { path: e.into() },
+                    path: e.into(),
+                    python_version: None,
+                    pin: bombadil_core::model::PythonPin::Unpinned,
+                    active: false,
+                })
+                .collect(),
+            expanded: false,
+            git: None,
+        }
+    }
+
+    fn shape(entries: &[MenuEntry]) -> Vec<String> {
+        entries
+            .iter()
+            .map(|e| match e {
+                MenuEntry::Item { label, .. } => label.clone(),
+                MenuEntry::Disabled(label) => format!("({label})"),
+                MenuEntry::Separator => "--".into(),
+                MenuEntry::Submenu { label, children } => {
+                    format!("{label}[{}]", shape(children).join(","))
+                }
+            })
+            .collect()
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn underscores_in_names_survive_the_linux_menu() {
+        assert_eq!(linux::literal("my_api"), "my__api");
+        assert_eq!(linux::literal("plain"), "plain");
+    }
+
+    #[test]
+    fn the_menu_nests_projects_and_environments() {
+        let menu = menu_entries(&[
+            project("api", &["a", "b"]),
+            project("worker", &["w"]),
+            project("empty", &[]),
+        ]);
+        assert_eq!(
+            shape(&menu),
+            [
+                "Show Bombadil",
+                "--",
+                "api[a \u{b7} not created[Open terminal,Open in PyCharm],\
+                 b \u{b7} not created[Open terminal,Open in PyCharm]]",
+                "worker[Open terminal,Open in PyCharm]",
+                "empty[(No environment)]",
+                "--",
+                "Quit",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_menu_press_names_the_environment_it_was_built_for() {
+        let menu = menu_entries(&[project("worker", &["w"])]);
+        let MenuEntry::Submenu { children, .. } = &menu[2] else {
+            panic!("{:?}", shape(&menu));
+        };
+        let MenuEntry::Item { command, .. } = &children[0] else {
+            panic!();
+        };
+        assert_eq!(
+            *command,
+            TrayCommand::OpenTerminal {
+                project: uuid::Uuid::nil(),
+                environment: bombadil_core::model::VenvLocation::Custom { path: "w".into() },
+            }
+        );
+    }
 
     #[cfg(target_os = "linux")]
     #[test]

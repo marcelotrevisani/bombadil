@@ -29,7 +29,7 @@ pub struct EnvInputs {
 }
 
 /// The directory holding a venv's executables, which differs by platform.
-fn venv_bin_dir(venv: &std::path::Path) -> PathBuf {
+pub(crate) fn venv_bin_dir(venv: &std::path::Path) -> PathBuf {
     if cfg!(windows) {
         venv.join("Scripts")
     } else {

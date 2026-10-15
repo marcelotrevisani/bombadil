@@ -1,36 +1,36 @@
 # Pinned uv release. Checksums come from the `.sha256` files GitHub publishes
 # alongside each asset; verify with:
-#   curl -sSL https://github.com/astral-sh/uv/releases/download/0.12.1/<asset>.sha256
-version = "0.12.1"
+#   curl -sSL https://github.com/astral-sh/uv/releases/download/0.13.1/<asset>.sha256
+version = "0.13.1"
 
 [targets.x86_64-unknown-linux-gnu]
 asset = "uv-x86_64-unknown-linux-gnu.tar.gz"
-sha256 = "90b2f223fb69d19db49e117da601f64978593417988530aa733d456141b4bcbb"
+sha256 = "eadd9d27c134ab5ac1ffd4473b97a741407f3ea238288f03121fc4deddf90220"
 
 [targets.aarch64-apple-darwin]
 asset = "uv-aarch64-apple-darwin.tar.gz"
-sha256 = "77d2906988e8074fd43f2f329ec452ebbf9b0c257ba1c66451c71de70a6baf42"
+sha256 = "cfe454573412ff7380d15fc7dae5997ab53ffce72fce0a78e91ddbc84001acd2"
 
 [targets.x86_64-apple-darwin]
 asset = "uv-x86_64-apple-darwin.tar.gz"
-sha256 = "69d9f9a00337f25a50dcb13882052da08b8469bac11091c98c5694c3c6721467"
+sha256 = "bb7b805bdcf3d0bc8c74ceb94569e6b3e8aa35bd492acdbb9d46bf46d9d4ff6b"
 
 [targets.aarch64-unknown-linux-gnu]
 asset = "uv-aarch64-unknown-linux-gnu.tar.gz"
-sha256 = "769d373e146692c639b5fbaae33b331c297a32e03d30448772051902df52bbf4"
+sha256 = "9041c73c99fdc5892cf128140beb354eca9231d502068cc36e6cb53a8e59ad14"
 
 [targets.x86_64-pc-windows-msvc]
 asset = "uv-x86_64-pc-windows-msvc.zip"
-sha256 = "8fcb0cb46e1229065e344758980924e569bef5882ef45f46fada8fb24e06b74a"
+sha256 = "3b2661a463a5baea7f5076ea2b25ab71d77f36a6c0d809e5350651792f80a672"
 
 [targets.aarch64-pc-windows-msvc]
 asset = "uv-aarch64-pc-windows-msvc.zip"
-sha256 = "9bc7c18e616230fa2dc6fb24bc3afde18a95c2b5c9433de747e9502c66041568"
+sha256 = "ec7846a5939b4654afee24f2d82bf6fde71bd7a6952d7748f1135ab301dd0a49"
 
 [targets.x86_64-unknown-linux-musl]
 asset = "uv-x86_64-unknown-linux-musl.tar.gz"
-sha256 = "47823f814693bab8623308341369190de30b5c621eec5b1ee20352eae8c7982c"
+sha256 = "6c86040a8f045ab9adc9e3ec4cdafa03fd00e9a988ed2bf28971c7fc2d0debd0"
 
 [targets.aarch64-unknown-linux-musl]
 asset = "uv-aarch64-unknown-linux-musl.tar.gz"
-sha256 = "ce218dad9eb48a39dd86160bec6291fac7275f20a9cabcc4bc10dd2c757208f8"
+sha256 = "345a8308e4d1835cdfaadf692836fd3137a6d45864773f05ad7bf59442b1ba16"

@@ -5,8 +5,9 @@
 <p align="center">
   <a href="https://github.com/marcelotrevisani/bombadil/actions"><img alt="CI" src="https://github.com/marcelotrevisani/bombadil/actions/workflows/ci.yml/badge.svg"></a>
   <img alt="Rust 1.88+" src="https://img.shields.io/badge/rust-1.88%2B-B7410E">
-  <img alt="uv 0.12.1" src="https://img.shields.io/badge/uv-0.12.1-5E94D6">
+  <img alt="uv 0.13.1" src="https://img.shields.io/badge/uv-0.13.1-5E94D6">
   <img alt="Apache 2.0" src="https://img.shields.io/badge/licence-Apache--2.0-8B9187">
+  <a href="https://github.com/sponsors/marcelotrevisani"><img alt="Sponsor" src="https://img.shields.io/badge/sponsor-%E2%9D%A4-ea4aaa?logo=githubsponsors"></a>
 </p>
 
 ---
@@ -78,7 +79,7 @@ conflict, and a genuinely destructive pin change asks first.
 
 ## Install
 
-Bombadil bundles `uv 0.12.1`, so there is nothing else to install. By default it
+Bombadil bundles `uv 0.13.1`, so there is nothing else to install. By default it
 uses `uv` from `PATH` when that is at least `0.12.1` and falls back to the
 bundled copy; you can force either.
 
@@ -192,6 +193,11 @@ nothing outside the publish job can read it.
 | `bombadil-gui` | The iced front end, as a library with one public function. |
 | `bombadil-core` | Model, config store, uv invocation, environment composition, keychain, terminals, IDE launch. No GUI. |
 | `bombadil-uv-bin` | Fetches and embeds the pinned `uv` binary at build time. |
+
+## Sponsor
+
+If Bombadil saves you time, please consider [sponsoring its development on GitHub](https://github.com/sponsors/marcelotrevisani).
+The **Sponsor Bombadil** button at the foot of the app's sidebar opens the same page.
 
 ## Licence
 

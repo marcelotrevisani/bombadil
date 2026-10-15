@@ -322,7 +322,7 @@ fn field<'a>(
     iced::widget::row![
         iced::widget::text(label)
             .size(theme::LABEL)
-            .color(theme::SLATE)
+            .style(theme::text_muted)
             .width(theme::INDEX_LABEL_WIDTH),
         control,
     ]
@@ -345,12 +345,14 @@ fn index_row<'a>(
     // `app::commit_index_edit`. Both fields are data -- a name and a URL are
     // compared character by character -- so both render in Plex.
     let name_input = iced::widget::text_input("internal", &index.name)
+        .style(crate::theme::text_field)
         .font(theme::FONT_DATA)
         .size(theme::DATA)
         .padding(theme::SPACE_1)
         .on_input(move |v| Message::IndexNameChanged(i, v))
         .on_submit(Message::IndexEditCommitted(i));
     let url_input = iced::widget::text_input("https://nexus.example/simple", &index.url)
+        .style(crate::theme::text_field)
         .font(theme::FONT_DATA)
         .size(theme::DATA)
         .padding(theme::SPACE_1)
@@ -401,6 +403,7 @@ fn index_row<'a>(
         card = card.push(field(
             "username",
             iced::widget::text_input("alice", username)
+                .style(crate::theme::text_field)
                 .font(theme::FONT_DATA)
                 .size(theme::DATA)
                 .padding(theme::SPACE_1)
@@ -415,6 +418,7 @@ fn index_row<'a>(
         // back from the keychain, and rendered `.secure(true)` so even the
         // in-flight text is masked on screen.
         let credential_input = iced::widget::text_input(CREDENTIAL_PLACEHOLDER, draft)
+            .style(crate::theme::text_field)
             .font(theme::FONT_DATA)
             .size(theme::DATA)
             .padding(theme::SPACE_1)
@@ -498,7 +502,7 @@ pub fn global_view<'a>(
              keyed by the index name."
         )
         .size(theme::BODY)
-        .color(theme::SLATE),
+        .style(theme::text_muted),
     ]
     .spacing(theme::SPACE_3);
 
@@ -529,7 +533,7 @@ pub fn project_view<'a>(config: &Config, project_index: usize) -> iced::Element<
     let mut column = iced::widget::column![
         iced::widget::text("Which of the indexes above this project resolves against.")
             .size(theme::BODY)
-            .color(theme::SLATE),
+            .style(theme::text_muted),
     ]
     .spacing(theme::SPACE_2);
 
@@ -548,7 +552,7 @@ pub fn project_view<'a>(config: &Config, project_index: usize) -> iced::Element<
         let line = iced::widget::row![
             iced::widget::text(glyph.glyph.to_string())
                 .size(theme::BODY)
-                .color(glyph.colour)
+                .style(theme::tinted(glyph.swatch))
                 .width(theme::GLYPH_COLUMN_WIDTH),
             checkbox,
         ]

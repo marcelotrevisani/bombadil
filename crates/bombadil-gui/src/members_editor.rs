@@ -288,8 +288,11 @@ pub fn confirm_view<'a>(confirm: &ConfirmMemberSync) -> iced::Element<'a, Messag
     iced::widget::column![
         iced::widget::text(format!("{}\n\n{}", confirm.label, confirm.warning)),
         iced::widget::button(iced::widget::text("Sync anyway"))
-            .on_press(Message::MembersSyncConfirmed),
-        iced::widget::button(iced::widget::text("Cancel")).on_press(Message::MembersSyncCancelled),
+            .on_press(Message::MembersSyncConfirmed)
+            .style(theme::button_danger),
+        iced::widget::button(iced::widget::text("Cancel"))
+            .on_press(Message::MembersSyncCancelled)
+            .style(theme::button_quiet),
     ]
     .spacing(theme::SPACE_2)
     .into()
@@ -321,7 +324,7 @@ fn member_row<'a>(row: &MemberRow, project_index: usize) -> iced::Element<'a, Me
     let mut line = iced::widget::row![
         iced::widget::text(glyph.glyph.to_string())
             .size(theme::BODY)
-            .color(glyph.colour)
+            .style(theme::tinted(glyph.swatch))
             .width(theme::GLYPH_COLUMN_WIDTH),
         checkbox,
     ]
@@ -332,22 +335,23 @@ fn member_row<'a>(row: &MemberRow, project_index: usize) -> iced::Element<'a, Me
             iced::widget::text("(no [project].name -- cannot be installed)")
                 .font(theme::FONT_PROSE)
                 .size(theme::DATA)
-                .color(theme::SLATE),
+                .style(theme::text_muted),
         );
     }
 
     iced::widget::container(line)
         .padding(theme::SPACE_1)
-        .style(|_theme| iced::widget::container::Style {
-            background: Some(iced::Background::Color(theme::BARK)),
-            ..iced::widget::container::Style::default()
-        })
+        .style(theme::fill(theme::Swatch::Bark))
         .into()
 }
 
 /// Renders the checklist. Deliberately dumb, like every other `view` in this
 /// crate: all the logic worth testing lives in the functions above.
-pub fn view<'a>(tab: &MembersTab, project_index: usize) -> iced::Element<'a, Message> {
+pub fn view<'a>(
+    tab: &MembersTab,
+    project_index: usize,
+    waiting: Option<&str>,
+) -> iced::Element<'a, Message> {
     let mut column = iced::widget::column![
         iced::widget::text("Members")
             .font(theme::FONT_PROSE_SEMIBOLD)
@@ -359,7 +363,7 @@ pub fn view<'a>(tab: &MembersTab, project_index: usize) -> iced::Element<'a, Mes
         column = column.push(
             iced::widget::text("No additional pyproject.toml files found below this project.")
                 .size(theme::BODY)
-                .color(theme::SLATE),
+                .style(theme::text_muted),
         );
     }
 
@@ -373,14 +377,20 @@ pub fn view<'a>(tab: &MembersTab, project_index: usize) -> iced::Element<'a, Mes
         column = column.push(
             iced::widget::text(warning)
                 .size(theme::BODY)
-                .color(theme::BOOT),
+                .style(theme::text_warning),
         );
     }
 
-    column = column.push(
+    column = column.push(theme::wait_tip(
         iced::widget::button(iced::widget::text("Sync members"))
-            .on_press(Message::MembersSyncRequested(project_index)),
-    );
+            .on_press_maybe(
+                waiting
+                    .is_none()
+                    .then_some(Message::MembersSyncRequested(project_index)),
+            )
+            .style(theme::button_secondary),
+        waiting,
+    ));
 
     column.into()
 }

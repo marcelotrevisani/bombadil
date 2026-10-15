@@ -19,20 +19,15 @@
 //!   configuration that does not override them. `VIRTUAL_ENV` and the venv's
 //!   `bin` at the front of `PATH` are part of that composition, so anything
 //!   the IDE spawns resolves `python` to the configured environment.
-//! - **The interpreter itself**: not settable from out here. PyCharm records
+//! - **The interpreter itself**: written to disk before the launch, by
+//!   [`configure_interpreter`]. There is no CLI flag for it. PyCharm records
 //!   a project's SDK in `.idea/misc.xml` *by name*, and that name has to
 //!   resolve in a `jdk.table.xml` under the IDE's own versioned config
-//!   directory -- a file PyCharm holds in memory and rewrites wholesale when
-//!   it exits, so anything written into it behind a running IDE's back is
-//!   discarded. The entries also carry resolved classpath roots pointing at
-//!   stub caches the IDE generates itself. There is no CLI flag for it: the
-//!   JetBrains launcher takes a path, `diff`, `merge`, `format` and
-//!   `inspect`, and nothing else.
-//!
-//!   In practice the gap is smaller than it sounds. PyCharm detects a venv
-//!   sitting in the project directory on first open, which is where Bombadil
-//!   puts one by default; for an environment kept elsewhere the user picks it
-//!   once, and PyCharm remembers it per project from then on.
+//!   directory. PyCharm holds that file in memory and rewrites it wholesale
+//!   when it exits, so while an IDE is running only an entry that already
+//!   names the venv is reused. Otherwise the step reports what to set by
+//!   hand, and the launch goes ahead. A new entry carries empty classpath
+//!   roots, and PyCharm fills them in itself on first use.
 
 use crate::envspec::{EnvInputs, compose};
 use crate::error::EnvError;
@@ -66,6 +61,7 @@ pub fn candidates(os: Os, home: &Path) -> Vec<PathBuf> {
             home.join("Library/Application Support/JetBrains/Toolbox/scripts/pycharm"),
             PathBuf::from("/Applications/PyCharm.app/Contents/MacOS/pycharm"),
             PathBuf::from("/Applications/PyCharm CE.app/Contents/MacOS/pycharm"),
+            home.join("Applications/PyCharm.app/Contents/MacOS/pycharm"),
         ],
         Os::Windows => vec![
             home.join("AppData/Local/JetBrains/Toolbox/scripts/pycharm.cmd"),
@@ -180,6 +176,244 @@ pub fn open(
         })?;
 
     Ok(())
+}
+
+// --- interpreter ---
+
+/// `JetBrains` under this user's config directory, where every IDE keeps a
+/// versioned folder (`PyCharm2026.2`, ...). Reads the environment, so it is
+/// called at the GUI's boundary, never from a test.
+pub fn jetbrains_config_dir() -> Option<PathBuf> {
+    directories::BaseDirs::new().map(|d| d.config_dir().join("JetBrains"))
+}
+
+/// Whether a PyCharm is running right now. Only `Some(1)` from `pgrep` --
+/// "nothing matched" -- counts as not running: a probe that failed must not
+/// license a write the running IDE would throw away on exit.
+// ponytail: matches the process name only; a java-launched PyCharm (old pycharm.sh) isn't detected.
+pub fn is_running(os: Os, runner: &dyn CommandRunner) -> bool {
+    match os {
+        Os::Windows => {
+            let spec =
+                CommandSpec::new("tasklist").args(["/FI", "IMAGENAME eq pycharm64.exe", "/NH"]);
+            runner
+                .run(&spec)
+                .map(|o| o.stdout.contains("pycharm64.exe"))
+                .unwrap_or(true)
+        }
+        _ => {
+            let spec = CommandSpec::new("pgrep").args(["-x", "pycharm"]);
+            runner
+                .run(&spec)
+                .map(|o| o.status != Some(1))
+                .unwrap_or(true)
+        }
+    }
+}
+
+/// Point the project's PyCharm interpreter at the environment in `inputs`:
+/// register the venv's python in `jdk.table.xml` (reusing an entry that
+/// already names it) and select it by name in `.idea/misc.xml`.
+///
+/// The module doc's caveat still holds for a *running* IDE -- it rewrites
+/// `jdk.table.xml` from memory on exit -- so with `running` set only an
+/// existing entry is reused. `misc.xml` is per project and read on open, so
+/// it is always safe to write before the launch.
+///
+/// The error is a user-facing sentence ending in what to do by hand.
+pub fn configure_interpreter(
+    inputs: &EnvInputs,
+    jetbrains: &Path,
+    home: &Path,
+    running: bool,
+) -> Result<(), String> {
+    let exe = if cfg!(windows) {
+        "python.exe"
+    } else {
+        "python"
+    };
+    let python = crate::envspec::venv_bin_dir(&inputs.venv_path).join(exe);
+    let manual = format!("set the interpreter to {} by hand", python.display());
+
+    let config = latest_pycharm_dir(jetbrains).ok_or_else(|| {
+        format!(
+            "no PyCharm settings under {}; {manual}",
+            jetbrains.display()
+        )
+    })?;
+    let table = config.join("options").join("jdk.table.xml");
+
+    let sdk = if running {
+        let content = std::fs::read_to_string(&table).unwrap_or_default();
+        find_sdk(&content, &python, home)
+            .ok_or_else(|| format!("PyCharm is already running; {manual}"))?
+    } else {
+        let base = format!("Bombadil ({})", inputs.project.label);
+        ensure_sdk(&table, &base, &python, home).map_err(|e| format!("{e}; {manual}"))?
+    };
+
+    let misc = project_dir(inputs).join(".idea").join("misc.xml");
+    set_project_sdk(&misc, &sdk).map_err(|e| format!("{e}; {manual}"))
+}
+
+/// The newest `PyCharm<version>` / `PyCharmCE<version>` folder.
+fn latest_pycharm_dir(jetbrains: &Path) -> Option<PathBuf> {
+    std::fs::read_dir(jetbrains)
+        .ok()?
+        .filter_map(Result::ok)
+        .filter_map(|entry| {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let version = name
+                .strip_prefix("PyCharm")?
+                .trim_start_matches(char::is_alphabetic);
+            let parts: Vec<u32> = version
+                .split('.')
+                .map(|p| p.parse().ok())
+                .collect::<Option<_>>()?;
+            Some((parts, entry.path()))
+        })
+        .max_by(|a, b| a.0.cmp(&b.0))
+        .map(|(_, path)| path)
+}
+
+const EMPTY_TABLE: &str =
+    "<application>\n  <component name=\"ProjectJdkTable\">\n  </component>\n</application>\n";
+
+/// The value of the first `<tag value="..." />` in `block`.
+fn tag_value<'a>(block: &'a str, tag: &str) -> Option<&'a str> {
+    let open = format!("<{tag} value=\"");
+    let start = block.find(&open)? + open.len();
+    let len = block[start..].find('"')?;
+    Some(&block[start..start + len])
+}
+
+fn jdk_blocks(content: &str) -> impl Iterator<Item = &str> {
+    content
+        .split("<jdk ")
+        .skip(1)
+        .map(|b| b.split("</jdk>").next().unwrap_or(b))
+}
+
+/// The name of an existing SDK whose interpreter is `python`.
+fn find_sdk(content: &str, python: &Path, home: &Path) -> Option<String> {
+    // PyCharm writes '/' on Windows too, and abbreviates the home directory.
+    let norm = |p: &str| p.replace('\\', "/");
+    let python = norm(&python.to_string_lossy());
+    let home = norm(&home.to_string_lossy());
+    jdk_blocks(content).find_map(|b| {
+        let path = norm(&xml_unescape(tag_value(b, "homePath")?)).replace("$USER_HOME$", &home);
+        (path == python).then(|| tag_value(b, "name").map(xml_unescape))?
+    })
+}
+
+/// The SDK name for `python`, adding an entry to the table if there is none.
+fn ensure_sdk(table: &Path, base: &str, python: &Path, home: &Path) -> Result<String, String> {
+    let content = match std::fs::read_to_string(table) {
+        Ok(c) => c,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => EMPTY_TABLE.to_string(),
+        Err(e) => return Err(format!("cannot read {}: {e}", table.display())),
+    };
+    if let Some(name) = find_sdk(&content, python, home) {
+        return Ok(name);
+    }
+
+    // SDK names are unique; PyCharm drops a duplicate on load.
+    let taken: Vec<String> = jdk_blocks(&content)
+        .filter_map(|b| tag_value(b, "name").map(xml_unescape))
+        .collect();
+    let mut name = base.to_string();
+    let mut n = 2;
+    while taken.contains(&name) {
+        name = format!("{base} {n}");
+        n += 1;
+    }
+
+    let bad = || format!("unrecognised format in {}", table.display());
+    let component = content.find("name=\"ProjectJdkTable\"").ok_or_else(bad)?;
+    let close = component + content[component..].find("</component>").ok_or_else(bad)?;
+    // At the start of the closing tag's line, so the indentation stays tidy.
+    let at = content[..close].rfind('\n').map_or(close, |i| i + 1);
+
+    let entry = format!(
+        r#"    <jdk version="2">
+      <name value="{name}" />
+      <type value="Python SDK" />
+      <homePath value="{path}" />
+      <roots>
+        <classPath>
+          <root type="composite" />
+        </classPath>
+        <sourcePath>
+          <root type="composite" />
+        </sourcePath>
+      </roots>
+      <additional>
+        <setting name="FLAVOR_ID" value="VirtualEnvSdkFlavor" />
+        <setting name="FLAVOR_DATA" value="{{}}" />
+      </additional>
+    </jdk>
+"#,
+        name = xml_escape(&name),
+        path = xml_escape(&python.to_string_lossy()),
+    );
+
+    let mut updated = content;
+    updated.insert_str(at, &entry);
+    if let Some(dir) = table.parent() {
+        std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+    }
+    std::fs::write(table, updated).map_err(|e| format!("cannot write {}: {e}", table.display()))?;
+    Ok(name)
+}
+
+/// Create or patch `misc.xml` so the project uses the SDK named `sdk`,
+/// leaving every other component in it alone.
+fn set_project_sdk(misc: &Path, sdk: &str) -> Result<(), String> {
+    let line = format!(
+        r#"<component name="ProjectRootManager" version="2" project-jdk-name="{}" project-jdk-type="Python SDK" />"#,
+        xml_escape(sdk)
+    );
+
+    let updated = match std::fs::read_to_string(misc) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => format!(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<project version=\"4\">\n  {line}\n</project>\n"
+        ),
+        Err(e) => return Err(format!("cannot read {}: {e}", misc.display())),
+        Ok(content) => {
+            let bad = || format!("unrecognised format in {}", misc.display());
+            if let Some(start) = content.find("<component name=\"ProjectRootManager\"") {
+                let gt = start + content[start..].find('>').ok_or_else(bad)?;
+                let end = if content[..gt].ends_with('/') {
+                    gt + 1
+                } else {
+                    gt + content[gt..].find("</component>").ok_or_else(bad)? + "</component>".len()
+                };
+                format!("{}{line}{}", &content[..start], &content[end..])
+            } else {
+                let close = content.rfind("</project>").ok_or_else(bad)?;
+                format!("{}  {line}\n{}", &content[..close], &content[close..])
+            }
+        }
+    };
+
+    if let Some(dir) = misc.parent() {
+        std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+    }
+    std::fs::write(misc, updated).map_err(|e| format!("cannot write {}: {e}", misc.display()))
+}
+
+fn xml_escape(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+}
+
+fn xml_unescape(s: &str) -> String {
+    s.replace("&quot;", "\"")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&amp;", "&")
 }
 
 #[cfg(test)]
@@ -467,5 +701,217 @@ mod tests {
             0,
             "opening an IDE must not block on it"
         );
+    }
+
+    // --- interpreter ---
+
+    const HOME: &str = "/home/u";
+
+    /// A JetBrains dir holding one PyCharm config, and a project whose venv
+    /// sits beside its manifest -- both in a scratch directory.
+    fn scratch() -> (tempfile::TempDir, PathBuf, EnvInputs) {
+        let dir = tempfile::tempdir().unwrap();
+        let jetbrains = dir.path().join("JetBrains");
+        std::fs::create_dir_all(jetbrains.join("PyCharm2026.2")).unwrap();
+        let mut inputs = inputs();
+        inputs.project.pyproject_path = dir.path().join("api/pyproject.toml");
+        inputs.venv_path = dir.path().join("api/.venv");
+        (dir, jetbrains, inputs)
+    }
+
+    #[test]
+    fn the_interpreter_is_registered_and_selected_for_the_project() {
+        let (dir, jetbrains, inputs) = scratch();
+        configure_interpreter(&inputs, &jetbrains, Path::new(HOME), false).unwrap();
+
+        let table = std::fs::read_to_string(jetbrains.join("PyCharm2026.2/options/jdk.table.xml"))
+            .expect("the SDK must be registered");
+        assert!(
+            table.contains(r#"<name value="Bombadil (api)" />"#),
+            "{table}"
+        );
+        let misc = std::fs::read_to_string(dir.path().join("api/.idea/misc.xml"))
+            .expect("the project must select it");
+        assert!(
+            misc.contains(r#"project-jdk-name="Bombadil (api)""#),
+            "{misc}"
+        );
+    }
+
+    #[test]
+    fn a_running_pycharm_table_is_never_written() {
+        // It would be overwritten from memory when the IDE exits, leaving
+        // misc.xml naming an SDK that no longer exists.
+        let (dir, jetbrains, inputs) = scratch();
+        let err = configure_interpreter(&inputs, &jetbrains, Path::new(HOME), true)
+            .expect_err("nothing to reuse while PyCharm is running");
+
+        assert!(
+            err.contains("by hand"),
+            "the user must be told what to do: {err}"
+        );
+        assert!(
+            !jetbrains
+                .join("PyCharm2026.2/options/jdk.table.xml")
+                .exists()
+        );
+        assert!(!dir.path().join("api/.idea/misc.xml").exists());
+    }
+
+    #[test]
+    fn no_pycharm_settings_is_a_warning_naming_where_it_looked() {
+        let (_dir, jetbrains, inputs) = scratch();
+        std::fs::remove_dir(jetbrains.join("PyCharm2026.2")).unwrap();
+        let err = configure_interpreter(&inputs, &jetbrains, Path::new(HOME), false).unwrap_err();
+        assert!(err.contains("JetBrains"), "{err}");
+    }
+
+    #[test]
+    fn an_existing_sdk_is_reused_not_duplicated() {
+        let dir = tempfile::tempdir().unwrap();
+        let table = dir.path().join("options/jdk.table.xml");
+        let py = Path::new("/venvs/a & b/bin/python");
+
+        assert_eq!(
+            ensure_sdk(&table, "Bombadil (a)", py, Path::new(HOME)).unwrap(),
+            "Bombadil (a)"
+        );
+        let content = std::fs::read_to_string(&table).unwrap();
+        assert!(content.contains(r#"<homePath value="/venvs/a &amp; b/bin/python" />"#));
+
+        assert_eq!(
+            ensure_sdk(&table, "other", py, Path::new(HOME)).unwrap(),
+            "Bombadil (a)"
+        );
+        assert_eq!(std::fs::read_to_string(&table).unwrap(), content);
+    }
+
+    #[test]
+    fn user_home_macro_matches_and_taken_names_get_a_suffix() {
+        let dir = tempfile::tempdir().unwrap();
+        let table = dir.path().join("jdk.table.xml");
+        std::fs::write(
+            &table,
+            r#"<application>
+  <component name="ProjectJdkTable">
+    <jdk version="2">
+      <name value="uv (api)" />
+      <homePath value="$USER_HOME$/api/.venv/bin/python" />
+    </jdk>
+    <jdk version="2">
+      <name value="Bombadil (x)" />
+      <homePath value="/elsewhere/bin/python" />
+    </jdk>
+  </component>
+</application>
+"#,
+        )
+        .unwrap();
+
+        let existing = Path::new("/home/u/api/.venv/bin/python");
+        assert_eq!(
+            ensure_sdk(&table, "n", existing, Path::new(HOME)).unwrap(),
+            "uv (api)"
+        );
+
+        let new = Path::new("/venvs/x/bin/python");
+        assert_eq!(
+            ensure_sdk(&table, "Bombadil (x)", new, Path::new(HOME)).unwrap(),
+            "Bombadil (x) 2"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&table)
+                .unwrap()
+                .matches("<jdk ")
+                .count(),
+            3
+        );
+    }
+
+    #[test]
+    fn windows_separators_still_match() {
+        let table = r#"<jdk version="2"><name value="w" /><homePath value="$USER_HOME$/p/.venv/Scripts/python.exe" /></jdk>"#;
+        let py = Path::new(r"C:\Users\u\p\.venv\Scripts\python.exe");
+        assert_eq!(
+            find_sdk(table, py, Path::new(r"C:\Users\u")).as_deref(),
+            Some("w")
+        );
+    }
+
+    #[test]
+    fn an_unrecognised_table_is_left_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let table = dir.path().join("jdk.table.xml");
+        std::fs::write(&table, "garbage").unwrap();
+        assert!(ensure_sdk(&table, "n", Path::new("/p"), Path::new(HOME)).is_err());
+        assert_eq!(std::fs::read_to_string(&table).unwrap(), "garbage");
+    }
+
+    #[test]
+    fn misc_xml_keeps_its_other_components() {
+        let dir = tempfile::tempdir().unwrap();
+        let misc = dir.path().join("misc.xml");
+        std::fs::write(
+            &misc,
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<project version="4">
+  <component name="Black">
+    <option name="sdkName" value="old" />
+  </component>
+  <component name="ProjectRootManager" version="2" project-jdk-name="old" project-jdk-type="Python SDK" />
+</project>
+"#,
+        )
+        .unwrap();
+        set_project_sdk(&misc, "new").unwrap();
+        let content = std::fs::read_to_string(&misc).unwrap();
+        assert!(content.contains(r#"project-jdk-name="new""#));
+        assert!(!content.contains(r#"project-jdk-name="old""#));
+        assert!(content.contains(r#"<component name="Black">"#));
+        assert_eq!(content.matches("ProjectRootManager").count(), 1);
+    }
+
+    #[test]
+    fn misc_xml_without_the_component_gets_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let misc = dir.path().join("misc.xml");
+        std::fs::write(&misc, "<project version=\"4\">\n</project>\n").unwrap();
+        set_project_sdk(&misc, "new").unwrap();
+        let content = std::fs::read_to_string(&misc).unwrap();
+        assert!(content.contains("ProjectRootManager"));
+        assert!(content.ends_with("</project>\n"));
+    }
+
+    #[test]
+    fn the_newest_pycharm_settings_win() {
+        let dir = tempfile::tempdir().unwrap();
+        for d in [
+            "PyCharm2025.3",
+            "PyCharm2026.2",
+            "PyCharmCE2026.1",
+            "PyCharm2026.10x",
+            "CLion2027.1",
+        ] {
+            std::fs::create_dir(dir.path().join(d)).unwrap();
+        }
+        let got = latest_pycharm_dir(dir.path()).unwrap();
+        assert_eq!(got.file_name().unwrap(), "PyCharm2026.2");
+    }
+
+    #[test]
+    fn a_failed_running_probe_assumes_running() {
+        // Assuming "not running" would license a write the IDE discards.
+        let runner = FakeCommandRunner::new();
+        assert!(is_running(Os::Linux, &runner));
+        runner.expect(
+            "pgrep",
+            &["-x", "pycharm"],
+            CommandOutcome {
+                status: Some(1),
+                stdout: String::new(),
+                stderr: String::new(),
+            },
+        );
+        assert!(!is_running(Os::Linux, &runner));
     }
 }

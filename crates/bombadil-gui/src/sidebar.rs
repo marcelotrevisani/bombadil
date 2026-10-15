@@ -67,6 +67,9 @@ pub struct Entry {
     /// Whether the tree shows them. Persisted on the project, so a project
     /// you collapse stays collapsed.
     pub expanded: bool,
+    /// The project directory's git branch and status, once probed. `None`
+    /// before then and for a project that is not in a repository.
+    pub git: Option<bombadil_core::git::GitStatus>,
 }
 
 /// Builds one `Entry` per project, in config order.
@@ -103,6 +106,7 @@ pub fn entries(config: &Config) -> Vec<Entry> {
                 })
                 .collect(),
             expanded: project.expanded,
+            git: None,
         })
         .collect()
 }
@@ -152,6 +156,44 @@ pub fn rolled_up(rows: &[EnvironmentRow], requires_python: Option<&str>) -> Stat
 /// crate does not test by convention.
 pub fn environment_press(project: usize, row: &EnvironmentRow) -> Message {
     Message::EnvironmentActivated(project, row.location.clone())
+}
+
+/// The indices of `entries` the sidebar shows under `filter`: those whose
+/// label or project folder contains it (case-insensitively), and always the
+/// selected one, so the project the detail pane shows never vanishes from
+/// the list. Only what is shown changes; messages keep real indices.
+pub fn visible(
+    entries: &[Entry],
+    dirs: &[std::path::PathBuf],
+    filter: &str,
+    selected: Option<usize>,
+) -> Vec<usize> {
+    entries
+        .iter()
+        .enumerate()
+        .filter(|(i, entry)| {
+            selected == Some(*i)
+                || crate::deps::name_matches(&entry.label, filter)
+                // The folder's own name, not its whole path: every project
+                // shares its parents (the home folder, "projects"), so
+                // matching them would make short queries match everything.
+                || dirs.get(*i).and_then(|d| d.file_name()).is_some_and(|name| {
+                    crate::deps::name_matches(&name.to_string_lossy(), filter)
+                })
+        })
+        .map(|(i, _)| i)
+        .collect()
+}
+
+/// What to say when an environment's own pin is not what it runs: the pin
+/// was changed and nothing has rebuilt it yet. `None` when unpinned, not yet
+/// probed, or agreeing.
+pub fn pin_note(row: &EnvironmentRow) -> Option<String> {
+    let (Some(version), PythonPin::Version(pinned)) = (&row.python_version, &row.pin) else {
+        return None;
+    };
+    (!interpreter::satisfies_pin(version, &row.pin))
+        .then(|| format!("pinned {pinned}: sync to apply"))
 }
 
 /// The glyph for one environment row.
@@ -207,9 +249,25 @@ pub fn state(entry: &Entry) -> State {
 /// Each row is wrapped in a `mouse_area` so a right-click opens the project's
 /// context menu (spec §8) without disturbing the left-click select behaviour
 /// the button already provides.
-pub fn view<'a>(entries: &[Entry], selected: Option<usize>) -> iced::Element<'a, Message> {
+/// `busy` is the project running a command and the spinner's angle: its row
+/// shows the spinner where the state glyph would be. `waiting` is that
+/// command's label, for the disabled Sync's tooltip.
+///
+/// Hovering a row (or selecting it) shows its actions -- Sync, terminal and
+/// More, which opens the right-click menu -- so nothing depends on knowing
+/// to right-click.
+pub fn view<'a>(
+    entries: &[Entry],
+    selected: Option<usize>,
+    busy: Option<(uuid::Uuid, f32)>,
+    waiting: Option<&str>,
+    shown: &[usize],
+) -> iced::Element<'a, Message> {
     let mut list = iced::widget::column![].spacing(theme::SPACE_2);
     for (i, entry) in entries.iter().enumerate() {
+        if !shown.contains(&i) {
+            continue;
+        }
         let is_selected = selected == Some(i);
         let glyph = theme::state_glyph(state(entry));
 
@@ -230,14 +288,14 @@ pub fn view<'a>(entries: &[Entry], selected: Option<usize>) -> iced::Element<'a,
             Some(version) => iced::widget::text(version.clone())
                 .font(theme::FONT_DATA)
                 .size(theme::DATA)
-                .color(theme::SLATE)
+                .style(theme::text_muted)
                 .into(),
             // Words, not a version, so prose rather than the data face --
             // the rule `theme` sets and this row has always followed.
             None => iced::widget::text("no env")
                 .font(theme::FONT_PROSE)
                 .size(theme::DATA)
-                .color(theme::SLATE)
+                .style(theme::text_muted)
                 .into(),
         };
 
@@ -255,7 +313,7 @@ pub fn view<'a>(entries: &[Entry], selected: Option<usize>) -> iced::Element<'a,
         .on_press(Message::ProjectExpandToggled(i))
         .padding(0.0)
         .width(theme::DISCLOSURE_WIDTH)
-        .style(theme::button_bare(theme::SLATE));
+        .style(theme::button_bare(theme::Swatch::Slate));
 
         // The selection marker: a `jacket` bar down the row's leading edge,
         // and the row's fill becomes the `ink` of the pane it opens, so the
@@ -271,8 +329,8 @@ pub fn view<'a>(entries: &[Entry], selected: Option<usize>) -> iced::Element<'a,
                 .height(iced::Length::Fill),
         )
         .height(iced::Length::Fill)
-        .style(move |_theme| iced::widget::container::Style {
-            background: is_selected.then_some(iced::Background::Color(theme::JACKET)),
+        .style(move |t| iced::widget::container::Style {
+            background: is_selected.then_some(iced::Background::Color(theme::palette(t).jacket)),
             ..iced::widget::container::Style::default()
         });
 
@@ -280,40 +338,80 @@ pub fn view<'a>(entries: &[Entry], selected: Option<usize>) -> iced::Element<'a,
             marker,
             iced::widget::column![
                 iced::widget::row![
-                    iced::widget::text(glyph.glyph.to_string())
-                        .size(theme::BODY)
-                        .color(glyph.colour)
-                        .width(theme::GLYPH_COLUMN_WIDTH),
+                    match busy {
+                        Some((id, angle)) if id == entry.id => iced::widget::container(
+                            crate::icons::spinner(angle, 12.0, theme::Swatch::Slate)
+                        )
+                        .width(theme::GLYPH_COLUMN_WIDTH)
+                        .into(),
+                        _ => theme::tip(
+                            iced::widget::text(glyph.glyph.to_string())
+                                .size(theme::BODY)
+                                .style(theme::tinted(glyph.swatch))
+                                .width(theme::GLYPH_COLUMN_WIDTH),
+                            theme::state_meaning(state(entry)),
+                            iced::widget::tooltip::Position::Right,
+                        ),
+                    },
                     iced::widget::text(entry.label.clone())
                         .font(label_font)
                         .size(theme::BODY),
                 ]
                 .spacing(theme::SPACE_1),
-                version_line,
+                // Indented to start under the label, not under the glyph.
+                iced::widget::row![
+                    // Less the gap: this row spaces wider than the label's.
+                    iced::widget::Space::new().width(theme::GLYPH_COLUMN_WIDTH - theme::SPACE_1),
+                    version_line
+                ]
+                .push(entry.git.as_ref().map(|git| {
+                    // `*` for uncommitted changes, the mark a shell
+                    // prompt uses; the detail header says which.
+                    let dirty = if git.is_clean() { "" } else { "*" };
+                    iced::widget::text(format!("{}{dirty}", git.branch))
+                        .font(theme::FONT_DATA)
+                        .size(theme::DATA)
+                        .style(theme::text_muted)
+                        // One line, cut at the row's edge: a long branch
+                        // wrapped out of the row and under its neighbour.
+                        .wrapping(iced::widget::text::Wrapping::None)
+                }))
+                .spacing(theme::SPACE_2),
             ]
             .spacing(theme::SPACE_1),
         ]
         .spacing(theme::SPACE_2);
 
+        // A fixed height, as environment rows have: the marker fills the
+        // row's height, and with the row left to shrink the two resolved
+        // each other to one squashed line that hid the version and branch.
         let row = iced::widget::button(content)
             .on_press(Message::ProjectSelected(i))
             .padding(theme::SPACE_1)
             .width(iced::Length::Fill)
-            .style(move |_theme, status| iced::widget::button::Style {
+            .height(theme::PROJECT_ROW_HEIGHT)
+            .clip(true)
+            .style(move |t, status| iced::widget::button::Style {
                 background: match (is_selected, status) {
-                    (true, _) => Some(iced::Background::Color(theme::INK)),
+                    (true, _) => Some(iced::Background::Color(theme::palette(t).ink)),
                     (false, iced::widget::button::Status::Hovered) => {
-                        Some(iced::Background::Color(theme::INK))
+                        Some(iced::Background::Color(theme::palette(t).ink))
                     }
                     _ => None,
                 },
-                text_color: theme::PARCHMENT,
+                text_color: theme::palette(t).parchment,
                 border: iced::Border {
                     radius: theme::RADIUS.into(),
                     ..iced::Border::default()
                 },
                 ..iced::widget::button::Style::default()
             });
+        let actions = row_actions(i, is_selected, waiting);
+        let row: iced::Element<'a, Message> = if is_selected {
+            iced::widget::stack![row, actions].into()
+        } else {
+            iced::widget::hover(row, actions)
+        };
         list = list.push(
             iced::widget::mouse_area(
                 iced::widget::row![disclosure, row]
@@ -338,6 +436,97 @@ pub fn view<'a>(entries: &[Entry], selected: Option<usize>) -> iced::Element<'a,
         }
     }
     list.into()
+}
+
+/// The collapsed sidebar: the expand button, then one state glyph per
+/// project (the spinner for the busy one), its label in a tooltip. Pressing
+/// a glyph selects that project, as its full row would.
+pub fn rail<'a>(
+    entries: &[Entry],
+    selected: Option<usize>,
+    busy: Option<(uuid::Uuid, f32)>,
+    shown: &[usize],
+) -> iced::Element<'a, Message> {
+    use crate::icons::{self, Icon};
+    use crate::shortcuts::{Shortcut, keys};
+    let mut column = iced::widget::column![icons::icon_button(
+        Icon::PanelLeft,
+        format!("Expand sidebar ({})", keys(Shortcut::ToggleSidebar)),
+        Some(Message::SidebarToggled),
+    )]
+    .spacing(theme::SPACE_1)
+    .align_x(iced::Alignment::Center);
+    for (i, entry) in entries.iter().enumerate() {
+        if !shown.contains(&i) {
+            continue;
+        }
+        let glyph = theme::state_glyph(state(entry));
+        let mark: iced::Element<'a, Message> = match busy {
+            Some((id, angle)) if id == entry.id => {
+                icons::spinner(angle, 12.0, theme::Swatch::Slate)
+            }
+            _ => iced::widget::text(glyph.glyph.to_string())
+                .size(theme::BODY)
+                .style(theme::tinted(glyph.swatch))
+                .into(),
+        };
+        column = column.push(theme::tip(
+            iced::widget::button(mark)
+                .on_press(Message::ProjectSelected(i))
+                .padding([theme::SPACE_1, theme::SPACE_2])
+                .style(theme::button_choice(selected == Some(i))),
+            entry.label.clone(),
+            iced::widget::tooltip::Position::Right,
+        ));
+    }
+    iced::widget::scrollable(column)
+        .height(iced::Length::Fill)
+        .into()
+}
+
+/// The quiet icon buttons a project row shows on hover, on an `ink` pill
+/// (the hovered row's own fill) at its right edge. Only the pill takes
+/// presses; the rest of the row still selects.
+fn row_actions<'a>(i: usize, selected: bool, waiting: Option<&str>) -> iced::Element<'a, Message> {
+    use crate::icons::{Icon, icon_button};
+    use crate::shortcuts::{Shortcut, hint};
+    let sync = match waiting {
+        None => icon_button(
+            Icon::Refresh,
+            hint("Sync", Shortcut::Sync, selected),
+            Some(Message::SyncRequested(i)),
+        ),
+        Some(label) => icon_button(Icon::Refresh, format!("Wait for {label} to finish"), None),
+    };
+    let pill = iced::widget::container(iced::widget::row![
+        sync,
+        icon_button(
+            Icon::Terminal,
+            hint("Open a terminal", Shortcut::Terminal, selected),
+            Some(Message::OpenTerminalHereRequested(i)),
+        ),
+        icon_button(
+            Icon::Ellipsis,
+            "More: open folder, recreate, remove",
+            Some(Message::ContextMenuOpened(i)),
+        ),
+    ])
+    .style(|t| iced::widget::container::Style {
+        background: Some(iced::Background::Color(theme::palette(t).ink)),
+        border: iced::Border {
+            radius: theme::RADIUS.into(),
+            ..iced::Border::default()
+        },
+        ..iced::widget::container::Style::default()
+    });
+    iced::widget::container(pill)
+        .width(iced::Length::Fill)
+        .height(iced::Length::Fill)
+        .align_x(iced::alignment::Horizontal::Right)
+        // On the label's line, leaving the version and branch beneath it
+        // readable while the row is selected.
+        .align_y(iced::alignment::Vertical::Top)
+        .into()
 }
 
 /// One environment beneath its project.
@@ -368,7 +557,6 @@ fn environment_row<'a>(
     // "default" rather than "active", which is the user's own word for it:
     // the environment a project uses when you select it. The model calls it
     // `active`; nothing on screen has to.
-    let suffix = if active { "  default" } else { "" };
 
     // The active marker: a `jacket` bar down the leading edge, the same shape
     // a selected project uses. It replaced a full outline around the row,
@@ -380,8 +568,8 @@ fn environment_row<'a>(
             .height(iced::Length::Fill),
     )
     .height(iced::Length::Fill)
-    .style(move |_theme| iced::widget::container::Style {
-        background: active.then_some(iced::Background::Color(theme::JACKET)),
+    .style(move |t| iced::widget::container::Style {
+        background: active.then_some(iced::Background::Color(theme::palette(t).jacket)),
         ..iced::widget::container::Style::default()
     });
 
@@ -389,16 +577,27 @@ fn environment_row<'a>(
         marker,
         iced::widget::text(glyph.glyph.to_string())
             .size(theme::BODY)
-            .color(glyph.colour)
+            .style(theme::tinted(glyph.swatch))
             .width(theme::GLYPH_COLUMN_WIDTH),
         iced::widget::column![
-            iced::widget::text(format!("{name}{suffix}"))
-                .font(theme::FONT_DATA)
-                .size(theme::DATA),
-            iced::widget::text(version)
-                .font(theme::FONT_DATA)
-                .size(theme::LABEL)
-                .color(theme::SLATE),
+            iced::widget::row![
+                iced::widget::text(name)
+                    .font(theme::FONT_DATA)
+                    .size(theme::DATA)
+            ]
+            .push(active.then(|| theme::badge("default")))
+            .spacing(theme::SPACE_2)
+            .align_y(iced::Alignment::Center),
+            match pin_note(row) {
+                Some(note) => iced::widget::text(format!("{version} \u{b7} {note}"))
+                    .font(theme::FONT_DATA)
+                    .size(theme::LABEL)
+                    .style(theme::text_warning),
+                None => iced::widget::text(version)
+                    .font(theme::FONT_DATA)
+                    .size(theme::LABEL)
+                    .style(theme::text_muted),
+            },
         ]
         .spacing(0),
     ]
@@ -420,15 +619,15 @@ fn environment_row<'a>(
             .width(iced::Length::Fill)
             .height(theme::TREE_ROW_HEIGHT)
             .padding(theme::SPACE_1)
-            .style(move |_theme, status| iced::widget::button::Style {
+            .style(move |t, status| iced::widget::button::Style {
                 background: match (active, status) {
-                    (true, _) => Some(iced::Background::Color(theme::INK)),
+                    (true, _) => Some(iced::Background::Color(theme::palette(t).ink)),
                     (false, iced::widget::button::Status::Hovered) => {
-                        Some(iced::Background::Color(theme::INK))
+                        Some(iced::Background::Color(theme::palette(t).ink))
                     }
                     _ => None,
                 },
-                text_color: theme::PARCHMENT,
+                text_color: theme::palette(t).parchment,
                 border: iced::Border {
                     radius: theme::RADIUS.into(),
                     ..iced::Border::default()
@@ -469,13 +668,13 @@ fn add_environment_row<'a>(project_id: uuid::Uuid) -> iced::Element<'a, Message>
         iced::widget::button(
             iced::widget::text("+ add environment")
                 .size(theme::DATA)
-                .color(theme::SLATE),
+                .style(theme::text_muted),
         )
         .on_press(Message::EnvironmentAdded(project_id))
         .width(iced::Length::Fill)
         .height(theme::TREE_ROW_HEIGHT)
         .padding(theme::SPACE_1)
-        .style(theme::button_bare(theme::SLATE)),
+        .style(theme::button_bare(theme::Swatch::Slate)),
     ]
     .spacing(0)
     .height(theme::TREE_ROW_HEIGHT)
@@ -498,6 +697,55 @@ mod tests {
         }
     }
 
+    #[test]
+    fn a_pin_the_environment_misses_says_sync_applies_it() {
+        assert_eq!(
+            pin_note(&pinned("3.11.9", "3.12").environments[0]).as_deref(),
+            Some("pinned 3.12: sync to apply")
+        );
+        assert_eq!(pin_note(&pinned("3.12.4", "3.12").environments[0]), None);
+        assert_eq!(
+            pin_note(&entry(None, None).environments[0]),
+            None,
+            "nothing probed, nothing to claim"
+        );
+        assert_eq!(
+            pin_note(&entry(Some("3.11.9"), None).environments[0]),
+            None,
+            "unpinned"
+        );
+    }
+
+    fn named(label: &str) -> Entry {
+        Entry {
+            label: label.into(),
+            ..entry(None, None)
+        }
+    }
+
+    #[test]
+    fn the_project_filter_matches_label_or_folder_and_keeps_the_selection() {
+        let entries = [named("api"), named("worker"), named("web")];
+        let dirs = [
+            std::path::PathBuf::from("/code/api"),
+            std::path::PathBuf::from("/code/jobs"),
+            std::path::PathBuf::from("/code/site"),
+        ];
+        assert_eq!(visible(&entries, &dirs, "", None), [0, 1, 2]);
+        assert_eq!(visible(&entries, &dirs, "WO", None), [1]);
+        assert_eq!(visible(&entries, &dirs, "jobs", None), [1], "by folder too");
+        assert_eq!(
+            visible(&entries, &dirs, "code", None),
+            Vec::<usize>::new(),
+            "a parent every project shares narrows nothing, so it does not match"
+        );
+        assert_eq!(
+            visible(&entries, &dirs, "web", Some(0)),
+            [0, 2],
+            "the selected project never vanishes"
+        );
+    }
+
     fn entry(python_version: Option<&str>, requires_python: Option<&str>) -> Entry {
         Entry {
             id: uuid::Uuid::nil(),
@@ -509,6 +757,7 @@ mod tests {
                 ..row("/p/api/.venv")
             }],
             expanded: true,
+            git: None,
         }
     }
 

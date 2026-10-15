@@ -18,7 +18,7 @@ pub struct UvVersion {
 /// `bombadil-core` stays independent of the binary crate.
 pub const BUNDLED_UV_VERSION: UvVersion = UvVersion {
     major: 0,
-    minor: 12,
+    minor: 13,
     patch: 1,
 };
 
