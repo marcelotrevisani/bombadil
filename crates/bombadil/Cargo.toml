@@ -13,7 +13,7 @@ categories.workspace = true
 readme = "../../README.md"
 
 [dependencies]
-bombadil-gui = { path = "../bombadil-gui", version = "0.3.3" }
+bombadil-gui = { path = "../bombadil-gui", version = "0.3.4" }
 
 # Linux packages, built by the release workflow with `cargo deb` and
 # `cargo generate-rpm`. Paths are relative to this crate, except
