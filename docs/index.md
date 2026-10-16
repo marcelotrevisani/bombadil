@@ -11,7 +11,12 @@ It never owns an environment. [uv](https://docs.astral.sh/uv/) creates them and
 resolves them, and Bombadil reports on their state and runs uv for you. If you
 uninstall Bombadil, every environment it showed you is still there, untouched.
 
-![The main window](images/main.png)
+<video controls muted playsinline preload="metadata" poster="images/main.png" style="width: 100%">
+  <source src="images/demo.mp4" type="video/mp4">
+</video>
+
+Adding a project and a second environment, setting a variable, then opening a
+terminal and PyCharm with the environment activated.
 
 ## What you can do with it
 

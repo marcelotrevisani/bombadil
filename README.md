@@ -28,6 +28,12 @@ untouched.
 > Tom Bombadil is the keeper of a bounded domain who owns nothing he tends.
 > That is the whole design brief, and it is where the palette comes from.
 
+<p align="center">
+  <a href="docs/images/demo.mp4"><img src="assets/demo.gif" alt="Adding a project, then opening a terminal and PyCharm with its environment activated" width="900"></a>
+  <br>
+  <em>Adding a project, then opening a terminal and PyCharm with its environment activated. Click for the full two-minute video, which also adds a second environment and a variable.</em>
+</p>
+
 ## What it does
 
 **Projects and environments.** Register a project by its `pyproject.toml`. A
@@ -160,8 +166,6 @@ which is why it is set both ways.
   look. If it starts appearing elsewhere it stops meaning anything, and the
   test that guards this is the most important one in `theme`.
 - **Never edit `deny.toml` to dodge a licence or advisory failure.** Escalate.
-
-Specs and implementation plans live in `docs/superpowers/`.
 
 ### Releasing
 
