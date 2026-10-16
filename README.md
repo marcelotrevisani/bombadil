@@ -167,8 +167,6 @@ which is why it is set both ways.
   test that guards this is the most important one in `theme`.
 - **Never edit `deny.toml` to dodge a licence or advisory failure.** Escalate.
 
-Specs and implementation plans live in `docs/superpowers/`.
-
 ### Releasing
 
 Publishing is irreversible — crates.io versions can be yanked but never

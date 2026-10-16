@@ -6,9 +6,7 @@ repo_name: marcelotrevisani/bombadil
 edit_uri: edit/main/docs/
 copyright: Apache-2.0
 
-# Specs and implementation plans live under docs/ too; they are not user docs.
 exclude_docs: |
-  superpowers/
   requirements.txt
 
 validation:
