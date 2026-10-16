@@ -216,8 +216,11 @@ impl Store {
 /// Idempotent, because [`Store::open`] runs it on every load including files
 /// it wrote itself: a project that already has environments is left alone.
 pub fn migrate(mut config: Config) -> Config {
+    // Only a version-1 file gets an environment made up for it. A version-2
+    // project with none is one whose last environment the user removed.
+    let from_version_1 = config.schema_version < 2;
     for project in &mut config.projects {
-        if project.environments.is_empty() {
+        if from_version_1 && project.environments.is_empty() {
             let location = project.legacy_venv.take().unwrap_or_default();
             let python = project
                 .legacy_python
@@ -316,6 +319,16 @@ mod tests {
         // including on files it wrote itself.
         let already: Config = toml::from_str(GOLDEN_FIXTURE).expect("v2 parses");
         assert_eq!(migrate(already.clone()), already);
+    }
+
+    #[test]
+    fn a_version_2_project_with_no_environments_keeps_none() {
+        // Removing a project's last environment is allowed. Refilling an
+        // empty list on every load would bring a removed `.venv` back on
+        // the next start.
+        let mut config: Config = toml::from_str(GOLDEN_FIXTURE).expect("v2 parses");
+        config.projects[0].environments.clear();
+        assert!(migrate(config).projects[0].environments.is_empty());
     }
 
     #[test]

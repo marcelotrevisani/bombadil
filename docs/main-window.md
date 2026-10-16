@@ -48,8 +48,9 @@ environment is marked **default**.
   and the Dependencies tab all act on the default environment.
 - The **trash** button at the end of an environment row removes it from the
   project, after asking. Right-clicking the row does the same. The folder
-  stays on disk. A project needs at least one environment, so the button is
-  greyed out when there is only one: add another first.
+  stays on disk. You can remove a project's last environment too. The project
+  then shows only its folder and an **Add environment** button, since Sync,
+  the terminal, PyCharm and the tabs all need an environment.
 - **+ add environment** asks for a folder and adds it as another environment
   of the project. Use this to keep, for example, a Python 3.12 environment
   next to a 3.13 one. You can also point at an environment that another

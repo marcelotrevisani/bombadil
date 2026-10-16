@@ -410,7 +410,7 @@ pub fn view<'a>(
                 },
                 ..iced::widget::button::Style::default()
             });
-        let actions = row_actions(i, is_selected, waiting);
+        let actions = row_actions(i, is_selected, waiting, !entry.environments.is_empty());
         let row: iced::Element<'a, Message> = if is_selected {
             iced::widget::stack![row, actions].into()
         } else {
@@ -435,7 +435,6 @@ pub fn view<'a>(
                     i,
                     entry.id,
                     environment,
-                    entry.environments.len() > 1,
                     entry.requires_python.as_deref(),
                 ));
             }
@@ -559,7 +558,12 @@ pub fn rail<'a>(
 /// The quiet icon buttons a project row shows on hover, on an `ink` pill
 /// (the hovered row's own fill) at its right edge. Only the pill takes
 /// presses; the rest of the row still selects.
-fn row_actions<'a>(i: usize, selected: bool, waiting: Option<&str>) -> iced::Element<'a, Message> {
+fn row_actions<'a>(
+    i: usize,
+    selected: bool,
+    waiting: Option<&str>,
+    has_environment: bool,
+) -> iced::Element<'a, Message> {
     use crate::icons::{Icon, icon_button};
     use crate::shortcuts::{Shortcut, hint};
     let sync = match waiting {
@@ -570,19 +574,20 @@ fn row_actions<'a>(i: usize, selected: bool, waiting: Option<&str>) -> iced::Ele
         ),
         Some(label) => icon_button(Icon::Refresh, format!("Wait for {label} to finish"), None),
     };
-    let pill = iced::widget::container(iced::widget::row![
-        sync,
-        crate::icons::tile_button(
+    // Sync and the terminal need an environment to act on.
+    let mut buttons = iced::widget::row![];
+    if has_environment {
+        buttons = buttons.push(sync).push(crate::icons::tile_button(
             crate::icons::Tile::Terminal,
             hint("Open a terminal", Shortcut::Terminal, selected),
             Some(Message::OpenTerminalHereRequested(i)),
-        ),
-        icon_button(
-            Icon::Ellipsis,
-            "More: open folder, recreate, remove",
-            Some(Message::ContextMenuOpened(i)),
-        ),
-    ])
+        ));
+    }
+    let pill = iced::widget::container(buttons.push(icon_button(
+        Icon::Ellipsis,
+        "More: open folder, recreate, remove",
+        Some(Message::ContextMenuOpened(i)),
+    )))
     .style(|t| iced::widget::container::Style {
         background: Some(iced::Background::Color(theme::palette(t).ink)),
         border: iced::Border {
@@ -610,7 +615,6 @@ fn environment_row<'a>(
     project: usize,
     project_id: uuid::Uuid,
     row: &EnvironmentRow,
-    removable: bool,
     requires_python: Option<&str>,
 ) -> iced::Element<'a, Message> {
     let glyph = theme::state_glyph(row_state(row, requires_python));
@@ -709,30 +713,22 @@ fn environment_row<'a>(
     .height(theme::TREE_ROW_HEIGHT)
     .align_y(iced::Alignment::Center);
     // A visible remove button as well as the right-press below: a gesture
-    // with nothing on screen to hint at it is one nobody finds. Shown, but
-    // disabled, on the last one, with the reason in its tip: a hidden button
-    // reads as a missing feature.
+    // with nothing on screen to hint at it is one nobody finds.
     pressable = pressable.push(crate::icons::icon_button(
         crate::icons::Icon::Trash,
-        if removable {
-            "Remove environment"
-        } else {
-            "A project needs at least one environment. Add another before removing this one."
-        },
-        removable.then(|| Message::EnvironmentRemoveRequested(project_id, location.clone())),
+        "Remove environment",
+        Some(Message::EnvironmentRemoveRequested(
+            project_id,
+            location.clone(),
+        )),
     ));
 
     // Right-press removes, the same gesture the project rows already use for
     // their own menu -- and it opens the confirmation rather than removing,
-    // so an accidental right-click costs nothing. Never offered for the last
-    // one: a project with no environments has nothing to sync.
-    if removable {
-        iced::widget::mouse_area(pressable)
-            .on_right_press(Message::EnvironmentRemoveRequested(project_id, location))
-            .into()
-    } else {
-        pressable.into()
-    }
+    // so an accidental right-click costs nothing.
+    iced::widget::mouse_area(pressable)
+        .on_right_press(Message::EnvironmentRemoveRequested(project_id, location))
+        .into()
 }
 
 /// The "add an environment" control beneath a project's environments.

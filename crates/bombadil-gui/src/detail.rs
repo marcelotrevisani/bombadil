@@ -239,6 +239,50 @@ fn project_dir(project: &Project) -> PathBuf {
 /// against the selection instead is a bug.
 /// `busy` is the running command, if any: its label, the spinner angle, and
 /// whether it is this project's.
+/// The project view for a project with no environment: its name, its
+/// folder, and a way to add one. Sync, the terminal, PyCharm, the status
+/// tiles and the tabs all act on an environment, so none of them is shown.
+pub fn no_environment_view<'a>(
+    project: &bombadil_core::model::Project,
+    index: usize,
+) -> iced::Element<'a, Message> {
+    let folder = project
+        .pyproject_path
+        .parent()
+        .unwrap_or(&project.pyproject_path)
+        .display()
+        .to_string();
+    iced::widget::column![
+        iced::widget::row![
+            iced::widget::text(project.label.clone())
+                .font(theme::FONT_PROSE_SEMIBOLD)
+                .size(theme::DISPLAY),
+            iced::widget::Space::new().width(iced::Length::Fill),
+            icons::icon_button(
+                Icon::Folder,
+                "Open the project folder",
+                Some(Message::OpenFolderRequested(index)),
+            ),
+        ]
+        .align_y(iced::Alignment::Center),
+        iced::widget::text(folder)
+            .font(theme::FONT_DATA)
+            .size(theme::DATA)
+            .style(theme::text_muted),
+        iced::widget::Space::new().height(theme::SPACE_4),
+        iced::widget::text("This project has no environment.").size(theme::BODY),
+        iced::widget::text("Add one to sync it, open a terminal or open it in PyCharm.")
+            .size(theme::BODY)
+            .style(theme::text_muted),
+        iced::widget::button(iced::widget::text("Add environment").size(theme::BODY))
+            .on_press(Message::EnvironmentAdded(project.id))
+            .padding([theme::SPACE_1, theme::SPACE_3])
+            .style(theme::button_primary),
+    ]
+    .spacing(theme::SPACE_2)
+    .into()
+}
+
 pub fn view<'a>(
     header: &Header,
     index: usize,

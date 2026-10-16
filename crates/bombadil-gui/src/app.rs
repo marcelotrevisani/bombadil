@@ -5930,6 +5930,10 @@ pub fn view(app: &App) -> iced::Element<'_, Message> {
                 .style(theme::text_muted),
         )
         .into()
+    } else if let Some((i, project)) = selected
+        && project.environments.is_empty()
+    {
+        detail::no_environment_view(project, i)
     } else {
         iced::widget::column![
             detail,
@@ -6112,7 +6116,12 @@ pub fn view(app: &App) -> iced::Element<'_, Message> {
                 .get(menu.project_index)
                 .map(|project| project.label.as_str())
                 .unwrap_or_default();
-            context_menu::view(menu, label, default, waiting)
+            let has_environment = app
+                .config
+                .projects
+                .get(menu.project_index)
+                .is_some_and(|project| !project.environments.is_empty());
+            context_menu::view(menu, label, default, waiting, has_environment)
         }
         None => iced::widget::text("").into(),
     };
@@ -9181,6 +9190,28 @@ mod tests {
             app.config.projects[0].environments.last().unwrap().python,
             PythonPin::Version("3.12".into())
         );
+    }
+
+    #[test]
+    fn the_last_environment_can_be_removed_and_the_project_stays() {
+        let mut app = App::new(Config {
+            projects: vec![project("api")],
+            ..Config::default()
+        });
+        let id = app.config.projects[0].id;
+        let _ = update(
+            &mut app,
+            Message::EnvironmentRemoveRequested(id, VenvLocation::Alongside),
+            unused_runner(),
+        );
+        let _ = update(
+            &mut app,
+            Message::EnvironmentRemovalConfirmed,
+            unused_runner(),
+        );
+        assert_eq!(app.config.projects.len(), 1);
+        assert!(app.config.projects[0].environments.is_empty());
+        assert!(app.entries[0].environments.is_empty());
     }
 
     #[test]
