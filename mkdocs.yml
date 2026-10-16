@@ -1,0 +1,74 @@
+site_name: Bombadil
+site_description: A desktop keeper for uv virtual environments
+site_url: https://marcelotrevisani.github.io/bombadil/
+repo_url: https://github.com/marcelotrevisani/bombadil
+repo_name: marcelotrevisani/bombadil
+edit_uri: edit/main/docs/
+copyright: Apache-2.0
+
+# Specs and implementation plans live under docs/ too; they are not user docs.
+exclude_docs: |
+  superpowers/
+  requirements.txt
+
+validation:
+  links:
+    anchors: warn
+
+theme:
+  name: material
+  logo: images/logo.png
+  favicon: images/logo.png
+  palette:
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      primary: blue grey
+      accent: amber
+      toggle:
+        icon: material/weather-night
+        name: Switch to dark mode
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      primary: blue grey
+      accent: amber
+      toggle:
+        icon: material/weather-sunny
+        name: Switch to light mode
+  features:
+    - navigation.sections
+    - navigation.top
+    - navigation.footer
+    - content.code.copy
+    - content.tabs.link
+    - search.highlight
+
+markdown_extensions:
+  - admonition
+  - attr_list
+  - md_in_html
+  - tables
+  - toc:
+      permalink: true
+  - pymdownx.details
+  - pymdownx.superfences
+  - pymdownx.keys
+  - pymdownx.tabbed:
+      alternate_style: true
+
+nav:
+  - Home: index.md
+  - Install: install.md
+  - Getting started: getting-started.md
+  - Using Bombadil:
+      - The main window: main-window.md
+      - Dependencies and sync: dependencies.md
+      - Workspace members: members.md
+      - Environment variables and secrets: env-vars.md
+      - Pre-activate scripts: scripts.md
+      - Package indexes: indexes.md
+      - Terminals and PyCharm: terminals-pycharm.md
+      - The tray: tray.md
+  - Settings: settings.md
+  - Configuration file: configuration.md
+  - Gotchas: gotchas.md
+  - Keyboard shortcuts: shortcuts.md
