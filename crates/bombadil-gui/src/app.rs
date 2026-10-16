@@ -440,6 +440,14 @@ pub enum Message {
     /// or closes it -- output arriving no longer does, and neither does a
     /// command finishing.
     DrawerToggled,
+    /// The drawer's Copy button: the whole transcript to the clipboard.
+    DrawerCopyRequested,
+    /// The drawer's Export button: ask where to save the transcript.
+    DrawerExportRequested,
+    /// The save dialog closed. `None` when cancelled.
+    DrawerExportPicked(Option<PathBuf>),
+    /// The transcript was written to the path, or the error saying why not.
+    DrawerExportFinished(Result<PathBuf, String>),
     /// The sidebar's disclosure control for `projects[usize]`. Persisted, so
     /// a project you collapse stays collapsed across a restart.
     ProjectExpandToggled(usize),
@@ -1742,6 +1750,39 @@ pub fn update(app: &mut App, message: Message, runner: Arc<dyn CommandRunner>) -
         // dismisses it, whether or not the press was swallowed.
         Message::DrawerToggled => {
             app.drawer.expanded = !app.drawer.expanded;
+        }
+        Message::DrawerCopyRequested => {
+            crate::busy::push(
+                &mut app.toasts,
+                crate::busy::ToastKind::Success,
+                "Copied output".to_string(),
+                std::time::Instant::now(),
+            );
+            return iced::clipboard::write(drawer::transcript(&app.drawer));
+        }
+        Message::DrawerExportRequested => {
+            return Task::perform(pick_save_file(), Message::DrawerExportPicked);
+        }
+        Message::DrawerExportPicked(None) => {}
+        Message::DrawerExportPicked(Some(path)) => {
+            let text = drawer::transcript(&app.drawer);
+            return Task::perform(
+                async move { write_transcript(path, &text) },
+                Message::DrawerExportFinished,
+            );
+        }
+        Message::DrawerExportFinished(result) => {
+            let (kind, text) = match result {
+                Ok(path) => (
+                    crate::busy::ToastKind::Success,
+                    format!("Saved output to {}", path.display()),
+                ),
+                Err(error) => (
+                    crate::busy::ToastKind::Warning,
+                    format!("Could not save output: {error}"),
+                ),
+            };
+            crate::busy::push(&mut app.toasts, kind, text, std::time::Instant::now());
         }
         Message::ProjectExpandToggled(i) => {
             let Some(project) = app.config.projects.get_mut(i) else {
@@ -4315,6 +4356,24 @@ async fn pick_folder() -> Option<PathBuf> {
         .map(|handle| handle.path().to_path_buf())
 }
 
+/// The save dialog for the drawer's Export, async for the same reason as
+/// `pick_folder`.
+async fn pick_save_file() -> Option<PathBuf> {
+    rfd::AsyncFileDialog::new()
+        .set_file_name("bombadil-output.txt")
+        .add_filter("Text", &["txt", "log"])
+        .save_file()
+        .await
+        .map(|handle| handle.path().to_path_buf())
+}
+
+/// Writes an exported transcript, the error as a sentence for the toast.
+fn write_transcript(path: PathBuf, text: &str) -> Result<PathBuf, String> {
+    std::fs::write(&path, text)
+        .map(|()| path)
+        .map_err(|error| error.to_string())
+}
+
 /// Opens the async file picker: a pre-activate script (criterion 3), or the
 /// PyCharm launcher in Settings. Same
 /// reasoning as `pick_pyproject`: the blocking `rfd::FileDialog` must never
@@ -5904,7 +5963,7 @@ pub fn view(app: &App) -> iced::Element<'_, Message> {
                 iced::widget::button(iced::widget::text("Add").size(theme::LABEL))
                     .on_press(Message::AddProjectPickManifestRequested)
                     .padding([theme::SPACE_1, theme::SPACE_2])
-                    .style(theme::button_quiet),
+                    .style(theme::button_secondary),
                 format!(
                     "Add a project ({})",
                     crate::shortcuts::keys(crate::shortcuts::Shortcut::AddProject)
@@ -5914,7 +5973,7 @@ pub fn view(app: &App) -> iced::Element<'_, Message> {
             Some(_) => theme::wait_tip(
                 iced::widget::button(iced::widget::text("Add").size(theme::LABEL))
                     .padding([theme::SPACE_1, theme::SPACE_2])
-                    .style(theme::button_quiet),
+                    .style(theme::button_secondary),
                 waiting,
             ),
         },
@@ -6237,6 +6296,39 @@ mod tests {
     /// most messages here never touch a `CommandRunner` at all.
     fn unused_runner() -> Arc<dyn CommandRunner> {
         Arc::new(FakeCommandRunner::new())
+    }
+
+    #[test]
+    fn exporting_the_drawer_writes_the_transcript_and_says_where() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("out.txt");
+        let written = write_transcript(path.clone(), "a\nb\n").unwrap();
+        assert_eq!(written, path);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "a\nb\n");
+
+        let mut app = App::new(Config::default());
+        let _ = update(
+            &mut app,
+            Message::DrawerExportFinished(Ok(path.clone())),
+            unused_runner(),
+        );
+        assert_eq!(app.toasts[0].kind, crate::busy::ToastKind::Success);
+        assert!(app.toasts[0].text.contains("out.txt"));
+    }
+
+    #[test]
+    fn a_failed_export_is_a_warning_that_stays() {
+        let dir = tempfile::tempdir().unwrap();
+        // A directory, so the write fails.
+        let error = write_transcript(dir.path().to_path_buf(), "x").unwrap_err();
+        let mut app = App::new(Config::default());
+        let _ = update(
+            &mut app,
+            Message::DrawerExportFinished(Err(error)),
+            unused_runner(),
+        );
+        assert_eq!(app.toasts[0].kind, crate::busy::ToastKind::Warning);
+        assert!(app.toasts[0].text.starts_with("Could not save output"));
     }
 
     #[test]
