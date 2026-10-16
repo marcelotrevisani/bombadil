@@ -280,7 +280,8 @@ jobs:
           xvfb-run -a timeout 10 /usr/bin/bombadil || status=$?
           test "$status" -eq 124
       - name: The .rpm installs
-        run: docker run --rm -v "$PWD/dist:/dist:ro" fedora:latest dnf install -y /dist/*.rpm
+        # The glob is expanded inside the container, where /dist exists.
+        run: docker run --rm -v "$PWD/dist:/dist:ro" fedora:latest sh -c 'dnf install -y /dist/*.rpm && test -x /usr/bin/bombadil'
       - uses: actions/upload-artifact@v4
         with:
           name: installers-linux-${{ matrix.arch }}
