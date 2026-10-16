@@ -72,6 +72,16 @@ test-integration:
     @# keychain test skips itself when no backend is present.
     cargo test -p bombadil-core --locked --features uv-integration --test uv_integration
 
+# --- docs -------------------------------------------------------------------
+
+# Serve the user docs with live reload at http://127.0.0.1:8000.
+docs:
+    uv run --no-project --with-requirements docs/requirements.txt mkdocs serve
+
+# Build the user docs into site/, failing on any warning, as CI does.
+docs-build:
+    uv run --no-project --with-requirements docs/requirements.txt mkdocs build --strict
+
 # --- housekeeping -----------------------------------------------------------
 
 # Run the pre-commit hooks over every file, as the `hygiene` CI job does.

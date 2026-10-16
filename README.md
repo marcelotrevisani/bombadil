@@ -12,6 +12,8 @@
 
 ---
 
+**Documentation: <https://marcelotrevisani.github.io/bombadil/>**
+
 A desktop application for the Python virtual environments you already have.
 Bombadil keeps an account of them — which exist, which have drifted from what
 their manifest declares, what is installed in each — and gives you one place to
@@ -68,9 +70,9 @@ Bombadil launches.
 **Terminals and PyCharm.** Open a terminal in the project directory with the
 environment activated — every emulator's argv is built for the platform, and the
 app knows which ones cannot carry an environment rather than pretending. The
-PyCharm button opens the project folder with the same composed environment.
-(PyCharm's *interpreter* cannot be set from outside the IDE; `bombadil_core::ide`
-documents exactly why.)
+PyCharm button sets the environment as the project's interpreter and opens the
+project folder with the same composed environment. PyCharm is detected, or
+chosen in Settings.
 
 **Pinned interpreters, safely.** `uv sync -p X` against an environment built on
 another version **deletes it**. Bombadil compares pins segment-wise against what
