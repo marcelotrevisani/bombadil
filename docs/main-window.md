@@ -46,11 +46,15 @@ environment is marked **default**.
 
 - **Click an environment** to make it the default. Sync, the terminal, PyCharm
   and the Dependencies tab all act on the default environment.
+- The **trash** button at the end of an environment row removes it from the
+  project, after asking. Right-clicking the row does the same. The folder
+  stays on disk. The button is not shown when the project has only one
+  environment.
 - **+ add environment** asks for a folder and adds it as another environment
   of the project. Use this to keep, for example, a Python 3.12 environment
   next to a 3.13 one. You can also point at an environment that another
   project already uses.
-- To set an environment's location or Python version, or to remove it, go to
+- To set an environment's location or Python version, go to
   [Settings › Environments](settings.md#environments) and pick the project's
   scope.
 
@@ -73,6 +77,12 @@ environment, then five tabs. You can drag the tabs to reorder them.
 The bar at the bottom shows what Bombadil is doing (**idle** when nothing is
 running). Click it to open the drawer, which shows the output of the latest uv
 command. It follows new output as it arrives, unless you scroll up.
+
+- **Copy** puts the whole output on the clipboard.
+- **Export…** asks where to save it and writes it to a text file.
+
+Secrets from your environment variables are hidden in the drawer, so they are
+also hidden in what you copy or export.
 
 ## Notifications
 

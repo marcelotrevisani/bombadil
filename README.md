@@ -91,6 +91,11 @@ Bombadil bundles `uv 0.13.1`, so there is nothing else to install. By default it
 uses `uv` from `PATH` when that is at least `0.12.1` and falls back to the
 bundled copy; you can force either.
 
+Each [release](https://github.com/marcelotrevisani/bombadil/releases/latest)
+has installers: a `.deb` and an `.rpm` for Linux (x86-64 and ARM), a
+universal `.dmg` for macOS and a setup `.exe` for Windows. Or install from a
+package registry:
+
 ```sh
 pip install bombadil     # or: uv tool install bombadil
 cargo install bombadil
