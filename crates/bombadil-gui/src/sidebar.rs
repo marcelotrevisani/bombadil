@@ -709,17 +709,18 @@ fn environment_row<'a>(
     .height(theme::TREE_ROW_HEIGHT)
     .align_y(iced::Alignment::Center);
     // A visible remove button as well as the right-press below: a gesture
-    // with nothing on screen to hint at it is one nobody finds.
-    if removable {
-        pressable = pressable.push(crate::icons::icon_button(
-            crate::icons::Icon::Trash,
-            "Remove environment",
-            Some(Message::EnvironmentRemoveRequested(
-                project_id,
-                location.clone(),
-            )),
-        ));
-    }
+    // with nothing on screen to hint at it is one nobody finds. Shown, but
+    // disabled, on the last one, with the reason in its tip: a hidden button
+    // reads as a missing feature.
+    pressable = pressable.push(crate::icons::icon_button(
+        crate::icons::Icon::Trash,
+        if removable {
+            "Remove environment"
+        } else {
+            "A project needs at least one environment. Add another before removing this one."
+        },
+        removable.then(|| Message::EnvironmentRemoveRequested(project_id, location.clone())),
+    ));
 
     // Right-press removes, the same gesture the project rows already use for
     // their own menu -- and it opens the confirmation rather than removing,
