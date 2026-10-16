@@ -682,7 +682,7 @@ fn environment_row<'a>(
     // built exactly like a project's -- same marker, same glyph column -- so
     // the two read as one list at two depths.
     let location = row.location.clone();
-    let pressable = iced::widget::row![
+    let mut pressable = iced::widget::row![
         guide(false),
         iced::widget::button(content)
             .on_press(environment_press(project, row))
@@ -706,7 +706,20 @@ fn environment_row<'a>(
             }),
     ]
     .spacing(0)
-    .height(theme::TREE_ROW_HEIGHT);
+    .height(theme::TREE_ROW_HEIGHT)
+    .align_y(iced::Alignment::Center);
+    // A visible remove button as well as the right-press below: a gesture
+    // with nothing on screen to hint at it is one nobody finds.
+    if removable {
+        pressable = pressable.push(crate::icons::icon_button(
+            crate::icons::Icon::Trash,
+            "Remove environment",
+            Some(Message::EnvironmentRemoveRequested(
+                project_id,
+                location.clone(),
+            )),
+        ));
+    }
 
     // Right-press removes, the same gesture the project rows already use for
     // their own menu -- and it opens the confirmation rather than removing,
