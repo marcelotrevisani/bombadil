@@ -1,7 +1,7 @@
 # Dependencies and sync
 
 The **Dependencies** tab compares what `pyproject.toml` declares with what is
-actually installed in the project's default environment. Package names are
+installed in the project's default environment. Package names are
 matched after normalisation, so `calc_service` and `calc-service` are the same
 package.
 

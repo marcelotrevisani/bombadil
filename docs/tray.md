@@ -18,7 +18,7 @@ would have no way back.
 - **Show Bombadil** opens the window again. Clicking the icon also opens it:
   a left click on Linux, a double click on Windows. On macOS, any click opens
   the menu.
-- **One submenu per project.**
+- A submenu for each project:
     - With one environment, it has **Open terminal** and **Open in PyCharm**.
     - With several environments, it has one submenu per environment, labelled
       with its folder name and Python version, with the default marked

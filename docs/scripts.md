@@ -2,8 +2,8 @@
 
 A pre-activate script runs before an environment is used: before every uv
 command, terminal and PyCharm launch. Every variable it exports becomes part
-of the environment of whatever Bombadil starts next. Use one to log in to a
-cloud profile, read a token from a vault, or set a cache directory.
+of the environment of whatever Bombadil starts next. For example, a script can
+select a cloud profile or read a token from a vault.
 
 ![The Scripts tab](images/scripts.png)
 

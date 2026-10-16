@@ -6,9 +6,9 @@ to it.
 
 ## Global and project variables
 
-- **Global variables** apply to every project. Set them in
+- Global variables apply to every project. Set them in
   [Settings › Env vars](settings.md#env-vars) with the **Global** scope.
-- **Project variables** apply to one project. Set them in the project's
+- Project variables apply to one project. Set them in the project's
   **Env vars** tab, or in Settings with that project's scope.
 
 When both set the same key, the project's value wins. The project tab lists

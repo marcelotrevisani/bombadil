@@ -1,7 +1,7 @@
 # Configuration file
 
-Bombadil keeps everything in one TOML file. You never need to edit it by
-hand, but it is plain text, and you can back it up, read it, or copy it to
+Bombadil keeps everything in one TOML file. You don't need to edit it by
+hand, but it is plain text, so you can read it, back it up or copy it to
 another machine.
 
 | OS | Location |
@@ -11,8 +11,8 @@ another machine.
 | Windows | `%APPDATA%\bombadil\config\config.toml` |
 
 Secrets are **not** in this file. Secret variables and index credentials are
-kept in the OS keychain. Copying the file to another machine copies the
-fact that a secret exists, not its value. Set the value again there.
+kept in the OS keychain. A copy of the file on another machine lists the
+secret variables without their values, so set the values again there.
 
 ## Example
 
@@ -95,13 +95,12 @@ value = { template = "myterm --cd {cwd} -e {shell}" }
 
 ## Rules worth knowing
 
-- **Bombadil rewrites the file** whenever you change something in the app.
-  Comments and fields it doesn't recognise are not kept. Edit the file while
+- Bombadil rewrites the file whenever you change something in the app, and
+  drops comments and fields it doesn't recognise. Edit the file while
   Bombadil is closed.
-- **A config from a newer version opens read-only.** If the file's
-  `schema_version` is newer than your Bombadil supports, the app shows it but
-  never writes to it, so an older build can't damage a newer config.
-- **Older configs are upgraded on load.** Fields added in later versions take
+- If the file's `schema_version` is newer than your Bombadil supports, the
+  app opens it read-only, so an older build can't damage a newer config.
+- An older config is upgraded on load. Fields added in later versions take
   their defaults.
-- **Projects are identified by `id`, not by path.** Moving a project folder
-  and updating `pyproject_path` keeps its variables and scripts.
+- A project is identified by its `id`. If you move a project folder and update
+  `pyproject_path`, its variables and scripts stay with it.

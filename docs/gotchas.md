@@ -13,7 +13,7 @@ Bombadil compares the pin with the version recorded in the environment's
 `pyvenv.cfg` and asks before a sync that would rebuild. Versions are compared
 segment by segment, so `3.12` and `3.12.13` are not a conflict and don't ask.
 
-**Tip:** to try a new Python without losing the current environment,
+To try a new Python without losing the current environment,
 [add a second environment](main-window.md#environments) with the new pin
 instead of changing the existing one.
 
@@ -37,7 +37,7 @@ already running:
 - PyCharm can re-import `pyproject.toml` and pin modules to a different
   interpreter.
 
-**Fix:** close the project in PyCharm, then use **Open in PyCharm** from
+To fix it, close the project in PyCharm, then use **Open in PyCharm** from
 Bombadil.
 
 Also:
@@ -83,7 +83,7 @@ the window back.
 ## The uv in use isn't the one you expected
 
 With **auto**, Bombadil uses uv from `PATH` only if it is version 0.12.1 or
-newer. Otherwise it quietly uses its bundled copy. If you need one specific
+newer. Otherwise it uses its bundled copy without saying so. If you need one specific
 uv, pick **from PATH** or a binary in [Settings › uv](settings.md#uv).
 Explicit choices fail loudly instead of falling back.
 

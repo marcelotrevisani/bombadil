@@ -57,6 +57,6 @@ Wayland show the right icon in the dock and the window switcher. See
 ## Updating
 
 Upgrade the same way you installed it, with `pip install -U bombadil`,
-`uv tool upgrade bombadil` or `cargo install bombadil`. Your settings and
-projects are kept, because they live in the
-[configuration file](configuration.md), not in the app.
+`uv tool upgrade bombadil` or `cargo install bombadil`. Upgrading keeps your
+settings and projects, which live in the
+[configuration file](configuration.md).
