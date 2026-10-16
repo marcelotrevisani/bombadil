@@ -320,7 +320,6 @@ fn environments_panel<'a>(config: &Config, project_index: usize) -> iced::Elemen
         return iced::widget::text("").into();
     };
     let id = project.id;
-    let removable = project.environments.len() > 1;
 
     let mut column = iced::widget::column![
         iced::widget::text(
@@ -363,14 +362,8 @@ fn environments_panel<'a>(config: &Config, project_index: usize) -> iced::Elemen
                 .padding([theme::SPACE_1, theme::SPACE_3])
                 .style(theme::button_choice(active)),
                 iced::widget::Space::new().width(iced::Length::Fill),
-                // Never offered for the last one: a project with no
-                // environments has nothing to sync, and the state is only
-                // reachable by removing them all one at a time.
                 iced::widget::button(iced::widget::text("Remove").size(theme::BODY))
-                    .on_press_maybe(
-                        removable
-                            .then_some(Message::EnvironmentRemoveRequested(id, location.clone()))
-                    )
+                    .on_press(Message::EnvironmentRemoveRequested(id, location.clone()))
                     .padding([theme::SPACE_1, theme::SPACE_3])
                     .style(theme::button_quiet),
             ]
@@ -452,7 +445,7 @@ fn environments_panel<'a>(config: &Config, project_index: usize) -> iced::Elemen
             iced::widget::button(iced::widget::text("Add environment").size(theme::BODY))
                 .on_press(Message::EnvironmentAdded(id))
                 .padding([theme::SPACE_1, theme::SPACE_3])
-                .style(theme::button_quiet),
+                .style(theme::button_secondary),
         )
         .push(
             iced::widget::text(

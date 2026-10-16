@@ -379,6 +379,7 @@ pub fn view<'a>(
     label: &str,
     default: Option<&TerminalChoice>,
     waiting: Option<&str>,
+    has_environment: bool,
 ) -> iced::Element<'a, Message> {
     let index = menu.project_index;
     let enabled = waiting.is_none();
@@ -395,9 +396,27 @@ pub fn view<'a>(
         )
         .padding([theme::SPACE_1, theme::SPACE_3]),
         theme::hairline_row(),
-        section_heading("Open terminal"),
     ]
     .spacing(0);
+
+    // A project with no environment has nothing to open a terminal on,
+    // sync or recreate: only Open folder and Remove from list are offered.
+    if !has_environment {
+        return column
+            .push(entry(
+                "Open folder",
+                None,
+                Message::OpenFolderRequested(index),
+            ))
+            .push(theme::hairline_row())
+            .push(entry(
+                "Remove from list",
+                None,
+                Message::RemoveProjectRequested(index),
+            ))
+            .into();
+    }
+    column = column.push(section_heading("Open terminal"));
 
     for option in submenu(menu.terminals.clone(), default) {
         match option {

@@ -194,10 +194,19 @@ pub fn view<'a>(drawer: &Drawer, busy_label: Option<String>) -> iced::Element<'a
             .into()
     };
 
+    let has_output = !drawer.lines.is_empty();
+    let action = |label: &'static str, message: Message| {
+        iced::widget::button(iced::widget::text(label).size(theme::LABEL))
+            .on_press_maybe(has_output.then_some(message))
+            .padding([0.0, theme::SPACE_2])
+            .style(theme::button_secondary)
+    };
     let header = iced::widget::row![
         toggle,
         iced::widget::Space::new().width(iced::Length::Fill),
         count,
+        action("Copy", Message::DrawerCopyRequested),
+        action("Export\u{2026}", Message::DrawerExportRequested),
     ]
     .spacing(theme::SPACE_2)
     .align_y(iced::Alignment::Center);
@@ -244,6 +253,17 @@ pub fn view<'a>(drawer: &Drawer, busy_label: Option<String>) -> iced::Element<'a
         .into()
 }
 
+/// The whole transcript as one text, a newline after every line: what Copy
+/// puts on the clipboard and Export writes to a file. Already redacted, like
+/// everything in `lines`.
+pub fn transcript(drawer: &Drawer) -> String {
+    drawer
+        .lines
+        .iter()
+        .map(|line| format!("{line}\n"))
+        .collect()
+}
+
 /// A fresh transcript for a command starting, with the drawer left open or
 /// closed exactly as the user had it.
 pub fn start(drawer: &mut Drawer, status: String) {
@@ -254,6 +274,19 @@ pub fn start(drawer: &mut Drawer, status: String) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_transcript_is_every_line_each_ending_in_a_newline() {
+        let mut drawer = Drawer::default();
+        assert_eq!(transcript(&drawer), "");
+        push_line(&mut drawer, "Resolved 3 packages", &[]);
+        push_line(&mut drawer, "token=hunter2", &["hunter2".to_string()]);
+        assert_eq!(
+            transcript(&drawer),
+            format!("Resolved 3 packages\n{}\n", drawer.lines[1])
+        );
+        assert!(!transcript(&drawer).contains("hunter2"));
+    }
 
     #[test]
     fn lines_accumulate_in_order() {

@@ -19,6 +19,7 @@ contributor to install them, this points fontconfig at
 config file in a temp directory, nothing written to the user's font settings.
 """
 
+import base64
 import os
 import struct
 import subprocess
@@ -35,6 +36,8 @@ FONTS = ROOT / "crates" / "bombadil-gui" / "fonts"
 SIZES = (512, 256, 128, 64, 32)
 RGBA_SIDE = 64
 BANNER_SIZE = (1200, 340)
+MACOS_SIDE = 1024
+MACOS_ART = 824
 
 
 def with_repo_fonts() -> None:
@@ -135,6 +138,25 @@ def main() -> None:
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_bytes(rgba)
     print(f"wrote {target.relative_to(ROOT)} ({len(rgba)} bytes)")
+
+    # macOS draws Dock icons on a 1024 grid with the artwork in the middle
+    # 824 (Apple's template), so a full-bleed icon looks a size too big next
+    # to every other app. This one is padded to match. The GUI embeds it to
+    # set the Dock icon at runtime, and the release workflow builds the
+    # .app bundle's .icns from it.
+    art = base64.b64encode(
+        cairosvg.svg2png(url=str(ICON_SVG), output_width=MACOS_ART, output_height=MACOS_ART)
+    ).decode()
+    pad = (MACOS_SIDE - MACOS_ART) // 2
+    padded = (
+        f'<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" '
+        f'width="{MACOS_SIDE}" height="{MACOS_SIDE}">'
+        f'<image x="{pad}" y="{pad}" width="{MACOS_ART}" height="{MACOS_ART}" '
+        f'xlink:href="data:image/png;base64,{art}"/></svg>'
+    )
+    macos = ROOT / "crates" / "bombadil-gui" / "assets" / "icon-macos.png"
+    cairosvg.svg2png(bytestring=padded.encode(), write_to=str(macos))
+    print(f"wrote {macos.relative_to(ROOT)}")
 
     # The desktop entry Bombadil writes for itself at startup embeds this one;
     # it has to sit under the crate for the same `cargo package` reason.

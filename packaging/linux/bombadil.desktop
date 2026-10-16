@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Bombadil
+GenericName=Virtual environment manager
+Comment=A desktop keeper for uv virtual environments
+Exec=bombadil
+Icon=bombadil
+Terminal=false
+Categories=Development;IDE;
+Keywords=python;uv;virtualenv;venv;
+StartupWMClass=bombadil

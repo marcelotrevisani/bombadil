@@ -59,3 +59,12 @@ ksni = { version = "0.3.6", default-features = false, features = ["blocking", "a
 # GTK dependency on these platforms.
 [target.'cfg(any(target_os = "macos", target_os = "windows"))'.dependencies]
 tray-icon = { version = "0.24.2", default-features = false }
+
+# The Dock icon. winit ignores a window's icon on macOS, where the Dock takes
+# the application's icon instead -- from the .app bundle, or, for a bare
+# binary (`cargo install`, `pip install`), from `NSApplication` at runtime.
+# All three are already in Cargo.lock through tray-icon, muda and rfd.
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSApplication", "NSImage", "NSResponder"] }
+objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSData"] }

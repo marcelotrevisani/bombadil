@@ -516,7 +516,7 @@ pub fn global_view<'a>(
             iced::widget::button(iced::widget::text("Add index").size(theme::BODY))
                 .on_press(Message::IndexAdded)
                 .padding([theme::SPACE_1, theme::SPACE_3])
-                .style(theme::button_quiet),
+                .style(theme::button_secondary),
         )
         .into()
 }

@@ -14,3 +14,43 @@ readme = "../../README.md"
 
 [dependencies]
 bombadil-gui = { path = "../bombadil-gui", version = "0.3.3" }
+
+# Linux packages, built by the release workflow with `cargo deb` and
+# `cargo generate-rpm`. Paths are relative to this crate, except
+# `target/release/...`, which both tools resolve to the workspace's target
+# directory.
+[package.metadata.deb]
+maintainer = "Marcelo Duarte Trevisani"
+copyright = "Marcelo Duarte Trevisani"
+section = "devel"
+extended-description = "Track, sync and open the uv virtual environments you already have."
+# iced opens Wayland, X11 and xkbcommon at runtime rather than linking them,
+# so `$auto` cannot see them.
+depends = "$auto, libxkbcommon0"
+recommends = "libwayland-client0, libxkbcommon-x11-0"
+assets = [
+    ["target/release/bombadil", "usr/bin/", "755"],
+    ["../../packaging/linux/bombadil.desktop", "usr/share/applications/", "644"],
+    ["../../assets/icon.svg", "usr/share/icons/hicolor/scalable/apps/bombadil.svg", "644"],
+    ["../../assets/icon-512.png", "usr/share/icons/hicolor/512x512/apps/bombadil.png", "644"],
+    ["../../assets/icon-256.png", "usr/share/icons/hicolor/256x256/apps/bombadil.png", "644"],
+    ["../../assets/icon-128.png", "usr/share/icons/hicolor/128x128/apps/bombadil.png", "644"],
+    ["../../assets/icon-64.png", "usr/share/icons/hicolor/64x64/apps/bombadil.png", "644"],
+    ["../../assets/icon-32.png", "usr/share/icons/hicolor/32x32/apps/bombadil.png", "644"],
+]
+
+[package.metadata.generate-rpm]
+summary = "A desktop keeper for uv virtual environments"
+assets = [
+    { source = "target/release/bombadil", dest = "/usr/bin/bombadil", mode = "755" },
+    { source = "../../packaging/linux/bombadil.desktop", dest = "/usr/share/applications/bombadil.desktop", mode = "644" },
+    { source = "../../assets/icon.svg", dest = "/usr/share/icons/hicolor/scalable/apps/bombadil.svg", mode = "644" },
+    { source = "../../assets/icon-512.png", dest = "/usr/share/icons/hicolor/512x512/apps/bombadil.png", mode = "644" },
+    { source = "../../assets/icon-256.png", dest = "/usr/share/icons/hicolor/256x256/apps/bombadil.png", mode = "644" },
+    { source = "../../assets/icon-128.png", dest = "/usr/share/icons/hicolor/128x128/apps/bombadil.png", mode = "644" },
+    { source = "../../assets/icon-64.png", dest = "/usr/share/icons/hicolor/64x64/apps/bombadil.png", mode = "644" },
+    { source = "../../assets/icon-32.png", dest = "/usr/share/icons/hicolor/32x32/apps/bombadil.png", mode = "644" },
+]
+
+[package.metadata.generate-rpm.requires]
+libxkbcommon = "*"
