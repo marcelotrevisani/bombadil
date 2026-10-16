@@ -83,6 +83,32 @@ fn window_icon() -> Option<iced::window::Icon> {
     iced::window::icon::from_rgba(ICON_RGBA.to_vec(), ICON_SIDE, ICON_SIDE).ok()
 }
 
+/// Sets the Dock icon on macOS, where the window icon above is ignored.
+///
+/// A bundled `.app` already has one from its `Info.plist`; this is for the
+/// bare binary `cargo install` and `pip install` put on the PATH, which the
+/// Dock would otherwise show as a generic executable. Padded to Apple's grid
+/// (see `scripts/render_assets.py`), so it sits level with its neighbours.
+/// Called when a window opens, not at startup: winit creates `NSApplication`
+/// as its own subclass and only sets the activation policy once launching
+/// finishes, and changing the policy can put the default tile back.
+#[cfg(target_os = "macos")]
+fn set_dock_icon() {
+    use objc2::AnyThread;
+    const PNG: &[u8] = include_bytes!("../assets/icon-macos.png");
+    let Some(main_thread) = objc2::MainThreadMarker::new() else {
+        return;
+    };
+    let data = objc2_foundation::NSData::with_bytes(PNG);
+    let Some(image) = objc2_app_kit::NSImage::initWithData(objc2_app_kit::NSImage::alloc(), &data)
+    else {
+        return;
+    };
+    let app = objc2_app_kit::NSApplication::sharedApplication(main_thread);
+    // SAFETY: on the main thread (checked above), with a valid image.
+    unsafe { app.setApplicationIconImage(Some(&image)) };
+}
+
 /// The name the desktop expects this application to answer to: the basename of
 /// `assets/bombadil.desktop`, the `Icon=` key inside it, and the file installed
 /// into the hicolor icon theme all have to be this same word.
@@ -213,6 +239,10 @@ pub fn run() -> iced::Result {
             (state, iced::Task::batch([task, open]))
         },
         move |state: &mut app::App, message: app::Message| {
+            #[cfg(target_os = "macos")]
+            if matches!(message, app::Message::WindowOpened(_)) {
+                set_dock_icon();
+            }
             // Animation frames and pointer moves change no project, and come
             // sixty times a second; the menu is not rebuilt for them.
             let moves_nothing = matches!(
