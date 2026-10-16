@@ -2340,6 +2340,14 @@ pub fn update(app: &mut App, message: Message, runner: Arc<dyn CommandRunner>) -
             if !success && !app.drawer.lines.is_empty() {
                 app.drawer.expanded = true;
             }
+            // Adding selected the project before its first sync built the
+            // environment, so its tabs were read against nothing. Read them
+            // again now that the sync has landed.
+            let tabs = if app.selected == Some(index) {
+                reprobe_project(app, index, runner.clone())
+            } else {
+                Task::none()
+            };
             // Refreshes the sidebar entry the same way `boot` fills in every
             // other project's venv status, rather than trusting `success` to
             // imply a venv now exists.
@@ -2349,7 +2357,7 @@ pub fn update(app: &mut App, message: Message, runner: Arc<dyn CommandRunner>) -
             {
                 let pyproject_path = project.pyproject_path.clone();
                 let location = environment.location.clone();
-                return Task::perform(
+                let probe = Task::perform(
                     probe_venv_and_requirement(path, pyproject_path),
                     move |(python_version, requires_python)| Message::VenvProbed {
                         index,
@@ -2358,7 +2366,9 @@ pub fn update(app: &mut App, message: Message, runner: Arc<dyn CommandRunner>) -
                         requires_python,
                     },
                 );
+                return Task::batch([probe, tabs]);
             }
+            return tabs;
         }
         // A stale index can arrive the same way `ProjectSelected`'s can.
         Message::ContextMenuOpened(i) if i < app.config.projects.len() => {
@@ -7124,6 +7134,36 @@ mod tests {
         assert!(app.busy.is_none());
         assert_eq!(app.toasts.len(), 1);
         assert_eq!(app.toasts[0].text, "Added api");
+    }
+
+    #[test]
+    fn a_project_just_added_and_selected_reads_its_dependencies_and_git() {
+        // Adding selects the new project before its first sync has built the
+        // environment, so its tabs have nothing to show yet. Without a re-read
+        // once the sync lands, Dependencies stays on "loading..." and the Git
+        // tile never appears until the window happens to regain focus.
+        let mut app = App::new(Config {
+            projects: vec![project("api")],
+            ..Config::default()
+        });
+        app.selected = Some(0);
+        app.busy = Some(crate::busy::Busy::new(
+            app.config.projects[0].id,
+            crate::busy::Action::AddProject,
+        ));
+        let task = update(
+            &mut app,
+            Message::AddProjectConfirmFinished {
+                success: true,
+                lines: vec![],
+                index: 0,
+            },
+            Arc::new(FakeCommandRunner::new()),
+        );
+        assert!(
+            task.units() > 1,
+            "the venv probe alone leaves the tabs empty; git, deps and members must be read too"
+        );
     }
 
     #[test]
