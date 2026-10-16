@@ -176,7 +176,7 @@ pub fn global_view<'a>(config: &Config) -> iced::Element<'a, Message> {
         iced::widget::button(iced::widget::text("Add global script").size(theme::BODY))
             .on_press(Message::ScriptAddRequested(ScriptScope::Global))
             .padding([theme::SPACE_1, theme::SPACE_3])
-            .style(theme::button_quiet),
+            .style(theme::button_secondary),
     ]
     .spacing(theme::SPACE_3)
     .into()

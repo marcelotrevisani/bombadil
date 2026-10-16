@@ -452,7 +452,7 @@ fn environments_panel<'a>(config: &Config, project_index: usize) -> iced::Elemen
             iced::widget::button(iced::widget::text("Add environment").size(theme::BODY))
                 .on_press(Message::EnvironmentAdded(id))
                 .padding([theme::SPACE_1, theme::SPACE_3])
-                .style(theme::button_quiet),
+                .style(theme::button_secondary),
         )
         .push(
             iced::widget::text(

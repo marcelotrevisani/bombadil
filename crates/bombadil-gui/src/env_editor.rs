@@ -498,7 +498,7 @@ pub fn global_view<'a>(config: &Config, drafts: &ValueDrafts) -> iced::Element<'
         iced::widget::button(iced::widget::text("Add global variable").size(theme::BODY))
             .on_press(Message::EnvVarAdded(EnvScope::Global))
             .padding([theme::SPACE_1, theme::SPACE_3])
-            .style(theme::button_quiet),
+            .style(theme::button_secondary),
     ]
     .spacing(theme::SPACE_3)
     .into()
@@ -541,7 +541,7 @@ pub fn project_view<'a>(
         iced::widget::button(iced::widget::text("Add project variable").size(theme::BODY))
             .on_press(Message::EnvVarAdded(EnvScope::Project(project_index)))
             .padding([theme::SPACE_1, theme::SPACE_3])
-            .style(theme::button_quiet),
+            .style(theme::button_secondary),
     ]
     .spacing(theme::SPACE_3);
 
