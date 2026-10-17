@@ -2,6 +2,7 @@ pub mod envspec;
 pub mod error;
 pub mod folder;
 pub mod git;
+pub mod github;
 pub mod ide;
 pub mod members;
 pub mod model;

@@ -49,12 +49,13 @@ pub enum Section {
     Scripts,
     EnvVars,
     Indexes,
+    GitHub,
 }
 
 impl Section {
     /// Every section, in the order the list renders them: the four that decide
     /// how an environment is built and opened first, then the two lists.
-    pub const ALL: [Section; 9] = [
+    pub const ALL: [Section; 10] = [
         Section::Appearance,
         Section::Environments,
         Section::Python,
@@ -64,6 +65,7 @@ impl Section {
         Section::Scripts,
         Section::EnvVars,
         Section::Indexes,
+        Section::GitHub,
     ];
 
     /// The Settings menu's wording, which has room to name the thing a user
@@ -80,6 +82,7 @@ impl Section {
             Section::Scripts => "Scripts",
             Section::EnvVars => "Environment variables",
             Section::Indexes => "Package indexes and auth",
+            Section::GitHub => "GitHub pull requests",
         }
     }
 
@@ -94,6 +97,7 @@ impl Section {
             Section::Scripts => "Scripts",
             Section::EnvVars => "Env vars",
             Section::Indexes => "Indexes",
+            Section::GitHub => "GitHub",
         }
     }
 }
@@ -181,7 +185,8 @@ pub fn inherited_label(section: Section, config: &Config, os: Os) -> String {
         | Section::Environments
         | Section::Scripts
         | Section::EnvVars
-        | Section::Indexes => String::new(),
+        | Section::Indexes
+        | Section::GitHub => String::new(),
     }
 }
 
@@ -205,6 +210,10 @@ pub fn view<'a>(
     uv_custom_path_draft: &str,
     uv_custom_validation: Option<&Result<String, String>>,
     pycharm_detected: Option<&Option<std::path::PathBuf>>,
+    github_token_draft: &str,
+    github_source: Option<&String>,
+    github_accounts: Option<&Vec<bombadil_core::github::gh::Account>>,
+    github_login: Option<&crate::github_tab::GitHubLogin>,
 ) -> iced::Element<'a, Message> {
     let selected_project = match scope {
         Scope::Global => None,
@@ -267,6 +276,13 @@ pub fn view<'a>(
         (Section::Pycharm, _) => {
             pycharm_panel(config, pycharm_detected, selected_project.is_some())
         }
+        (Section::GitHub, _) => github_panel(
+            config,
+            github_token_draft,
+            github_source,
+            github_accounts,
+            github_login,
+        ),
     };
 
     let card = iced::widget::container(
@@ -836,6 +852,158 @@ fn pycharm_panel<'a>(
     }))
     .spacing(theme::SPACE_3)
     .into()
+}
+
+/// The GitHub section: whether to watch, how Bombadil reaches GitHub, and the
+/// token used when `gh` is unavailable. Global only; a project scope shows
+/// the same thing.
+fn github_panel<'a>(
+    config: &Config,
+    token_draft: &str,
+    source: Option<&String>,
+    accounts: Option<&Vec<bombadil_core::github::gh::Account>>,
+    login: Option<&crate::github_tab::GitHubLogin>,
+) -> iced::Element<'a, Message> {
+    let watching = config.settings.watch_github;
+    let account_row = github_accounts(config, accounts, login);
+    let choice = |label: &'static str, selected: bool, message: Message| {
+        iced::widget::button(iced::widget::text(label).size(theme::BODY))
+            .on_press(message)
+            .padding([theme::SPACE_1, theme::SPACE_3])
+            .style(theme::button_choice(selected))
+    };
+    iced::widget::column![
+        iced::widget::text("GitHub pull requests").size(theme::TITLE),
+        iced::widget::text(
+            "Every two minutes, each project on a branch with an open pull request has its \
+             checks looked up, and you are notified when they start and finish."
+        )
+        .size(theme::BODY)
+        .style(theme::text_muted),
+        iced::widget::row![
+            choice("Watch", watching, Message::GitHubWatchSelected(true)),
+            choice(
+                "Don't watch",
+                !watching,
+                Message::GitHubWatchSelected(false)
+            ),
+        ]
+        .spacing(theme::SPACE_1),
+        iced::widget::text(source.cloned().unwrap_or_else(|| "Checking\u{2026}".into()))
+            .font(theme::FONT_DATA)
+            .size(theme::DATA),
+        account_row,
+        iced::widget::text(
+            "gh is used when it is installed and signed in. Otherwise a personal access token \
+             with read access to pull requests and checks is used, kept in the system keychain."
+        )
+        .size(theme::BODY)
+        .style(theme::text_muted),
+        iced::widget::row![
+            iced::widget::text_input("Token", token_draft)
+                .secure(true)
+                .on_input(|v| Message::GitHubTokenDraftChanged(
+                    crate::index_editor::CredentialInput(v)
+                ))
+                .on_submit(Message::GitHubTokenSaved)
+                .style(theme::text_field),
+            iced::widget::button(iced::widget::text("Save").size(theme::BODY))
+                .on_press_maybe(
+                    (!token_draft.trim().is_empty()).then_some(Message::GitHubTokenSaved)
+                )
+                .padding([theme::SPACE_1, theme::SPACE_3])
+                .style(theme::button_primary),
+            iced::widget::button(iced::widget::text("Remove").size(theme::BODY))
+                .on_press(Message::GitHubTokenRemoved)
+                .padding([theme::SPACE_1, theme::SPACE_3])
+                .style(theme::button_secondary),
+        ]
+        .spacing(theme::SPACE_2)
+        .align_y(iced::Alignment::Center),
+    ]
+    .spacing(theme::SPACE_3)
+    .into()
+}
+
+/// The gh accounts to look pull requests up as, Add account, and -- while
+/// one is being added -- gh's one-time code.
+fn github_accounts<'a>(
+    config: &Config,
+    accounts: Option<&Vec<bombadil_core::github::gh::Account>>,
+    login: Option<&crate::github_tab::GitHubLogin>,
+) -> iced::Element<'a, Message> {
+    use crate::github_tab::GitHubLogin;
+    const DEVICE_URL: &str = "https://github.com/login/device";
+    let button = |label: String, style: fn(&iced::Theme, iced::widget::button::Status) -> _| {
+        iced::widget::button(iced::widget::text(label).size(theme::BODY))
+            .padding([theme::SPACE_1, theme::SPACE_3])
+            .style(style)
+    };
+    let Some(accounts) = accounts else {
+        return iced::widget::Space::new().into();
+    };
+    let chosen = config.settings.github_account.as_deref();
+    let mut row = iced::widget::row![iced::widget::text("Account").size(theme::BODY)]
+        .spacing(theme::SPACE_1)
+        .align_y(iced::Alignment::Center);
+    if accounts.is_empty() {
+        row = row.push(
+            iced::widget::text("gh isn't signed in to github.com")
+                .size(theme::BODY)
+                .style(theme::text_muted),
+        );
+    }
+    for account in accounts {
+        let selected = chosen.map_or(account.active, |c| c == account.login);
+        row = row.push(
+            iced::widget::button(iced::widget::text(account.login.clone()).size(theme::BODY))
+                .on_press(Message::GitHubAccountSelected(account.login.clone()))
+                .padding([theme::SPACE_1, theme::SPACE_3])
+                .style(theme::button_choice(selected)),
+        );
+    }
+    row = row.push(
+        button("Add account".into(), theme::button_secondary)
+            .on_press_maybe(login.is_none().then_some(Message::GitHubAddAccount)),
+    );
+    let mut column = iced::widget::column![row.wrap()].spacing(theme::SPACE_2);
+    match login {
+        None => {}
+        Some(GitHubLogin::Waiting) => {
+            column = column.push(
+                iced::widget::row![
+                    iced::widget::text("Starting gh\u{2026}")
+                        .size(theme::BODY)
+                        .style(theme::text_muted),
+                    button("Cancel".into(), theme::button_secondary)
+                        .on_press(Message::GitHubLoginCancelled),
+                ]
+                .spacing(theme::SPACE_2)
+                .align_y(iced::Alignment::Center),
+            );
+        }
+        Some(GitHubLogin::Code(code)) => {
+            column = column.push(
+                iced::widget::row![
+                    iced::widget::text("Enter").size(theme::BODY),
+                    iced::widget::text(code.clone())
+                        .font(theme::FONT_DATA)
+                        .size(theme::TITLE),
+                    iced::widget::text("at github.com/login/device to sign in.").size(theme::BODY),
+                    button("Copy code".into(), theme::button_secondary)
+                        .on_press(Message::GitHubCopyLoginCode),
+                    button("Open GitHub".into(), theme::button_primary)
+                        .on_press(Message::GitHubOpen(DEVICE_URL.into())),
+                    button("Cancel".into(), theme::button_secondary)
+                        .on_press(Message::GitHubLoginCancelled),
+                ]
+                .spacing(theme::SPACE_2)
+                .align_y(iced::Alignment::Center)
+                .wrap(),
+            );
+        }
+    }
+    column.into()
 }
 
 #[cfg(test)]

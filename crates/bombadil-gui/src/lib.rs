@@ -39,6 +39,7 @@ mod desktop_entry;
 mod detail;
 mod drawer;
 mod env_editor;
+mod github_tab;
 mod icons;
 mod index_editor;
 mod interpreter;
@@ -166,6 +167,25 @@ static TRAY_COMMANDS: std::sync::OnceLock<
     std::sync::Mutex<Option<std::sync::mpsc::Receiver<tray::TrayCommand>>>,
 > = std::sync::OnceLock::new();
 
+/// A `GitHubTick` every two minutes. iced's `time::every` needs the tokio or
+/// smol backend and Bombadil runs the thread-pool one, so a sleeping thread
+/// feeds the stream instead; when the subscription is dropped (watching
+/// turned off) the next send fails and the thread ends.
+fn github_ticker() -> iced::Subscription<app::Message> {
+    iced::Subscription::run_with((), |()| {
+        let (mut sender, receiver) = futures::channel::mpsc::channel(1);
+        std::thread::spawn(move || {
+            loop {
+                std::thread::sleep(std::time::Duration::from_secs(120));
+                if sender.try_send(app::Message::GitHubTick).is_err() && sender.is_closed() {
+                    break;
+                }
+            }
+        });
+        receiver
+    })
+}
+
 /// Turns the tray's commands into application messages.
 ///
 /// A `std::sync::mpsc::Receiver` is not a `Stream`, and blocking on one would
@@ -270,6 +290,11 @@ pub fn run() -> iced::Result {
             iced::system::theme_changes().map(app::Message::SystemThemeChanged),
             iced::window::events().filter_map(window_event),
             iced::event::listen_with(key_event),
+            if state.config.settings.watch_github {
+                github_ticker()
+            } else {
+                iced::Subscription::none()
+            },
             // The pointer only while something is being dragged.
             if app::dragging(state) {
                 iced::event::listen_with(drag_event)
