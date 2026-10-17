@@ -136,6 +136,30 @@ pub struct App {
     pub busy: Option<crate::busy::Busy>,
     /// Finished commands, newest first. See `busy::push`.
     pub toasts: Vec<crate::busy::Toast>,
+    /// The last GitHub lookup per project, by id. See `github_tab`.
+    pub github: std::collections::HashMap<uuid::Uuid, crate::github_tab::GitHubState>,
+    /// Projects whose lookup is running; Refresh is disabled for them and
+    /// ticks skip them.
+    pub github_in_flight: std::collections::HashSet<uuid::Uuid>,
+    /// The token being typed in Preferences > GitHub; cleared once saved.
+    pub github_token_draft: String,
+    /// How Bombadil reaches GitHub, as Preferences shows it; `None` until checked.
+    pub github_source: Option<String>,
+    /// The github.com accounts gh is signed in to; `None` until listed.
+    pub github_accounts: Option<Vec<bombadil_core::github::gh::Account>>,
+    /// An "Add account" in progress.
+    pub github_login: Option<crate::github_tab::GitHubLogin>,
+    /// Set by Cancel; the running `gh auth login` is killed when it is.
+    pub github_login_cancel: Option<Arc<std::sync::atomic::AtomicBool>>,
+    /// The last event announced per pull request URL, so projects sharing
+    /// one pull request (worktrees, monorepo members) announce it once.
+    pub github_notified: std::collections::HashMap<
+        String,
+        (
+            String,
+            std::mem::Discriminant<bombadil_core::github::transition::Event>,
+        ),
+    >,
     /// The clock as of the last frame tick: what views measure elapsed time
     /// and the spinner's angle against. Only advances while `animating`.
     pub now: std::time::Instant,
@@ -314,6 +338,7 @@ pub enum Tab {
     EnvVars,
     Scripts,
     Indexes,
+    GitHub,
 }
 
 impl Tab {
@@ -329,12 +354,13 @@ impl Tab {
     /// Settings has no per-project half worth a tab (uv, terminal and the
     /// venv default are all resolved per project from Preferences), so it is
     /// the one that stayed absorbed.
-    pub const ALL: [Tab; 5] = [
+    pub const ALL: [Tab; 6] = [
         Tab::Dependencies,
         Tab::Members,
         Tab::EnvVars,
         Tab::Scripts,
         Tab::Indexes,
+        Tab::GitHub,
     ];
 
     pub fn label(self) -> &'static str {
@@ -344,6 +370,7 @@ impl Tab {
             Tab::EnvVars => "Env vars",
             Tab::Scripts => "Scripts",
             Tab::Indexes => "Indexes",
+            Tab::GitHub => "GitHub",
         }
     }
 
@@ -356,6 +383,7 @@ impl Tab {
             Tab::EnvVars => "env",
             Tab::Scripts => "scripts",
             Tab::Indexes => "indexes",
+            Tab::GitHub => "github",
         }
     }
 }
@@ -567,6 +595,32 @@ pub enum Message {
     ShowOutput,
     /// The sidebar's Sponsor button: open the GitHub Sponsors page.
     SponsorRequested,
+    /// Every two minutes while watching: look up every project's pull request.
+    GitHubTick,
+    /// The GitHub tab's Refresh: this project now.
+    GitHubRefreshRequested(uuid::Uuid),
+    GitHubLooked(Vec<(uuid::Uuid, bombadil_core::github::Lookup)>),
+    /// A pull request or check run link.
+    GitHubOpen(String),
+    GitHubWatchSelected(bool),
+    /// Redacted in `Debug`, like an index credential.
+    GitHubTokenDraftChanged(index_editor::CredentialInput),
+    GitHubTokenSaved,
+    GitHubTokenRemoved,
+    /// The toast text, or why the keychain refused.
+    GitHubTokenStored(Result<String, String>),
+    GitHubSourceChecked(String),
+    GitHubAccountsListed(Vec<bombadil_core::github::gh::Account>),
+    /// Preferences > GitHub: look pull requests up as this gh account.
+    GitHubAccountSelected(String),
+    /// Preferences > GitHub > Add account: `gh auth login` in the background.
+    GitHubAddAccount,
+    /// The one-time code gh printed, to enter at github.com/login/device.
+    GitHubLoginCode(String),
+    /// The new account's login, or why it failed.
+    GitHubLoginFinished(Result<String, String>),
+    GitHubLoginCancelled,
+    GitHubCopyLoginCode,
     /// A project's git status landed, `None` outside a repository.
     GitProbed {
         id: uuid::Uuid,
@@ -1031,6 +1085,14 @@ impl App {
             load_problems: Vec::new(),
             busy: None,
             toasts: Vec::new(),
+            github: Default::default(),
+            github_in_flight: Default::default(),
+            github_token_draft: String::new(),
+            github_source: None,
+            github_accounts: None,
+            github_login: None,
+            github_login_cancel: None,
+            github_notified: Default::default(),
             now: std::time::Instant::now(),
             last_focus_refresh: None,
             sidebar_drag: false,
@@ -1099,6 +1161,8 @@ pub fn boot(loaded: Loaded) -> (App, Task<Message>) {
     if let Some(i) = app.selected {
         probes.push(Task::done(Message::ProjectSelected(i)));
     }
+    // The first GitHub lookup, at launch; silent, as every first one is.
+    probes.push(Task::done(Message::GitHubTick));
     (app, Task::batch(probes))
 }
 
@@ -1148,6 +1212,214 @@ fn probe_every_venv(app: &App) -> Task<Message> {
                 }))
             }))
             .collect::<Vec<_>>(),
+    )
+}
+
+/// How long one GitHub lookup may take before the UI stops waiting for it.
+const GITHUB_TIMEOUT: Duration = Duration::from_secs(45);
+
+/// Looks the projects up one after another, so a tick over thirty projects
+/// starts one `gh` at a time rather than thirty. The real runner, keychain
+/// and HTTP client are built here at the boundary, as `probe_git` does, so no
+/// test reaches GitHub.
+fn look_up_github(projects: Vec<(uuid::Uuid, PathBuf)>, account: Option<String>) -> Task<Message> {
+    Task::perform(
+        look_up_each(projects, GITHUB_TIMEOUT, move |dir: PathBuf| {
+            bombadil_core::github::lookup(
+                &dir,
+                &bombadil_core::process::SystemCommandRunner,
+                &KeyringSecretStore::new(),
+                &bombadil_core::github::rest::UreqFetch::new(),
+                account.as_deref(),
+            )
+        }),
+        Message::GitHubLooked,
+    )
+}
+
+/// Each lookup on its own job with its own `timeout`, so one hung `gh` costs
+/// only its own project a "took too long" rather than stalling the rest.
+async fn look_up_each<F>(
+    projects: Vec<(uuid::Uuid, PathBuf)>,
+    timeout: Duration,
+    look: F,
+) -> Vec<(uuid::Uuid, bombadil_core::github::Lookup)>
+where
+    F: Fn(PathBuf) -> bombadil_core::github::Lookup + Clone + Send + 'static,
+{
+    let mut found = Vec::with_capacity(projects.len());
+    for (id, dir) in projects {
+        let look = look.clone();
+        let lookup = match job::run(move || look(dir), timeout).await {
+            job::JobResult::Done(lookup) => lookup,
+            job::JobResult::TimedOut | job::JobResult::Failed => {
+                bombadil_core::github::Lookup::Failed("GitHub took too long to answer".into())
+            }
+        };
+        found.push((id, lookup));
+    }
+    found
+}
+
+/// Whether `event` on `status` is news: not already announced for the same
+/// pull request and commit by another project. Records it when it is.
+fn github_news(
+    notified: &mut std::collections::HashMap<
+        String,
+        (
+            String,
+            std::mem::Discriminant<bombadil_core::github::transition::Event>,
+        ),
+    >,
+    status: &bombadil_core::github::PrStatus,
+    event: &bombadil_core::github::transition::Event,
+) -> bool {
+    let this = (status.pr.head_sha.clone(), std::mem::discriminant(event));
+    notified.insert(status.pr.url.clone(), this.clone()) != Some(this)
+}
+
+/// The folder a project's lookups run in: its manifest's directory.
+fn project_dir(project: &bombadil_core::model::Project) -> PathBuf {
+    project
+        .pyproject_path
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_default()
+}
+
+/// A desktop notification, shown off the render thread; a failure (no
+/// notification daemon) has nowhere useful to go -- the toast already said it.
+fn notify_desktop(title: String, body: String) -> Task<Message> {
+    Task::future(async move {
+        job::run(
+            move || {
+                notify_rust::Notification::new()
+                    .appname("Bombadil")
+                    .summary(&title)
+                    .body(&body)
+                    .show()
+                    .map(|_| ())
+                    .ok()
+            },
+            Duration::from_secs(5),
+        )
+        .await
+    })
+    .discard()
+}
+
+/// Writes (`Some`) or deletes (`None`) the GitHub token, on a job thread.
+fn store_github_token(token: Option<String>) -> Task<Message> {
+    Task::perform(
+        async move {
+            job::run(
+                move || {
+                    let store = KeyringSecretStore::new();
+                    match token {
+                        Some(t) => store
+                            .set(&SecretKey::GitHubToken, t.trim())
+                            .map(|()| "Saved the GitHub token".to_string()),
+                        None => store
+                            .delete(&SecretKey::GitHubToken)
+                            .map(|()| "Removed the GitHub token".to_string()),
+                    }
+                    .map_err(|e| e.to_string())
+                },
+                VENV_PROBE_TIMEOUT,
+            )
+            .await
+        },
+        |result| {
+            Message::GitHubTokenStored(match result {
+                job::JobResult::Done(r) => r,
+                _ => Err("the keychain did not answer".into()),
+            })
+        },
+    )
+}
+
+/// How long gh's one-time code lasts; gh gives up on its own after it.
+const GITHUB_LOGIN_TIMEOUT: Duration = Duration::from_secs(15 * 60);
+
+/// `gh auth login` in the background: the code as soon as gh prints it, then
+/// the outcome. Built lazily, so nothing starts until iced polls it -- a test
+/// that only inspects `update` never reaches the real gh.
+fn add_github_account(
+    before: Vec<bombadil_core::github::gh::Account>,
+    cancel: Arc<std::sync::atomic::AtomicBool>,
+) -> impl futures::Stream<Item = Message> {
+    futures::stream::once(async move {
+        job::stream(
+            move |emit| {
+                let result = bombadil_core::github::gh::add_account(
+                    &bombadil_core::process::SystemCommandRunner,
+                    &before,
+                    &mut |code| emit(Message::GitHubLoginCode(code)),
+                    &cancel,
+                );
+                emit(Message::GitHubLoginFinished(result));
+            },
+            GITHUB_LOGIN_TIMEOUT,
+        )
+        .map(|result| match result {
+            job::JobResult::Done(message) => message,
+            job::JobResult::TimedOut => {
+                Message::GitHubLoginFinished(Err("the sign-in code expired".into()))
+            }
+            job::JobResult::Failed => {
+                Message::GitHubLoginFinished(Err("gh stopped unexpectedly".into()))
+            }
+        })
+    })
+    .flatten()
+}
+
+/// Preferences' source line and account list, both from gh, off the render
+/// thread.
+fn check_github(account: Option<String>) -> Task<Message> {
+    let accounts = Task::perform(
+        async move {
+            job::run(
+                || {
+                    bombadil_core::github::gh::accounts(
+                        &bombadil_core::process::SystemCommandRunner,
+                    )
+                },
+                Duration::from_secs(15),
+            )
+            .await
+        },
+        |result| {
+            Message::GitHubAccountsListed(match result {
+                job::JobResult::Done(accounts) => accounts,
+                _ => Vec::new(),
+            })
+        },
+    );
+    Task::batch([check_github_source(account), accounts])
+}
+
+fn check_github_source(account: Option<String>) -> Task<Message> {
+    Task::perform(
+        async move {
+            job::run(
+                move || {
+                    bombadil_core::github::source(
+                        &bombadil_core::process::SystemCommandRunner,
+                        &KeyringSecretStore::new(),
+                        account.as_deref(),
+                    )
+                },
+                Duration::from_secs(15),
+            )
+            .await
+        },
+        |result| {
+            Message::GitHubSourceChecked(match result {
+                job::JobResult::Done(text) => text,
+                _ => "Could not tell how Bombadil reaches GitHub".into(),
+            })
+        },
     )
 }
 
@@ -1953,6 +2225,205 @@ pub fn update(app: &mut App, message: Message, runner: Arc<dyn CommandRunner>) -
                 other => other,
             };
         }
+        Message::GitHubTick => {
+            if !app.config.settings.watch_github {
+                return Task::none();
+            }
+            let now = bombadil_core::github::now_unix();
+            let due: Vec<_> = app
+                .config
+                .projects
+                .iter()
+                .filter(|p| !app.github_in_flight.contains(&p.id))
+                .filter(|p| {
+                    !matches!(
+                        app.github.get(&p.id).map(|s| &s.lookup),
+                        Some(bombadil_core::github::Lookup::RateLimited { until }) if *until > now
+                    )
+                })
+                .map(|p| (p.id, project_dir(p)))
+                .collect();
+            if due.is_empty() {
+                return Task::none();
+            }
+            app.github_in_flight.extend(due.iter().map(|(id, _)| *id));
+            return look_up_github(due, app.config.settings.github_account.clone());
+        }
+        Message::GitHubRefreshRequested(id) => {
+            if app.github_in_flight.contains(&id) {
+                return Task::none();
+            }
+            let Some(project) = app.config.projects.iter().find(|p| p.id == id) else {
+                return Task::none();
+            };
+            let due = vec![(id, project_dir(project))];
+            app.github_in_flight.insert(id);
+            return look_up_github(due, app.config.settings.github_account.clone());
+        }
+        Message::GitHubLooked(results) => {
+            let mut tasks = Vec::new();
+            for (id, lookup) in results {
+                app.github_in_flight.remove(&id);
+                // By id: the project may have been removed while this ran.
+                let Some(project) = app.config.projects.iter().find(|p| p.id == id) else {
+                    continue;
+                };
+                let previous = app.github.get(&id).and_then(|s| s.last_found.clone());
+                let last_found = match &lookup {
+                    bombadil_core::github::Lookup::Found(status) => {
+                        if let Some(event) =
+                            bombadil_core::github::transition::event(previous.as_ref(), status)
+                            && app.config.settings.watch_github
+                            && github_news(&mut app.github_notified, status, &event)
+                        {
+                            let (kind, title, body) =
+                                crate::github_tab::notice(&project.label, status, &event);
+                            crate::busy::push(
+                                &mut app.toasts,
+                                kind,
+                                format!("{title}. {body}"),
+                                std::time::Instant::now(),
+                            );
+                            tasks.push(notify_desktop(title, body));
+                        }
+                        Some(status.clone())
+                    }
+                    // A hiccup is not news: keep showing what was there.
+                    bombadil_core::github::Lookup::Failed(_)
+                    | bombadil_core::github::Lookup::RateLimited { .. } => previous,
+                    _ => None,
+                };
+                app.github.insert(
+                    id,
+                    crate::github_tab::GitHubState {
+                        lookup,
+                        last_found,
+                        checked_at: std::time::Instant::now(),
+                    },
+                );
+            }
+            return Task::batch(tasks);
+        }
+        Message::GitHubOpen(url) => {
+            if !crate::github_tab::openable(&url) {
+                return Task::none();
+            }
+            return Task::future(async move {
+                job::run(
+                    move || bombadil_core::folder::open_url(Os::host(), &url, runner.as_ref()).ok(),
+                    VENV_PROBE_TIMEOUT,
+                )
+                .await
+            })
+            .discard();
+        }
+        Message::GitHubWatchSelected(on) => {
+            app.config.settings.watch_github = on;
+            let persist = persist_settings_edit(app);
+            // Look now rather than at the next two-minute tick.
+            let tick = if on {
+                update(app, Message::GitHubTick, runner)
+            } else {
+                Task::none()
+            };
+            return Task::batch([persist, tick]);
+        }
+        Message::GitHubTokenDraftChanged(text) => app.github_token_draft = text.0,
+        Message::GitHubTokenSaved => {
+            let token = app.github_token_draft.clone();
+            if token.trim().is_empty() {
+                return Task::none();
+            }
+            return store_github_token(Some(token));
+        }
+        Message::GitHubTokenRemoved => return store_github_token(None),
+        Message::GitHubTokenStored(result) => {
+            let (kind, text) = match result {
+                Ok(text) => {
+                    app.github_token_draft.clear();
+                    (crate::busy::ToastKind::Success, text)
+                }
+                Err(e) => (
+                    crate::busy::ToastKind::Warning,
+                    format!("Could not save the token: {e}"),
+                ),
+            };
+            crate::busy::push(&mut app.toasts, kind, text, std::time::Instant::now());
+            app.github_source = None;
+            let refresh = app
+                .selected
+                .and_then(|i| app.config.projects.get(i))
+                .map(|p| p.id);
+            return Task::batch(
+                [check_github(app.config.settings.github_account.clone())]
+                    .into_iter()
+                    .chain(refresh.map(|id| Task::done(Message::GitHubRefreshRequested(id)))),
+            );
+        }
+        Message::GitHubSourceChecked(text) => app.github_source = Some(text),
+        Message::GitHubAccountsListed(accounts) => app.github_accounts = Some(accounts),
+        Message::GitHubAccountSelected(login) => {
+            app.config.settings.github_account = Some(login);
+            app.github_source = None;
+            let persist = persist_settings_edit(app);
+            let tick = update(app, Message::GitHubTick, runner);
+            return Task::batch([
+                persist,
+                check_github(app.config.settings.github_account.clone()),
+                tick,
+            ]);
+        }
+        Message::GitHubAddAccount => {
+            if app.github_login.is_some() {
+                return Task::none();
+            }
+            app.github_login = Some(crate::github_tab::GitHubLogin::Waiting);
+            let before = app.github_accounts.clone().unwrap_or_default();
+            let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            app.github_login_cancel = Some(cancel.clone());
+            return Task::stream(add_github_account(before, cancel));
+        }
+        Message::GitHubLoginCode(code) => {
+            if app.github_login.is_some() {
+                app.github_login = Some(crate::github_tab::GitHubLogin::Code(code));
+            }
+        }
+        Message::GitHubLoginFinished(result) => {
+            // Cancelled: gh may still have signed in, so the list is
+            // refreshed, but nothing is chosen or announced.
+            app.github_login_cancel = None;
+            if app.github_login.take().is_none() {
+                return check_github(app.config.settings.github_account.clone());
+            }
+            match result {
+                Ok(login) => {
+                    crate::busy::push(
+                        &mut app.toasts,
+                        crate::busy::ToastKind::Success,
+                        format!("Signed in to GitHub as {login}"),
+                        std::time::Instant::now(),
+                    );
+                    return update(app, Message::GitHubAccountSelected(login), runner);
+                }
+                Err(e) => crate::busy::push(
+                    &mut app.toasts,
+                    crate::busy::ToastKind::Warning,
+                    format!("Could not add a GitHub account: {e}"),
+                    std::time::Instant::now(),
+                ),
+            }
+        }
+        Message::GitHubLoginCancelled => {
+            app.github_login = None;
+            if let Some(cancel) = app.github_login_cancel.take() {
+                cancel.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+        Message::GitHubCopyLoginCode => {
+            if let Some(crate::github_tab::GitHubLogin::Code(code)) = &app.github_login {
+                return iced::clipboard::write(code.clone());
+            }
+        }
         Message::SponsorRequested => {
             // Spawned, never waited on, off the render thread -- the browser
             // outlives the click. A failure has nowhere useful to go: the
@@ -2571,7 +3042,9 @@ pub fn update(app: &mut App, message: Message, runner: Arc<dyn CommandRunner>) -
             // `AddProjectConfirmed` uses, so the sidebar reflects the removal
             // the instant `update` returns rather than only once the
             // background persist lands.
-            app.config.projects.remove(i);
+            let removed = app.config.projects.remove(i);
+            app.github.remove(&removed.id);
+            app.github_in_flight.remove(&removed.id);
             app.dep_filter.clear();
             app.entries.remove(i);
             // Indices shift on removal; `deps` is tagged with one, and a
@@ -2734,6 +3207,9 @@ pub fn update(app: &mut App, message: Message, runner: Arc<dyn CommandRunner>) -
             if section == preferences::Section::Pycharm {
                 return detect_pycharm(runner);
             }
+            if section == preferences::Section::GitHub && app.github_source.is_none() {
+                return check_github(app.config.settings.github_account.clone());
+            }
         }
         Message::PreferencesClosed => {
             // No undo: every control in there has already written through to
@@ -2771,6 +3247,9 @@ pub fn update(app: &mut App, message: Message, runner: Arc<dyn CommandRunner>) -
             // upgrade since the last look should show up.
             if section == preferences::Section::Pycharm {
                 return detect_pycharm(runner);
+            }
+            if section == preferences::Section::GitHub && app.github_source.is_none() {
+                return check_github(app.config.settings.github_account.clone());
             }
         }
         Message::PycharmDetected(found) => app.pycharm_detected = Some(found),
@@ -3034,7 +3513,8 @@ pub fn update(app: &mut App, message: Message, runner: Arc<dyn CommandRunner>) -
                 | preferences::Section::Environments
                 | preferences::Section::Scripts
                 | preferences::Section::EnvVars
-                | preferences::Section::Indexes => return Task::none(),
+                | preferences::Section::Indexes
+                | preferences::Section::GitHub => return Task::none(),
             }
             return persist_env_edit(app);
         }
@@ -5839,6 +6319,16 @@ pub fn view(app: &App) -> iced::Element<'_, Message> {
             Some(i) => index_editor::project_view(&app.config, i),
             None => iced::widget::text("").into(),
         },
+        // This project's open pull request and its checks, when there is one.
+        Tab::GitHub => match app.selected.and_then(|i| app.config.projects.get(i)) {
+            Some(project) => crate::github_tab::view(
+                project.id,
+                app.github.get(&project.id),
+                app.config.settings.watch_github,
+                app.github_in_flight.contains(&project.id),
+            ),
+            None => iced::widget::text("").into(),
+        },
     };
 
     // The current tab's own button is disabled rather than hidden -- the
@@ -6246,6 +6736,10 @@ pub fn view(app: &App) -> iced::Element<'_, Message> {
             &app.uv_custom_path_draft,
             app.uv_custom_validation.as_ref(),
             app.pycharm_detected.as_ref(),
+            &app.github_token_draft,
+            app.github_source.as_ref(),
+            app.github_accounts.as_ref(),
+            app.github_login.as_ref(),
         ));
     }
     if let Some(modal) = app.modal {
@@ -7382,7 +7876,8 @@ mod tests {
                 Tab::Dependencies,
                 Tab::Members,
                 Tab::EnvVars,
-                Tab::Indexes
+                Tab::Indexes,
+                Tab::GitHub
             ],
             "unknown and repeated keys go; missing tabs follow in built-in order"
         );
@@ -8931,8 +9426,8 @@ mod tests {
         }
         assert_eq!(
             Tab::ALL.len(),
-            5,
-            "Dependencies, Members, Env vars, Scripts, Indexes -- and Settings \
+            6,
+            "Dependencies, Members, Env vars, Scripts, Indexes, GitHub -- and Settings \
              deliberately not, since it has no per-project half"
         );
     }
@@ -14874,6 +15369,372 @@ mod tests {
             "the transcript must carry the reason; got {:?}",
             app.drawer.lines
         );
+    }
+
+    fn with_project() -> (App, uuid::Uuid) {
+        let mut config = Config::default();
+        config.projects.push(project("api"));
+        let id = config.projects[0].id;
+        (App::new(config), id)
+    }
+
+    fn looked(app: &mut App, id: uuid::Uuid, lookup: bombadil_core::github::Lookup) {
+        let _ = update(
+            app,
+            Message::GitHubLooked(vec![(id, lookup)]),
+            unused_runner(),
+        );
+    }
+
+    #[test]
+    fn the_first_github_result_is_stored_and_silent() {
+        use bombadil_core::github::{CheckState::*, Lookup};
+        let (mut app, id) = with_project();
+        looked(
+            &mut app,
+            id,
+            Lookup::Found(crate::github_tab::tests::found("a", &[Running])),
+        );
+        assert!(app.toasts.is_empty());
+        assert!(app.github[&id].last_found.is_some());
+    }
+
+    #[test]
+    fn checks_finishing_raise_a_toast_once() {
+        use bombadil_core::github::{CheckState::*, Lookup};
+        let (mut app, id) = with_project();
+        looked(
+            &mut app,
+            id,
+            Lookup::Found(crate::github_tab::tests::found("a", &[Running])),
+        );
+        looked(
+            &mut app,
+            id,
+            Lookup::Found(crate::github_tab::tests::found("a", &[Failed])),
+        );
+        assert_eq!(app.toasts.len(), 1);
+        assert_eq!(app.toasts[0].kind, crate::busy::ToastKind::Warning);
+        assert!(app.toasts[0].text.starts_with("Checks failed: api"));
+        looked(
+            &mut app,
+            id,
+            Lookup::Found(crate::github_tab::tests::found("a", &[Failed])),
+        );
+        assert_eq!(app.toasts.len(), 1, "no repeat");
+    }
+
+    #[test]
+    fn a_failed_lookup_keeps_the_last_result_and_never_notifies() {
+        use bombadil_core::github::{CheckState::*, Lookup};
+        let (mut app, id) = with_project();
+        looked(
+            &mut app,
+            id,
+            Lookup::Found(crate::github_tab::tests::found("a", &[Running])),
+        );
+        looked(&mut app, id, Lookup::Failed("offline".into()));
+        assert!(app.github[&id].last_found.is_some());
+        looked(
+            &mut app,
+            id,
+            Lookup::Found(crate::github_tab::tests::found("a", &[Running])),
+        );
+        assert!(app.toasts.is_empty());
+    }
+
+    #[test]
+    fn leaving_the_pr_forgets_it() {
+        use bombadil_core::github::{CheckState::*, Lookup};
+        let (mut app, id) = with_project();
+        looked(
+            &mut app,
+            id,
+            Lookup::Found(crate::github_tab::tests::found("a", &[Running])),
+        );
+        looked(&mut app, id, Lookup::DefaultBranch("main".into()));
+        assert!(app.github[&id].last_found.is_none());
+    }
+
+    #[test]
+    fn a_result_for_a_removed_project_is_dropped() {
+        let (mut app, _) = with_project();
+        let stranger = uuid::Uuid::new_v4();
+        looked(&mut app, stranger, bombadil_core::github::Lookup::NotGit);
+        assert!(!app.github.contains_key(&stranger));
+    }
+
+    #[test]
+    fn refresh_marks_only_that_project_in_flight_and_a_result_clears_it() {
+        let mut config = Config::default();
+        config.projects.push(project("api"));
+        config.projects.push(project("web"));
+        let (a, b) = (config.projects[0].id, config.projects[1].id);
+        let mut app = App::new(config);
+        let _ = update(
+            &mut app,
+            Message::GitHubRefreshRequested(a),
+            unused_runner(),
+        );
+        assert!(app.github_in_flight.contains(&a));
+        assert!(!app.github_in_flight.contains(&b));
+        // A second press while one is running starts nothing new.
+        let _ = update(
+            &mut app,
+            Message::GitHubRefreshRequested(a),
+            unused_runner(),
+        );
+        assert_eq!(app.github_in_flight.len(), 1);
+        looked(&mut app, a, bombadil_core::github::Lookup::NotGit);
+        assert!(app.github_in_flight.is_empty());
+    }
+
+    #[test]
+    fn a_tick_looks_up_every_project_unless_watching_is_off_or_rate_limited() {
+        let mut config = Config::default();
+        config.projects.push(project("api"));
+        config.projects.push(project("web"));
+        let (a, b) = (config.projects[0].id, config.projects[1].id);
+        let mut app = App::new(config);
+        looked(
+            &mut app,
+            b,
+            bombadil_core::github::Lookup::RateLimited {
+                until: bombadil_core::github::now_unix() + 600,
+            },
+        );
+        let _ = update(&mut app, Message::GitHubTick, unused_runner());
+        assert!(app.github_in_flight.contains(&a));
+        assert!(!app.github_in_flight.contains(&b));
+
+        let (mut app, id) = with_project();
+        app.config.settings.watch_github = false;
+        let _ = update(&mut app, Message::GitHubTick, unused_runner());
+        assert!(!app.github_in_flight.contains(&id));
+    }
+
+    #[test]
+    fn the_github_tab_has_a_stable_key_and_comes_last_by_default() {
+        assert_eq!(Tab::GitHub.key(), "github");
+        assert_eq!(*tab_order(&[]).last().unwrap(), Tab::GitHub);
+    }
+
+    #[test]
+    fn turning_watching_off_is_saved() {
+        let mut app = App::new(Config::default());
+        let _ = update(
+            &mut app,
+            Message::GitHubWatchSelected(false),
+            unused_runner(),
+        );
+        assert!(!app.config.settings.watch_github);
+    }
+
+    #[test]
+    fn turning_watching_on_looks_up_at_once() {
+        let (mut app, id) = with_project();
+        app.config.settings.watch_github = false;
+        let _ = update(
+            &mut app,
+            Message::GitHubWatchSelected(true),
+            unused_runner(),
+        );
+        assert!(app.github_in_flight.contains(&id));
+    }
+
+    #[test]
+    fn removing_a_project_forgets_its_github_state() {
+        let (mut app, id) = with_project();
+        looked(&mut app, id, bombadil_core::github::Lookup::NotGit);
+        app.github_in_flight.insert(id);
+        let _ = update(
+            &mut app,
+            Message::RemoveProjectRequested(0),
+            unused_runner(),
+        );
+        assert!(!app.github.contains_key(&id));
+        assert!(!app.github_in_flight.contains(&id));
+    }
+
+    #[test]
+    fn a_refresh_while_watching_is_off_never_notifies() {
+        use bombadil_core::github::{CheckState::*, Lookup};
+        let (mut app, id) = with_project();
+        app.config.settings.watch_github = false;
+        let running = crate::github_tab::tests::found("a", &[Running]);
+        looked(&mut app, id, Lookup::Found(running));
+        looked(
+            &mut app,
+            id,
+            Lookup::Found(crate::github_tab::tests::found("a", &[Failed])),
+        );
+        assert!(app.toasts.is_empty());
+        assert!(app.github[&id].last_found.is_some(), "still shown");
+    }
+
+    #[test]
+    fn projects_on_one_pull_request_notify_once() {
+        use bombadil_core::github::{CheckState::*, Lookup};
+        let found = crate::github_tab::tests::found;
+        let mut config = Config::default();
+        for label in ["api", "web", "cli"] {
+            config.projects.push(project(label));
+        }
+        let ids: Vec<_> = config.projects.iter().map(|p| p.id).collect();
+        let mut app = App::new(config);
+        let _ = update(
+            &mut app,
+            Message::GitHubLooked(
+                ids.iter()
+                    .map(|id| (*id, Lookup::Found(found("a", &[Running]))))
+                    .collect(),
+            ),
+            unused_runner(),
+        );
+        // Two in one batch, the third on its own later.
+        let _ = update(
+            &mut app,
+            Message::GitHubLooked(
+                ids[..2]
+                    .iter()
+                    .map(|id| (*id, Lookup::Found(found("a", &[Failed]))))
+                    .collect(),
+            ),
+            unused_runner(),
+        );
+        looked(&mut app, ids[2], Lookup::Found(found("a", &[Failed])));
+        assert_eq!(app.toasts.len(), 1, "{:?}", app.toasts);
+        // A re-run of the same commit is news again.
+        looked(&mut app, ids[0], Lookup::Found(found("a", &[Running])));
+        assert_eq!(app.toasts.len(), 2);
+    }
+
+    #[test]
+    fn a_failed_token_save_keeps_the_draft() {
+        let mut app = App::new(Config::default());
+        app.github_token_draft = "ghp_x".into();
+        let _ = update(&mut app, Message::GitHubTokenSaved, unused_runner());
+        let _ = update(
+            &mut app,
+            Message::GitHubTokenStored(Err("locked".into())),
+            unused_runner(),
+        );
+        assert_eq!(app.github_token_draft, "ghp_x");
+        let _ = update(
+            &mut app,
+            Message::GitHubTokenStored(Ok("Saved the GitHub token".into())),
+            unused_runner(),
+        );
+        assert!(app.github_token_draft.is_empty());
+    }
+
+    #[test]
+    fn one_hung_github_lookup_does_not_hold_up_the_others() {
+        use bombadil_core::github::Lookup;
+        let (a, b) = (uuid::Uuid::new_v4(), uuid::Uuid::new_v4());
+        let projects = vec![(a, PathBuf::from("/hung")), (b, PathBuf::from("/fine"))];
+        let started = std::time::Instant::now();
+        let got = futures::executor::block_on(look_up_each(
+            projects,
+            Duration::from_millis(100),
+            |dir: PathBuf| {
+                if dir.ends_with("hung") {
+                    std::thread::sleep(Duration::from_secs(5));
+                }
+                Lookup::NotGit
+            },
+        ));
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert!(matches!(got[0], (id, Lookup::Failed(_)) if id == a));
+        assert_eq!(got[1], (b, Lookup::NotGit));
+    }
+
+    #[test]
+    fn choosing_a_github_account_saves_it_and_looks_up_again() {
+        let (mut app, id) = with_project();
+        app.github_source = Some("Using gh as work".into());
+        let _ = update(
+            &mut app,
+            Message::GitHubAccountSelected("me".into()),
+            unused_runner(),
+        );
+        assert_eq!(app.config.settings.github_account.as_deref(), Some("me"));
+        assert_eq!(app.github_source, None, "rechecked");
+        assert!(app.github_in_flight.contains(&id));
+    }
+
+    #[test]
+    fn adding_a_github_account_shows_its_code_then_selects_it() {
+        use crate::github_tab::GitHubLogin;
+        let mut app = App::new(Config::default());
+        let _ = update(&mut app, Message::GitHubAddAccount, unused_runner());
+        assert_eq!(app.github_login, Some(GitHubLogin::Waiting));
+        let _ = update(
+            &mut app,
+            Message::GitHubLoginCode("AB12-CD34".into()),
+            unused_runner(),
+        );
+        assert_eq!(
+            app.github_login,
+            Some(GitHubLogin::Code("AB12-CD34".into()))
+        );
+        let _ = update(
+            &mut app,
+            Message::GitHubLoginFinished(Ok("new".into())),
+            unused_runner(),
+        );
+        assert_eq!(app.github_login, None);
+        assert_eq!(app.config.settings.github_account.as_deref(), Some("new"));
+        assert_eq!(app.toasts.len(), 1);
+        assert_eq!(app.toasts[0].kind, crate::busy::ToastKind::Success);
+        assert!(app.toasts[0].text.contains("new"), "{}", app.toasts[0].text);
+    }
+
+    #[test]
+    fn a_failed_login_warns_and_a_cancelled_one_stays_quiet() {
+        let mut app = App::new(Config::default());
+        let _ = update(&mut app, Message::GitHubAddAccount, unused_runner());
+        let _ = update(
+            &mut app,
+            Message::GitHubLoginFinished(Err("expired_token".into())),
+            unused_runner(),
+        );
+        assert_eq!(app.github_login, None);
+        assert_eq!(app.toasts.len(), 1);
+        assert_eq!(app.toasts[0].kind, crate::busy::ToastKind::Warning);
+        assert!(app.toasts[0].text.contains("expired_token"));
+
+        let mut app = App::new(Config::default());
+        let _ = update(&mut app, Message::GitHubAddAccount, unused_runner());
+        let flag = app.github_login_cancel.clone().expect("a running login");
+        let _ = update(&mut app, Message::GitHubLoginCancelled, unused_runner());
+        assert_eq!(app.github_login, None);
+        assert!(
+            flag.load(std::sync::atomic::Ordering::SeqCst),
+            "gh is stopped"
+        );
+        let _ = update(
+            &mut app,
+            Message::GitHubLoginFinished(Err("expired_token".into())),
+            unused_runner(),
+        );
+        assert!(app.toasts.is_empty());
+        assert_eq!(app.config.settings.github_account, None);
+    }
+
+    #[test]
+    fn the_github_accounts_listed_are_kept_for_preferences() {
+        let mut app = App::new(Config::default());
+        let me = bombadil_core::github::gh::Account {
+            login: "me".into(),
+            active: true,
+        };
+        let _ = update(
+            &mut app,
+            Message::GitHubAccountsListed(vec![me.clone()]),
+            unused_runner(),
+        );
+        assert_eq!(app.github_accounts, Some(vec![me]));
     }
 
     fn project(label: &str) -> bombadil_core::model::Project {

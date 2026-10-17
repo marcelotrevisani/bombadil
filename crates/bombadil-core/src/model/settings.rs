@@ -89,6 +89,14 @@ pub struct Settings {
     /// The GUI still quits when there is no tray to come back from.
     #[serde(default = "yes")]
     pub close_to_tray: bool,
+    /// Whether every project's open pull request is looked up every two
+    /// minutes and its checks announced.
+    #[serde(default = "yes")]
+    pub watch_github: bool,
+    /// The `gh` account Bombadil looks pull requests up as. `None` follows
+    /// whichever account `gh` has active; it never changes gh's own choice.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub github_account: Option<String>,
     /// The PyCharm launcher chosen by hand. `None` detects it each time it
     /// is opened, which also follows an upgrade to a new install.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -108,6 +116,8 @@ impl Default for Settings {
             theme: ThemeChoice::default(),
             layout: Layout::default(),
             close_to_tray: true,
+            watch_github: true,
+            github_account: None,
             pycharm: None,
         }
     }
@@ -176,5 +186,29 @@ mod tests {
         let text = toml::to_string(&settings).unwrap();
         assert!(text.contains("theme = \"light\""), "{text}");
         assert_eq!(toml::from_str::<Settings>(&text).unwrap(), settings);
+    }
+
+    #[test]
+    fn the_github_account_is_unset_until_chosen_and_round_trips() {
+        let settings: Settings = toml::from_str("theme = \"dark\"\n").unwrap();
+        assert_eq!(settings.github_account, None);
+        let chosen = Settings {
+            github_account: Some("me".into()),
+            ..Settings::default()
+        };
+        let text = toml::to_string(&chosen).unwrap();
+        assert!(text.contains("github_account = \"me\""), "{text}");
+        assert!(
+            !toml::to_string(&Settings::default())
+                .unwrap()
+                .contains("github_account")
+        );
+    }
+
+    #[test]
+    fn watching_github_defaults_on_for_old_configs() {
+        let settings: Settings = toml::from_str("theme = \"dark\"\n").unwrap();
+        assert!(settings.watch_github);
+        assert!(Settings::default().watch_github);
     }
 }

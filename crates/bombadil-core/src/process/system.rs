@@ -85,6 +85,15 @@ impl CommandRunner for SystemCommandRunner {
         spec: &CommandSpec,
         on_line: &mut dyn FnMut(OutputLine),
     ) -> Result<CommandOutcome, CommandError> {
+        self.stream_cancellable(spec, on_line, &std::sync::atomic::AtomicBool::new(false))
+    }
+
+    fn stream_cancellable(
+        &self,
+        spec: &CommandSpec,
+        on_line: &mut dyn FnMut(OutputLine),
+        cancel: &std::sync::atomic::AtomicBool,
+    ) -> Result<CommandOutcome, CommandError> {
         let spawn_error = |source| CommandError::Spawn {
             program: spec.program.clone(),
             source,
@@ -117,7 +126,20 @@ impl CommandRunner for SystemCommandRunner {
 
         let mut collected_stdout = String::new();
         let mut collected_stderr = String::new();
-        for line in rx {
+        let mut cancelled = false;
+        loop {
+            if cancel.load(std::sync::atomic::Ordering::SeqCst) {
+                // Killed, then not drained: a grandchild may still hold the
+                // pipes open, and waiting on it is what Cancel is to avoid.
+                let _ = child.kill();
+                cancelled = true;
+                break;
+            }
+            let line = match rx.recv_timeout(std::time::Duration::from_millis(200)) {
+                Ok(line) => line,
+                Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            };
             let sink = match line {
                 OutputLine::Stdout(_) => &mut collected_stdout,
                 OutputLine::Stderr(_) => &mut collected_stderr,
@@ -127,9 +149,12 @@ impl CommandRunner for SystemCommandRunner {
             on_line(line);
         }
         // Joining is not for the output -- the channel already delivered all
-        // of it -- but so a reader thread cannot outlive this call.
-        for handle in [stdout, stderr].into_iter().flatten() {
-            let _ = handle.join();
+        // of it -- but so a reader thread cannot outlive this call. Skipped
+        // after a cancel, for the same reason the drain is.
+        if !cancelled {
+            for handle in [stdout, stderr].into_iter().flatten() {
+                let _ = handle.join();
+            }
         }
 
         let status = child.wait().map_err(spawn_error)?;
@@ -168,5 +193,38 @@ fn pump(
             // The receiver is gone: nobody is left to show these lines.
             return Ok(());
         }
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    #[test]
+    fn a_cancelled_stream_kills_the_child_and_returns() {
+        let spec = CommandSpec::new("sh")
+            .arg("-c")
+            .arg("echo started; exec sleep 30");
+        let cancel = AtomicBool::new(false);
+        let started = std::time::Instant::now();
+        let outcome = SystemCommandRunner
+            .stream_cancellable(
+                &spec,
+                &mut |line| {
+                    if line.text() == "started" {
+                        cancel.store(true, Ordering::SeqCst);
+                    }
+                },
+                &cancel,
+            )
+            .expect("the child must run");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "took {:?}",
+            started.elapsed()
+        );
+        assert_ne!(outcome.status, Some(0), "killed, not finished");
+        assert!(outcome.stdout.contains("started"));
     }
 }

@@ -373,6 +373,8 @@ mod tests {
                     tab_order: vec!["members".into(), "deps".into()],
                 },
                 close_to_tray: false,
+                watch_github: true,
+                github_account: None,
                 pycharm: None,
             },
             indexes: vec![

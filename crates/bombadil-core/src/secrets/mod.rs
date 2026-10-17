@@ -23,6 +23,8 @@ pub enum SecretKey {
     ProjectEnv { project_id: Uuid, key: String },
     /// A secret environment variable applying to every project.
     GlobalEnv { key: String },
+    /// The personal access token used when `gh` is unavailable.
+    GitHubToken,
 }
 
 impl SecretKey {
@@ -36,6 +38,7 @@ impl SecretKey {
             SecretKey::Index { name } => format!("index/{name}"),
             SecretKey::ProjectEnv { project_id, key } => format!("env/{project_id}/{key}"),
             SecretKey::GlobalEnv { key } => format!("env/global/{key}"),
+            SecretKey::GitHubToken => "github/token".to_string(),
         }
     }
 }
@@ -65,6 +68,11 @@ pub trait SecretStore: Send + Sync {
 mod tests {
     use super::*;
     use uuid::Uuid;
+
+    #[test]
+    fn the_github_token_has_a_fixed_account() {
+        assert_eq!(SecretKey::GitHubToken.account(), "github/token");
+    }
 
     #[test]
     fn account_names_match_the_three_documented_shapes() {
