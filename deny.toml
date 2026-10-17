@@ -11,10 +11,11 @@ all-features = true
 # unactionable gets an entry here with a comment explaining why — an empty
 # list is the goal, not a formality.
 #
-# Both entries below are "unmaintained", not vulnerabilities, discovered only
-# once bombadil-gui pulled in iced 0.14 and its winit/cosmic-text font stack
-# (they postdate the licence-only spike behind the deny.toml change in plan
-# 3a task 1). Neither has a safe upgrade path today; revisit if one appears.
+# Every entry below is "unmaintained", not a vulnerability, with no safe
+# upgrade path today; revisit each when one appears. The first two were
+# discovered once bombadil-gui pulled in iced 0.14 and its winit/cosmic-text
+# font stack (they postdate the licence-only spike behind the deny.toml change
+# in plan 3a task 1).
 ignore = [
     # dtolnay's `paste`, archived by its author. Reached via
     # winit -> metal -> wgpu-hal, used only on macOS's Metal backend.
@@ -23,6 +24,14 @@ ignore = [
     # (fontdb, owned_ttf_parser). The advisory recommends `skrifa`, which
     # cosmic-text does not yet use.
     "RUSTSEC-2026-0192",
+    # `zvariant`, `zbus_names` and `zvariant_derive`, merged into `zbus` 6 as
+    # its `wire` and `names` modules. Every crate here that uses D-Bus still
+    # requires zbus 5 in its newest release: ksni (tray), notify-rust (desktop
+    # notifications), secret-service via the keyring store, and mundy via
+    # iced_winit. Drop these once they have all moved to zbus 6.
+    "RUSTSEC-2026-0370",
+    "RUSTSEC-2026-0371",
+    "RUSTSEC-2026-0372",
 ]
 
 [licenses]
