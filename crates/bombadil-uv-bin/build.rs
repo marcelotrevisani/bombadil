@@ -136,7 +136,7 @@ fn extract_from_zip(archive: &[u8], exe_name: &str) -> Vec<u8> {
     let mut zip = zip::ZipArchive::new(reader).expect("open uv zip");
     for i in 0..zip.len() {
         let mut entry = zip.by_index(i).expect("zip entry");
-        let name = entry.name().to_string();
+        let name = entry.name().expect("zip entry name").to_string();
         if matches_name(Path::new(&name), exe_name) {
             let mut bytes = Vec::new();
             entry.read_to_end(&mut bytes).expect("read uv from zip");
