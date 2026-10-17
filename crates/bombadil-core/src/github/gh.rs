@@ -25,8 +25,20 @@ enum Reply {
     Failed(String),
 }
 
+/// Every `gh` Bombadil runs. gh calls git inside the project, and a
+/// repository's own config can make git run a command (`core.fsmonitor`)
+/// that would inherit `GH_TOKEN`; the same override Bombadil's own git calls
+/// pass with `-c` reaches gh's git through the environment.
+fn gh(args: &[&str]) -> CommandSpec {
+    CommandSpec::new("gh")
+        .args(args.iter().copied())
+        .env("GIT_CONFIG_COUNT", "1")
+        .env("GIT_CONFIG_KEY_0", "core.fsmonitor")
+        .env("GIT_CONFIG_VALUE_0", "false")
+}
+
 fn run(dir: &Path, runner: &dyn CommandRunner, token: Option<&str>, args: &[&str]) -> Reply {
-    let mut spec = CommandSpec::new("gh").args(args.iter().copied()).cwd(dir);
+    let mut spec = gh(args).cwd(dir);
     if let Some(token) = token {
         spec = spec.env("GH_TOKEN", token);
     }
@@ -95,10 +107,7 @@ pub fn lookup(
 /// environment: gh refuses `auth login` while `GH_TOKEN` is set and reports
 /// only that token's account, and it treats an empty value as unset.
 fn auth(args: &[&str]) -> CommandSpec {
-    CommandSpec::new("gh")
-        .args(args.iter().copied())
-        .env("GH_TOKEN", "")
-        .env("GITHUB_TOKEN", "")
+    gh(args).env("GH_TOKEN", "").env("GITHUB_TOKEN", "")
 }
 
 /// One account `gh` is signed in to on github.com.
@@ -221,7 +230,7 @@ pub fn add_account(
 
 /// The signed-in user, or `None` when `gh` is missing or signed out.
 pub fn login(runner: &dyn CommandRunner) -> Option<String> {
-    let spec = CommandSpec::new("gh").args(["api", "user", "--jq", ".login"]);
+    let spec = gh(&["api", "user", "--jq", ".login"]);
     let out = runner.run(&spec).ok().filter(|o| o.success())?;
     Some(out.stdout.trim().to_string()).filter(|s| !s.is_empty())
 }
@@ -699,6 +708,29 @@ mod tests {
                     call.args
                 );
             }
+        }
+    }
+
+    #[test]
+    fn gh_s_own_git_calls_never_run_a_repository_s_fsmonitor() {
+        // gh runs git inside the project, and a repository's config can make
+        // git run a command that would inherit GH_TOKEN.
+        let runner = FakeCommandRunner::new();
+        runner.expect("gh", &["repo", "view"], ok(DEFAULT));
+        runner.expect("gh", &["pr", "list"], ok("[]"));
+        runner.expect("gh", &["auth"], ok(STATUS));
+        runner.expect("gh", &["api", "user"], ok("me\n"));
+        let _ = lookup(dir(), "feat/x", None, Some("t"), &runner);
+        let _ = accounts(&runner);
+        let _ = token_for(&runner, "me");
+        let _ = login(&runner);
+        let calls = runner.calls();
+        assert_eq!(calls.len(), 5);
+        for call in calls {
+            let env = |k: &str| call.env.get(k).map(String::as_str);
+            assert_eq!(env("GIT_CONFIG_COUNT"), Some("1"), "{:?}", call.args);
+            assert_eq!(env("GIT_CONFIG_KEY_0"), Some("core.fsmonitor"));
+            assert_eq!(env("GIT_CONFIG_VALUE_0"), Some("false"));
         }
     }
 
