@@ -66,6 +66,7 @@ nav:
       - Package indexes: indexes.md
       - Terminals and PyCharm: terminals-pycharm.md
       - The tray: tray.md
+      - GitHub pull requests: github.md
   - Settings: settings.md
   - Configuration file: configuration.md
   - Gotchas: gotchas.md

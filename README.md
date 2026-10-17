@@ -85,6 +85,11 @@ another version **deletes it**. Bombadil compares pins segment-wise against what
 `pyvenv.cfg` actually records, so `3.12.13` and `3.12` are not treated as a
 conflict, and a genuinely destructive pin change asks first.
 
+**Pull request checks.** A project on a branch with an open GitHub pull request
+shows it in the GitHub tab, with every check run and links to the PR and the
+runs. You are notified when its checks start and finish. It uses `gh` when it
+is signed in, or a read-only token kept in the keychain.
+
 ## Install
 
 Bombadil bundles `uv 0.13.1`, so there is nothing else to install. By default it

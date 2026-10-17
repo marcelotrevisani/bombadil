@@ -25,4 +25,4 @@ toml.workspace = true
 # a compiled-in copy of Mozilla's roots, which never consults the OS store --
 # see `download` in build.rs for why that broke real installs.
 ureq = { version = "3.3.0", features = ["platform-verifier"] }
-zip = { version = "8.6.0", default-features = false, features = ["deflate-flate2"] }
+zip = { version = "9.0.3", default-features = false, features = ["deflate-flate2"] }

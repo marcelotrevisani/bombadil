@@ -150,6 +150,18 @@ pub trait CommandRunner: Send + Sync {
     /// The default delegates to `run` and replays the buffered output line by
     /// line -- the same shape `spawn`'s default takes, so every existing
     /// implementation stays correct, just not incremental.
+    /// `stream`, but the child is killed once `cancel` is set, for a wait
+    /// the user can call off (a sign-in waiting on a browser). The default
+    /// ignores `cancel`: a runner with no real child has nothing to kill.
+    fn stream_cancellable(
+        &self,
+        spec: &CommandSpec,
+        on_line: &mut dyn FnMut(OutputLine),
+        _cancel: &std::sync::atomic::AtomicBool,
+    ) -> Result<CommandOutcome, CommandError> {
+        self.stream(spec, on_line)
+    }
+
     fn stream(
         &self,
         spec: &CommandSpec,
