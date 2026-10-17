@@ -198,7 +198,7 @@ jobs:
           target: ${{ matrix.target }}
           manylinux: ${{ matrix.manylinux }}
           args: --release --out dist
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: wheel-${{ matrix.os }}-${{ matrix.target }}
           path: dist/*.whl
@@ -213,7 +213,7 @@ jobs:
     runs-on: ubuntu-latest
     environment: crates_deploy
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           pattern: wheel-*
           merge-multiple: true
@@ -282,7 +282,7 @@ jobs:
       - name: The .rpm installs
         # The glob is expanded inside the container, where /dist exists.
         run: docker run --rm -v "$PWD/dist:/dist:ro" fedora:latest sh -c 'dnf install -y /dist/*.rpm && test -x /usr/bin/bombadil'
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: installers-linux-${{ matrix.arch }}
           path: dist/*
@@ -345,7 +345,7 @@ jobs:
           kill "$pid"
           wait "$pid" || true
           hdiutil detach "$mount"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: installers-macos
           path: dist/*
@@ -384,7 +384,7 @@ jobs:
           Start-Sleep -Seconds 10
           if ($app.HasExited) { throw "bombadil exited with $($app.ExitCode)" }
           Stop-Process -Id $app.Id
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: installers-windows
           path: dist/*
@@ -421,7 +421,7 @@ jobs:
             --title "Bombadil $GITHUB_REF_NAME" \
             --generate-notes \
             --notes "Published to crates.io: \`bombadil\`, \`bombadil-gui\`, \`bombadil-core\`, \`bombadil-uv-bin\` $VERSION."
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           pattern: installers-*
           merge-multiple: true
