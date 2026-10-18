@@ -620,6 +620,10 @@ pub enum Message {
     /// The new account's login, or why it failed.
     GitHubLoginFinished(Result<String, String>),
     GitHubLoginCancelled,
+    /// Sign in through GitHub's device flow, for machines without gh.
+    GitHubBrowserSignIn,
+    /// The device flow's outcome: the token is already in the keychain.
+    GitHubBrowserFinished(Result<String, String>),
     GitHubCopyLoginCode,
     /// A project's git status landed, `None` outside a repository.
     GitProbed {
@@ -1368,6 +1372,44 @@ fn add_github_account(
             }
             job::JobResult::Failed => {
                 Message::GitHubLoginFinished(Err("gh stopped unexpectedly".into()))
+            }
+        })
+    })
+    .flatten()
+}
+
+/// The device flow in the background: the code as soon as GitHub gives it,
+/// then the token straight into the keychain. Lazy, as `add_github_account`.
+fn sign_in_with_browser(
+    cancel: Arc<std::sync::atomic::AtomicBool>,
+) -> impl futures::Stream<Item = Message> {
+    use bombadil_core::github::{device, rest::UreqFetch};
+    futures::stream::once(async move {
+        job::stream(
+            move |emit| {
+                let result = device::login(
+                    &UreqFetch::new(),
+                    device::CLIENT_ID,
+                    &mut |code| emit(Message::GitHubLoginCode(code)),
+                    &mut |d| device::sleep_unless(&cancel, d),
+                )
+                .and_then(|token| {
+                    KeyringSecretStore::new()
+                        .set(&SecretKey::GitHubToken, &token)
+                        .map_err(|e| format!("could not save the token: {e}"))
+                })
+                .map(|()| "Signed in to GitHub".to_string());
+                emit(Message::GitHubBrowserFinished(result));
+            },
+            GITHUB_LOGIN_TIMEOUT,
+        )
+        .map(|result| match result {
+            job::JobResult::Done(message) => message,
+            job::JobResult::TimedOut => {
+                Message::GitHubBrowserFinished(Err("the sign-in code expired".into()))
+            }
+            job::JobResult::Failed => {
+                Message::GitHubBrowserFinished(Err("the sign-in stopped unexpectedly".into()))
             }
         })
     })
@@ -2418,6 +2460,33 @@ pub fn update(app: &mut App, message: Message, runner: Arc<dyn CommandRunner>) -
             if let Some(cancel) = app.github_login_cancel.take() {
                 cancel.store(true, std::sync::atomic::Ordering::SeqCst);
             }
+        }
+        Message::GitHubBrowserSignIn => {
+            if app.github_login.is_some() {
+                return Task::none();
+            }
+            app.github_login = Some(crate::github_tab::GitHubLogin::Waiting);
+            let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            app.github_login_cancel = Some(cancel.clone());
+            return Task::stream(sign_in_with_browser(cancel));
+        }
+        Message::GitHubBrowserFinished(result) => {
+            app.github_login_cancel = None;
+            if app.github_login.take().is_none() {
+                return Task::none();
+            }
+            return match result {
+                Ok(text) => update(app, Message::GitHubTokenStored(Ok(text)), runner),
+                Err(e) => {
+                    crate::busy::push(
+                        &mut app.toasts,
+                        crate::busy::ToastKind::Warning,
+                        format!("Could not sign in to GitHub: {e}"),
+                        std::time::Instant::now(),
+                    );
+                    Task::none()
+                }
+            };
         }
         Message::GitHubCopyLoginCode => {
             if let Some(crate::github_tab::GitHubLogin::Code(code)) = &app.github_login {
@@ -15720,6 +15789,63 @@ mod tests {
         );
         assert!(app.toasts.is_empty());
         assert_eq!(app.config.settings.github_account, None);
+    }
+
+    #[test]
+    fn signing_in_with_the_browser_shows_its_code_then_uses_the_token() {
+        use crate::github_tab::GitHubLogin;
+        let mut app = App::new(Config::default());
+        app.github_source = Some("Not signed in".into());
+        let _ = update(&mut app, Message::GitHubBrowserSignIn, unused_runner());
+        assert_eq!(app.github_login, Some(GitHubLogin::Waiting));
+        let _ = update(&mut app, Message::GitHubAddAccount, unused_runner());
+        assert!(app.github_login_cancel.is_some(), "one sign-in at a time");
+        let _ = update(
+            &mut app,
+            Message::GitHubLoginCode("AB12-CD34".into()),
+            unused_runner(),
+        );
+        assert_eq!(
+            app.github_login,
+            Some(GitHubLogin::Code("AB12-CD34".into()))
+        );
+        let _ = update(
+            &mut app,
+            Message::GitHubBrowserFinished(Ok("Signed in to GitHub".into())),
+            unused_runner(),
+        );
+        assert_eq!(app.github_login, None);
+        assert!(app.github_login_cancel.is_none());
+        assert_eq!(app.github_source, None, "rechecked");
+        assert_eq!(app.toasts.len(), 1);
+        assert_eq!(app.toasts[0].kind, crate::busy::ToastKind::Success);
+    }
+
+    #[test]
+    fn a_failed_browser_sign_in_warns_and_a_cancelled_one_stays_quiet() {
+        let mut app = App::new(Config::default());
+        let _ = update(&mut app, Message::GitHubBrowserSignIn, unused_runner());
+        let _ = update(
+            &mut app,
+            Message::GitHubBrowserFinished(Err("the sign-in was declined".into())),
+            unused_runner(),
+        );
+        assert_eq!(app.github_login, None);
+        assert_eq!(app.toasts.len(), 1);
+        assert_eq!(app.toasts[0].kind, crate::busy::ToastKind::Warning);
+        assert!(app.toasts[0].text.contains("declined"));
+
+        let mut app = App::new(Config::default());
+        let _ = update(&mut app, Message::GitHubBrowserSignIn, unused_runner());
+        let flag = app.github_login_cancel.clone().expect("a running sign-in");
+        let _ = update(&mut app, Message::GitHubLoginCancelled, unused_runner());
+        assert!(flag.load(std::sync::atomic::Ordering::SeqCst));
+        let _ = update(
+            &mut app,
+            Message::GitHubBrowserFinished(Err("cancelled".into())),
+            unused_runner(),
+        );
+        assert!(app.toasts.is_empty());
     }
 
     #[test]
