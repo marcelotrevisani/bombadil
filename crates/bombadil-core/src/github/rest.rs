@@ -45,6 +45,12 @@ impl UreqFetch {
     }
 }
 
+impl UreqFetch {
+    pub(crate) fn agent(&self) -> &ureq::Agent {
+        &self.0
+    }
+}
+
 impl Default for UreqFetch {
     fn default() -> Self {
         Self::new()

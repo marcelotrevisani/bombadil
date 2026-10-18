@@ -894,8 +894,9 @@ fn github_panel<'a>(
             .size(theme::DATA),
         account_row,
         iced::widget::text(
-            "gh is used when it is installed and signed in. Otherwise a personal access token \
-             with read access to pull requests and checks is used, kept in the system keychain."
+            "gh is used when it is installed and signed in. Otherwise sign in with the browser, \
+             or paste a personal access token with read access to pull requests and checks. \
+             Either is kept in the system keychain."
         )
         .size(theme::BODY)
         .style(theme::text_muted),
@@ -913,6 +914,10 @@ fn github_panel<'a>(
                 )
                 .padding([theme::SPACE_1, theme::SPACE_3])
                 .style(theme::button_primary),
+            iced::widget::button(iced::widget::text("Sign in with browser").size(theme::BODY))
+                .on_press_maybe(login.is_none().then_some(Message::GitHubBrowserSignIn))
+                .padding([theme::SPACE_1, theme::SPACE_3])
+                .style(theme::button_secondary),
             iced::widget::button(iced::widget::text("Remove").size(theme::BODY))
                 .on_press(Message::GitHubTokenRemoved)
                 .padding([theme::SPACE_1, theme::SPACE_3])
@@ -926,7 +931,7 @@ fn github_panel<'a>(
 }
 
 /// The gh accounts to look pull requests up as, Add account, and -- while
-/// one is being added -- gh's one-time code.
+/// one is being added, or the browser sign-in runs -- the one-time code.
 fn github_accounts<'a>(
     config: &Config,
     accounts: Option<&Vec<bombadil_core::github::gh::Account>>,
@@ -972,7 +977,7 @@ fn github_accounts<'a>(
         Some(GitHubLogin::Waiting) => {
             column = column.push(
                 iced::widget::row![
-                    iced::widget::text("Starting gh\u{2026}")
+                    iced::widget::text("Starting sign-in\u{2026}")
                         .size(theme::BODY)
                         .style(theme::text_muted),
                     button("Cancel".into(), theme::button_secondary)

@@ -7,6 +7,7 @@
 //! `gh` is asked first; when it is missing or signed out, a token from the
 //! keychain is used against the REST API instead.
 
+pub mod device;
 pub mod gh;
 pub mod rest;
 pub mod transition;
