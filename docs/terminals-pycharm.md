@@ -1,5 +1,9 @@
 # Terminals and PyCharm
 
+The project header has a button for each: **>_** opens a terminal and **PC**
+opens PyCharm. The **Ju** button next to them starts JupyterLab; see
+[Running code](running.md#jupyter).
+
 ## Open a terminal
 
 Click the **>_** button on a project, or press ++ctrl+t++. A terminal opens

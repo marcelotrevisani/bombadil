@@ -19,6 +19,7 @@ The buttons at the top choose what you are editing:
 | [Environments](#environments) | default location | the project's environments |
 | [Python](#python) | default pin for new environments | the default environment's pin |
 | [uv](#uv) | yes | yes (auto, bundled or from PATH) |
+| [just](#just) | yes | no (applies to every project) |
 | [Terminal](#terminal) | yes | yes |
 | [PyCharm](#pycharm) | yes | no (applies to every project) |
 | [Scripts](#scripts) | global scripts | in the project's Scripts tab |
@@ -44,8 +45,8 @@ The buttons at the top choose what you are editing:
   for example `~/.venvs/weather-api-3f9a2c`.
 
 **Check installed packages for known vulnerabilities** asks osv.dev about the
-installed packages of the project you are looking at. It sends package names
-and versions only. It is on by default; see
+installed packages of the project you are looking at, sending their names
+and versions. It is on by default; see
 [Known vulnerabilities](dependencies.md#known-vulnerabilities).
 
 ![Environment and uv settings](images/prefs-envs.png)
@@ -91,7 +92,7 @@ Which uv binary Bombadil runs:
 |---|---|
 | **auto** (default) | uv from `PATH` if it is version 0.12.1 or newer, otherwise the copy bundled with Bombadil. |
 | **bundled** | Always the bundled copy. |
-| **from PATH** | Always uv from `PATH`. Fails with an error, rather than falling back, if there is none. |
+| **from PATH** | Always uv from `PATH`. If there is none, Bombadil shows an error. |
 | **path to a uv binary** | A specific binary. Type its path and click **validate and use**. Bombadil runs it to check its version before using it. |
 
 In a project's scope you can override the choice with **auto**, **bundled**
@@ -108,7 +109,7 @@ only.
 |---|---|
 | **auto** (default) | `just` from `PATH` if there is one, otherwise the copy bundled with Bombadil. |
 | **bundled** | Always the bundled copy. |
-| **from PATH** | Always `just` from `PATH`. If there is none, the Run tab says so instead of falling back. |
+| **from PATH** | Always `just` from `PATH`. If there is none, the Run tab says so. |
 
 ## Terminal
 

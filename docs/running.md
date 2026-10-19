@@ -2,9 +2,9 @@
 
 The **Run** tab runs a project's code inside its default environment, with the
 same environment variables, secrets and pre-activate scripts a terminal gets.
-The output appears right under the button that started it, as the program
-prints it. The box grows with the output up to a few hundred pixels, then
-scrolls and keeps the newest line in view.
+The output shows up right under the button you pressed, line by line as the
+program prints it. The box grows with the output until it is a few hundred
+pixels tall, then scrolls, keeping the newest line in view.
 
 Each project can have one program running at a time. Other projects keep
 working: you can sync one project while another runs a server.
@@ -20,6 +20,8 @@ it gets a button. Pressing one runs `uv run <name>`. A project made with
 
 ## Just recipes
 
+![A just recipe's output under its Run button](images/run.png)
+
 If the project folder has a justfile (`justfile`, `Justfile` or `.justfile`),
 its recipes are listed with the comment above each one and their parameters.
 Private recipes (named with a leading `_`, or marked `[private]`) are left
@@ -34,13 +36,14 @@ out.
   parameter without a default has a value, and its tooltip says which.
 
 Bombadil comes with its own copy of `just`, so you don't need to install it.
-If `just` is on your `PATH`, Bombadil uses that one instead. You can change
-this in [Settings](settings.md#just). Above the recipes, the tab says which
-`just` it is using: "Using the bundled just 1.58.0", or "Using just from
-PATH" followed by its location. If you choose **from PATH** and `just`
-isn't on your `PATH`, the tab says so and links to how to install it. If the
-justfile has a mistake, the tab shows just's own message. On Windows, `just` runs recipes
-with `sh` unless the justfile sets `windows-shell`.
+If you have `just` on your `PATH`, Bombadil uses yours instead; you can change
+this in [Settings](settings.md#just). The line above the recipes says which
+one is in use, for example "Using the bundled just 1.58.0" or "Using just from
+PATH (/usr/bin/just)". If you pick **from PATH** and there is no `just` on
+it, the tab says so and links to the install instructions.
+
+If the justfile has a mistake, the tab shows just's own message. On Windows,
+`just` runs recipes with `sh` unless the justfile sets `windows-shell`.
 
 ## Saved commands
 
@@ -62,8 +65,9 @@ added to your saved commands, so it is one click the next time.
 
 The **Ju** button in the project header, next to PyCharm, starts JupyterLab
 for the project and opens it in your browser. Bombadil switches to the Run
-tab, where JupyterLab's output and **Stop** are. JupyterLab runs from a temporary install: your project's
-dependencies and `uv.lock` don't change.
+tab, where you'll find JupyterLab's output and **Stop**. JupyterLab runs from
+a temporary install, so your project's dependencies and `uv.lock` don't
+change.
 
 ## Stopping
 

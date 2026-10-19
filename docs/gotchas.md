@@ -83,9 +83,10 @@ the window back.
 ## The uv in use isn't the one you expected
 
 With **auto**, Bombadil uses uv from `PATH` only if it is version 0.12.1 or
-newer. Otherwise it uses its bundled copy without saying so. If you need one specific
-uv, pick **from PATH** or a binary in [Settings › uv](settings.md#uv).
-Explicit choices fail loudly instead of falling back.
+newer. Otherwise it uses its bundled copy without saying so. If you need one
+specific uv, pick **from PATH** or a binary in [Settings › uv](settings.md#uv).
+With either of those, a missing or unusable uv is an error and Bombadil
+doesn't switch to the bundled one.
 
 ## Moving a project changes its central environment
 

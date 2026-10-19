@@ -1,7 +1,7 @@
 # Install
 
-Bombadil bundles its own copy of uv, so you don't need to install anything
-else.
+Bombadil comes with its own copies of uv and just, so you don't need to
+install anything else.
 
 === "Installer"
 

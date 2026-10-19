@@ -26,7 +26,8 @@ the status mark and name. The second line shows the Python version and the Git
 branch, with a `*` when the working tree has changes.
 
 - **Filter projects** narrows the list as you type.
-- **Add** adds a project.
+- **New** creates a project from scratch with `uv init`, and **Add** adds an
+  existing one.
 - The panel button next to **Add** collapses the sidebar. The shortcut is
   ++ctrl+b++. Drag the sidebar's edge to resize it.
 - Hover a project to show its **Sync**, **terminal** and **⋯** buttons.
@@ -69,8 +70,9 @@ environment is marked **default**.
 
 The project view has a header with the project's name, action buttons and
 status tiles. The buttons open the project folder, PyCharm,
-[Jupyter](running.md#jupyter) and a terminal, and run Sync. Below that are the **path** of the project and of its default
-environment, then the tabs. You can drag the tabs to reorder them.
+[Jupyter](running.md#jupyter) and a terminal, and run Sync. Below that are the
+**path** of the project and of its default environment, then the tabs. You can
+drag the tabs to reorder them.
 
 | Tab | What it is for |
 |---|---|
@@ -79,7 +81,7 @@ environment, then the tabs. You can drag the tabs to reorder them.
 | [Env vars](env-vars.md) | The project's environment variables and secrets. |
 | [Scripts](scripts.md) | Shell scripts to run before the environment is used. |
 | [Indexes](indexes.md) | Which private package indexes this project uses. |
-| [Run](running.md) | Run entry points, saved commands, a file or Jupyter. |
+| [Run](running.md) | Run entry points, just recipes, saved commands or a file. |
 
 ## Drawer
 

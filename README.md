@@ -69,6 +69,13 @@ and never read back to be redisplayed.
 **Private indexes.** Name, URL, and credentials in the keychain, injected as
 `UV_INDEX_*` at sync time. Global by default, selectable per project.
 
+**Run things.** The Run tab runs a project's entry points, its `just` recipes
+and your saved commands inside the environment, and streams the output right
+under the button you pressed, with Stop ending the whole process tree. `just`
+is bundled; your own on `PATH` is used when there is one. The **Ju** button in
+the header starts JupyterLab from a temporary install, leaving the project's
+dependencies alone.
+
 **Pre-activate scripts.** Shell scripts run before an environment is used, in an
 order you control, with their exported variables composed into everything
 Bombadil launches.

@@ -55,17 +55,17 @@ packages** for the ones they pull in.
 
 When the Dependencies tab loads and after each sync, Bombadil asks
 [osv.dev](https://osv.dev), a free database of security advisories, whether
-any installed package has a known vulnerability. It sends package names and
-versions, nothing else, and asks again only when the installed packages
-change, or after a day.
+any installed package has a known vulnerability. It sends only the names and
+versions of published packages, never anything about your own projects or
+workspace members, and asks again only when the installed packages change or
+a day has passed.
 
 A package with a known vulnerability has a **!** beside its name, and the
 project shows a warning such as "2 packages have known vulnerabilities". Open
 the package's details to read each advisory; click its id to read more.
 **Upgrade to …** installs the one version that fixes every advisory with a
 published fix, and says how many that is. An advisory with no fix yet says
-so. Bombadil also sends nothing about your own projects or workspace members,
-only published packages.
+so.
 
 Without an internet connection the check is skipped, and the tab says
 "Couldn't check for vulnerabilities". To stop the check altogether, untick it
