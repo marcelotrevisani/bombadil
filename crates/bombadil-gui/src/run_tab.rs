@@ -12,6 +12,107 @@ pub enum RunEnd {
     Failed(String),
 }
 
+/// What the Run tab knows about the project's `just` recipes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum JustState {
+    NoJustfile,
+    Loading,
+    /// There is a justfile, but `just` couldn't be started.
+    NotInstalled,
+    /// `just` refused the justfile; its own words.
+    Error(String),
+    Recipes {
+        recipes: Vec<bombadil_core::just::Recipe>,
+        /// Which `just` read them, e.g. "Using the bundled just 1.58.0".
+        using: String,
+    },
+}
+
+/// Says which `just` runs the recipes.
+pub fn just_label(found: &bombadil_core::just::Found) -> String {
+    if found.bundled {
+        format!(
+            "Using the bundled just {}",
+            bombadil_uv_bin::JUST_BUNDLED_VERSION
+        )
+    } else {
+        format!("Using just from PATH ({})", found.path.display())
+    }
+}
+
+/// Reads the recipes of the justfile in `dir`, by asking `just`. Blocking.
+pub fn just_blocking(
+    dir: &std::path::Path,
+    just: &dyn Fn() -> Result<Option<bombadil_core::just::Found>, String>,
+    runner: &dyn bombadil_core::process::CommandRunner,
+) -> JustState {
+    if bombadil_core::just::find_justfile(dir).is_none() {
+        return JustState::NoJustfile;
+    }
+    let just = match just() {
+        Ok(Some(just)) => just,
+        Ok(None) => return JustState::NotInstalled,
+        Err(why) => return JustState::Error(why),
+    };
+    match runner.run(&bombadil_core::just::dump(&just.path, dir)) {
+        Err(_) => JustState::NotInstalled,
+        Ok(out) if !out.success() => {
+            let words = format!("{}{}", out.stderr, out.stdout);
+            JustState::Error(words.trim().to_string())
+        }
+        Ok(out) => match bombadil_core::just::parse_dump(&out.stdout) {
+            Ok(recipes) => JustState::Recipes {
+                recipes,
+                using: just_label(&just),
+            },
+            Err(e) => JustState::Error(e),
+        },
+    }
+}
+
+/// A run's arguments with a leading `just` swapped for the `just` the
+/// settings chose, so a recipe still runs through `uv run` in the project's
+/// environment. Anything else passes through untouched.
+pub fn with_resolved_just(
+    mut args: Vec<String>,
+    just: &dyn Fn() -> Result<Option<bombadil_core::just::Found>, String>,
+) -> Result<Vec<String>, String> {
+    if args.first().map(String::as_str) != Some("just") {
+        return Ok(args);
+    }
+    match just()? {
+        Some(found) => {
+            args[0] = found.path.to_string_lossy().into_owned();
+            Ok(args)
+        }
+        None => Err(JUST_NOT_ON_PATH.into()),
+    }
+}
+
+/// What to say when the settings ask for `just` from PATH and there is none.
+pub const JUST_NOT_ON_PATH: &str =
+    "just isn't on PATH. Install it, or choose the bundled just in Settings.";
+
+/// What a recipe's Run button runs (`just <recipe> <args>`), or why it
+/// can't yet.
+pub fn just_args(recipe: &bombadil_core::just::Recipe, typed: &str) -> Result<Vec<String>, String> {
+    let words = split_command(typed);
+    if let Some(why) = bombadil_core::just::missing_args(recipe, &words) {
+        return Err(why);
+    }
+    Ok(["just".to_string(), recipe.name.clone()]
+        .into_iter()
+        .chain(words)
+        .collect())
+}
+
+/// What the view needs to draw the recipes.
+pub struct JustView<'a> {
+    pub state: Option<&'a JustState>,
+    pub args: &'a std::collections::HashMap<String, String>,
+    pub shown: Option<&'a (String, String)>,
+}
+
 /// Lines kept per run; the oldest go first.
 pub const MAX_LINES: usize = 2000;
 
@@ -125,6 +226,9 @@ fn elapsed(d: std::time::Duration) -> String {
 }
 
 /// The Run tab. Deliberately dumb: what it shows is decided in `app`.
+// Every input is something the tab shows; the same allowance
+// `preferences::view` takes.
+#[allow(clippy::too_many_arguments)]
 pub fn view<'a>(
     project: &'a bombadil_core::model::Project,
     index: usize,
@@ -133,6 +237,7 @@ pub fn view<'a>(
     draft: &'a CommandDraft,
     blocked: Option<&'static str>,
     now: std::time::Instant,
+    just: JustView<'a>,
 ) -> iced::Element<'a, crate::app::Message> {
     use crate::app::Message;
     use crate::theme;
@@ -233,6 +338,8 @@ pub fn view<'a>(
         );
     }
 
+    page = just_section(page, &just, blocked, id);
+
     page = page.push(heading("Saved commands"));
     for (row_index, c) in project.commands.iter().enumerate() {
         page = page.push(
@@ -308,6 +415,142 @@ pub fn view<'a>(
         "Jupyter runs from a temporary install; your project's dependencies don't change.".into(),
     ));
     page.into()
+}
+
+/// The "Just recipes" section, when the project has a justfile.
+fn just_section<'a>(
+    mut page: iced::widget::Column<'a, crate::app::Message>,
+    just: &JustView<'a>,
+    blocked: Option<&'static str>,
+    project: uuid::Uuid,
+) -> iced::widget::Column<'a, crate::app::Message> {
+    use crate::app::Message;
+    use crate::theme;
+    use iced::widget::{button, column, row, text, text_input};
+    let muted = |t: String| text(t).size(theme::BODY).style(theme::text_muted);
+    let state = match just.state {
+        None | Some(JustState::NoJustfile) => return page,
+        Some(state) => state,
+    };
+    page = page.push(text("Just recipes").size(theme::TITLE));
+    match state {
+        JustState::NoJustfile => {}
+        JustState::Loading => page = page.push(muted("Reading the justfile\u{2026}".into())),
+        JustState::NotInstalled => {
+            page = page.push(
+                row![
+                    muted(JUST_NOT_ON_PATH.into()),
+                    button(text("How to install just").size(theme::BODY))
+                        .on_press(Message::GitHubOpen(
+                            "https://just.systems/man/en/packages.html".into(),
+                        ))
+                        .padding([theme::SPACE_1, theme::SPACE_2])
+                        .style(theme::button_quiet),
+                ]
+                .spacing(theme::SPACE_2)
+                .align_y(iced::Alignment::Center),
+            );
+        }
+        JustState::Error(why) => {
+            page = page.push(
+                text(why.clone())
+                    .font(theme::FONT_DATA)
+                    .size(theme::DATA)
+                    .style(theme::text_warning),
+            );
+        }
+        JustState::Recipes { recipes, using } => {
+            page = page.push(muted(using.clone()));
+            if recipes.is_empty() {
+                page = page.push(muted("The justfile has no public recipes.".into()));
+            }
+            for recipe in recipes {
+                let typed = just
+                    .args
+                    .get(&recipe.name)
+                    .map(String::as_str)
+                    .unwrap_or("");
+                let run = super::run_tab::just_args(recipe, typed);
+                let why = blocked
+                    .map(str::to_string)
+                    .or_else(|| run.as_ref().err().cloned());
+                let start = button(text("Run").size(theme::BODY))
+                    .on_press_maybe(run.ok().filter(|_| blocked.is_none()).map(|args| {
+                        Message::RunRequested {
+                            project,
+                            label: format!("just {}", recipe.name),
+                            args,
+                        }
+                    }))
+                    .padding([theme::SPACE_1, theme::SPACE_3])
+                    .style(theme::button_secondary);
+                let start: iced::Element<'a, Message> = match why {
+                    Some(why) => theme::tip(start, why, iced::widget::tooltip::Position::Top),
+                    None => start.into(),
+                };
+                let params = recipe
+                    .params
+                    .iter()
+                    .map(|p| match &p.default {
+                        Some(d) => format!("{} = {d}", p.name),
+                        None if p.optional_many => format!("{}\u{2026}", p.name),
+                        None => p.name.clone(),
+                    })
+                    .collect::<Vec<_>>()
+                    .join("  ");
+                let mut line = row![
+                    column![
+                        text(recipe.name.clone())
+                            .font(theme::FONT_DATA)
+                            .size(theme::DATA),
+                    ]
+                    .push(recipe.doc.clone().map(muted))
+                    .push((!params.is_empty()).then(|| {
+                        text(params.clone())
+                            .font(theme::FONT_DATA)
+                            .size(theme::DATA)
+                            .style(theme::text_muted)
+                    }))
+                    .width(iced::Length::Fill),
+                ]
+                .spacing(theme::SPACE_2)
+                .align_y(iced::Alignment::Center);
+                if !recipe.params.is_empty() {
+                    let name = recipe.name.clone();
+                    line = line.push(
+                        text_input("arguments", typed)
+                            .on_input(move |v| Message::JustArgsChanged(name.clone(), v))
+                            .style(theme::text_field)
+                            .width(200.0),
+                    );
+                }
+                line = line
+                    .push(
+                        button(text("Show").size(theme::BODY))
+                            .on_press(Message::JustShowRequested(recipe.name.clone()))
+                            .padding([theme::SPACE_1, theme::SPACE_2])
+                            .style(theme::button_quiet),
+                    )
+                    .push(start);
+                page = page.push(line);
+                if let Some((shown, source)) = just.shown
+                    && *shown == recipe.name
+                {
+                    page = page.push(
+                        iced::widget::container(
+                            text(source.clone())
+                                .font(theme::FONT_DATA)
+                                .size(theme::DATA),
+                        )
+                        .padding(theme::SPACE_2)
+                        .width(iced::Length::Fill)
+                        .style(theme::panel),
+                    );
+                }
+            }
+        }
+    }
+    page
 }
 
 /// A two-button confirmation: the danger action and Cancel.
@@ -391,6 +634,169 @@ mod tests {
         assert_eq!(
             split_command(&file_command(std::path::Path::new("/p/api"), &outside)),
             ["python", outside.to_str().unwrap()]
+        );
+    }
+
+    fn just_runner(
+        outcome: Option<(i32, &str, &str)>,
+    ) -> bombadil_core::process::FakeCommandRunner {
+        let runner = bombadil_core::process::FakeCommandRunner::new();
+        if let Some((status, stdout, stderr)) = outcome {
+            runner.expect(
+                "just",
+                &["--dump"],
+                bombadil_core::process::CommandOutcome {
+                    status: Some(status),
+                    stdout: stdout.into(),
+                    stderr: stderr.into(),
+                },
+            );
+        }
+        runner
+    }
+
+    fn on_path() -> Result<Option<bombadil_core::just::Found>, String> {
+        Ok(Some(bombadil_core::just::Found {
+            path: "/tools/just".into(),
+            bundled: false,
+        }))
+    }
+
+    #[test]
+    fn the_recipes_say_which_just_read_them() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("justfile"), "x:\n  echo\n").unwrap();
+        let empty = r#"{"recipes":{}}"#;
+        let using = |state| match state {
+            JustState::Recipes { using, .. } => using,
+            other => panic!("{other:?}"),
+        };
+        let mine = using(just_blocking(
+            dir.path(),
+            &on_path,
+            &just_runner(Some((0, empty, ""))),
+        ));
+        assert!(mine.contains("from PATH"), "{mine}");
+        assert!(mine.contains(&std::path::Path::new("/tools/just").display().to_string()));
+        let ours = using(just_blocking(
+            dir.path(),
+            &|| {
+                Ok(Some(bombadil_core::just::Found {
+                    path: "/data/just".into(),
+                    bundled: true,
+                }))
+            },
+            &just_runner(Some((0, empty, ""))),
+        ));
+        assert_eq!(
+            ours,
+            format!(
+                "Using the bundled just {}",
+                bombadil_uv_bin::JUST_BUNDLED_VERSION
+            )
+        );
+    }
+
+    #[test]
+    fn the_resolved_just_is_the_one_asked() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("justfile"), "x:\n  echo\n").unwrap();
+        let runner = just_runner(Some((0, r#"{"recipes":{}}"#, "")));
+        let _ = just_blocking(dir.path(), &on_path, &runner);
+        assert_eq!(
+            runner.calls()[0].program,
+            std::path::Path::new("/tools/just")
+        );
+    }
+
+    #[test]
+    fn a_bundled_just_that_cannot_be_unpacked_says_why() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("justfile"), "x:\n  echo\n").unwrap();
+        let state = just_blocking(dir.path(), &|| Err("disk full".into()), &just_runner(None));
+        assert_eq!(state, JustState::Error("disk full".into()));
+    }
+
+    #[test]
+    fn a_recipe_run_uses_the_resolved_just() {
+        let args = vec!["just".to_string(), "test".into()];
+        assert_eq!(
+            with_resolved_just(args.clone(), &on_path),
+            Ok(vec!["/tools/just".to_string(), "test".into()])
+        );
+        assert!(with_resolved_just(args, &|| Ok(None)).is_err());
+        let python = vec!["python".to_string(), "-V".into()];
+        assert_eq!(
+            with_resolved_just(python.clone(), &|| panic!("not a recipe")),
+            Ok(python),
+            "only a recipe run looks just up"
+        );
+    }
+
+    #[test]
+    fn a_folder_without_a_justfile_has_no_recipes() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(
+            just_blocking(
+                dir.path(),
+                &|| panic!("no justfile, no just"),
+                &just_runner(None)
+            ),
+            JustState::NoJustfile
+        );
+    }
+
+    #[test]
+    fn a_justfile_without_just_says_to_install_it() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("justfile"), "x:\n  echo\n").unwrap();
+        assert_eq!(
+            just_blocking(dir.path(), &|| Ok(None), &just_runner(None)),
+            JustState::NotInstalled
+        );
+    }
+
+    #[test]
+    fn a_broken_justfile_shows_justs_words() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("justfile"), "x:\n  echo\n").unwrap();
+        let state = just_blocking(
+            dir.path(),
+            &on_path,
+            &just_runner(Some((1, "", "error: Unknown start of token\n"))),
+        );
+        assert_eq!(
+            state,
+            JustState::Error("error: Unknown start of token".into())
+        );
+    }
+
+    #[test]
+    fn recipes_are_listed() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("justfile"), "x:\n  echo\n").unwrap();
+        let dump = r#"{"recipes":{"test":{"name":"test","doc":"Run the tests.","private":false,"parameters":[]}}}"#;
+        match just_blocking(dir.path(), &on_path, &just_runner(Some((0, dump, "")))) {
+            JustState::Recipes { recipes, .. } => assert_eq!(recipes[0].name, "test"),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_recipe_runs_as_just_with_its_arguments() {
+        let recipe = bombadil_core::just::Recipe {
+            name: "greet".into(),
+            doc: None,
+            params: vec![bombadil_core::just::Param {
+                name: "who".into(),
+                default: None,
+                optional_many: false,
+            }],
+        };
+        assert_eq!(just_args(&recipe, ""), Err("Needs: who".to_string()));
+        assert_eq!(
+            just_args(&recipe, r#""Ana Bo""#),
+            Ok(vec!["just".into(), "greet".into(), "Ana Bo".into()])
         );
     }
 

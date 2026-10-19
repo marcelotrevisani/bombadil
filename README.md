@@ -219,6 +219,6 @@ The **Sponsor Bombadil** button at the foot of the app's sidebar opens the same 
 
 Apache-2.0. See [LICENSE](LICENSE).
 
-Bombadil ships `uv` (Apache-2.0 / MIT), Atkinson Hyperlegible Next and IBM Plex
+Bombadil ships `uv` (Apache-2.0 / MIT), `just` (CC0 1.0), Atkinson Hyperlegible Next and IBM Plex
 Mono (both SIL OFL 1.1). Every licence text is in the application itself, under
 **Help → Bundled licences**, as those licences require.

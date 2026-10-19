@@ -414,6 +414,7 @@ fn licences_body<'a>() -> iced::Element<'a, Message> {
     let mut column = iced::widget::column![].spacing(theme::SPACE_3);
     for (heading, text) in [
         ("uv - Apache License 2.0", about::license()),
+        ("just - CC0 1.0 Universal", about::just_license()),
         (
             "Atkinson Hyperlegible Next - SIL Open Font License 1.1",
             about::atkinson_license(),

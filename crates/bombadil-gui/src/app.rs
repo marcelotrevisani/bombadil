@@ -235,6 +235,12 @@ pub struct App {
     pub entry_points: Option<(uuid::Uuid, Vec<String>)>,
     /// The Run tab's add/edit form.
     pub command_draft: run_tab::CommandDraft,
+    /// The selected project's `just` recipes.
+    pub just: Option<(uuid::Uuid, run_tab::JustState)>,
+    /// Arguments typed for each recipe, by recipe name.
+    pub just_args: std::collections::HashMap<String, String>,
+    /// The recipe whose source is open, and that source.
+    pub just_shown: Option<(String, String)>,
     /// Each project's installed list as last read, for "what changed".
     pub installed: std::collections::HashMap<uuid::Uuid, Vec<uv::results::InstalledPackage>>,
     /// Projects whose next installed list follows an action, mapped to that
@@ -886,6 +892,13 @@ pub enum Message {
     CommandRemoved(usize),
     RunFileRequested,
     RunFilePicked(uuid::Uuid, Option<PathBuf>),
+    JustLoaded(uuid::Uuid, run_tab::JustState),
+    JustArgsChanged(String, String),
+    /// Show (or hide) a recipe's source.
+    JustShowRequested(String),
+    JustShown(String, Result<String, String>),
+    /// Settings: which `just` runs recipes.
+    JustSourceSelected(bombadil_core::model::JustSource),
     CheckVulnerabilitiesSelected(bool),
     /// A package row's name was pressed: open or close its details.
     DepDetailsToggled(usize, String),
@@ -1313,6 +1326,9 @@ impl App {
             quitting: false,
             entry_points: None,
             command_draft: Default::default(),
+            just: None,
+            just_args: Default::default(),
+            just_shown: None,
             installed: Default::default(),
             awaiting_change: Default::default(),
             last_change: None,
@@ -3691,15 +3707,20 @@ pub fn update(app: &mut App, message: Message, runner: Arc<dyn CommandRunner>) -
             let config = app.config.clone();
             return Task::stream(
                 job::stream_untimed(move |emit| {
-                    let end = run_program(
-                        &target,
-                        &config,
-                        &args,
-                        &KeyringSecretStore::new(),
-                        runner.as_ref(),
-                        &cancel,
-                        &mut |line| emit(Message::RunLine(project, line)),
-                    );
+                    let source = config.settings.just_source;
+                    let end = match run_tab::with_resolved_just(args, &|| resolve_just_for(source))
+                    {
+                        Err(why) => run_tab::RunEnd::Failed(why),
+                        Ok(args) => run_program(
+                            &target,
+                            &config,
+                            &args,
+                            &KeyringSecretStore::new(),
+                            runner.as_ref(),
+                            &cancel,
+                            &mut |line| emit(Message::RunLine(project, line)),
+                        ),
+                    };
                     emit(Message::RunFinished(project, end));
                 })
                 .map(move |result| match result {
@@ -3799,6 +3820,11 @@ pub fn update(app: &mut App, message: Message, runner: Arc<dyn CommandRunner>) -
         }
         Message::DepPinRequested(i, name, version, group) => {
             return add_requirement(app, i, format!("{name}=={version}"), group, runner);
+        }
+        Message::JustSourceSelected(source) => {
+            app.config.settings.just_source = source;
+            let reread = tab_opened(app);
+            return Task::batch([persist_edit(app, "settings change"), reread]);
         }
         Message::CheckVulnerabilitiesSelected(on) => {
             app.config.settings.check_vulnerabilities = on;
@@ -4115,6 +4141,63 @@ pub fn update(app: &mut App, message: Message, runner: Arc<dyn CommandRunner>) -
                 },
                 move |file| Message::RunFilePicked(id, file),
             );
+        }
+        Message::JustLoaded(id, state) => {
+            if app
+                .selected
+                .and_then(|i| app.config.projects.get(i))
+                .is_some_and(|p| p.id == id)
+            {
+                app.just = Some((id, state));
+            }
+        }
+        Message::JustArgsChanged(recipe, text) => {
+            app.just_args.insert(recipe, text);
+        }
+        Message::JustShowRequested(recipe) => {
+            if app.just_shown.as_ref().is_some_and(|(r, _)| *r == recipe) {
+                app.just_shown = None;
+                return Task::none();
+            }
+            let Some(dir) = app
+                .selected
+                .and_then(|i| app.config.projects.get(i))
+                .and_then(|p| p.pyproject_path.parent().map(Path::to_path_buf))
+            else {
+                return Task::none();
+            };
+            let name = recipe.clone();
+            let source = app.config.settings.just_source;
+            return Task::perform(
+                job::attempt(
+                    move || {
+                        let runner = bombadil_core::process::SystemCommandRunner;
+                        let just = resolve_just_for(source)?
+                            .ok_or_else(|| run_tab::JUST_NOT_ON_PATH.to_string())?
+                            .path;
+                        let out = runner
+                            .run(&bombadil_core::just::show(&just, &dir, &name))
+                            .map_err(|e| e.to_string())?;
+                        if out.success() {
+                            Ok(out.stdout)
+                        } else {
+                            Err(out.stderr.trim().to_string())
+                        }
+                    },
+                    VENV_PROBE_TIMEOUT,
+                    "reading the recipe",
+                ),
+                move |result| Message::JustShown(recipe.clone(), result),
+            );
+        }
+        Message::JustShown(recipe, result) => {
+            app.just_shown = Some((
+                recipe,
+                match result {
+                    Ok(text) => text,
+                    Err(why) => why,
+                },
+            ));
         }
         Message::RunFilePicked(_, None) => {}
         Message::RunFilePicked(id, Some(file)) => {
@@ -6532,17 +6615,64 @@ async fn pick_bombadil_open() -> Option<PathBuf> {
 /// are read for the project now shown.
 fn selection_changed(app: &mut App) -> Task<Message> {
     app.command_draft = run_tab::CommandDraft::default();
+    app.just = None;
+    app.just_args.clear();
+    app.just_shown = None;
     app.dep_details = None;
     app.last_change = None;
     tab_opened(app)
 }
 
 /// What the tab just opened needs read: the Run tab's entry points.
-fn tab_opened(app: &App) -> Task<Message> {
-    match app.selected.and_then(|i| app.config.projects.get(i)) {
-        Some(project) if app.tab == Tab::Run => load_entry_points(project),
-        _ => Task::none(),
-    }
+fn tab_opened(app: &mut App) -> Task<Message> {
+    let Some(project) = app
+        .selected
+        .and_then(|i| app.config.projects.get(i))
+        .filter(|_| app.tab == Tab::Run)
+        .cloned()
+    else {
+        return Task::none();
+    };
+    app.just = Some((project.id, run_tab::JustState::Loading));
+    Task::batch([
+        load_entry_points(&project),
+        load_just(&project, app.config.settings.just_source),
+    ])
+}
+
+/// Asks `just` for the project's recipes, off the render thread.
+fn load_just(project: &Project, source: bombadil_core::model::JustSource) -> Task<Message> {
+    let id = project.id;
+    let dir = project
+        .pyproject_path
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_default();
+    Task::perform(
+        async move {
+            match job::run(
+                move || {
+                    run_tab::just_blocking(
+                        &dir,
+                        &|| resolve_just_for(source),
+                        &bombadil_core::process::SystemCommandRunner,
+                    )
+                },
+                HEALTH_PROBE_TIMEOUT,
+            )
+            .await
+            {
+                job::JobResult::Done(state) => state,
+                job::JobResult::TimedOut => {
+                    run_tab::JustState::Error("just took too long to answer".into())
+                }
+                job::JobResult::Failed => {
+                    run_tab::JustState::Error("just failed unexpectedly".into())
+                }
+            }
+        },
+        move |state| Message::JustLoaded(id, state),
+    )
 }
 
 /// The Dependencies tab's extras for project `i`: its environment's
@@ -7043,6 +7173,20 @@ pub(crate) fn resolve_uv_for(
         &bundled,
     )
     .map_err(|err| err.to_string())
+}
+
+/// Which `just` runs recipes, given the `just_source` setting. The
+/// bundled copy is unpacked into the data dir only when it is the answer.
+/// `Ok(None)`: the settings want `just` from PATH and there is none.
+pub(crate) fn resolve_just_for(
+    source: bombadil_core::model::JustSource,
+) -> Result<Option<bombadil_core::just::Found>, String> {
+    let bundled = || -> Result<PathBuf, String> {
+        let data_dir =
+            bombadil_core::store::paths::default_data_dir().map_err(|e| e.to_string())?;
+        bombadil_uv_bin::ensure_just_extracted(&data_dir).map_err(|e| e.to_string())
+    };
+    bombadil_core::just::resolve(source, uv::locate_on_path("just"), &bundled)
 }
 
 /// The blocking half of interpreter discovery: resolve uv, run
@@ -8432,6 +8576,15 @@ pub fn view(app: &App) -> iced::Element<'_, Message> {
                     &app.command_draft,
                     run_blocked(app, i),
                     app.now,
+                    run_tab::JustView {
+                        state: app
+                            .just
+                            .as_ref()
+                            .filter(|(id, _)| *id == project.id)
+                            .map(|(_, s)| s),
+                        args: &app.just_args,
+                        shown: app.just_shown.as_ref(),
+                    },
                 )
             }
             None => iced::widget::text("").into(),
@@ -12499,6 +12652,67 @@ pub(crate) mod tests {
         );
         assert!(!app.config.settings.check_vulnerabilities);
         assert!(task.units() > 0);
+    }
+
+    #[test]
+    fn just_recipes_land_on_their_project_and_show_loads_the_source() {
+        let mut app = one_project();
+        app.selected = Some(0);
+        let id = first_id(&app);
+        let _ = update(
+            &mut app,
+            Message::JustLoaded(id, run_tab::JustState::NotInstalled),
+            unused_runner(),
+        );
+        assert!(matches!(&app.just, Some((p, run_tab::JustState::NotInstalled)) if *p == id));
+        let task = update(
+            &mut app,
+            Message::JustShowRequested("build".into()),
+            unused_runner(),
+        );
+        assert!(task.units() > 0);
+        let _ = update(
+            &mut app,
+            Message::JustShown("build".into(), Ok("build:\n    cargo build".into())),
+            unused_runner(),
+        );
+        assert_eq!(
+            app.just_shown.as_ref().map(|(n, _)| n.as_str()),
+            Some("build")
+        );
+        let _ = update(
+            &mut app,
+            Message::JustShowRequested("build".into()),
+            unused_runner(),
+        );
+        assert!(app.just_shown.is_none(), "Show again closes it");
+    }
+
+    #[test]
+    fn choosing_where_just_comes_from_is_saved_and_rereads_the_recipes() {
+        let mut app = one_project();
+        app.selected = Some(0);
+        app.tab = Tab::Run;
+        let task = update(
+            &mut app,
+            Message::JustSourceSelected(bombadil_core::model::JustSource::Bundled),
+            unused_runner(),
+        );
+        assert_eq!(
+            app.config.settings.just_source,
+            bombadil_core::model::JustSource::Bundled
+        );
+        assert!(matches!(&app.just, Some((_, run_tab::JustState::Loading))));
+        assert!(task.units() > 0);
+    }
+
+    #[test]
+    fn opening_the_run_tab_also_reads_the_recipes() {
+        let mut app = one_project();
+        app.selected = Some(0);
+        app.tab = Tab::Run;
+        let _ = update(&mut app, Message::TabSelected(Tab::Run), unused_runner());
+        assert!(matches!(&app.just, Some((_, run_tab::JustState::Loading))));
     }
 
     #[test]

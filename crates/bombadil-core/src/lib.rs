@@ -7,6 +7,7 @@ pub mod git;
 pub mod github;
 pub mod housekeeping;
 pub mod ide;
+pub mod just;
 pub mod members;
 pub mod metadata;
 pub mod model;

@@ -60,7 +60,9 @@
 
 use crate::app::Message;
 use crate::theme;
-use bombadil_core::model::{DefaultVenvLocation, Project, Settings, UvSource, VenvLocation};
+use bombadil_core::model::{
+    DefaultVenvLocation, JustSource, Project, Settings, UvSource, VenvLocation,
+};
 use bombadil_core::venv_path;
 use std::path::PathBuf;
 
@@ -223,6 +225,37 @@ pub fn global_view<'a>(
         };
         column = column.push(row);
     }
+
+    let just_button = |label: &'static str, source: JustSource| -> iced::Element<'a, Message> {
+        let current = settings.just_source == source;
+        iced::widget::button(iced::widget::text(label))
+            .on_press_maybe((!current).then_some(Message::JustSourceSelected(source)))
+            .style(theme::button_choice(current))
+            .into()
+    };
+    column = column
+        .push(
+            iced::widget::text("just, for a project's recipes")
+                .font(theme::FONT_PROSE)
+                .size(theme::LABEL)
+                .style(theme::text_muted),
+        )
+        .push(
+            iced::widget::row![
+                just_button("auto", JustSource::Auto),
+                just_button("bundled", JustSource::Bundled),
+                just_button("from PATH", JustSource::FromPath),
+            ]
+            .spacing(theme::SPACE_1),
+        )
+        .push(
+            iced::widget::text(format!(
+                "auto uses just from PATH when there is one, otherwise the bundled just {}.",
+                bombadil_uv_bin::JUST_BUNDLED_VERSION
+            ))
+            .size(theme::BODY)
+            .style(theme::text_muted),
+        );
 
     // Same per-arm face choice as `current_source` above: a sentence in one
     // arm, a path in the other.
