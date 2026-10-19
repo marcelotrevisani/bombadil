@@ -179,10 +179,43 @@ pub fn pip_list(uv: &ResolvedUv, ctx: &ProjectContext) -> CommandSpec {
         .args(["--format", "json"])
 }
 
+/// What has a newer release on the index. Needs the network.
+pub fn pip_list_outdated(uv: &ResolvedUv, ctx: &ProjectContext) -> CommandSpec {
+    project_spec(uv, ctx)
+        .args([
+            "pip",
+            "list",
+            "--outdated",
+            "--exclude-editable",
+            "--python",
+        ])
+        .arg(ctx.venv_path.to_string_lossy())
+        .args(["--format", "json"])
+}
+
 /// Interpreter discovery is machine-wide, not project-scoped, so it carries
 /// neither a working directory nor UV_PROJECT_ENVIRONMENT.
 pub fn python_list(uv: &ResolvedUv) -> CommandSpec {
     CommandSpec::new(&uv.path).args(["python", "list", "--output-format", "json"])
+}
+
+/// The interpreters already on this machine; nothing uv would download.
+pub fn python_list_installed(uv: &ResolvedUv) -> CommandSpec {
+    CommandSpec::new(&uv.path).args([
+        "python",
+        "list",
+        "--only-installed",
+        "--output-format",
+        "json",
+    ])
+}
+
+/// `sync` as a question: would it change anything? Takes the very sync spec
+/// Bombadil would run (pin, members) so the answer is about that sync.
+/// Verified against uv 0.12.19: read-only, offline; exit 0 in step, exit 1
+/// with "The environment is outdated" when not.
+pub fn as_check(sync: CommandSpec) -> CommandSpec {
+    sync.args(["--check", "--frozen", "--offline"])
 }
 
 pub fn python_install(uv: &ResolvedUv, version: &str) -> CommandSpec {
@@ -338,6 +371,24 @@ mod tests {
     }
 
     #[test]
+    fn pip_list_outdated_asks_the_index_about_the_venv() {
+        assert_eq!(
+            pip_list_outdated(&uv(), &ctx()).args,
+            vec![
+                "pip",
+                "list",
+                "--outdated",
+                // A local package's name can belong to someone else on PyPI.
+                "--exclude-editable",
+                "--python",
+                "/envs/my-api-3f9c1a",
+                "--format",
+                "json"
+            ]
+        );
+    }
+
+    #[test]
     fn pip_list_requests_json_and_pins_the_venv_explicitly() {
         // `uv pip` ignores UV_PROJECT_ENVIRONMENT, so --python must carry the
         // venv directory directly or this lists the wrong environment.
@@ -361,6 +412,28 @@ mod tests {
         assert_eq!(
             spec.cwd, None,
             "interpreter discovery is not project-scoped"
+        );
+    }
+
+    #[test]
+    fn a_check_is_the_same_sync_made_read_only_and_offline() {
+        assert_eq!(
+            as_check(sync_all_members(&uv(), &ctx())).args,
+            vec!["sync", "--all-packages", "--check", "--frozen", "--offline"]
+        );
+    }
+
+    #[test]
+    fn installed_pythons_only() {
+        assert_eq!(
+            python_list_installed(&uv()).args,
+            vec![
+                "python",
+                "list",
+                "--only-installed",
+                "--output-format",
+                "json"
+            ]
         );
     }
 
@@ -396,6 +469,8 @@ mod tests {
             ),
             ("tree", tree(&uv, &ctx, 2)),
             ("pip_list", pip_list(&uv, &ctx)),
+            ("pip_list_outdated", pip_list_outdated(&uv, &ctx)),
+            ("as_check", as_check(sync(&uv, &ctx))),
         ];
 
         for (name, spec) in specs {
@@ -420,6 +495,7 @@ mod tests {
         for (name, spec) in [
             ("python_list", python_list(&uv())),
             ("python_install", python_install(&uv(), "3.13")),
+            ("python_list_installed", python_list_installed(&uv())),
         ] {
             assert_eq!(spec.cwd, None, "{name} must not be project-scoped");
             assert!(

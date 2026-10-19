@@ -259,6 +259,7 @@ pub fn state(entry: &Entry) -> State {
 /// to right-click.
 pub fn view<'a>(
     entries: &[Entry],
+    findings: &[Vec<crate::health::Finding>],
     selected: Option<usize>,
     busy: Option<(uuid::Uuid, f32)>,
     waiting: Option<&str>,
@@ -361,6 +362,23 @@ pub fn view<'a>(
                         .font(label_font)
                         .size(theme::BODY),
                 ]
+                // Something needs the user: an amber mark, every finding in
+                // its tooltip. Notes alone never raise it.
+                .push(
+                    findings
+                        .get(i)
+                        .filter(|found| crate::health::has_warning(found))
+                        .map(|found| {
+                            theme::tip(
+                                iced::widget::text("!")
+                                    .font(theme::FONT_PROSE_SEMIBOLD)
+                                    .size(theme::BODY)
+                                    .style(theme::text_warning),
+                                crate::health::tooltip(found),
+                                iced::widget::tooltip::Position::Right,
+                            )
+                        }),
+                )
                 .spacing(theme::SPACE_1),
                 // Indented to start under the label, not under the glyph.
                 iced::widget::row![

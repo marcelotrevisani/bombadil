@@ -37,9 +37,12 @@ mod deps;
 #[cfg(target_os = "linux")]
 mod desktop_entry;
 mod detail;
+mod doctor_tab;
 mod drawer;
 mod env_editor;
 mod github_tab;
+mod glossary;
+mod health;
 mod icons;
 mod index_editor;
 mod interpreter;

@@ -187,6 +187,38 @@ pub fn pinned_requirement(name: &str, draft: &str) -> Result<String, String> {
 }
 
 /// The `uv add` flags that keep a requirement in the group its row came from.
+/// A package name as PyPI compares them: case, `_` and `.` do not matter.
+pub fn normalise(name: &str) -> String {
+    name.to_lowercase().replace(['_', '.'], "-")
+}
+
+/// What the doctor says beside a row with a newer release, if anything.
+pub fn outdated_note(
+    row: &DepRow,
+    outdated: &[bombadil_core::uv::results::Outdated],
+) -> Option<String> {
+    let found = outdated
+        .iter()
+        .find(|o| normalise(&o.name) == normalise(&row.name))?;
+    match row
+        .constraint
+        .as_deref()
+        .and_then(|c| c.trim().strip_prefix("=="))
+    {
+        Some(pinned) => Some(format!(
+            "pinned to {}; {} exists",
+            pinned.trim(),
+            found.latest
+        )),
+        None => Some(format!("{} available", found.latest)),
+    }
+}
+
+fn join_notes(notes: [Option<String>; 2]) -> Option<String> {
+    let notes: Vec<String> = notes.into_iter().flatten().collect();
+    (!notes.is_empty()).then(|| notes.join(" \u{b7} "))
+}
+
 pub fn uv_group(kind: &GroupKind) -> bombadil_core::uv::command::DependencyGroup {
     use bombadil_core::uv::command::DependencyGroup;
     match kind {
@@ -676,6 +708,7 @@ fn dep_row<'a>(
 /// unconditionally rather than behind a click -- `App` carries no per-row
 /// expand state, so "expand" here means "the tree is rendered," not an
 /// interaction to wire up later.
+#[allow(clippy::too_many_arguments)]
 pub fn view<'a>(
     fetched: &Result<DepsTab, String>,
     editing: Option<&DepEdit>,
@@ -684,6 +717,7 @@ pub fn view<'a>(
     project: usize,
     waiting: Option<&str>,
     no_environment: bool,
+    outdated: &[bombadil_core::uv::results::Outdated],
 ) -> iced::Element<'a, crate::app::Message> {
     use crate::app::Message;
     let enabled = waiting.is_none();
@@ -718,19 +752,21 @@ pub fn view<'a>(
             .on_press(Message::AddLocalRequested(project))
             .padding([theme::SPACE_1, theme::SPACE_2])
             .style(theme::button_secondary),
-        theme::wait_tip(
+        crate::glossary::wait_tip(
             iced::widget::button(labelled(Icon::ArrowUp, "Upgrade all"))
                 .on_press_maybe(enabled.then_some(Message::DepUpgradeAllRequested(project)))
                 .padding([theme::SPACE_1, theme::SPACE_2])
                 .style(theme::button_secondary),
             waiting,
+            crate::glossary::Term::Upgrade,
         ),
-        theme::wait_tip(
+        crate::glossary::wait_tip(
             iced::widget::button(labelled(Icon::Rotate, "Recreate venv"))
                 .on_press_maybe(enabled.then_some(Message::RecreateVenvRequested(project)))
                 .padding([theme::SPACE_1, theme::SPACE_2])
                 .style(theme::button_secondary),
             waiting,
+            crate::glossary::Term::Environment,
         ),
     ]
     .spacing(theme::SPACE_1)
@@ -753,10 +789,14 @@ pub fn view<'a>(
         (Err(cause), _) => iced::widget::text(unavailable_message(cause))
             .size(theme::BODY)
             .into(),
-        (Ok(tab), DepsView::Tree) => {
-            tree_view(&filter_tree(tab, filter), editing, enabled, project)
-        }
-        (Ok(tab), DepsView::All) => all_view(tab, filter, editing, enabled, project),
+        (Ok(tab), DepsView::Tree) => tree_view(
+            &filter_tree(tab, filter),
+            editing,
+            enabled,
+            project,
+            outdated,
+        ),
+        (Ok(tab), DepsView::All) => all_view(tab, filter, editing, enabled, project, outdated),
     };
     let headed = fetched.is_ok();
     iced::widget::column![toolbar]
@@ -774,6 +814,7 @@ fn all_view<'a>(
     editing: Option<&DepEdit>,
     enabled: bool,
     project: usize,
+    outdated: &[bombadil_core::uv::results::Outdated],
 ) -> iced::Element<'a, crate::app::Message> {
     let mut rows = iced::widget::column![
         iced::widget::text(
@@ -795,6 +836,7 @@ fn all_view<'a>(
             GroupKind::Main => None,
         }
         .filter(|_| flat.row.declared);
+        let label = join_notes([label, outdated_note(&flat.row, outdated)]);
         rows = rows.push(dep_row(
             &flat.row,
             &flat.group,
@@ -844,6 +886,7 @@ fn tree_view<'a>(
     editing: Option<&DepEdit>,
     enabled: bool,
     project: usize,
+    outdated: &[bombadil_core::uv::results::Outdated],
 ) -> iced::Element<'a, crate::app::Message> {
     let mut column = iced::widget::column![].spacing(theme::SPACE_3);
 
@@ -874,7 +917,14 @@ fn tree_view<'a>(
         ]
         .spacing(theme::SPACE_1);
         for row in &group.rows {
-            rows = rows.push(dep_row(row, &group.kind, editing, enabled, project, None));
+            rows = rows.push(dep_row(
+                row,
+                &group.kind,
+                editing,
+                enabled,
+                project,
+                outdated_note(row, outdated),
+            ));
             if !row.declared {
                 // A leftover's place is the All view; the tree is what the
                 // manifest asks for.
@@ -965,6 +1015,38 @@ pub fn confirm_upgrade_all_view<'a>(label: &str) -> iced::Element<'a, crate::app
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn outdated_notes_match_normalised_names() {
+        use bombadil_core::uv::results::Outdated;
+        let outdated = vec![
+            Outdated {
+                name: "Typing_Extensions".into(),
+                version: "4.1".into(),
+                latest: "4.16".into(),
+            },
+            Outdated {
+                name: "six".into(),
+                version: "1.16.0".into(),
+                latest: "1.17.0".into(),
+            },
+        ];
+        let row = |name: &str, constraint: Option<&str>| DepRow {
+            name: name.into(),
+            constraint: constraint.map(Into::into),
+            version: Some("x".into()),
+            declared: true,
+        };
+        assert_eq!(
+            outdated_note(&row("typing-extensions", Some(">=4")), &outdated).as_deref(),
+            Some("4.16 available")
+        );
+        assert_eq!(
+            outdated_note(&row("six", Some("==1.16.0")), &outdated).as_deref(),
+            Some("pinned to 1.16.0; 1.17.0 exists")
+        );
+        assert_eq!(outdated_note(&row("httpx", None), &outdated), None);
+    }
 
     #[test]
     fn a_typed_version_becomes_an_exact_pin() {

@@ -381,7 +381,7 @@ pub fn view<'a>(
         );
     }
 
-    column = column.push(theme::wait_tip(
+    column = column.push(crate::glossary::wait_tip(
         iced::widget::button(iced::widget::text("Sync members"))
             .on_press_maybe(
                 waiting
@@ -390,6 +390,7 @@ pub fn view<'a>(
             )
             .style(theme::button_secondary),
         waiting,
+        crate::glossary::Term::Member,
     ));
 
     column.into()

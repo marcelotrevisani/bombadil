@@ -92,13 +92,13 @@ pub fn git_summary(git: &bombadil_core::git::GitStatus) -> String {
         (Some(upstream), false) => format!("{} \u{2192} {upstream}", git.branch),
         (None, false) => format!("{} (no upstream)", git.branch),
     }];
-    let ahead_behind: Vec<String> = [("\u{2191}", git.ahead), ("\u{2193}", git.behind)]
+    let ahead_behind: Vec<String> = [(git.ahead, "to push"), (git.behind, "to pull")]
         .into_iter()
-        .filter(|(_, n)| *n > 0)
-        .map(|(arrow, n)| format!("{arrow}{n}"))
+        .filter(|(n, _)| *n > 0)
+        .map(|(n, what)| format!("{n} {what}"))
         .collect();
     if !ahead_behind.is_empty() {
-        parts.push(ahead_behind.join(" "));
+        parts.push(ahead_behind.join(", "));
     }
     let changes: Vec<String> = [
         (git.staged, "staged"),
@@ -123,6 +123,8 @@ pub struct Tile {
     pub label: &'static str,
     pub state: theme::State,
     pub value: String,
+    /// A muted second line: a note that needs no action.
+    pub note: Option<String>,
     /// Where pressing the tile goes, if anywhere.
     pub press: Option<Message>,
     /// A Sync button inside the tile, where the drift it fixes is shown.
@@ -307,7 +309,11 @@ pub fn view<'a>(
             .on_press(Message::SyncRequested(index))
             .padding([theme::SPACE_1, theme::SPACE_3])
             .style(theme::button_primary),
-            format!("Sync ({})", shortcuts::keys(Shortcut::Sync)),
+            format!(
+                "{} ({})",
+                crate::glossary::explain(crate::glossary::Term::Sync),
+                shortcuts::keys(Shortcut::Sync)
+            ),
             iced::widget::tooltip::Position::Left,
         ),
         Some((label, angle, true)) => iced::widget::button(sync_row(
@@ -391,13 +397,21 @@ pub fn view<'a>(
             .spacing(theme::SPACE_1)
             .align_y(iced::Alignment::Center),
         ]
+        .push(tile.note.map(|note| {
+            iced::widget::text(note)
+                .size(theme::LABEL)
+                .style(theme::text_muted)
+        }))
         .spacing(theme::SPACE_1);
         let body = iced::widget::row![body]
             .push(tile.sync.map(|message| {
-                iced::widget::button(iced::widget::text("Sync").size(theme::LABEL))
-                    .on_press(message)
-                    .padding([0.0, theme::SPACE_2])
-                    .style(theme::button_primary)
+                crate::glossary::tip(
+                    iced::widget::button(iced::widget::text("Sync").size(theme::LABEL))
+                        .on_press(message)
+                        .padding([0.0, theme::SPACE_2])
+                        .style(theme::button_primary),
+                    crate::glossary::Term::Sync,
+                )
             }))
             .spacing(theme::SPACE_2)
             .align_y(iced::Alignment::End);
@@ -573,7 +587,7 @@ mod tests {
         };
         assert_eq!(
             git_summary(&git),
-            "main \u{2192} origin/trunk \u{b7} \u{2191}1 \u{2193}2 \u{b7} 3 modified, 1 untracked"
+            "main \u{2192} origin/trunk \u{b7} 1 to push, 2 to pull \u{b7} 3 modified, 1 untracked"
         );
         let clean = GitStatus {
             branch: "abc12345".into(),

@@ -42,6 +42,8 @@ pub enum Modal {
     Licences,
     /// Every keyboard shortcut, from `shortcuts::SHORTCUTS`.
     Shortcuts,
+    /// Every term from `glossary::TERMS`, in plain words.
+    Glossary,
 }
 
 impl Modal {
@@ -52,6 +54,7 @@ impl Modal {
             Modal::About => "About Bombadil",
             Modal::Licences => "Bundled licences",
             Modal::Shortcuts => "Keyboard shortcuts",
+            Modal::Glossary => "Glossary",
         }
     }
 }
@@ -98,6 +101,7 @@ impl TopMenu {
                 .collect(),
             TopMenu::Help => vec![
                 ("Keyboard shortcuts", Message::ModalOpened(Modal::Shortcuts)),
+                ("Glossary", Message::ModalOpened(Modal::Glossary)),
                 ("About Bombadil", Message::ModalOpened(Modal::About)),
                 ("Bundled licences", Message::ModalOpened(Modal::Licences)),
             ],
@@ -248,6 +252,7 @@ pub fn modal_layer<'a>(modal: Modal) -> iced::Element<'a, Message> {
         Modal::About => about_body(),
         Modal::Licences => licences_body(),
         Modal::Shortcuts => shortcuts_body(),
+        Modal::Glossary => glossary_body(),
     };
 
     let card = iced::widget::container(
@@ -376,6 +381,27 @@ fn shortcuts_body<'a>() -> iced::Element<'a, Message> {
     column.into()
 }
 
+/// The Glossary body: each term, bold, over its sentence.
+fn glossary_body<'a>() -> iced::Element<'a, Message> {
+    let mut column = iced::widget::column![].spacing(theme::SPACE_2);
+    for (_, name, sentence) in crate::glossary::alphabetical() {
+        column = column.push(
+            iced::widget::column![
+                iced::widget::text(*name)
+                    .font(theme::FONT_PROSE_SEMIBOLD)
+                    .size(theme::BODY),
+                iced::widget::text(*sentence)
+                    .size(theme::BODY)
+                    .style(theme::text_muted),
+            ]
+            .spacing(theme::SPACE_1),
+        );
+    }
+    iced::widget::scrollable(column)
+        .height(iced::Length::Shrink)
+        .into()
+}
+
 /// The Licences body: every bundled licence text in one scrollable, each under its own
 /// heading, in the mono face they were written in.
 fn licences_body<'a>() -> iced::Element<'a, Message> {
@@ -464,6 +490,17 @@ mod tests {
                 .iter()
                 .any(|(_, message)| matches!(message, Message::ModalOpened(Modal::Licences))),
             "no menu entry opens the licences"
+        );
+    }
+
+    #[test]
+    fn help_lists_the_glossary() {
+        assert!(
+            TopMenu::Help
+                .entries()
+                .iter()
+                .any(|(_, message)| matches!(message, Message::ModalOpened(Modal::Glossary))),
+            "no menu entry opens the glossary"
         );
     }
 
@@ -557,7 +594,12 @@ mod tests {
 
     #[test]
     fn every_modal_has_a_title() {
-        for modal in [Modal::About, Modal::Licences, Modal::Shortcuts] {
+        for modal in [
+            Modal::About,
+            Modal::Licences,
+            Modal::Shortcuts,
+            Modal::Glossary,
+        ] {
             assert!(!modal.title().trim().is_empty(), "{modal:?} has no title");
         }
         assert_ne!(
