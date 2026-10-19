@@ -1,3 +1,4 @@
+pub mod doctor;
 pub mod envspec;
 pub mod error;
 pub mod folder;

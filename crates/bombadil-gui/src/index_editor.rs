@@ -512,12 +512,13 @@ pub fn global_view<'a>(
     }
 
     column
-        .push(
+        .push(crate::glossary::tip(
             iced::widget::button(iced::widget::text("Add index").size(theme::BODY))
                 .on_press(Message::IndexAdded)
                 .padding([theme::SPACE_1, theme::SPACE_3])
                 .style(theme::button_secondary),
-        )
+            crate::glossary::Term::Index,
+        ))
         .into()
 }
 

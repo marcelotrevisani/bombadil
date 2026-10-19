@@ -48,6 +48,10 @@ pub enum PyProjectError {
     /// it only sees text. Kept separate from [`PyProjectError::ParseAt`] so
     /// that a path-free caller (e.g. parsing an in-memory string) doesn't
     /// have to invent one.
+    /// From [`crate::pyproject::set_requires_python`].
+    #[error("could not edit pyproject.toml: {0}")]
+    Edit(String),
+
     #[error("could not parse pyproject.toml: {source}")]
     Parse {
         #[source]

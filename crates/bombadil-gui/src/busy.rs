@@ -135,6 +135,8 @@ pub struct Toast {
     pub text: String,
     /// `None` until dismissed: a failure must not vanish unread.
     pub expires: Option<Instant>,
+    /// The doctor's first fix for a failure, for the project with this id.
+    pub fix: Option<(uuid::Uuid, bombadil_core::doctor::DoctorFix)>,
 }
 
 /// Newest first; the oldest beyond [`MAX_TOASTS`] is dropped.
@@ -146,6 +148,7 @@ pub fn push(toasts: &mut Vec<Toast>, kind: ToastKind, text: String, now: Instant
             kind,
             text,
             expires,
+            fix: None,
         },
     );
     toasts.truncate(MAX_TOASTS);

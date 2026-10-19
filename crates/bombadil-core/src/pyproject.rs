@@ -97,9 +97,179 @@ pub fn load(path: &Path) -> Result<PyProject, PyProjectError> {
     })
 }
 
+/// `text` with `[project] requires-python` set to `spec`; every other byte
+/// kept. Errors when the file does not parse or has no `[project]` table.
+pub fn set_requires_python(text: &str, spec: &str) -> Result<String, PyProjectError> {
+    let mut doc: toml_edit::DocumentMut = text
+        .parse()
+        .map_err(|e: toml_edit::TomlError| PyProjectError::Edit(e.to_string()))?;
+    let project = doc
+        .get_mut("project")
+        .and_then(|p| p.as_table_mut())
+        .ok_or_else(|| PyProjectError::Edit("there is no [project] table".into()))?;
+    match project
+        .get_mut("requires-python")
+        .and_then(|v| v.as_value_mut())
+    {
+        Some(value) => {
+            // Without the old decor the space before a trailing comment goes.
+            let decor = value.decor().clone();
+            *value = toml_edit::Value::from(spec);
+            *value.decor_mut() = decor;
+        }
+        None => {
+            project.insert("requires-python", toml_edit::value(spec));
+        }
+    }
+    Ok(doc.to_string())
+}
+
+/// `text` with every requirement on `package` stripped of its version
+/// specifier, keeping its extras, markers and comments; `None` when no
+/// dependency list declares it. Looks in `[project] dependencies`,
+/// `[project.optional-dependencies]` and `[dependency-groups]`.
+pub fn loosen_requirement(text: &str, package: &str) -> Result<Option<String>, PyProjectError> {
+    let mut doc: toml_edit::DocumentMut = text
+        .parse()
+        .map_err(|e: toml_edit::TomlError| PyProjectError::Edit(e.to_string()))?;
+    let key = normalised(package);
+    let mut changed = false;
+    let mut loosen = |list: &mut toml_edit::Item| {
+        let Some(array) = list.as_array_mut() else {
+            return;
+        };
+        for value in array.iter_mut() {
+            let Some(requirement) = value.as_str() else {
+                continue;
+            };
+            let (name, rest) = split_name(requirement.trim());
+            if normalised(name) != key {
+                continue;
+            }
+            let loose = loosened(name, rest);
+            let decor = value.decor().clone();
+            *value = toml_edit::Value::from(loose);
+            *value.decor_mut() = decor;
+            changed = true;
+        }
+    };
+    if let Some(project) = doc.get_mut("project").and_then(|p| p.as_table_like_mut()) {
+        if let Some(list) = project.get_mut("dependencies") {
+            loosen(list);
+        }
+        if let Some(extras) = project
+            .get_mut("optional-dependencies")
+            .and_then(|e| e.as_table_like_mut())
+        {
+            for (_, list) in extras.iter_mut() {
+                loosen(list);
+            }
+        }
+    }
+    if let Some(groups) = doc
+        .get_mut("dependency-groups")
+        .and_then(|g| g.as_table_like_mut())
+    {
+        for (_, list) in groups.iter_mut() {
+            loosen(list);
+        }
+    }
+    Ok(changed.then(|| doc.to_string()))
+}
+
+fn normalised(name: &str) -> String {
+    name.to_lowercase().replace(['_', '.'], "-")
+}
+
+/// A requirement's leading name and everything after it.
+fn split_name(requirement: &str) -> (&str, &str) {
+    let end = requirement
+        .find(|c: char| !(c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-')))
+        .unwrap_or(requirement.len());
+    requirement.split_at(end)
+}
+
+/// `name` with `rest`'s extras and markers but no version specifier. A
+/// direct reference (`name @ url`) is left as it is.
+fn loosened(name: &str, rest: &str) -> String {
+    let (head, markers) = match rest.split_once(';') {
+        Some((head, markers)) => (head, Some(markers.trim())),
+        None => (rest, None),
+    };
+    if head.trim_start().starts_with('@') {
+        return format!("{name}{rest}");
+    }
+    let extras = head
+        .trim_start()
+        .strip_prefix('[')
+        .and_then(|e| e.split_once(']'))
+        .map(|(e, _)| format!("[{e}]"))
+        .unwrap_or_default();
+    match markers {
+        Some(markers) => format!("{name}{extras}; {markers}"),
+        None => format!("{name}{extras}"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn raising_requires_python_keeps_the_rest_of_the_file() {
+        let text = "# my project\n[project]\nname = \"x\"  # the name\nrequires-python = \">=3.8\"  # min\ndependencies = [\n  \"six\",  # pinned later\n]\n\n[tool.uv]\ndev-dependencies = []\n";
+        let out = set_requires_python(text, ">=3.11").unwrap();
+        assert_eq!(out, text.replace("\">=3.8\"", "\">=3.11\""));
+    }
+
+    #[test]
+    fn loosening_drops_only_the_version_specifier() {
+        let text = "[project]\nname = \"x\"\ndependencies = [\n  \"Six==9.9\",  # pinned\n  \"uvicorn[standard]>=0.3; sys_platform != 'win32'\",\n  \"httpx\",\n]\n";
+        assert_eq!(
+            loosen_requirement(text, "six").unwrap().as_deref(),
+            Some(text.replace("Six==9.9", "Six").as_str())
+        );
+        assert_eq!(
+            loosen_requirement(text, "uvicorn").unwrap().as_deref(),
+            Some(
+                text.replace(">=0.3; sys_platform", "; sys_platform")
+                    .as_str()
+            )
+        );
+    }
+
+    #[test]
+    fn loosening_finds_groups_and_extras() {
+        let text = "[project]\nname = \"x\"\n\n[project.optional-dependencies]\nweb = [\"six_x>=2\"]\n\n[dependency-groups]\ndev = [\"pytest==9.9\"]\n";
+        assert_eq!(
+            loosen_requirement(text, "six.x").unwrap().as_deref(),
+            Some(text.replace("six_x>=2", "six_x").as_str())
+        );
+        assert_eq!(
+            loosen_requirement(text, "pytest").unwrap().as_deref(),
+            Some(text.replace("pytest==9.9", "pytest").as_str())
+        );
+    }
+
+    #[test]
+    fn an_undeclared_package_is_not_loosened() {
+        let text = "[project]\nname = \"x\"\ndependencies = [\"six\"]\n";
+        assert_eq!(loosen_requirement(text, "numpy").unwrap(), None);
+        assert!(loosen_requirement("not toml [", "six").is_err());
+    }
+
+    #[test]
+    fn requires_python_is_added_when_missing() {
+        let out = set_requires_python("[project]\nname = \"x\"\n", ">=3.11").unwrap();
+        assert!(out.contains("requires-python = \">=3.11\""), "{out}");
+        assert!(out.starts_with("[project]\nname = \"x\"\n"));
+    }
+
+    #[test]
+    fn without_a_project_table_nothing_is_written() {
+        assert!(set_requires_python("[tool.uv]\n", ">=3.11").is_err());
+        assert!(set_requires_python("not toml [", ">=3.11").is_err());
+    }
 
     const FIXTURE: &str = include_str!("../tests/fixtures/realistic_pyproject.toml");
 

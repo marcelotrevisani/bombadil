@@ -57,6 +57,88 @@ pub fn parse_python_list(json: &str) -> Result<Vec<Interpreter>, ResultsError> {
     })
 }
 
+/// A package with a newer release than the one installed.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct Outdated {
+    pub name: String,
+    pub version: String,
+    #[serde(rename = "latest_version")]
+    pub latest: String,
+}
+
+pub fn parse_outdated(json: &str) -> Result<Vec<Outdated>, ResultsError> {
+    serde_json::from_str(json).map_err(|source| ResultsError::Json {
+        command: "uv pip list --outdated",
+        source,
+    })
+}
+
+/// What `uv sync --check` said about an environment.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SyncCheck {
+    InSync,
+    /// There is no environment yet; uv would create one.
+    NoEnvironment,
+    /// uv would delete the environment and build it again, on `python`
+    /// (from its "Using CPython X" line) -- usually a `.python-version` or
+    /// pin the environment's interpreter no longer matches.
+    WouldReplace {
+        python: Option<String>,
+    },
+    /// Packages by name: only in the lock (`missing`), in both at different
+    /// versions (`changed`), only in the environment (`extra`).
+    Behind {
+        missing: usize,
+        changed: usize,
+        extra: usize,
+    },
+    /// Anything else, such as no `uv.lock`: nothing to say.
+    Unknown,
+}
+
+/// Reads `uv sync --check`'s exit and stderr (it writes nothing to stdout).
+/// Exit 1 alone is not "behind": a missing lock exits 1 too.
+///
+/// The environment lines come first: with nothing to install, creating or
+/// replacing an environment still exits 0 (verified).
+pub fn parse_sync_check(exit: Option<i32>, stderr: &str) -> SyncCheck {
+    if !matches!(exit, Some(0 | 1)) {
+        return SyncCheck::Unknown;
+    }
+    if stderr.contains("Would create project environment") {
+        return SyncCheck::NoEnvironment;
+    }
+    if stderr.contains("Would replace project environment") {
+        let python = stderr
+            .lines()
+            .find_map(|line| line.trim().strip_prefix("Using CPython "))
+            .and_then(|rest| rest.split_whitespace().next())
+            .map(str::to_string);
+        return SyncCheck::WouldReplace { python };
+    }
+    if exit == Some(0) {
+        return SyncCheck::InSync;
+    }
+    if !stderr.contains("The environment is outdated") {
+        return SyncCheck::Unknown;
+    }
+    let names = |sign: &str| -> std::collections::BTreeSet<String> {
+        stderr
+            .lines()
+            .filter_map(|line| line.trim_start().strip_prefix(sign))
+            .filter_map(|rest| rest.split("==").next())
+            .map(|name| name.trim().to_string())
+            .collect()
+    };
+    let (added, removed) = (names("+ "), names("- "));
+    let changed = added.intersection(&removed).count();
+    SyncCheck::Behind {
+        missing: added.len() - changed,
+        changed,
+        extra: removed.len() - changed,
+    }
+}
+
 /// One node in the resolved dependency graph.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TreePackage {
@@ -209,9 +291,104 @@ pub fn parse_tree(json: &str) -> Result<TreeOutcome, ResultsError> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn outdated_packages_parse_from_uv_json() {
+        let json = r#"[{"name":"six","version":"1.16.0","latest_version":"1.17.0","latest_filetype":"wheel"}]"#;
+        assert_eq!(
+            parse_outdated(json).unwrap(),
+            vec![Outdated {
+                name: "six".into(),
+                version: "1.16.0".into(),
+                latest: "1.17.0".into()
+            }]
+        );
+        assert_eq!(parse_outdated("[]").unwrap(), vec![]);
+        assert!(parse_outdated("nope").is_err());
+    }
+
     const PIP_LIST: &str = include_str!("../../tests/fixtures/uv-pip-list.json");
     const PYTHON_LIST: &str = include_str!("../../tests/fixtures/uv-python-list.json");
     const TREE: &str = include_str!("../../tests/fixtures/uv-tree.json");
+
+    const BEHIND: &str = "Would use project environment at: .venv\n\
+Would uninstall 2 packages\nWould install 2 packages\n \
+- idna==3.20\n - six==1.16.0\n + six==1.17.0\n + certifi==2026.7.22\n\
+error: The environment is outdated; run `uv sync` to update the environment\n";
+
+    #[test]
+    fn in_sync_is_exit_zero() {
+        assert_eq!(
+            parse_sync_check(Some(0), "Would make no changes\n"),
+            SyncCheck::InSync
+        );
+    }
+
+    #[test]
+    fn a_version_change_counts_once() {
+        assert_eq!(
+            parse_sync_check(Some(1), BEHIND),
+            SyncCheck::Behind {
+                missing: 1,
+                changed: 1,
+                extra: 1
+            }
+        );
+    }
+
+    #[test]
+    fn no_venv_is_no_environment() {
+        let stderr = "Using CPython 3.12.14\nWould create project environment at: .venv\n\
+Would install 1 package\n + six==1.17.0\n\
+error: The environment is outdated; run `uv sync` to update the environment\n";
+        assert_eq!(parse_sync_check(Some(1), stderr), SyncCheck::NoEnvironment);
+    }
+
+    #[test]
+    fn outdated_without_package_lines_is_behind_by_zero() {
+        assert_eq!(
+            parse_sync_check(
+                Some(1),
+                "error: The environment is outdated; run `uv sync`\n"
+            ),
+            SyncCheck::Behind {
+                missing: 0,
+                changed: 0,
+                extra: 0
+            }
+        );
+    }
+
+    #[test]
+    fn no_venv_with_nothing_to_install_is_still_no_environment() {
+        // uv 0.12.19, a project with `dependencies = []` and no `.venv`.
+        let stderr = "Using CPython 3.12.14\nWould create project environment at: .venv\n\
+Would make no changes\n";
+        assert_eq!(parse_sync_check(Some(0), stderr), SyncCheck::NoEnvironment);
+    }
+
+    #[test]
+    fn a_replaced_environment_names_the_python_not_the_packages() {
+        let stderr = "Using CPython 3.13.15\nWould replace project environment at: .venv\n\
+Would install 2 packages\n + six==1.17.0\n + idna==3.20\n\
+error: The environment is outdated; run `uv sync` to update the environment\n";
+        let replace = SyncCheck::WouldReplace {
+            python: Some("3.13.15".into()),
+        };
+        assert_eq!(parse_sync_check(Some(1), stderr), replace);
+        let quiet = "Would replace project environment at: .venv\nWould make no changes\n";
+        assert_eq!(
+            parse_sync_check(Some(0), quiet),
+            SyncCheck::WouldReplace { python: None }
+        );
+    }
+
+    #[test]
+    fn a_missing_lock_or_any_other_failure_is_unknown() {
+        let no_lock = "error: Unable to find lockfile at `uv.lock`, but `--frozen` was provided.\n";
+        assert_eq!(parse_sync_check(Some(1), no_lock), SyncCheck::Unknown);
+        assert_eq!(parse_sync_check(Some(2), BEHIND), SyncCheck::Unknown);
+        assert_eq!(parse_sync_check(None, ""), SyncCheck::Unknown);
+    }
 
     #[test]
     fn reads_installed_packages() {

@@ -141,6 +141,11 @@ pub struct App {
     /// Projects whose lookup is running; Refresh is disabled for them and
     /// ticks skip them.
     pub github_in_flight: std::collections::HashSet<uuid::Uuid>,
+    /// `uv sync --check` per project, from the last probe round.
+    pub sync_checks: std::collections::HashMap<uuid::Uuid, uv::results::SyncCheck>,
+    /// The interpreters on this machine (pre-releases are filtered in
+    /// `health`); `None` until listed or when listing failed.
+    pub installed_pythons: Option<Vec<String>>,
     /// The token being typed in Preferences > GitHub; cleared once saved.
     pub github_token_draft: String,
     /// How Bombadil reaches GitHub, as Preferences shows it; `None` until checked.
@@ -244,6 +249,14 @@ pub struct App {
     /// could not read the environment -- which the tab reports, rather than
     /// showing rows that would claim nothing is installed.
     pub deps: Option<(usize, Result<deps::DepsTab, String>)>,
+    /// Newer releases for the selected project's packages, by project index.
+    pub outdated: Option<(usize, Result<Vec<uv::results::Outdated>, String>)>,
+    /// The last failed uv command per project, diagnosed; cleared by its next
+    /// success.
+    pub last_failure: std::collections::HashMap<
+        uuid::Uuid,
+        (crate::busy::Action, bombadil_core::doctor::Diagnosis),
+    >,
     /// The version cell open for editing on the Dependencies tab, if any.
     pub dep_edit: Option<deps::DepEdit>,
     /// Tree or All packages, on the Dependencies tab.
@@ -339,6 +352,7 @@ pub enum Tab {
     Scripts,
     Indexes,
     GitHub,
+    Doctor,
 }
 
 impl Tab {
@@ -354,13 +368,14 @@ impl Tab {
     /// Settings has no per-project half worth a tab (uv, terminal and the
     /// venv default are all resolved per project from Preferences), so it is
     /// the one that stayed absorbed.
-    pub const ALL: [Tab; 6] = [
+    pub const ALL: [Tab; 7] = [
         Tab::Dependencies,
         Tab::Members,
         Tab::EnvVars,
         Tab::Scripts,
         Tab::Indexes,
         Tab::GitHub,
+        Tab::Doctor,
     ];
 
     pub fn label(self) -> &'static str {
@@ -371,6 +386,19 @@ impl Tab {
             Tab::Scripts => "Scripts",
             Tab::Indexes => "Indexes",
             Tab::GitHub => "GitHub",
+            Tab::Doctor => "Doctor",
+        }
+    }
+
+    /// The jargon the tab's name is, for its tooltip.
+    pub fn term(self) -> Option<crate::glossary::Term> {
+        use crate::glossary::Term;
+        match self {
+            Tab::Dependencies => Some(Term::Dependency),
+            Tab::Members => Some(Term::Member),
+            Tab::EnvVars => Some(Term::EnvVars),
+            Tab::Indexes => Some(Term::Index),
+            Tab::Scripts | Tab::GitHub | Tab::Doctor => None,
         }
     }
 
@@ -384,6 +412,7 @@ impl Tab {
             Tab::Scripts => "scripts",
             Tab::Indexes => "indexes",
             Tab::GitHub => "github",
+            Tab::Doctor => "doctor",
         }
     }
 }
@@ -453,6 +482,13 @@ pub enum Message {
     /// can say so instead of rendering every declared package as
     /// `"(not installed)"` -- see `fetch_deps_blocking`.
     DepsLoaded(usize, Result<DepsFetch, String>),
+    OutdatedLoaded(usize, Result<Vec<uv::results::Outdated>, String>),
+    /// A doctor fix button, for the project with this id.
+    DoctorFixRequested(uuid::Uuid, bombadil_core::doctor::DoctorFix),
+    /// A doctor fix's edit to this project's pyproject.toml, written or not.
+    PyprojectEdited(uuid::Uuid, Result<(), String>),
+    /// Doctor tab "Update pin": install this `name==latest` on `projects[usize]`.
+    DoctorPinRequested(usize, String),
     /// The Sync action was pressed for `projects[usize]`. Never gated on
     /// whether a venv already exists -- creating one is how the user
     /// recovers from not having one.
@@ -630,6 +666,13 @@ pub enum Message {
         id: uuid::Uuid,
         status: Option<bombadil_core::git::GitStatus>,
     },
+    /// A project's `uv sync --check`, from a probe round.
+    SyncChecked {
+        id: uuid::Uuid,
+        check: uv::results::SyncCheck,
+    },
+    /// The interpreters installed on this machine, from a probe round.
+    PythonsListed(Option<Vec<String>>),
     DepVersionEditCancelled,
     /// Enter in the version cell: install that exact version with `uv add`.
     DepVersionSubmitted,
@@ -1091,6 +1134,8 @@ impl App {
             toasts: Vec::new(),
             github: Default::default(),
             github_in_flight: Default::default(),
+            sync_checks: Default::default(),
+            installed_pythons: None,
             github_token_draft: String::new(),
             github_source: None,
             github_accounts: None,
@@ -1120,6 +1165,8 @@ impl App {
             modal: None,
             preferences: None,
             deps: None,
+            outdated: None,
+            last_failure: Default::default(),
             dep_edit: None,
             deps_view: deps::DepsView::default(),
             system_mode: iced::theme::Mode::Dark,
@@ -1215,6 +1262,13 @@ fn probe_every_venv(app: &App) -> Task<Message> {
                     Message::GitProbed { id, status }
                 }))
             }))
+            // Health reads, at the same moments: whether each environment
+            // matches its lock, and which Pythons could replace it.
+            .chain(health_round_targets(app).into_iter().filter_map(|id| {
+                let project = app.config.projects.iter().find(|p| p.id == id)?.clone();
+                Some(probe_sync_check(project, app.config.clone()))
+            }))
+            .chain(std::iter::once(probe_installed_pythons(app.config.clone())))
             .collect::<Vec<_>>(),
     )
 }
@@ -1465,6 +1519,79 @@ fn check_github_source(account: Option<String>) -> Task<Message> {
     )
 }
 
+/// How long one background uv read may take before it says nothing.
+const HEALTH_PROBE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// `uv sync --check` for one project, off the render thread. Any failure is
+/// `Unknown`: a background read has nothing useful to report.
+fn probe_sync_check(project: Project, config: Config) -> Task<Message> {
+    let id = project.id;
+    Task::perform(
+        async move {
+            job::run(
+                move || {
+                    let runner = bombadil_core::process::SystemCommandRunner;
+                    let Some(ctx) = deps_command_context(&project, &config) else {
+                        return uv::results::SyncCheck::Unknown;
+                    };
+                    let Ok(uv) = resolve_uv_for(&config, &runner) else {
+                        return uv::results::SyncCheck::Unknown;
+                    };
+                    let (kind, discovered) = discover_members(&project);
+                    let plan = members_editor::sync_plan(&project.members, &kind, &discovered);
+                    // A member selection means two syncs want different
+                    // environments: Sync (root dependencies) and Sync
+                    // members (the selected members, exactly). No one check
+                    // matches both, so say nothing; the Dependencies and
+                    // Members tiles describe it.
+                    if plan != members_editor::SyncPlan::Plain {
+                        return uv::results::SyncCheck::Unknown;
+                    }
+                    let spec = sync_check_spec(&uv, &ctx, &active_pin(&project), &plan);
+                    match runner.run(&spec) {
+                        Ok(out) => uv::results::parse_sync_check(out.status, &out.stderr),
+                        Err(_) => uv::results::SyncCheck::Unknown,
+                    }
+                },
+                HEALTH_PROBE_TIMEOUT,
+            )
+            .await
+        },
+        move |result| Message::SyncChecked {
+            id,
+            check: match result {
+                job::JobResult::Done(check) => check,
+                _ => uv::results::SyncCheck::Unknown,
+            },
+        },
+    )
+}
+
+/// The interpreters already installed, once per probe round.
+fn probe_installed_pythons(config: Config) -> Task<Message> {
+    Task::perform(
+        async move {
+            job::run(
+                move || {
+                    let runner = bombadil_core::process::SystemCommandRunner;
+                    let uv = resolve_uv_for(&config, &runner).ok()?;
+                    let out = runner.run(&uv::command::python_list_installed(&uv)).ok()?;
+                    let list = uv::results::parse_python_list(&out.stdout).ok()?;
+                    Some(list.into_iter().map(|i| i.version).collect::<Vec<_>>())
+                },
+                HEALTH_PROBE_TIMEOUT,
+            )
+            .await
+        },
+        |result| {
+            Message::PythonsListed(match result {
+                job::JobResult::Done(list) => list,
+                _ => None,
+            })
+        },
+    )
+}
+
 /// `git status` for the sidebar and header, off the render thread. The real
 /// runner is built here at the boundary, as `KeyringSecretStore` is elsewhere,
 /// so no test reaches a real `git`.
@@ -1659,9 +1786,53 @@ fn fetch_deps_task(
     config: Config,
     runner: Arc<dyn CommandRunner>,
 ) -> Task<Message> {
-    Task::perform(load_deps(project, config, runner), move |fetch| {
-        Message::DepsLoaded(index, fetch)
-    })
+    let outdated = fetch_outdated_task(index, project.clone(), config.clone(), runner.clone());
+    Task::batch([
+        Task::perform(load_deps(project, config, runner), move |fetch| {
+            Message::DepsLoaded(index, fetch)
+        }),
+        outdated,
+    ])
+}
+
+/// Newer releases of the installed packages. Needs the network, so it is
+/// its own task: the Dependencies tab never waits on it.
+fn fetch_outdated_task(
+    index: usize,
+    project: Project,
+    config: Config,
+    runner: Arc<dyn CommandRunner>,
+) -> Task<Message> {
+    Task::perform(
+        async move {
+            job::run(
+                move || -> Result<Vec<uv::results::Outdated>, String> {
+                    let ctx = deps_command_context(&project, &config)
+                        .ok_or("this project has no environment")?;
+                    let uv = resolve_uv_for(&config, runner.as_ref())?;
+                    let out = runner
+                        .run(&uv::command::pip_list_outdated(&uv, &ctx))
+                        .map_err(|e| e.to_string())?;
+                    if !out.success() {
+                        return Err(uv_refusal(&out, "uv could not check for newer versions"));
+                    }
+                    uv::results::parse_outdated(&out.stdout).map_err(|e| e.to_string())
+                },
+                SYNC_TIMEOUT,
+            )
+            .await
+        },
+        move |result| {
+            Message::OutdatedLoaded(
+                index,
+                match result {
+                    job::JobResult::Done(r) => r,
+                    job::JobResult::TimedOut => Err("checking for newer versions timed out".into()),
+                    job::JobResult::Failed => Err("checking for newer versions failed".into()),
+                },
+            )
+        },
+    )
 }
 
 /// The blocking half of a Members fetch (spec §5a, Task 5): classify the
@@ -1672,25 +1843,35 @@ fn fetch_deps_task(
 /// venv yet -- all leave `discovered`/`installed` empty rather than failing,
 /// since a project that has never been synced or has no siblings at all is a
 /// normal state for this tab, not an error to report.
+/// The project's workspace kind and the members on disk: reads its manifest
+/// and walks its tree. Blocking.
+fn discover_members(
+    project: &Project,
+) -> (
+    bombadil_core::members::WorkspaceKind,
+    Vec<bombadil_core::members::DiscoveredMember>,
+) {
+    let project_dir = project
+        .pyproject_path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty());
+    let kind = project_dir
+        .and_then(|_| std::fs::read_to_string(&project.pyproject_path).ok())
+        .map(|text| bombadil_core::members::parse_workspace(&text))
+        .unwrap_or(bombadil_core::members::WorkspaceKind::Loose);
+    let discovered = match project_dir {
+        Some(dir) => bombadil_core::members::discover(dir, &kind),
+        None => Vec::new(),
+    };
+    (kind, discovered)
+}
+
 fn fetch_members_blocking(
     project: &Project,
     config: &Config,
     runner: &dyn CommandRunner,
 ) -> MembersFetch {
-    let project_dir = project
-        .pyproject_path
-        .parent()
-        .filter(|p| !p.as_os_str().is_empty());
-
-    let kind = project_dir
-        .and_then(|_| std::fs::read_to_string(&project.pyproject_path).ok())
-        .map(|text| bombadil_core::members::parse_workspace(&text))
-        .unwrap_or(bombadil_core::members::WorkspaceKind::Loose);
-
-    let discovered = match project_dir {
-        Some(dir) => bombadil_core::members::discover(dir, &kind),
-        None => Vec::new(),
-    };
+    let (kind, discovered) = discover_members(project);
 
     let installed = match (
         resolve_uv_for(config, runner).ok(),
@@ -2008,6 +2189,13 @@ pub fn update(app: &mut App, message: Message, runner: Arc<dyn CommandRunner>) -
         Message::TabSelected(tab) => {
             app.tab = tab;
         }
+        Message::SyncChecked { id, check } => {
+            // A project removed while its check ran is not kept.
+            if app.config.projects.iter().any(|p| p.id == id) {
+                app.sync_checks.insert(id, check);
+            }
+        }
+        Message::PythonsListed(versions) => app.installed_pythons = versions,
         Message::GitProbed { id, status } => {
             // By id: the list may have been reordered or edited since.
             if let Some(entry) = app.entries.iter_mut().find(|entry| entry.id == id) {
@@ -2047,6 +2235,49 @@ pub fn update(app: &mut App, message: Message, runner: Arc<dyn CommandRunner>) -
         // user has since moved away from -- `view` only ever reads
         // `app.deps` when its index still matches the current selection.
         Message::DepsLoaded(_, _) => {}
+        // Only the selected project's: a slow lookup for one left behind
+        // must not replace the current one's.
+        Message::OutdatedLoaded(i, result) if Some(i) == app.selected => {
+            app.outdated = Some((i, result));
+        }
+        Message::OutdatedLoaded(..) => {}
+        Message::DoctorFixRequested(id, fix) => {
+            use bombadil_core::doctor::DoctorFix;
+            let Some(i) = app.config.projects.iter().position(|p| p.id == id) else {
+                return Task::none();
+            };
+            let runs_uv = matches!(
+                fix,
+                DoctorFix::LetUvPick(_) | DoctorFix::RequirePython(_) | DoctorFix::Retry
+            );
+            if runs_uv && !can_start(app) {
+                drawer::push_line(
+                    &mut app.drawer,
+                    "another uv command is still running; try again when it finishes",
+                    &[],
+                );
+                return Task::none();
+            }
+            // Its toast has done its job; the fix's own outcome follows.
+            let pressed = Some((id, fix.clone()));
+            app.toasts.retain(|t| t.fix != pressed);
+            return apply_fix(app, i, fix, runner);
+        }
+        Message::DoctorPinRequested(i, requirement) => {
+            let group = declared_group(app, i, &requirement).unwrap_or(deps::GroupKind::Main);
+            return add_requirement(app, i, requirement, group, runner);
+        }
+        Message::PyprojectEdited(id, Ok(())) => {
+            if let Some(i) = app.config.projects.iter().position(|p| p.id == id) {
+                return update(app, Message::SyncRequested(i), runner);
+            }
+        }
+        Message::PyprojectEdited(_, Err(e)) => crate::busy::push(
+            &mut app.toasts,
+            crate::busy::ToastKind::Warning,
+            format!("Could not update pyproject.toml: {e}"),
+            std::time::Instant::now(),
+        ),
         Message::MembersLoaded(i, fetch) if i < app.config.projects.len() => {
             app.members = Some((i, fetch));
         }
@@ -2535,31 +2766,8 @@ pub fn update(app: &mut App, message: Message, runner: Arc<dyn CommandRunner>) -
                 );
                 return Task::none();
             }
-            let Some(project) = app.config.projects.get(edit.project).cloned() else {
-                app.dep_edit = None;
-                return Task::none();
-            };
             app.dep_edit = None;
-            app.busy = Some(crate::busy::Busy::new(
-                project.id,
-                crate::busy::Action::InstallVersion(requirement.clone()),
-            ));
-            drawer::start(&mut app.drawer, format!("installing {requirement}..."));
-            let group = deps::uv_group(&edit.group);
-            let (pin, plan) = (active_pin(&project), sync_plan_for(app, edit.project));
-            return Task::stream(stream_in_project(
-                project,
-                app.config.clone(),
-                move |uv, ctx| {
-                    let add = uv::command::add(uv, ctx, &requirement, group.clone());
-                    dep_commands(uv, ctx, &pin, &plan, &DepOp::Add(add))
-                },
-                (
-                    "installing the version timed out",
-                    "installing the version failed unexpectedly",
-                ),
-                runner,
-            ));
+            return add_requirement(app, edit.project, requirement, edit.group, runner);
         }
         Message::SyncFinished { success, lines } => {
             let finished = app.busy.take();
@@ -2585,6 +2793,29 @@ pub fn update(app: &mut App, message: Message, runner: Arc<dyn CommandRunner>) -
                 None if success => "sync succeeded".to_string(),
                 None => "sync failed".to_string(),
             };
+            // The drawer was cleared when this command started, so its
+            // transcript is exactly this command's output.
+            let diagnosis = match &finished {
+                Some(b) if success => {
+                    app.last_failure.remove(&b.project_id);
+                    None
+                }
+                Some(b) => {
+                    let mut d = bombadil_core::doctor::diagnose(&drawer::transcript(&app.drawer));
+                    // These cannot be re-run from here: their input is gone.
+                    if matches!(
+                        b.action,
+                        crate::busy::Action::AddLocal(_) | crate::busy::Action::AddProject
+                    ) {
+                        d.fixes
+                            .retain(|f| *f != bombadil_core::doctor::DoctorFix::Retry);
+                    }
+                    app.last_failure
+                        .insert(b.project_id, (b.action.clone(), d.clone()));
+                    Some((b.project_id, d))
+                }
+                None => None,
+            };
             if finished.is_some() {
                 // The drawer stays as the user left it; a failure's toast
                 // carries "Show output" for the reason.
@@ -2595,9 +2826,21 @@ pub fn update(app: &mut App, message: Message, runner: Arc<dyn CommandRunner>) -
                     } else {
                         crate::busy::ToastKind::Failure
                     },
-                    status.clone(),
+                    // An unrecognised failure keeps the action's own words,
+                    // which at least name what failed.
+                    match &diagnosis {
+                        Some((_, d))
+                            if !matches!(d.kind, bombadil_core::doctor::Kind::Other { .. }) =>
+                        {
+                            d.sentence.clone()
+                        }
+                        _ => status.clone(),
+                    },
                     std::time::Instant::now(),
                 );
+                if let Some((id, d)) = diagnosis {
+                    app.toasts[0].fix = d.fixes.first().cloned().map(|fix| (id, fix));
+                }
             }
             drawer::set_idle(&mut app.drawer, status);
             // Nothing re-expands here any more. `set_idle` no longer
@@ -4164,6 +4407,14 @@ fn toast_layer<'a>(toasts: &[crate::busy::Toast]) -> iced::Element<'a, Message> 
         ]
         .spacing(theme::SPACE_2)
         .align_y(iced::Alignment::Center);
+        if let Some((project, fix)) = &toast.fix {
+            row = row.push(
+                iced::widget::button(iced::widget::text(fix_label(fix)).size(theme::LABEL))
+                    .on_press(Message::DoctorFixRequested(*project, fix.clone()))
+                    .padding([theme::SPACE_1, theme::SPACE_2])
+                    .style(theme::button_primary),
+            );
+        }
         if toast.kind == ToastKind::Failure {
             row = row.push(
                 iced::widget::button(iced::widget::text("Show output").size(theme::LABEL))
@@ -4327,6 +4578,189 @@ pub fn pointed_at(
 
 /// Starts `uv sync --upgrade[-package]` for `projects[i]`, if nothing else
 /// runs.
+/// `uv add <requirement>` into `group`, then the usual sync: the one path a
+/// version edit and the doctor's fixes install through.
+fn add_requirement(
+    app: &mut App,
+    i: usize,
+    requirement: String,
+    group: deps::GroupKind,
+    runner: Arc<dyn CommandRunner>,
+) -> Task<Message> {
+    let Some(project) = app.config.projects.get(i).cloned() else {
+        return Task::none();
+    };
+    if !can_start(app) {
+        return Task::none();
+    }
+    app.busy = Some(crate::busy::Busy::new(
+        project.id,
+        crate::busy::Action::InstallVersion(requirement.clone()),
+    ));
+    drawer::start(&mut app.drawer, format!("installing {requirement}..."));
+    let group = deps::uv_group(&group);
+    let (pin, plan) = (active_pin(&project), sync_plan_for(app, i));
+    Task::stream(stream_in_project(
+        project,
+        app.config.clone(),
+        move |uv, ctx| {
+            let add = uv::command::add(uv, ctx, &requirement, group.clone());
+            dep_commands(uv, ctx, &pin, &plan, &DepOp::Add(add))
+        },
+        (
+            "installing the version timed out",
+            "installing the version failed unexpectedly",
+        ),
+        runner,
+    ))
+}
+
+/// The group `requirement`'s package is declared in on project `i`'s
+/// Dependencies tab; `None` when it is not declared or the tab is not loaded.
+fn declared_group(app: &App, i: usize, requirement: &str) -> Option<deps::GroupKind> {
+    let key = deps::normalise(requirement_name(requirement));
+    match &app.deps {
+        Some((index, Ok(tab))) if *index == i => tab
+            .groups
+            .iter()
+            .find(|g| {
+                g.rows
+                    .iter()
+                    .any(|r| r.declared && deps::normalise(&r.name) == key)
+            })
+            .map(|g| g.kind.clone()),
+        _ => None,
+    }
+}
+
+/// The package a requirement such as `six==9.9` names.
+fn requirement_name(requirement: &str) -> &str {
+    requirement
+        .split(|c: char| !(c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-')))
+        .next()
+        .unwrap_or(requirement)
+}
+
+/// Rewrites project `i`'s pyproject.toml with `edit` off the UI thread;
+/// `PyprojectEdited` then syncs, or says why nothing was written.
+fn edit_pyproject(
+    app: &App,
+    i: usize,
+    edit: impl FnOnce(&str) -> Result<String, String> + Send + 'static,
+) -> Task<Message> {
+    let Some((id, path)) = app
+        .config
+        .projects
+        .get(i)
+        .map(|p| (p.id, p.pyproject_path.clone()))
+    else {
+        return Task::none();
+    };
+    Task::perform(
+        async move {
+            job::run(
+                move || -> Result<(), String> {
+                    let text = std::fs::read_to_string(&path).map_err(|e| e.to_string())?;
+                    let out = edit(&text)?;
+                    bombadil_core::store::atomic::write_atomic(&path, &out)
+                        .map_err(|e| e.to_string())
+                },
+                VENV_PROBE_TIMEOUT,
+            )
+            .await
+        },
+        move |r| {
+            Message::PyprojectEdited(
+                id,
+                match r {
+                    job::JobResult::Done(r) => r,
+                    _ => Err("writing pyproject.toml timed out".into()),
+                },
+            )
+        },
+    )
+}
+
+pub fn fix_label(fix: &bombadil_core::doctor::DoctorFix) -> String {
+    use bombadil_core::doctor::DoctorFix;
+    match fix {
+        DoctorFix::LetUvPick(p) => format!("Let uv pick a {p} that fits"),
+        DoctorFix::RequirePython(spec) => format!("Require Python {spec}"),
+        DoctorFix::Retry => "Retry".into(),
+        DoctorFix::OpenIndexes => "Open Indexes".into(),
+        DoctorFix::ShowOutput => "Show output".into(),
+    }
+}
+
+fn apply_fix(
+    app: &mut App,
+    i: usize,
+    fix: bombadil_core::doctor::DoctorFix,
+    runner: Arc<dyn CommandRunner>,
+) -> Task<Message> {
+    use bombadil_core::doctor::DoctorFix;
+    match fix {
+        DoctorFix::OpenIndexes => {
+            app.tab = Tab::Indexes;
+            Task::none()
+        }
+        DoctorFix::ShowOutput => {
+            app.drawer.expanded = true;
+            Task::none()
+        }
+        DoctorFix::LetUvPick(package) => {
+            let failed_edit = app
+                .last_failure
+                .get(&app.config.projects[i].id)
+                .is_some_and(|(action, _)| match action {
+                    crate::busy::Action::InstallVersion(req) => {
+                        deps::normalise(requirement_name(req)) == deps::normalise(&package)
+                    }
+                    _ => false,
+                });
+            if failed_edit {
+                // A failed version edit never reached pyproject.toml, so the
+                // bare name is all uv needs.
+                let group = declared_group(app, i, &package).unwrap_or(deps::GroupKind::Main);
+                return add_requirement(app, i, package, group, runner);
+            }
+            // `uv add six` keeps a declared `six==9.9`, so the specifier is
+            // dropped in pyproject.toml itself and the sync lets uv choose.
+            edit_pyproject(app, i, move |text| {
+                bombadil_core::pyproject::loosen_requirement(text, &package)
+                    .map_err(|e| e.to_string())?
+                    .ok_or_else(|| {
+                        format!(
+                            "{package} isn't listed in pyproject.toml; another package asks for that version"
+                        )
+                    })
+            })
+        }
+        DoctorFix::RequirePython(spec) => edit_pyproject(app, i, move |text| {
+            bombadil_core::pyproject::set_requires_python(text, &spec).map_err(|e| e.to_string())
+        }),
+        DoctorFix::Retry => {
+            let action = app
+                .config
+                .projects
+                .get(i)
+                .and_then(|p| app.last_failure.get(&p.id))
+                .map(|(a, _)| a.clone());
+            match action {
+                Some(crate::busy::Action::Upgrade(name)) => start_upgrade(app, i, name, runner),
+                Some(crate::busy::Action::MembersSync) => {
+                    update(app, Message::MembersSyncRequested(i), runner)
+                }
+                Some(crate::busy::Action::InstallVersion(req)) => {
+                    let group = declared_group(app, i, &req).unwrap_or(deps::GroupKind::Main);
+                    add_requirement(app, i, req, group, runner)
+                }
+                _ => update(app, Message::SyncRequested(i), runner),
+            }
+        }
+    }
+}
+
 fn start_upgrade(
     app: &mut App,
     i: usize,
@@ -4395,6 +4829,40 @@ pub fn initial_size(layout: &bombadil_core::model::Layout) -> Option<iced::Size>
     })
 }
 
+/// The health findings for `projects[i]`, from what has been probed so far.
+pub fn project_findings(app: &App, i: usize) -> Vec<crate::health::Finding> {
+    let (Some(project), Some(entry)) = (app.config.projects.get(i), app.entries.get(i)) else {
+        return Vec::new();
+    };
+    let row = entry.environments.iter().find(|r| r.active);
+    let pr = app.github.get(&project.id).and_then(|s| match &s.lookup {
+        bombadil_core::github::Lookup::Found(status) => Some(status),
+        _ => None,
+    });
+    let unpinned = PythonPin::Unpinned;
+    crate::health::findings(&crate::health::Input {
+        python: row.and_then(|r| r.python_version.as_deref()),
+        requires_python: entry.requires_python.as_deref(),
+        pin: row.map_or(&unpinned, |r| &r.pin),
+        sync: app.sync_checks.get(&project.id),
+        git: entry.git.as_ref(),
+        pr,
+        installed: app.installed_pythons.as_deref(),
+    })
+}
+
+/// Projects a probe round sync-checks: all but the one a uv command is
+/// running on, which would read as out of step mid-sync.
+fn health_round_targets(app: &App) -> Vec<uuid::Uuid> {
+    let busy = app.busy.as_ref().map(|b| b.project_id);
+    app.config
+        .projects
+        .iter()
+        .map(|p| p.id)
+        .filter(|id| Some(*id) != busy)
+        .collect()
+}
+
 /// The header card's tiles for `projects[i]`, from what has been probed and
 /// fetched so far. Members and Git appear only when there are any.
 fn summary_tiles(
@@ -4423,6 +4891,10 @@ fn summary_tiles(
         label: "Environment",
         state: env_state,
         value,
+        note: project_findings(app, i)
+            .into_iter()
+            .find(|f| f.level == crate::health::Level::Note && f.text.starts_with("Python "))
+            .map(|f| f.text),
         press: None,
         sync: (pin_note.is_some() && can_start(app)).then_some(Message::SyncRequested(i)),
     }];
@@ -4436,6 +4908,7 @@ fn summary_tiles(
         label: "Dependencies",
         state,
         value,
+        note: None,
         press: Some(Message::TabSelected(Tab::Dependencies)),
         // The fix beside the signal: drift or missing packages, nothing busy.
         // Only for a real answer: "loading" and "unavailable" are not drift,
@@ -4463,6 +4936,7 @@ fn summary_tiles(
                 label: "Members",
                 state,
                 value,
+                note: None,
                 press: Some(Message::TabSelected(Tab::Members)),
                 sync: None,
             });
@@ -4477,7 +4951,38 @@ fn summary_tiles(
                 State::Drifted
             },
             value: detail::git_summary(git),
+            note: None,
             press: None,
+            sync: None,
+        });
+    }
+    let pr = app
+        .config
+        .projects
+        .get(i)
+        .and_then(|p| app.github.get(&p.id))
+        .and_then(|s| match &s.lookup {
+            bombadil_core::github::Lookup::Found(status) => Some(status),
+            _ => None,
+        });
+    if let Some(status) = pr {
+        let c = status.counts();
+        let (state, value) = if c.failed > 0 {
+            (
+                State::Drifted,
+                format!("{} of {} failed", c.failed, c.total),
+            )
+        } else if c.done < c.total {
+            (State::Absent, "running".to_string())
+        } else {
+            (State::Present, format!("all {} passed", c.total))
+        };
+        tiles.push(detail::Tile {
+            label: "Checks",
+            state,
+            value,
+            note: None,
+            press: Some(Message::TabSelected(Tab::GitHub)),
             sync: None,
         });
     }
@@ -5286,23 +5791,55 @@ pub fn dep_commands(
     op: &DepOp,
 ) -> Vec<bombadil_core::process::CommandSpec> {
     use members_editor::SyncPlan;
-    let python = |spec: bombadil_core::process::CommandSpec| match pin {
-        PythonPin::Version(version) => spec.args(["-p", version.as_str()]),
-        PythonPin::Unpinned => spec,
-    };
-    let sync = || {
-        python(match plan {
-            SyncPlan::Plain => uv::command::sync(uv, ctx),
-            SyncPlan::AllPackages => uv::command::sync_all_members(uv, ctx),
-            SyncPlan::Named(names) => uv::command::sync_members(uv, ctx, names),
-        })
-    };
+    let python = |spec: bombadil_core::process::CommandSpec| with_pin(spec, pin);
+    let sync = || sync_spec(uv, ctx, pin, plan);
     match op {
         DepOp::Upgrade(Some(name)) => vec![sync().args(["--upgrade-package", name.as_str()])],
         DepOp::Upgrade(None) => vec![sync().arg("--upgrade")],
         DepOp::Add(add) if *plan == SyncPlan::Plain => vec![python(add.clone())],
         DepOp::Add(add) => vec![add.clone().arg("--no-sync"), sync()],
     }
+}
+
+/// `spec` with the environment's pin, when it has one.
+fn with_pin(
+    spec: bombadil_core::process::CommandSpec,
+    pin: &PythonPin,
+) -> bombadil_core::process::CommandSpec {
+    match pin {
+        PythonPin::Version(version) => spec.args(["-p", version.as_str()]),
+        PythonPin::Unpinned => spec,
+    }
+}
+
+/// The sync Bombadil runs for this pin and member plan.
+fn sync_spec(
+    uv: &uv::ResolvedUv,
+    ctx: &uv::command::ProjectContext,
+    pin: &PythonPin,
+    plan: &members_editor::SyncPlan,
+) -> bombadil_core::process::CommandSpec {
+    use members_editor::SyncPlan;
+    with_pin(
+        match plan {
+            SyncPlan::Plain => uv::command::sync(uv, ctx),
+            SyncPlan::AllPackages => uv::command::sync_all_members(uv, ctx),
+            SyncPlan::Named(names) => uv::command::sync_members(uv, ctx, names),
+        },
+        pin,
+    )
+}
+
+/// Whether that same sync would change anything: the health probe asks
+/// about the sync the user would actually run, or it reports drift that
+/// Sync never clears.
+fn sync_check_spec(
+    uv: &uv::ResolvedUv,
+    ctx: &uv::command::ProjectContext,
+    pin: &PythonPin,
+    plan: &members_editor::SyncPlan,
+) -> bombadil_core::process::CommandSpec {
+    uv::command::as_check(sync_spec(uv, ctx, pin, plan))
 }
 
 /// How a Sync of `projects[i]` treats workspace members, from the Members
@@ -6343,6 +6880,11 @@ pub fn view(app: &App) -> iced::Element<'_, Message> {
                         .and_then(|row| row.python_version.as_ref())
                         .is_none()
                 }),
+                app.outdated
+                    .as_ref()
+                    .filter(|(j, _)| j == i)
+                    .and_then(|(_, r)| r.as_ref().ok())
+                    .map_or(&[][..], Vec::as_slice),
             ),
             _ => iced::widget::text("").into(),
         },
@@ -6396,6 +6938,39 @@ pub fn view(app: &App) -> iced::Element<'_, Message> {
                 app.config.settings.watch_github,
                 app.github_in_flight.contains(&project.id),
             ),
+            None => iced::widget::text("").into(),
+        },
+        Tab::Doctor => match app
+            .selected
+            .and_then(|i| app.config.projects.get(i).map(|p| (i, p.id)))
+        {
+            Some((i, id)) => {
+                let pinned: Vec<String> = match &app.deps {
+                    Some((j, Ok(tab))) if *j == i => tab
+                        .groups
+                        .iter()
+                        .flat_map(|g| &g.rows)
+                        .filter(|r| {
+                            r.constraint
+                                .as_deref()
+                                .is_some_and(|c| c.trim().starts_with("=="))
+                        })
+                        .map(|r| deps::normalise(&r.name))
+                        .collect(),
+                    _ => Vec::new(),
+                };
+                crate::doctor_tab::view(
+                    i,
+                    id,
+                    app.last_failure.get(&id).map(|(_, d)| d),
+                    app.outdated
+                        .as_ref()
+                        .filter(|(j, _)| *j == i)
+                        .map(|(_, r)| r),
+                    &pinned,
+                    waiting.is_none(),
+                )
+            }
             None => iced::widget::text("").into(),
         },
     };
@@ -6453,6 +7028,10 @@ pub fn view(app: &App) -> iced::Element<'_, Message> {
         // press and release together, before that subscription exists.
         .on_release(Message::DragEnded)
         .on_enter(Message::TabDragOver(tab));
+        let label: iced::Element<'_, Message> = match tab.term() {
+            Some(term) => crate::glossary::tip(label, term),
+            None => label.into(),
+        };
 
         let underline = iced::widget::container(
             iced::widget::Space::new()
@@ -6470,8 +7049,7 @@ pub fn view(app: &App) -> iced::Element<'_, Message> {
         });
 
         tab_bar = tab_bar.push(
-            iced::widget::Column::from_vec(vec![label.into(), underline.into()])
-                .spacing(theme::SPACE_1),
+            iced::widget::Column::from_vec(vec![label, underline.into()]).spacing(theme::SPACE_1),
         );
     }
 
@@ -6569,8 +7147,12 @@ pub fn view(app: &App) -> iced::Element<'_, Message> {
             .style(theme::text_muted)
             .into()
     } else {
+        let findings: Vec<Vec<crate::health::Finding>> = (0..app.entries.len())
+            .map(|i| project_findings(app, i))
+            .collect();
         iced::widget::scrollable(sidebar::view(
             &app.entries,
+            &findings,
             app.selected,
             app.busy
                 .as_ref()
@@ -6714,14 +7296,36 @@ pub fn view(app: &App) -> iced::Element<'_, Message> {
     // The drawer is pinned below the body rather than stacked inside it, with
     // a hairline above: a running command's transcript is the one thing that
     // must not move when the pane above it scrolls.
-    let frame = iced::widget::column![
+    // Above an open transcript, the doctor's reading of it and its fixes.
+    let doctor_header: Option<iced::Element<'_, Message>> =
+        app.selected.filter(|_| app.drawer.expanded).and_then(|i| {
+            let project_id = app.config.projects.get(i)?.id;
+            let (_, d) = app.last_failure.get(&project_id)?;
+            Some(
+                iced::widget::container(
+                    iced::widget::row![
+                        iced::widget::text(d.sentence.clone()).size(theme::BODY),
+                        crate::doctor_tab::fix_buttons(project_id, &d.fixes, waiting.is_none()),
+                    ]
+                    .spacing(theme::SPACE_3)
+                    .align_y(iced::Alignment::Center),
+                )
+                .padding([theme::SPACE_2, theme::SPACE_3])
+                .into(),
+            )
+        });
+    let mut frame = iced::widget::column![
         shell::topbar(app.open_menu),
         banner::view(&problems),
         body,
         theme::hairline_row(),
-        drawer::view(&app.drawer, waiting.map(str::to_string)),
-    ]
-    .height(iced::Length::Fill);
+    ];
+    if let Some(header) = doctor_header {
+        frame = frame.push(header);
+    }
+    let frame = frame
+        .push(drawer::view(&app.drawer, waiting.map(str::to_string)))
+        .height(iced::Length::Fill);
 
     // Layered, not appended. Every one of these used to be a row in this
     // column, so opening any of them shoved the whole application down the
@@ -7946,7 +8550,8 @@ mod tests {
                 Tab::Members,
                 Tab::EnvVars,
                 Tab::Indexes,
-                Tab::GitHub
+                Tab::GitHub,
+                Tab::Doctor
             ],
             "unknown and repeated keys go; missing tabs follow in built-in order"
         );
@@ -8931,6 +9536,184 @@ mod tests {
     }
 
     #[test]
+    fn the_sync_check_asks_about_the_sync_bombadil_would_run() {
+        use members_editor::SyncPlan;
+        let uv = uv::ResolvedUv {
+            path: PathBuf::from("/uv"),
+            origin: uv::UvOrigin::Bundled,
+            version: uv::UvVersion::parse("uv 0.12.19").unwrap(),
+            newer_than_bundled: false,
+        };
+        let ctx = uv::command::ProjectContext {
+            project_dir: PathBuf::from("/p"),
+            venv_path: PathBuf::from("/p/.venv"),
+        };
+        let pinned = PythonPin::Version("3.14".into());
+        assert_eq!(
+            sync_check_spec(&uv, &ctx, &pinned, &SyncPlan::AllPackages).args,
+            [
+                "sync",
+                "--all-packages",
+                "-p",
+                "3.14",
+                "--check",
+                "--frozen",
+                "--offline"
+            ]
+        );
+        assert_eq!(
+            sync_check_spec(&uv, &ctx, &PythonPin::Unpinned, &SyncPlan::Plain).args,
+            ["sync", "--check", "--frozen", "--offline"]
+        );
+    }
+
+    #[test]
+    fn sync_checks_and_pythons_are_kept() {
+        use bombadil_core::uv::results::SyncCheck;
+        let mut app = one_project();
+        let id = app.config.projects[0].id;
+        let _ = update(
+            &mut app,
+            Message::SyncChecked {
+                id,
+                check: SyncCheck::NoEnvironment,
+            },
+            unused_runner(),
+        );
+        assert_eq!(app.sync_checks.get(&id), Some(&SyncCheck::NoEnvironment));
+        let _ = update(
+            &mut app,
+            Message::PythonsListed(Some(vec!["3.14.7".into()])),
+            unused_runner(),
+        );
+        assert_eq!(app.installed_pythons, Some(vec!["3.14.7".to_string()]));
+        let texts: Vec<String> = project_findings(&app, 0)
+            .into_iter()
+            .map(|f| f.text)
+            .collect();
+        assert_eq!(texts, ["No environment yet"]);
+    }
+
+    #[test]
+    fn a_sync_check_for_a_removed_project_is_dropped() {
+        use bombadil_core::uv::results::SyncCheck;
+        let mut app = one_project();
+        let _ = update(
+            &mut app,
+            Message::SyncChecked {
+                id: uuid::Uuid::new_v4(),
+                check: SyncCheck::InSync,
+            },
+            unused_runner(),
+        );
+        assert!(app.sync_checks.is_empty());
+    }
+
+    #[test]
+    fn a_busy_project_is_not_sync_checked() {
+        let mut app = one_project();
+        let id = app.config.projects[0].id;
+        assert_eq!(health_round_targets(&app), vec![id]);
+        app.busy = Some(crate::busy::Busy::new(id, crate::busy::Action::Sync));
+        assert!(health_round_targets(&app).is_empty());
+    }
+
+    #[test]
+    fn project_findings_read_the_default_environment() {
+        let mut app = one_project();
+        app.entries[0].requires_python = Some(">=3.12".into());
+        app.entries[0].environments[0].python_version = Some("3.11.2".into());
+        let texts: Vec<String> = project_findings(&app, 0)
+            .into_iter()
+            .map(|f| f.text)
+            .collect();
+        assert_eq!(texts, ["Python 3.11.2, but pyproject.toml needs >=3.12"]);
+        assert!(
+            project_findings(&app, 99).is_empty(),
+            "out of range is nothing"
+        );
+    }
+
+    #[test]
+    fn the_environment_tile_carries_the_newer_python_note() {
+        let mut app = one_project();
+        app.entries[0].environments[0].active = true;
+        app.entries[0].environments[0].python_version = Some("3.12.4".into());
+        app.installed_pythons = Some(vec!["3.14.7".into()]);
+        let header = detail::Header {
+            label: "api".into(),
+            path: "/p/api".into(),
+            venv_status: detail::VenvStatus::Present,
+            python_version: Some("3.12.4".into()),
+            venv_path: None,
+            git: None,
+        };
+        let env = summary_tiles(&app, 0, &header, app.entries.first())
+            .into_iter()
+            .find(|t| t.label == "Environment")
+            .unwrap();
+        assert_eq!(
+            env.note.as_deref(),
+            Some("Python 3.14 is installed and allowed; this environment uses 3.12")
+        );
+    }
+
+    #[test]
+    fn a_checks_tile_appears_only_with_a_pull_request() {
+        use bombadil_core::github::{Check, CheckState, Lookup, PrStatus, PullRequest};
+        let mut app = one_project();
+        let header = detail::Header {
+            label: "api".into(),
+            path: "/p/api".into(),
+            venv_status: detail::VenvStatus::Present,
+            python_version: None,
+            venv_path: None,
+            git: None,
+        };
+        let checks = |app: &App| {
+            summary_tiles(app, 0, &header, app.entries.first())
+                .into_iter()
+                .find(|t| t.label == "Checks")
+        };
+        assert!(checks(&app).is_none());
+        let check = |state| Check {
+            name: "t".into(),
+            workflow: None,
+            state,
+            url: None,
+            started: None,
+            completed: None,
+        };
+        let status = PrStatus {
+            pr: PullRequest {
+                number: 12,
+                title: "x".into(),
+                url: "https://github.com/o/r/pull/12".into(),
+                draft: false,
+                head_branch: "f".into(),
+                base_branch: "main".into(),
+                head_sha: "abc".into(),
+            },
+            checks: vec![check(CheckState::Failed), check(CheckState::Passed)],
+        };
+        app.github.insert(
+            app.config.projects[0].id,
+            crate::github_tab::GitHubState {
+                lookup: Lookup::Found(status),
+                last_found: None,
+                checked_at: std::time::Instant::now(),
+            },
+        );
+        let tile = checks(&app).expect("a Checks tile");
+        assert_eq!(tile.value, "1 of 2 failed");
+        assert_eq!(tile.state, theme::State::Drifted);
+        assert!(matches!(
+            tile.press,
+            Some(Message::TabSelected(Tab::GitHub))
+        ));
+    }
+
+    #[test]
     fn shortcuts_name_the_selected_project_when_allowed() {
         use crate::shortcuts::Shortcut;
         let mut app = one_project();
@@ -9495,8 +10278,8 @@ mod tests {
         }
         assert_eq!(
             Tab::ALL.len(),
-            6,
-            "Dependencies, Members, Env vars, Scripts, Indexes, GitHub -- and Settings \
+            7,
+            "Dependencies, Members, Env vars, Scripts, Indexes, GitHub, Doctor -- and Settings \
              deliberately not, since it has no per-project half"
         );
     }
@@ -15043,8 +15826,9 @@ mod tests {
         );
         assert_eq!(
             alongside.units(),
-            5,
-            "the persist plus one venv and one git probe per project; got {}",
+            8,
+            "the persist, one venv, git and sync-check probe per project, and \
+             one Python listing; got {}",
             alongside.units()
         );
 
@@ -15055,7 +15839,7 @@ mod tests {
         );
         assert_eq!(
             picked.units(),
-            5,
+            8,
             "picking a central folder must re-probe too; got {}",
             picked.units()
         );
@@ -15583,9 +16367,9 @@ mod tests {
     }
 
     #[test]
-    fn the_github_tab_has_a_stable_key_and_comes_last_by_default() {
+    fn the_github_tab_has_a_stable_key_and_comes_before_the_doctor_by_default() {
         assert_eq!(Tab::GitHub.key(), "github");
-        assert_eq!(*tab_order(&[]).last().unwrap(), Tab::GitHub);
+        assert_eq!(tab_order(&[]).iter().rev().nth(1), Some(&Tab::GitHub));
     }
 
     #[test]
@@ -15733,6 +16517,17 @@ mod tests {
     }
 
     #[test]
+    fn jargon_tabs_explain_their_term() {
+        use crate::glossary::Term;
+        assert_eq!(Tab::Dependencies.term(), Some(Term::Dependency));
+        assert_eq!(Tab::Members.term(), Some(Term::Member));
+        assert_eq!(Tab::EnvVars.term(), Some(Term::EnvVars));
+        assert_eq!(Tab::Indexes.term(), Some(Term::Index));
+        assert_eq!(Tab::Scripts.term(), None);
+        assert_eq!(Tab::GitHub.term(), None);
+    }
+
+    #[test]
     fn adding_a_github_account_shows_its_code_then_selects_it() {
         use crate::github_tab::GitHubLogin;
         let mut app = App::new(Config::default());
@@ -15875,5 +16670,361 @@ mod tests {
             active: bombadil_core::model::VenvLocation::Alongside,
             ..bombadil_core::model::Project::default()
         }
+    }
+
+    fn fail(app: &mut App, transcript: &str) {
+        let id = app.config.projects[0].id;
+        fail_with(app, id, crate::busy::Action::Sync, transcript);
+    }
+
+    fn fail_with(app: &mut App, id: uuid::Uuid, action: crate::busy::Action, transcript: &str) {
+        app.busy = Some(crate::busy::Busy::new(id, action));
+        drawer::start(&mut app.drawer, "syncing...".into());
+        let _ = update(
+            app,
+            Message::SyncFinished {
+                success: false,
+                lines: transcript.lines().map(String::from).collect(),
+            },
+            unused_runner(),
+        );
+    }
+
+    #[test]
+    fn a_failure_is_diagnosed_in_plain_words() {
+        let mut app = one_project();
+        fail(
+            &mut app,
+            include_str!("../../bombadil-core/src/doctor/fixtures/no_version.txt"),
+        );
+        let id = app.config.projects[0].id;
+        let (action, d) = app.last_failure.get(&id).expect("a diagnosis");
+        assert_eq!(*action, crate::busy::Action::Sync);
+        assert_eq!(d.sentence, "six has no version matching ==9.9");
+        assert_eq!(app.toasts[0].text, "six has no version matching ==9.9");
+        assert_eq!(
+            app.toasts[0].fix,
+            Some((
+                id,
+                bombadil_core::doctor::DoctorFix::LetUvPick("six".into())
+            ))
+        );
+    }
+
+    #[test]
+    fn success_clears_the_diagnosis() {
+        let mut app = one_project();
+        fail(&mut app, "error: boom\n");
+        let id = app.config.projects[0].id;
+        app.busy = Some(crate::busy::Busy::new(id, crate::busy::Action::Sync));
+        let _ = update(
+            &mut app,
+            Message::SyncFinished {
+                success: true,
+                lines: vec![],
+            },
+            unused_runner(),
+        );
+        assert!(app.last_failure.is_empty());
+    }
+
+    #[test]
+    fn diagnoses_are_kept_per_project() {
+        let mut app = App::new(Config {
+            projects: vec![project("a"), project("b")],
+            ..Config::default()
+        });
+        fail(&mut app, "error: first\n");
+        let b = app.config.projects[1].id;
+        fail_with(&mut app, b, crate::busy::Action::Sync, "error: second\n");
+        assert_eq!(app.last_failure.len(), 2);
+        let a = app.config.projects[0].id;
+        assert_eq!(app.last_failure[&a].1.sentence, "uv couldn't finish: first");
+        assert_eq!(
+            app.last_failure[&b].1.sentence,
+            "uv couldn't finish: second"
+        );
+    }
+
+    #[test]
+    fn a_failed_outdated_lookup_is_kept_as_its_reason() {
+        let mut app = one_project();
+        app.selected = Some(0);
+        let _ = update(
+            &mut app,
+            Message::OutdatedLoaded(0, Err("offline".into())),
+            unused_runner(),
+        );
+        assert_eq!(app.outdated, Some((0, Err("offline".into()))));
+    }
+
+    #[test]
+    fn each_fix_maps_to_an_existing_action() {
+        use bombadil_core::doctor::DoctorFix;
+        let mut app = one_project();
+        app.selected = Some(0);
+        let id = first_id(&app);
+        let _ = update(
+            &mut app,
+            Message::DoctorFixRequested(id, DoctorFix::OpenIndexes),
+            unused_runner(),
+        );
+        assert_eq!(app.tab, Tab::Indexes);
+        let _ = update(
+            &mut app,
+            Message::DoctorFixRequested(id, DoctorFix::ShowOutput),
+            unused_runner(),
+        );
+        assert!(app.drawer.expanded);
+        assert_eq!(
+            fix_label(&DoctorFix::RequirePython(">=3.11".into())),
+            "Require Python >=3.11"
+        );
+        assert_eq!(
+            fix_label(&DoctorFix::LetUvPick("numpy".into())),
+            "Let uv pick a numpy that fits"
+        );
+    }
+
+    #[test]
+    fn retry_runs_the_failed_sync_again() {
+        use bombadil_core::doctor::DoctorFix;
+        let mut app = one_project();
+        fail(
+            &mut app,
+            include_str!("../../bombadil-core/src/doctor/fixtures/network.txt"),
+        );
+        let id = first_id(&app);
+        let _ = update(
+            &mut app,
+            Message::DoctorFixRequested(id, DoctorFix::Retry),
+            unused_runner(),
+        );
+        assert_eq!(
+            app.busy.as_ref().map(|b| b.action.clone()),
+            Some(crate::busy::Action::Sync)
+        );
+    }
+
+    #[test]
+    fn retry_reruns_an_upgrade() {
+        use bombadil_core::doctor::DoctorFix;
+        let mut app = one_project();
+        let id = app.config.projects[0].id;
+        fail_with(
+            &mut app,
+            id,
+            crate::busy::Action::Upgrade(Some("six".into())),
+            "error: boom\n",
+        );
+        let id = first_id(&app);
+        let _ = update(
+            &mut app,
+            Message::DoctorFixRequested(id, DoctorFix::Retry),
+            unused_runner(),
+        );
+        assert_eq!(
+            app.busy.as_ref().map(|b| b.action.clone()),
+            Some(crate::busy::Action::Upgrade(Some("six".into())))
+        );
+    }
+
+    #[test]
+    fn the_doctor_tab_has_a_stable_key_and_a_place() {
+        assert_eq!(Tab::Doctor.key(), "doctor");
+        assert_eq!(Tab::Doctor.label(), "Doctor");
+        assert!(tab_order(&[]).contains(&Tab::Doctor));
+        assert_eq!(*Tab::ALL.last().unwrap(), Tab::Doctor);
+    }
+
+    #[test]
+    fn update_pin_installs_the_latest() {
+        let mut app = one_project();
+        let _ = update(
+            &mut app,
+            Message::DoctorPinRequested(0, "six==1.17.0".into()),
+            unused_runner(),
+        );
+        assert_eq!(
+            app.busy.as_ref().map(|b| b.action.clone()),
+            Some(crate::busy::Action::InstallVersion("six==1.17.0".into()))
+        );
+    }
+
+    #[test]
+    fn only_a_declared_package_is_replaced() {
+        let mut app = one_project();
+        let row = |name: &str, constraint: Option<&str>, declared| deps::DepRow {
+            name: name.into(),
+            constraint: constraint.map(Into::into),
+            version: None,
+            declared,
+        };
+        app.deps = Some((
+            0,
+            Ok(deps::DepsTab {
+                groups: vec![deps::DepGroup {
+                    kind: deps::GroupKind::Group("dev".into()),
+                    rows: vec![row("Six", Some("==9.9"), true), row("certifi", None, false)],
+                }],
+                graph: None,
+                tree_note: None,
+            }),
+        ));
+        assert_eq!(
+            declared_group(&app, 0, "six"),
+            Some(deps::GroupKind::Group("dev".into()))
+        );
+        assert_eq!(
+            declared_group(&app, 0, "six==1.17.0"),
+            Some(deps::GroupKind::Group("dev".into()))
+        );
+        assert_eq!(
+            declared_group(&app, 0, "certifi"),
+            None,
+            "installed, not declared"
+        );
+        assert_eq!(
+            declared_group(&app, 1, "six"),
+            None,
+            "another project's tab"
+        );
+    }
+
+    #[test]
+    fn pressing_a_toasts_fix_dismisses_that_toast() {
+        use bombadil_core::doctor::DoctorFix;
+        let mut app = one_project();
+        fail(
+            &mut app,
+            include_str!("../../bombadil-core/src/doctor/fixtures/network.txt"),
+        );
+        assert_eq!(app.toasts[0].fix, Some((first_id(&app), DoctorFix::Retry)));
+        let id = first_id(&app);
+        let _ = update(
+            &mut app,
+            Message::DoctorFixRequested(id, DoctorFix::Retry),
+            unused_runner(),
+        );
+        assert!(app.toasts.iter().all(|t| t.fix.is_none()));
+    }
+
+    #[test]
+    fn a_fix_while_busy_starts_nothing_and_keeps_its_toast() {
+        use bombadil_core::doctor::DoctorFix;
+        let mut app = one_project();
+        let id = first_id(&app);
+        fail(
+            &mut app,
+            include_str!("../../bombadil-core/src/doctor/fixtures/python.txt"),
+        );
+        app.busy = Some(crate::busy::Busy::new(id, crate::busy::Action::Sync));
+        for fix in [
+            DoctorFix::Retry,
+            DoctorFix::LetUvPick("numpy".into()),
+            DoctorFix::RequirePython(">=3.11".into()),
+        ] {
+            let task = update(
+                &mut app,
+                Message::DoctorFixRequested(id, fix),
+                unused_runner(),
+            );
+            assert_eq!(task.units(), 0);
+        }
+        assert_eq!(
+            app.busy.as_ref().map(|b| b.action.clone()),
+            Some(crate::busy::Action::Sync)
+        );
+        assert!(app.toasts[0].fix.is_some(), "the toast stays for later");
+    }
+
+    #[test]
+    fn a_toasts_fix_follows_its_project_when_the_list_changes() {
+        let mut app = two_projects();
+        let b = app.config.projects[1].id;
+        fail_with(
+            &mut app,
+            b,
+            crate::busy::Action::Sync,
+            include_str!("../../bombadil-core/src/doctor/fixtures/network.txt"),
+        );
+        let (project, fix) = app.toasts[0].fix.clone().expect("a fix");
+        app.config.projects.remove(0);
+        app.entries.remove(0);
+        let _ = update(
+            &mut app,
+            Message::DoctorFixRequested(project, fix),
+            unused_runner(),
+        );
+        assert_eq!(app.busy.as_ref().map(|x| x.project_id), Some(b));
+    }
+
+    #[test]
+    fn letting_uv_pick_after_a_failed_edit_adds_the_bare_name() {
+        use bombadil_core::doctor::DoctorFix;
+        let mut app = one_project();
+        let id = first_id(&app);
+        fail_with(
+            &mut app,
+            id,
+            crate::busy::Action::InstallVersion("six==9.9".into()),
+            include_str!("../../bombadil-core/src/doctor/fixtures/no_version.txt"),
+        );
+        let _ = update(
+            &mut app,
+            Message::DoctorFixRequested(id, DoctorFix::LetUvPick("six".into())),
+            unused_runner(),
+        );
+        assert_eq!(
+            app.busy.as_ref().map(|b| b.action.clone()),
+            Some(crate::busy::Action::InstallVersion("six".into()))
+        );
+    }
+
+    #[test]
+    fn letting_uv_pick_after_a_failed_sync_edits_pyproject_first() {
+        use bombadil_core::doctor::DoctorFix;
+        let mut app = one_project();
+        let id = first_id(&app);
+        fail(
+            &mut app,
+            include_str!("../../bombadil-core/src/doctor/fixtures/no_version.txt"),
+        );
+        let task = update(
+            &mut app,
+            Message::DoctorFixRequested(id, DoctorFix::LetUvPick("six".into())),
+            unused_runner(),
+        );
+        assert!(
+            app.busy.is_none(),
+            "no uv command until pyproject.toml is edited"
+        );
+        assert!(task.units() > 0);
+    }
+
+    #[test]
+    fn a_stale_outdated_result_is_ignored() {
+        let mut app = two_projects();
+        app.selected = Some(1);
+        let _ = update(
+            &mut app,
+            Message::OutdatedLoaded(0, Ok(vec![])),
+            unused_runner(),
+        );
+        assert_eq!(app.outdated, None);
+    }
+
+    #[test]
+    fn a_failed_local_add_offers_no_retry() {
+        let mut app = one_project();
+        let id = first_id(&app);
+        fail_with(
+            &mut app,
+            id,
+            crate::busy::Action::AddLocal("lib".into()),
+            include_str!("../../bombadil-core/src/doctor/fixtures/network.txt"),
+        );
+        assert!(app.last_failure[&id].1.fixes.is_empty());
+        assert_eq!(app.toasts[0].fix, None);
     }
 }

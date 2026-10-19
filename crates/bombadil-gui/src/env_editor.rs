@@ -559,12 +559,13 @@ pub fn project_view<'a>(
         .map(|over| over.key)
         .collect();
     if !config.global_env.is_empty() {
-        column = column.push(
+        column = column.push(crate::glossary::tip(
             iced::widget::text("Inherited from global")
                 .font(theme::FONT_PROSE_SEMIBOLD)
                 .size(theme::LABEL)
                 .style(theme::text_muted),
-        );
+            crate::glossary::Term::Inherited,
+        ));
         for var in &config.global_env {
             let overridden = shadowed.contains(&var.key);
             let mut line = iced::widget::row![
