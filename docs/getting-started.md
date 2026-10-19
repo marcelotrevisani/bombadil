@@ -81,6 +81,8 @@ The buttons at the top right of a project are, from left to right:
 - **Folder**: opens the project folder in your file manager.
 - **PC**: opens the project in PyCharm, with the environment set as its
   interpreter. See [Terminals and PyCharm](terminals-pycharm.md).
+- **Ju**: starts JupyterLab with the environment. See
+  [Running code](running.md#jupyter).
 - **>_**: opens a terminal in the project folder with the environment
   activated. The shortcut is ++ctrl+t++.
 - **Sync**: runs `uv sync`, as in step 3.

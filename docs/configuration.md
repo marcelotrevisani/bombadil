@@ -22,6 +22,9 @@ schema_version = 2
 [settings]
 theme = "system"            # "system" | "light" | "dark"
 close_to_tray = true
+watch_github = true         # look up each project's pull request
+check_vulnerabilities = true  # ask osv.dev about installed packages
+just_source = "auto"        # "auto" | "bundled" | "from_path"
 # pycharm = "/opt/pycharm/bin/pycharm.sh"   # omit to detect automatically
 
 [settings.uv_source]

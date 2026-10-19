@@ -50,12 +50,11 @@ enter the one-time code at [github.com/login/device](https://github.com/login/de
 and approve Bombadil. GitHub asks for the `repo` scope, which private
 repositories need; Bombadil only reads with it. **Remove** signs out.
 
-Or add a personal access token in **Settings › GitHub pull
-requests**. A fine-grained token with read-only access to *Pull requests*,
-*Checks* and *Commit statuses* is enough. Either token is stored in the system keychain,
+Or add a personal access token in **Settings › GitHub pull requests**. A
+fine-grained token with read-only access to *Pull requests*, *Checks* and
+*Commit statuses* is enough. Either token is stored in the system keychain,
 never in the configuration file, and only github.com is reached this way.
-
-Bombadil never changes anything on GitHub.
+Bombadil only reads from GitHub; it never changes anything there.
 
 ## Turning it off
 

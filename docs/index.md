@@ -34,7 +34,11 @@ terminal and PyCharm with the environment activated.
 - Set environment variables globally or per project. Secrets live in your OS
   keychain and are never written to the config file.
 - Use private package indexes, with their credentials kept in the keychain.
-- Open a terminal or PyCharm with the environment already activated.
+- Run a project's entry points, just recipes and saved commands inside its
+  environment, with the output right under the button you pressed. just comes
+  bundled, so it doesn't need installing.
+- Open a terminal, PyCharm or JupyterLab with the environment already
+  activated.
 - Close the window and keep Bombadil in the system tray, which has a menu for
   every project.
 
