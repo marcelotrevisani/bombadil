@@ -30,6 +30,7 @@ mod about;
 mod add_local;
 mod add_project;
 mod app;
+mod backup_panel;
 mod banner;
 mod busy;
 mod context_menu;
@@ -257,6 +258,7 @@ pub fn run() -> iced::Result {
             // need a `Store`; the real one, opened alongside `loaded` below,
             // replaces it here for the actual app.
             state.persist = persist.clone();
+            state.path_exists = |path| path.exists();
             state.tray_is_running = tray_is_running;
             let open = app::open_window(&state);
             (state, iced::Task::batch([task, open]))

@@ -68,6 +68,20 @@ where
     }
 }
 
+/// [`run`] for work that answers `Result<T, String>`: a timeout or a panic
+/// becomes the error "<what> timed out" or "<what> failed unexpectedly".
+pub async fn attempt<T, F>(work: F, timeout: Duration, what: &str) -> Result<T, String>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Result<T, String> + Send + 'static,
+{
+    match run(work, timeout).await {
+        JobResult::Done(result) => result,
+        JobResult::TimedOut => Err(format!("{what} timed out")),
+        JobResult::Failed => Err(format!("{what} failed unexpectedly")),
+    }
+}
+
 /// Run blocking work that produces items as it goes, off the render thread,
 /// and deliver each one as it is produced.
 ///
@@ -116,6 +130,27 @@ mod tests {
     use super::*;
     use futures::StreamExt;
     use std::time::Duration;
+
+    #[test]
+    fn attempt_words_a_timeout_and_a_panic() {
+        let ok = pollster_block(attempt(|| Ok::<_, String>(1), Duration::from_secs(5), "x"));
+        assert_eq!(ok, Ok(1));
+        let slow = pollster_block(attempt(
+            || {
+                std::thread::sleep(Duration::from_millis(200));
+                Ok::<(), String>(())
+            },
+            Duration::from_millis(10),
+            "reading dependencies",
+        ));
+        assert_eq!(slow, Err("reading dependencies timed out".to_string()));
+        let boom = pollster_block(attempt(
+            || -> Result<(), String> { panic!("boom") },
+            Duration::from_secs(5),
+            "exporting",
+        ));
+        assert_eq!(boom, Err("exporting failed unexpectedly".to_string()));
+    }
 
     #[test]
     fn work_that_finishes_returns_its_value() {

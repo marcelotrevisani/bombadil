@@ -50,12 +50,14 @@ pub enum Section {
     EnvVars,
     Indexes,
     GitHub,
+    /// Export this setup to a file, or import one: moving computers.
+    Backup,
 }
 
 impl Section {
     /// Every section, in the order the list renders them: the four that decide
     /// how an environment is built and opened first, then the two lists.
-    pub const ALL: [Section; 10] = [
+    pub const ALL: [Section; 11] = [
         Section::Appearance,
         Section::Environments,
         Section::Python,
@@ -66,6 +68,7 @@ impl Section {
         Section::EnvVars,
         Section::Indexes,
         Section::GitHub,
+        Section::Backup,
     ];
 
     /// The Settings menu's wording, which has room to name the thing a user
@@ -83,6 +86,7 @@ impl Section {
             Section::EnvVars => "Environment variables",
             Section::Indexes => "Package indexes and auth",
             Section::GitHub => "GitHub pull requests",
+            Section::Backup => "Move to another computer",
         }
     }
 
@@ -98,6 +102,7 @@ impl Section {
             Section::EnvVars => "Env vars",
             Section::Indexes => "Indexes",
             Section::GitHub => "GitHub",
+            Section::Backup => "Backup",
         }
     }
 }
@@ -186,7 +191,8 @@ pub fn inherited_label(section: Section, config: &Config, os: Os) -> String {
         | Section::Scripts
         | Section::EnvVars
         | Section::Indexes
-        | Section::GitHub => String::new(),
+        | Section::GitHub
+        | Section::Backup => String::new(),
     }
 }
 
@@ -214,6 +220,7 @@ pub fn view<'a>(
     github_source: Option<&String>,
     github_accounts: Option<&Vec<bombadil_core::github::gh::Account>>,
     github_login: Option<&crate::github_tab::GitHubLogin>,
+    backup: &'a crate::backup_panel::State,
 ) -> iced::Element<'a, Message> {
     let selected_project = match scope {
         Scope::Global => None,
@@ -283,6 +290,7 @@ pub fn view<'a>(
             github_accounts,
             github_login,
         ),
+        (Section::Backup, _) => crate::backup_panel::view(backup),
     };
 
     let card = iced::widget::container(
