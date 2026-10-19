@@ -57,9 +57,25 @@ pub fn format_size(bytes: u64) -> String {
 }
 
 /// `path` as the filesystem resolves it -- links followed, case and `..`
-/// settled -- or as written when it can't be resolved.
-fn resolved(path: &Path) -> PathBuf {
-    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+/// settled. A path that doesn't exist yet (an environment never created)
+/// resolves its deepest existing folder and keeps the rest as written, so
+/// it still compares with folders that do exist: on macOS `/var` is
+/// `/private/var`, and Windows adds `\\?\` to every resolved path.
+pub fn resolved(path: &Path) -> PathBuf {
+    let mut existing = path;
+    let mut rest = Vec::new();
+    loop {
+        if let Ok(real) = std::fs::canonicalize(existing) {
+            return rest.iter().rev().fold(real, |acc, part| acc.join(part));
+        }
+        match (existing.parent(), existing.file_name()) {
+            (Some(parent), Some(name)) => {
+                rest.push(name.to_os_string());
+                existing = parent;
+            }
+            _ => return path.to_path_buf(),
+        }
+    }
 }
 
 /// Whether `folder` must never be treated as a leftover: it is a project
@@ -200,6 +216,20 @@ mod tests {
         let link = holder.path().join("link");
         std::os::unix::fs::symlink(real.path(), &link).unwrap();
         assert!(leftovers(&link, &[real.path().join("foo")]).is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_registered_env_not_created_yet_still_protects_its_folder() {
+        // The folder resolves (through the link) but the env inside it does
+        // not exist, so it can't be resolved the same way -- the case
+        // macOS (/var -> /private/var) and Windows (\\?\) hit on every path.
+        let real = tempfile::tempdir().unwrap();
+        venv(&real.path().join("tool"));
+        let holder = tempfile::tempdir().unwrap();
+        let link = holder.path().join("link");
+        std::os::unix::fs::symlink(real.path(), &link).unwrap();
+        assert!(leftovers(&link, &[link.join("tool").join(".venv")]).is_empty());
     }
 
     #[test]

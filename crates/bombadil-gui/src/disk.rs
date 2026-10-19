@@ -67,10 +67,7 @@ pub fn freed_text(before: u64, after: u64) -> String {
     }
 }
 
-/// `path` as the filesystem resolves it, or as written.
-fn resolved(path: &std::path::Path) -> PathBuf {
-    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
-}
+use bombadil_core::housekeeping::resolved;
 
 /// Every registered environment's folder, with the project and location it
 /// belongs to.
