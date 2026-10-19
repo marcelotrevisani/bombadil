@@ -93,7 +93,7 @@ pub fn diagnose(transcript: &str) -> Diagnosis {
         let package = transcript
             .split_once("The `requires-python` value (")
             .and_then(|(_, hint)| hint.split_once("(e.g., "))
-            .map(|(_, rest)| package_name(rest.strip_prefix("all of:\n").unwrap_or(rest)))
+            .map(|(_, rest)| package_name(rest.strip_prefix("all of:").unwrap_or(rest)))
             .filter(|p| !p.is_empty());
         if let Some(package) = package {
             return d(
@@ -207,6 +207,15 @@ mod tests {
                 DoctorFix::RequirePython(">=3.11".into())
             ]
         );
+    }
+
+    #[test]
+    fn windows_line_endings_still_name_the_package() {
+        let crlf = fixture("python").replace('\n', "\r\n");
+        assert!(matches!(
+            diagnose(&crlf).kind,
+            Kind::NeedsNewerPython { package, .. } if package == "numpy"
+        ));
     }
 
     #[test]
