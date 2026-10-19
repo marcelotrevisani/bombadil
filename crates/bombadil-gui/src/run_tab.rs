@@ -120,6 +120,8 @@ pub const MAX_LINES: usize = 2000;
 #[derive(Debug, Clone)]
 pub struct Run {
     pub label: String,
+    /// Which button started it: the output shows under it.
+    pub spot: Spot,
     pub lines: Vec<String>,
     pub started: std::time::Instant,
     pub cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
@@ -225,6 +227,43 @@ fn elapsed(d: std::time::Duration) -> String {
     }
 }
 
+/// `uv run` arguments for Jupyter Lab from a temporary install, so the
+/// project's dependencies don't change.
+pub fn jupyter_args() -> Vec<String> {
+    ["--with", "jupyterlab", "jupyter", "lab"]
+        .map(String::from)
+        .to_vec()
+}
+
+/// Where on the tab a run was started, so its output shows right there.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Spot {
+    /// Above everything: where a run goes when its button is gone.
+    Top,
+    EntryPoints,
+    /// A just recipe, by name.
+    Recipe(String),
+    /// A saved command, by its command text.
+    Command(String),
+}
+
+/// Where the output goes: `spot` if that button is still on the tab,
+/// otherwise the top, so output never goes missing.
+pub fn placed(
+    spot: Spot,
+    entry_points: &[String],
+    recipes: &[String],
+    commands: &[bombadil_core::model::SavedCommand],
+) -> Spot {
+    let there = match &spot {
+        Spot::Top => true,
+        Spot::EntryPoints => !entry_points.is_empty(),
+        Spot::Recipe(name) => recipes.contains(name),
+        Spot::Command(command) => commands.iter().any(|c| c.command == *command),
+    };
+    if there { spot } else { Spot::Top }
+}
+
 /// The Run tab. Deliberately dumb: what it shows is decided in `app`.
 // Every input is something the tab shows; the same allowance
 // `preferences::view` takes.
@@ -243,10 +282,11 @@ pub fn view<'a>(
     use crate::theme;
     use iced::widget::{button, column, row, text, text_input};
     let id = project.id;
-    let start = |label: &str, args: Vec<String>| Message::RunRequested {
+    let start = |label: &str, args: Vec<String>, spot: Spot| Message::RunRequested {
         project: id,
         label: label.to_string(),
         args,
+        spot,
     };
     // A start button: enabled only when nothing blocks a run, and saying why
     // when something does.
@@ -265,6 +305,22 @@ pub fn view<'a>(
 
     let mut page = column![].spacing(theme::SPACE_3);
 
+    let recipe_names: Vec<String> = match just.state {
+        Some(JustState::Recipes { recipes, .. }) => {
+            recipes.iter().map(|r| r.name.clone()).collect()
+        }
+        _ => Vec::new(),
+    };
+    let spot = run.map(|run| {
+        placed(
+            run.spot.clone(),
+            entry_points,
+            &recipe_names,
+            &project.commands,
+        )
+    });
+    // Taken once, at the spot that started the run.
+    let mut output: Option<iced::Element<'a, Message>> = None;
     if let Some(run) = run {
         let status: iced::Element<'a, Message> = match &run.end {
             None => row![
@@ -301,13 +357,29 @@ pub fn view<'a>(
         let lines = run.lines.iter().fold(column![], |c, l| {
             c.push(text(l.clone()).font(theme::FONT_DATA).size(theme::DATA))
         });
-        page = page.push(status).push(
-            iced::widget::scrollable(lines)
-                .height(320.0)
-                .width(iced::Length::Fill)
-                .anchor_bottom(),
+        output = Some(
+            column![
+                status,
+                // As tall as the output, up to 320 px, then it scrolls.
+                iced::widget::container(
+                    iced::widget::scrollable(lines)
+                        .width(iced::Length::Fill)
+                        .anchor_bottom(),
+                )
+                .max_height(320.0),
+            ]
+            .spacing(theme::SPACE_2)
+            .into(),
         );
     }
+    let mut output_at = |page: iced::widget::Column<'a, Message>, here: Spot| {
+        if spot.as_ref() == Some(&here) {
+            page.push(output.take())
+        } else {
+            page
+        }
+    };
+    page = output_at(page, Spot::Top);
 
     page = page.push(
         row![
@@ -328,17 +400,19 @@ pub fn view<'a>(
         ));
     } else {
         page = page.push(
-            iced::widget::Row::with_children(
-                entry_points
-                    .iter()
-                    .map(|name| starter(name.clone(), start(name, vec![name.clone()]))),
-            )
+            iced::widget::Row::with_children(entry_points.iter().map(|name| {
+                starter(
+                    name.clone(),
+                    start(name, vec![name.clone()], Spot::EntryPoints),
+                )
+            }))
             .spacing(theme::SPACE_2)
             .wrap(),
         );
+        page = output_at(page, Spot::EntryPoints);
     }
 
-    page = just_section(page, &just, blocked, id);
+    page = just_section(page, &just, blocked, id, &mut output_at);
 
     page = page.push(heading("Saved commands"));
     for (row_index, c) in project.commands.iter().enumerate() {
@@ -351,7 +425,14 @@ pub fn view<'a>(
                     .font(theme::FONT_DATA)
                     .size(theme::DATA)
                     .width(iced::Length::FillPortion(2)),
-                starter("Run".into(), start(&c.label, split_command(&c.command))),
+                starter(
+                    "Run".into(),
+                    start(
+                        &c.label,
+                        split_command(&c.command),
+                        Spot::Command(c.command.clone()),
+                    ),
+                ),
                 button(text("Edit").size(theme::BODY))
                     .on_press(Message::CommandEdit(row_index))
                     .padding([theme::SPACE_1, theme::SPACE_3])
@@ -364,6 +445,7 @@ pub fn view<'a>(
             .spacing(theme::SPACE_2)
             .align_y(iced::Alignment::Center),
         );
+        page = output_at(page, Spot::Command(c.command.clone()));
     }
     page = page.push(
         row![
@@ -394,26 +476,11 @@ pub fn view<'a>(
 
     page = page.push(heading("More"));
     page = page.push(
-        row![
-            button(text("Run a file\u{2026}").size(theme::BODY))
-                .on_press_maybe(blocked.is_none().then_some(Message::RunFileRequested))
-                .padding([theme::SPACE_1, theme::SPACE_3])
-                .style(theme::button_secondary),
-            starter(
-                "Open in Jupyter".into(),
-                start(
-                    "Jupyter",
-                    ["--with", "jupyterlab", "jupyter", "lab"]
-                        .map(String::from)
-                        .to_vec(),
-                ),
-            ),
-        ]
-        .spacing(theme::SPACE_2),
+        button(text("Run a file\u{2026}").size(theme::BODY))
+            .on_press_maybe(blocked.is_none().then_some(Message::RunFileRequested))
+            .padding([theme::SPACE_1, theme::SPACE_3])
+            .style(theme::button_secondary),
     );
-    page = page.push(muted(
-        "Jupyter runs from a temporary install; your project's dependencies don't change.".into(),
-    ));
     page.into()
 }
 
@@ -423,6 +490,10 @@ fn just_section<'a>(
     just: &JustView<'a>,
     blocked: Option<&'static str>,
     project: uuid::Uuid,
+    output_at: &mut dyn FnMut(
+        iced::widget::Column<'a, crate::app::Message>,
+        Spot,
+    ) -> iced::widget::Column<'a, crate::app::Message>,
 ) -> iced::widget::Column<'a, crate::app::Message> {
     use crate::app::Message;
     use crate::theme;
@@ -480,6 +551,7 @@ fn just_section<'a>(
                             project,
                             label: format!("just {}", recipe.name),
                             args,
+                            spot: Spot::Recipe(recipe.name.clone()),
                         }
                     }))
                     .padding([theme::SPACE_1, theme::SPACE_3])
@@ -547,6 +619,7 @@ fn just_section<'a>(
                         .style(theme::panel),
                     );
                 }
+                page = output_at(page, Spot::Recipe(recipe.name.clone()));
             }
         }
     }
@@ -660,6 +733,29 @@ mod tests {
             path: "/tools/just".into(),
             bundled: false,
         }))
+    }
+
+    #[test]
+    fn the_output_goes_under_what_started_it_or_on_top() {
+        let entry_points = ["serve".to_string()];
+        let recipes = ["test".to_string()];
+        let commands = [bombadil_core::model::SavedCommand {
+            label: "tests".into(),
+            command: "pytest -q".into(),
+        }];
+        let at = |spot: Spot| placed(spot, &entry_points, &recipes, &commands);
+        assert_eq!(at(Spot::Recipe("test".into())), Spot::Recipe("test".into()));
+        assert_eq!(at(Spot::Recipe("gone".into())), Spot::Top);
+        assert_eq!(
+            at(Spot::Command("pytest -q".into())),
+            Spot::Command("pytest -q".into())
+        );
+        assert_eq!(at(Spot::Command("removed".into())), Spot::Top);
+        assert_eq!(at(Spot::EntryPoints), Spot::EntryPoints);
+        assert_eq!(
+            placed(Spot::EntryPoints, &[], &recipes, &commands),
+            Spot::Top
+        );
     }
 
     #[test]

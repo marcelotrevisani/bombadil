@@ -68,7 +68,8 @@ environment is marked **default**.
 ## Project view
 
 The project view has a header with the project's name, action buttons and
-status tiles. Below that are the **path** of the project and of its default
+status tiles. The buttons open the project folder, PyCharm,
+[Jupyter](running.md#jupyter) and a terminal, and run Sync. Below that are the **path** of the project and of its default
 environment, then the tabs. You can drag the tabs to reorder them.
 
 | Tab | What it is for |

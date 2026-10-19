@@ -187,6 +187,8 @@ pub enum Tile {
     Pycharm,
     /// An outlined square with a prompt in it.
     Terminal,
+    /// An outlined square with "Ju": Jupyter, without drawing its logo.
+    Jupyter,
 }
 
 /// Side of a [`Tile`], in points. Larger than a glyph icon: a tile's
@@ -202,6 +204,7 @@ fn tile<'a, M: 'a>(which: Tile, enabled: bool) -> iced::Element<'a, M> {
     let (label, font, size) = match which {
         Tile::Pycharm => ("PC", theme::FONT_PROSE_SEMIBOLD, 9.0),
         Tile::Terminal => (">_", theme::FONT_DATA, 11.0),
+        Tile::Jupyter => ("Ju", theme::FONT_PROSE_SEMIBOLD, 9.0),
     };
     let letters = iced::widget::text(label)
         .font(font)

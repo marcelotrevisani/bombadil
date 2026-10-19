@@ -850,6 +850,9 @@ pub enum Message {
     /// launcher and open the project folder in it, carrying the same composed
     /// environment `OpenTerminalHereRequested` delivers.
     OpenPycharmRequested(usize),
+    /// The Jupyter button: start Jupyter Lab in `projects[usize]` and show
+    /// the Run tab, where its address and Stop are.
+    OpenJupyterRequested(usize),
     /// The background open finished. Same redaction guarantee as
     /// `OpenTerminalFinished`, and for the same reason -- `ide::open` composes
     /// an environment that can hold keychain values.
@@ -875,6 +878,8 @@ pub enum Message {
         project: uuid::Uuid,
         label: String,
         args: Vec<String>,
+        /// Where its output shows on the Run tab.
+        spot: run_tab::Spot,
     },
     RunLine(uuid::Uuid, String),
     RunFinished(uuid::Uuid, run_tab::RunEnd),
@@ -3597,6 +3602,24 @@ pub fn update(app: &mut App, message: Message, runner: Arc<dyn CommandRunner>) -
                 tray::WindowAction::Stay => Task::none(),
             };
         }
+        Message::OpenJupyterRequested(i) => {
+            let Some(id) = app.config.projects.get(i).map(|p| p.id) else {
+                return Task::none();
+            };
+            app.tab = Tab::Run;
+            let opened = tab_opened(app);
+            let run = update(
+                app,
+                Message::RunRequested {
+                    project: id,
+                    label: "Jupyter".into(),
+                    args: run_tab::jupyter_args(),
+                    spot: run_tab::Spot::Top,
+                },
+                runner,
+            );
+            return Task::batch([opened, run]);
+        }
         Message::OpenPycharmRequested(i) => {
             let Some(project) = app.config.projects.get(i).cloned() else {
                 return Task::none();
@@ -3685,6 +3708,7 @@ pub fn update(app: &mut App, message: Message, runner: Arc<dyn CommandRunner>) -
             project,
             label,
             args,
+            spot,
         } => {
             let Some(i) = app.config.projects.iter().position(|p| p.id == project) else {
                 return Task::none();
@@ -3697,6 +3721,7 @@ pub fn update(app: &mut App, message: Message, runner: Arc<dyn CommandRunner>) -
                 project,
                 run_tab::Run {
                     label,
+                    spot,
                     lines: Vec::new(),
                     started: std::time::Instant::now(),
                     cancel: cancel.clone(),
@@ -4227,6 +4252,7 @@ pub fn update(app: &mut App, message: Message, runner: Arc<dyn CommandRunner>) -
                     project: id,
                     label,
                     args: run_tab::split_command(&command),
+                    spot: run_tab::Spot::Command(command.clone()),
                 },
                 runner,
             );
@@ -12042,9 +12068,32 @@ pub(crate) mod tests {
                 project: id,
                 label: "demo".into(),
                 args: args.iter().map(|s| s.to_string()).collect(),
+                spot: run_tab::Spot::Recipe("demo".into()),
             },
             unused_runner(),
         )
+    }
+
+    #[test]
+    fn the_jupyter_button_starts_jupyter_and_shows_its_output() {
+        let mut app = one_project();
+        app.entries[0].environments[0].python_version = Some("3.12.0".into());
+        app.selected = Some(0);
+        let id = first_id(&app);
+        let task = update(&mut app, Message::OpenJupyterRequested(0), unused_runner());
+        assert_eq!(app.tab, Tab::Run, "the output, URL and Stop are there");
+        assert_eq!(app.runs[&id].label, "Jupyter");
+        assert_eq!(app.runs[&id].spot, run_tab::Spot::Top);
+        assert!(app.runs[&id].live());
+        assert!(task.units() > 0);
+    }
+
+    #[test]
+    fn a_run_remembers_which_button_started_it() {
+        let mut app = one_project();
+        let id = first_id(&app);
+        let _ = start_run(&mut app, &["just", "demo"]);
+        assert_eq!(app.runs[&id].spot, run_tab::Spot::Recipe("demo".into()));
     }
 
     #[test]
@@ -12806,6 +12855,11 @@ pub(crate) mod tests {
         );
         assert_eq!(app.config.projects[0].commands[0].command, "python main.py");
         assert!(app.runs[&id].live());
+        assert_eq!(
+            app.runs[&id].spot,
+            run_tab::Spot::Command("python main.py".into()),
+            "its output shows under the command it saved"
+        );
         assert!(task.units() > 0);
     }
 

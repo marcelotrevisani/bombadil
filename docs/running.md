@@ -2,7 +2,9 @@
 
 The **Run** tab runs a project's code inside its default environment, with the
 same environment variables, secrets and pre-activate scripts a terminal gets.
-The output appears in the tab as the program prints it.
+The output appears right under the button that started it, as the program
+prints it. The box grows with the output up to a few hundred pixels, then
+scrolls and keeps the newest line in view.
 
 Each project can have one program running at a time. Other projects keep
 working: you can sync one project while another runs a server.
@@ -58,8 +60,9 @@ added to your saved commands, so it is one click the next time.
 
 ## Jupyter
 
-**Open in Jupyter** starts JupyterLab for the project and opens it in your
-browser. JupyterLab runs from a temporary install: your project's
+The **Ju** button in the project header, next to PyCharm, starts JupyterLab
+for the project and opens it in your browser. Bombadil switches to the Run
+tab, where JupyterLab's output and **Stop** are. JupyterLab runs from a temporary install: your project's
 dependencies and `uv.lock` don't change.
 
 ## Stopping

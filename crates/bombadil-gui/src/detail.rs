@@ -375,7 +375,7 @@ pub fn view<'a>(
         .into(),
     };
 
-    // Tiles for the two apps these open, with tooltips: "PC" in the
+    // Tiles for the apps these open, with tooltips: "PC" in the
     // JetBrains product-icon layout (their logo is not ours to draw), and a
     // prompt. PyCharm's tooltip names the interpreter because that is the
     // part a user would otherwise go and set by hand.
@@ -398,6 +398,13 @@ pub fn view<'a>(
         Some(Message::OpenPycharmRequested(index)),
     );
 
+    let jupyter = icons::tile_button(
+        icons::Tile::Jupyter,
+        "Open in Jupyter Lab with this environment. Jupyter runs from a temporary \
+         install; your project's dependencies don't change.",
+        Some(Message::OpenJupyterRequested(index)),
+    );
+
     let title_row = iced::widget::row![
         iced::widget::text(header.label.clone())
             .font(theme::FONT_PROSE_SEMIBOLD)
@@ -405,6 +412,7 @@ pub fn view<'a>(
         iced::widget::Space::new().width(iced::Length::Fill),
         folder,
         pycharm,
+        jupyter,
         terminal,
         sync,
     ]
