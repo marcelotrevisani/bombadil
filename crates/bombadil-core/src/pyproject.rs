@@ -80,6 +80,24 @@ pub fn parse(text: &str) -> Result<PyProject, PyProjectError> {
     })
 }
 
+/// The names under `[project.scripts]`, sorted: what `uv run <name>` runs.
+/// Empty when the file has none or does not parse.
+pub fn entry_points(text: &str) -> Vec<String> {
+    #[derive(Deserialize, Default)]
+    struct Project {
+        #[serde(default)]
+        scripts: BTreeMap<String, String>,
+    }
+    #[derive(Deserialize, Default)]
+    struct Root {
+        #[serde(default)]
+        project: Project,
+    }
+    toml::from_str::<Root>(text)
+        .map(|root| root.project.scripts.into_keys().collect())
+        .unwrap_or_default()
+}
+
 /// Read and parse a `pyproject.toml` from disk.
 pub fn load(path: &Path) -> Result<PyProject, PyProjectError> {
     let text = std::fs::read_to_string(path).map_err(|source| PyProjectError::Io {
@@ -214,6 +232,15 @@ fn loosened(name: &str, rest: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn entry_points_are_the_script_names() {
+        let text =
+            "[project]\nname = \"a\"\n\n[project.scripts]\nzeta = \"a:z\"\nalpha = \"a:main\"\n";
+        assert_eq!(entry_points(text), ["alpha", "zeta"]);
+        assert!(entry_points("[project]\nname = \"a\"\n").is_empty());
+        assert!(entry_points("not toml [").is_empty());
+    }
 
     #[test]
     fn raising_requires_python_keeps_the_rest_of_the_file() {

@@ -192,6 +192,112 @@ pub fn normalise(name: &str) -> String {
     name.to_lowercase().replace(['_', '.'], "-")
 }
 
+/// What the tab shows beyond its rows: known vulnerabilities, the open
+/// details panel, and the last change an action made.
+#[derive(Default)]
+pub struct Extras<'e> {
+    /// The active environment's last vulnerability check, when there is one.
+    pub vulns: Option<
+        &'e Result<std::collections::BTreeMap<String, Vec<bombadil_core::osv::Finding>>, String>,
+    >,
+    pub details: Option<Details<'e>>,
+    pub last_change: Option<&'e str>,
+}
+
+/// The package whose details panel is open.
+pub struct Details<'e> {
+    pub name: &'e str,
+    pub info: Option<&'e bombadil_core::metadata::PackageInfo>,
+    pub why: Vec<String>,
+}
+
+impl Extras<'_> {
+    fn findings(&self, name: &str) -> Option<&[bombadil_core::osv::Finding]> {
+        let want = normalise(name);
+        self.vulns?
+            .as_ref()
+            .ok()?
+            .iter()
+            .find(|(n, _)| normalise(n) == want)
+            .map(|(_, f)| f.as_slice())
+    }
+}
+
+/// How the tab titles a group: `main`, `group: test`, `extra: cli`.
+pub fn group_label(kind: &GroupKind) -> String {
+    match kind {
+        GroupKind::Main => "main".to_string(),
+        GroupKind::Group(name) => format!("group: {name}"),
+        GroupKind::Extra(name) => format!("extra: {name}"),
+    }
+}
+
+/// Why `name` is installed: its group when declared, else every shortest
+/// chain down from what the graph starts at. Breadth-first with a visited
+/// set, so a dependency cycle ends the walk.
+pub fn why_installed(tab: &DepsTab, name: &str) -> Vec<String> {
+    let want = normalise(name);
+    if let Some(group) = tab.groups.iter().find(|g| {
+        g.rows
+            .iter()
+            .any(|r| r.declared && normalise(&r.name) == want)
+    }) {
+        return vec![format!("Declared in {}", group_label(&group.kind))];
+    }
+    let Some(graph) = &tab.graph else {
+        return Vec::new();
+    };
+    let mut chains: Vec<Vec<String>> = Vec::new();
+    for root in &graph.roots {
+        let mut level = vec![(root.clone(), Vec::<String>::new())];
+        let mut seen = std::collections::HashSet::new();
+        while !level.is_empty() {
+            let mut hits = Vec::new();
+            let mut next = Vec::new();
+            // Seen at an earlier depth only: two chains of the same length
+            // may reach one package, and both are answers.
+            let this_level: Vec<String> = level.iter().map(|(id, _)| id.clone()).collect();
+            for (id, path) in level {
+                if seen.contains(&id) {
+                    continue;
+                }
+                let Some(pkg) = graph.packages.get(&id) else {
+                    continue;
+                };
+                if normalise(&pkg.name) == want {
+                    if !path.is_empty() {
+                        hits.push(path);
+                    }
+                    continue;
+                }
+                for dep in &pkg.dependencies {
+                    let mut longer = path.clone();
+                    longer.push(pkg.name.clone());
+                    next.push((dep.clone(), longer));
+                }
+            }
+            if !hits.is_empty() {
+                chains.extend(hits);
+                break;
+            }
+            seen.extend(this_level);
+            level = next;
+        }
+    }
+    chains.sort_by(|a, b| a.len().cmp(&b.len()).then(a.cmp(b)));
+    chains.dedup();
+    let more = chains.len().saturating_sub(2);
+    let mut out: Vec<String> = chains
+        .iter()
+        .take(2)
+        .map(|c| format!("Needed by {}", c.join(" → ")))
+        .collect();
+    if more > 0 {
+        out.push(format!("and {more} more"));
+    }
+    out
+}
+
 /// What the doctor says beside a row with a newer release, if anything.
 pub fn outdated_note(
     row: &DepRow,
@@ -553,6 +659,9 @@ pub fn state(row: &DepRow) -> theme::State {
 /// is missing -- `"not installed"`, `"(not declared)"` -- switch to the
 /// prose face, the same exception `sidebar::view` already makes for
 /// `"no env"`.
+// A row is the one place every column's inputs meet; the same allowance
+// `preferences::view` takes.
+#[allow(clippy::too_many_arguments)]
 fn dep_row<'a>(
     row: &DepRow,
     group: &GroupKind,
@@ -560,13 +669,38 @@ fn dep_row<'a>(
     enabled: bool,
     project: usize,
     note: Option<String>,
+    outdated: &[bombadil_core::uv::results::Outdated],
+    extras: &Extras<'_>,
 ) -> iced::Element<'a, crate::app::Message> {
     let glyph = theme::state_glyph(state(row));
+    let findings = extras.findings(&row.name);
 
-    let name = iced::widget::text(row.name.clone())
-        .font(theme::FONT_DATA)
-        .size(theme::DATA)
-        .width(theme::DEP_NAME_COLUMN_WIDTH);
+    // The name opens the package's details; a known vulnerability is marked
+    // beside it.
+    let name = iced::widget::row![
+        iced::widget::button(
+            iced::widget::text(row.name.clone())
+                .font(theme::FONT_DATA)
+                .size(theme::DATA)
+        )
+        .padding(0)
+        .on_press(crate::app::Message::DepDetailsToggled(
+            project,
+            row.name.clone()
+        ))
+        .style(theme::button_bare(theme::Swatch::Parchment)),
+    ]
+    .push(findings.map(|_| {
+        theme::tip(
+            iced::widget::text("!")
+                .size(theme::DATA)
+                .style(theme::text_warning),
+            "Known vulnerability",
+            iced::widget::tooltip::Position::Top,
+        )
+    }))
+    .spacing(theme::SPACE_1)
+    .width(theme::DEP_NAME_COLUMN_WIDTH);
 
     let constraint: iced::Element<'_, crate::app::Message> = match &row.constraint {
         Some(constraint) => iced::widget::text(constraint.clone())
@@ -684,7 +818,7 @@ fn dep_row<'a>(
 
     // Full width: hugging its content, each row's band ended wherever its
     // version text did, a ragged edge down the list.
-    iced::widget::container(line)
+    let band = iced::widget::container(line)
         .padding(theme::SPACE_1)
         .width(iced::Length::Fill)
         .style(|t| iced::widget::container::Style {
@@ -693,7 +827,132 @@ fn dep_row<'a>(
                 ..iced::Border::default()
             },
             ..theme::surface(t)
-        })
+        });
+    match &extras.details {
+        Some(details) if normalise(details.name) == normalise(&row.name) => iced::widget::column![
+            band,
+            details_panel(row, group, project, details, findings, outdated)
+        ]
+        .spacing(theme::SPACE_1)
+        .into(),
+        _ => band.into(),
+    }
+}
+
+/// Under an open row: what the package is, why it is here, its versions and
+/// its known vulnerabilities, with the fix when there is one.
+fn details_panel<'a>(
+    row: &DepRow,
+    group: &GroupKind,
+    project: usize,
+    details: &Details<'_>,
+    findings: Option<&[bombadil_core::osv::Finding]>,
+    outdated: &[bombadil_core::uv::results::Outdated],
+) -> iced::Element<'a, crate::app::Message> {
+    use crate::app::Message;
+    let muted = |t: String| {
+        iced::widget::text(t)
+            .size(theme::BODY)
+            .style(theme::text_muted)
+    };
+    let mut panel = iced::widget::column![].spacing(theme::SPACE_1);
+    match details.info {
+        Some(info) => {
+            if let Some(summary) = &info.summary {
+                panel = panel.push(iced::widget::text(summary.clone()).size(theme::BODY));
+            }
+            if let Some(home) = &info.homepage {
+                panel = panel.push(
+                    iced::widget::button(
+                        iced::widget::text(home.clone())
+                            .font(theme::FONT_DATA)
+                            .size(theme::DATA),
+                    )
+                    .padding(0)
+                    .on_press(Message::GitHubOpen(home.clone()))
+                    .style(theme::button_bare(theme::Swatch::Slate)),
+                );
+            }
+            if let Some(license) = &info.license {
+                panel = panel.push(muted(format!("Licence: {license}")));
+            }
+        }
+        None => panel = panel.push(muted("No description installed with this package.".into())),
+    }
+    for line in &details.why {
+        panel = panel.push(muted(line.clone()));
+    }
+    let newest = outdated
+        .iter()
+        .find(|o| normalise(&o.name) == normalise(&row.name))
+        .map(|o| o.latest.clone());
+    let versions = [
+        row.version.as_ref().map(|v| format!("Installed {v}")),
+        row.constraint.as_ref().map(|c| format!("Declared {c}")),
+        newest.map(|n| format!("Newest {n}")),
+    ];
+    panel = panel.push(muted(
+        versions
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>()
+            .join(" \u{b7} "),
+    ));
+    let findings = findings.unwrap_or(&[]);
+    // One button that fixes everything fixable: a button per advisory
+    // offered versions that each left the others open.
+    if let Some(fixed) = bombadil_core::osv::fix_all(findings) {
+        let fixable = findings.iter().filter(|f| f.fixed.is_some()).count();
+        panel = panel.push(
+            iced::widget::row![
+                iced::widget::button(
+                    iced::widget::text(format!("Upgrade to {fixed}")).size(theme::BODY)
+                )
+                .on_press(Message::DepPinRequested(
+                    project,
+                    row.name.clone(),
+                    fixed.clone(),
+                    group.clone(),
+                ))
+                .padding([theme::SPACE_1, theme::SPACE_3])
+                .style(theme::button_primary),
+                muted(match (fixable, findings.len()) {
+                    (1, 1) => "fixes its known vulnerability".to_string(),
+                    (f, n) if f == n => format!("fixes all {n} known vulnerabilities"),
+                    (f, n) => format!("fixes {f} of {n} known vulnerabilities"),
+                }),
+            ]
+            .spacing(theme::SPACE_2)
+            .align_y(iced::Alignment::Center),
+        );
+    }
+    for finding in findings {
+        let title = match &finding.severity {
+            Some(severity) => format!("{} ({severity}): {}", finding.id, finding.summary),
+            None => format!("{}: {}", finding.id, finding.summary),
+        };
+        panel = panel.push(
+            iced::widget::button(
+                iced::widget::text(title)
+                    .size(theme::BODY)
+                    .style(theme::text_warning),
+            )
+            .padding(0)
+            .on_press(Message::GitHubOpen(format!(
+                "https://osv.dev/vulnerability/{}",
+                finding.id
+            )))
+            .style(theme::button_bare(theme::Swatch::Parchment)),
+        );
+        panel = panel.push(muted(match &finding.fixed {
+            Some(fixed) => format!("Fixed in {fixed}"),
+            None => "No fixed version yet".into(),
+        }));
+    }
+    iced::widget::container(panel)
+        .padding(theme::SPACE_3)
+        .width(iced::Length::Fill)
+        .style(theme::panel)
         .into()
 }
 
@@ -718,6 +977,7 @@ pub fn view<'a>(
     waiting: Option<&str>,
     no_environment: bool,
     outdated: &[bombadil_core::uv::results::Outdated],
+    extras: &Extras<'_>,
 ) -> iced::Element<'a, crate::app::Message> {
     use crate::app::Message;
     let enabled = waiting.is_none();
@@ -795,11 +1055,28 @@ pub fn view<'a>(
             enabled,
             project,
             outdated,
+            extras,
         ),
-        (Ok(tab), DepsView::All) => all_view(tab, filter, editing, enabled, project, outdated),
+        (Ok(tab), DepsView::All) => {
+            all_view(tab, filter, editing, enabled, project, outdated, extras)
+        }
     };
     let headed = fetched.is_ok();
+    let muted = |t: String| {
+        iced::widget::text(t)
+            .size(theme::BODY)
+            .style(theme::text_muted)
+    };
     iced::widget::column![toolbar]
+        .push(
+            extras
+                .last_change
+                .map(|c| muted(format!("Last change: {c}"))),
+        )
+        .push(
+            matches!(extras.vulns, Some(Err(_)))
+                .then(|| muted("Couldn't check for vulnerabilities".into())),
+        )
         .push(headed.then(|| column_headings(mode)))
         .push(body)
         .spacing(theme::SPACE_3)
@@ -815,6 +1092,7 @@ fn all_view<'a>(
     enabled: bool,
     project: usize,
     outdated: &[bombadil_core::uv::results::Outdated],
+    extras: &Extras<'_>,
 ) -> iced::Element<'a, crate::app::Message> {
     let mut rows = iced::widget::column![
         iced::widget::text(
@@ -844,6 +1122,8 @@ fn all_view<'a>(
             enabled,
             project,
             label,
+            outdated,
+            extras,
         ));
     }
     rows.into()
@@ -887,6 +1167,7 @@ fn tree_view<'a>(
     enabled: bool,
     project: usize,
     outdated: &[bombadil_core::uv::results::Outdated],
+    extras: &Extras<'_>,
 ) -> iced::Element<'a, crate::app::Message> {
     let mut column = iced::widget::column![].spacing(theme::SPACE_3);
 
@@ -904,11 +1185,7 @@ fn tree_view<'a>(
     }
 
     for group in &tab.groups {
-        let title = match &group.kind {
-            GroupKind::Main => "main".to_string(),
-            GroupKind::Group(name) => format!("group: {name}"),
-            GroupKind::Extra(name) => format!("extra: {name}"),
-        };
+        let title = group_label(&group.kind);
         let mut rows = iced::widget::column![
             iced::widget::text(title)
                 .font(theme::FONT_PROSE)
@@ -924,6 +1201,8 @@ fn tree_view<'a>(
                 enabled,
                 project,
                 outdated_note(row, outdated),
+                outdated,
+                extras,
             ));
             if !row.declared {
                 // A leftover's place is the All view; the tree is what the
@@ -1015,6 +1294,72 @@ pub fn confirm_upgrade_all_view<'a>(label: &str) -> iced::Element<'a, crate::app
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn graph_tab() -> DepsTab {
+        use bombadil_core::uv::results::{DependencyGraph, TreePackage};
+        let pkg = |id: &str, deps: &[&str]| {
+            (
+                id.to_string(),
+                TreePackage {
+                    id: id.into(),
+                    name: id.split('@').next().unwrap().into(),
+                    version: "1".into(),
+                    dependencies: deps.iter().map(|d| d.to_string()).collect(),
+                },
+            )
+        };
+        DepsTab {
+            groups: vec![DepGroup {
+                kind: GroupKind::Main,
+                rows: vec![DepRow {
+                    name: "fastapi".into(),
+                    constraint: None,
+                    version: Some("1".into()),
+                    declared: true,
+                }],
+            }],
+            graph: Some(DependencyGraph {
+                roots: vec!["fastapi@1".into()],
+                members: vec![],
+                packages: [
+                    pkg("fastapi@1", &["starlette@1", "pydantic@1"]),
+                    pkg("starlette@1", &["anyio@1"]),
+                    pkg("pydantic@1", &["anyio@1"]),
+                    pkg("anyio@1", &["sniffio@1"]),
+                    pkg("sniffio@1", &["anyio@1"]),
+                ]
+                .into_iter()
+                .collect(),
+            }),
+            tree_note: None,
+        }
+    }
+
+    #[test]
+    fn why_a_declared_package_is_its_group() {
+        assert_eq!(why_installed(&graph_tab(), "FastAPI"), ["Declared in main"]);
+    }
+
+    #[test]
+    fn why_a_transitive_package_is_the_shortest_chain() {
+        assert_eq!(
+            why_installed(&graph_tab(), "starlette"),
+            ["Needed by fastapi"]
+        );
+        assert_eq!(
+            why_installed(&graph_tab(), "anyio"),
+            [
+                "Needed by fastapi → pydantic",
+                "Needed by fastapi → starlette"
+            ]
+        );
+        assert!(why_installed(&graph_tab(), "unknown").is_empty());
+    }
+
+    #[test]
+    fn why_survives_a_cycle() {
+        assert_eq!(why_installed(&graph_tab(), "sniffio").len(), 2);
+    }
 
     #[test]
     fn outdated_notes_match_normalised_names() {

@@ -285,6 +285,18 @@ pub fn global_view<'a>(
         );
     }
 
+    column = column
+        .push(
+            iced::widget::checkbox(settings.check_vulnerabilities)
+                .label("Check installed packages for known vulnerabilities")
+                .on_toggle(Message::CheckVulnerabilitiesSelected),
+        )
+        .push(
+            iced::widget::text("Sends package names and versions to osv.dev.")
+                .size(theme::BODY)
+                .style(theme::text_muted),
+        );
+
     column.into()
 }
 

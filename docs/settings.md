@@ -43,6 +43,11 @@ The buttons at the top choose what you are editing:
   directory, named after the project folder plus a short hash of its path,
   for example `~/.venvs/weather-api-3f9a2c`.
 
+**Check installed packages for known vulnerabilities** asks osv.dev about the
+installed packages of the project you are looking at. It sends package names
+and versions only. It is on by default; see
+[Known vulnerabilities](dependencies.md#known-vulnerabilities).
+
 ![Environment and uv settings](images/prefs-envs.png)
 
 **Project scope** lists every environment of that project:
@@ -139,3 +144,23 @@ scope, this shows that project's variables, the same as its **Env vars** tab.
 In the global scope, define [package indexes](indexes.md) and save their
 credentials to the keychain. In a project's scope, choose which of them the
 project uses.
+
+## Disk usage
+
+Global only. Every environment of every project with its size, largest
+first, and the total. Sizes are measured each time you open the section.
+
+- **Remove and delete** appears on a project's extra environments. It takes
+  the environment out of the project and deletes its folder. A project's
+  default environment is never offered.
+- **Leftover environments** are folders in your central venv folder (see
+  [Environments](#environments)) that no project in Bombadil uses any more,
+  for example after you removed a project. **Delete** removes one. A folder
+  that is itself a project, or holds one, is never listed.
+- **uv cache** shows where uv keeps downloaded packages and its size.
+  **Remove unused cache files** runs `uv cache prune`, which removes cache
+  entries uv no longer needs, and says how much space it freed. Your
+  environments are not touched.
+
+Every delete asks first, and can't be undone. An environment can't be
+deleted while its project is running a program or a uv command.

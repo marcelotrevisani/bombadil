@@ -38,6 +38,8 @@ pub struct Input<'a> {
     pub installed: Option<&'a [String]>,
     /// The project's `pyproject.toml` isn't on this computer.
     pub missing: bool,
+    /// How many installed packages have known vulnerabilities.
+    pub vulnerable: usize,
 }
 
 fn warning(text: String, fix: Option<Fix>) -> Finding {
@@ -179,6 +181,15 @@ pub fn findings(input: &Input) -> Vec<Finding> {
         }
     }
     out.sort_by_key(|f| f.level);
+    if input.vulnerable > 0 {
+        out.push(warning(
+            match input.vulnerable {
+                1 => "1 package has a known vulnerability".into(),
+                n => format!("{n} packages have known vulnerabilities"),
+            },
+            None,
+        ));
+    }
     out
 }
 
@@ -212,7 +223,23 @@ mod tests {
             pr: None,
             installed: None,
             missing: false,
+            vulnerable: 0,
         }
+    }
+
+    #[test]
+    fn vulnerable_packages_are_a_warning() {
+        let pin = PythonPin::Unpinned;
+        let f = findings(&Input {
+            vulnerable: 2,
+            ..input(&pin)
+        });
+        assert!(texts(&f).contains(&"2 packages have known vulnerabilities"));
+        let one = findings(&Input {
+            vulnerable: 1,
+            ..input(&pin)
+        });
+        assert!(texts(&one).contains(&"1 package has a known vulnerability"));
     }
 
     #[test]

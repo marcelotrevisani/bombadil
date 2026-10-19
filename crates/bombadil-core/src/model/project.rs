@@ -74,6 +74,9 @@ pub struct Project {
     pub env: Vec<EnvVar>,
     #[serde(default)]
     pub scripts: Vec<Script>,
+    /// Saved Run-tab commands, in the order shown.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub commands: Vec<super::SavedCommand>,
     #[serde(default)]
     pub members: MemberSelection,
     /// Which uv runs this project, or the global choice. A project that has
@@ -111,6 +114,7 @@ impl Default for Project {
             legacy_python: None,
             env: Vec::new(),
             scripts: Vec::new(),
+            commands: Vec::new(),
             members: MemberSelection::default(),
             uv_source: super::Override::Inherit,
             terminals: BTreeMap::new(),
@@ -131,5 +135,23 @@ impl Project {
             .iter()
             .find(|environment| environment.location == self.active)
             .or_else(|| self.environments.first())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn saved_commands_round_trip_and_are_omitted_when_empty() {
+        let mut p = Project::default();
+        let empty = toml::to_string(&p).unwrap();
+        assert!(!empty.contains("commands"), "{empty}");
+        p.commands.push(crate::model::SavedCommand {
+            label: "tests".into(),
+            command: "pytest -q".into(),
+        });
+        let back: Project = toml::from_str(&toml::to_string(&p).unwrap()).unwrap();
+        assert_eq!(back.commands, p.commands);
     }
 }

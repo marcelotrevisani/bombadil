@@ -14,6 +14,7 @@ schema_version = 2
 [settings]
 theme = "light"
 close_to_tray = false
+check_vulnerabilities = false
 
 [settings.uv_source]
 kind = "custom"
@@ -111,6 +112,10 @@ secret = true
 path = "./scripts/decrypt.sh"
 args = []
 enabled = false
+
+[[projects.commands]]
+label = "tests"
+command = "pytest -q"
 
 [projects.members]
 all_discovered = false

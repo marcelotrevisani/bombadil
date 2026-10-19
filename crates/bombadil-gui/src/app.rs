@@ -10,6 +10,7 @@ use crate::interpreter;
 use crate::job;
 use crate::members_editor;
 use crate::preferences;
+use crate::run_tab;
 use crate::scripts_editor;
 use crate::settings_editor;
 use crate::shell;
@@ -220,6 +221,48 @@ pub struct App {
     pub path_exists: fn(&std::path::Path) -> bool,
     /// Projects whose `pyproject.toml` was gone when last looked at.
     pub missing: std::collections::HashSet<uuid::Uuid>,
+    /// Each project's run, live or the last one ended (Run tab).
+    pub runs: std::collections::HashMap<uuid::Uuid, run_tab::Run>,
+    /// What to do once a project's run has stopped (a queued Sync).
+    pub after_stop: std::collections::HashMap<uuid::Uuid, Message>,
+    /// "Stop the run and continue?": the project and what continues.
+    pub confirm_stop: Option<(uuid::Uuid, Box<Message>)>,
+    /// "A program is still running. Stop it and quit?"
+    pub confirm_quit: bool,
+    /// Quit was confirmed: exit as soon as no run is live.
+    pub quitting: bool,
+    /// The selected project's `[project.scripts]` names, for the Run tab.
+    pub entry_points: Option<(uuid::Uuid, Vec<String>)>,
+    /// The Run tab's add/edit form.
+    pub command_draft: run_tab::CommandDraft,
+    /// Each project's installed list as last read, for "what changed".
+    pub installed: std::collections::HashMap<uuid::Uuid, Vec<uv::results::InstalledPackage>>,
+    /// Projects whose next installed list follows an action, mapped to that
+    /// action's success toast text, which the summary is appended to.
+    pub awaiting_change: std::collections::HashMap<uuid::Uuid, String>,
+    /// The selected project's last change, for the Dependencies tab.
+    pub last_change: Option<(uuid::Uuid, String)>,
+    /// The package whose details panel is open, and its METADATA once read.
+    pub dep_details: Option<(
+        uuid::Uuid,
+        String,
+        Option<bombadil_core::metadata::PackageInfo>,
+    )>,
+    /// The last vulnerability check per environment (by venv path).
+    pub vulns: std::collections::HashMap<PathBuf, VulnCheck>,
+    /// Advisories already fetched this session, by id.
+    pub vuln_details:
+        Arc<std::sync::Mutex<std::collections::HashMap<String, bombadil_core::osv::Vuln>>>,
+    /// Where advisories come from: osv.dev, or a fake in tests.
+    pub osv: Arc<dyn bombadil_core::osv::Http>,
+    /// Preferences › Disk: sizes, a pending delete, a prune's starting size.
+    pub disk: crate::disk::State,
+    /// The Find package dialog: the query, and every project's lock once read.
+    pub find: Option<(String, Option<Vec<crate::find_package::Entry>>)>,
+    /// The "New project" dialog, when open.
+    pub new_project: Option<crate::new_project::Draft>,
+    /// `uv init` is running for the dialog.
+    pub creating_project: bool,
     /// Preferences > Backup: the export passphrase and an import in progress.
     pub backup: crate::backup_panel::State,
     /// The open context menu (spec §8: right-click a project), if any.
@@ -365,6 +408,8 @@ pub struct App {
 pub enum Tab {
     #[default]
     Dependencies,
+    /// Entry points, saved commands, a picked file and Jupyter.
+    Run,
     Members,
     EnvVars,
     Scripts,
@@ -386,7 +431,7 @@ impl Tab {
     /// Settings has no per-project half worth a tab (uv, terminal and the
     /// venv default are all resolved per project from Preferences), so it is
     /// the one that stayed absorbed.
-    pub const ALL: [Tab; 7] = [
+    pub const ALL: [Tab; 8] = [
         Tab::Dependencies,
         Tab::Members,
         Tab::EnvVars,
@@ -394,11 +439,14 @@ impl Tab {
         Tab::Indexes,
         Tab::GitHub,
         Tab::Doctor,
+        // Last: a saved order from before it existed appends it here too.
+        Tab::Run,
     ];
 
     pub fn label(self) -> &'static str {
         match self {
             Tab::Dependencies => "Dependencies",
+            Tab::Run => "Run",
             Tab::Members => "Members",
             Tab::EnvVars => "Env vars",
             Tab::Scripts => "Scripts",
@@ -416,7 +464,7 @@ impl Tab {
             Tab::Members => Some(Term::Member),
             Tab::EnvVars => Some(Term::EnvVars),
             Tab::Indexes => Some(Term::Index),
-            Tab::Scripts | Tab::GitHub | Tab::Doctor => None,
+            Tab::Run | Tab::Scripts | Tab::GitHub | Tab::Doctor => None,
         }
     }
 
@@ -425,6 +473,7 @@ impl Tab {
     pub fn key(self) -> &'static str {
         match self {
             Tab::Dependencies => "deps",
+            Tab::Run => "run",
             Tab::Members => "members",
             Tab::EnvVars => "env",
             Tab::Scripts => "scripts",
@@ -814,6 +863,74 @@ pub enum Message {
     LocateRequested(uuid::Uuid),
     /// The picked `pyproject.toml`, or `None` when the picker was cancelled.
     LocatePicked(uuid::Uuid, Option<PathBuf>),
+    // --- Run lane ---
+    /// Start `uv run --no-sync <args>` in a project's lane.
+    RunRequested {
+        project: uuid::Uuid,
+        label: String,
+        args: Vec<String>,
+    },
+    RunLine(uuid::Uuid, String),
+    RunFinished(uuid::Uuid, run_tab::RunEnd),
+    RunStopRequested(uuid::Uuid),
+    StopThenConfirmed,
+    StopThenCancelled,
+    QuitConfirmed,
+    QuitCancelled,
+    // --- Run tab ---
+    EntryPointsLoaded(uuid::Uuid, Vec<String>),
+    CommandDraftLabel(String),
+    CommandDraftCommand(String),
+    CommandSaved,
+    CommandEdit(usize),
+    CommandRemoved(usize),
+    RunFileRequested,
+    RunFilePicked(uuid::Uuid, Option<PathBuf>),
+    CheckVulnerabilitiesSelected(bool),
+    /// A package row's name was pressed: open or close its details.
+    DepDetailsToggled(usize, String),
+    DepDetailsLoaded(
+        uuid::Uuid,
+        String,
+        Option<bombadil_core::metadata::PackageInfo>,
+    ),
+    /// Install exactly `name==version` in `group` (Upgrade to a fixed version).
+    DepPinRequested(usize, String, String, deps::GroupKind),
+    /// An environment's vulnerability check: its venv, the installed-list
+    /// key it was made for, and the vulnerable packages.
+    VulnsChecked(
+        PathBuf,
+        String,
+        Result<std::collections::BTreeMap<String, Vec<bombadil_core::osv::Finding>>, String>,
+    ),
+    // --- Disk ---
+    /// A measurement, and whether it is the one a prune asked for.
+    DiskMeasured(crate::disk::State, bool),
+    DiskDeleteRequested(crate::disk::Delete),
+    DiskDeleteConfirmed,
+    DiskDeleteCancelled,
+    DiskDeleted(crate::disk::Delete, Result<(), String>),
+    CachePruneRequested,
+    /// The projects whose `pyproject.toml` a background sweep didn't find.
+    MissingSwept(Vec<uuid::Uuid>),
+    // --- Find package ---
+    FindOpened,
+    FindIndexed(Vec<crate::find_package::Entry>),
+    FindQuery(String),
+    /// A result: select that project and filter its Dependencies to `name`.
+    FindPicked(uuid::Uuid, String),
+    FindClosed,
+    // --- New project ---
+    NewProjectRequested,
+    NewProjectName(String),
+    NewProjectBrowse,
+    NewProjectLocation(Option<PathBuf>),
+    NewProjectKind(crate::new_project::InitKind),
+    NewProjectPython(Option<String>),
+    NewProjectGit(bool),
+    NewProjectCreate,
+    NewProjectCancelled,
+    NewProjectCreated(Result<PathBuf, String>),
     // --- Move to another computer (Preferences > Backup) ---
     BackupPassphraseChanged(index_editor::CredentialInput),
     BackupConfirmChanged(index_editor::CredentialInput),
@@ -1189,6 +1306,24 @@ impl App {
             persist: Arc::new(NullPersist),
             path_exists: |_| true,
             missing: Default::default(),
+            runs: Default::default(),
+            after_stop: Default::default(),
+            confirm_stop: None,
+            confirm_quit: false,
+            quitting: false,
+            entry_points: None,
+            command_draft: Default::default(),
+            installed: Default::default(),
+            awaiting_change: Default::default(),
+            last_change: None,
+            dep_details: None,
+            vulns: Default::default(),
+            vuln_details: Default::default(),
+            osv: Arc::new(bombadil_core::github::rest::UreqFetch::new()),
+            disk: Default::default(),
+            find: None,
+            new_project: None,
+            creating_project: false,
             backup: Default::default(),
             context_menu: None,
             confirm_recreate: None,
@@ -1973,12 +2108,13 @@ pub fn update(app: &mut App, message: Message, runner: Arc<dyn CommandRunner>) -
             app.selected = Some(i);
             app.dep_edit = None;
             app.dep_filter.clear();
+            let opened = selection_changed(app);
             if folder_missing(app, i) {
                 return Task::none();
             }
             // Re-read on every selection: commits and checkouts happen
             // outside Bombadil, and this is the moment the user looks.
-            return reprobe_project(app, i, runner);
+            return Task::batch([reprobe_project(app, i, runner), opened]);
         }
         Message::WindowFocused => {
             let now = std::time::Instant::now();
@@ -1988,7 +2124,21 @@ pub fn update(app: &mut App, message: Message, runner: Arc<dyn CommandRunner>) -
                 app.last_focus_refresh = Some(now);
                 // The other moment the user looks. Venvs too: a `uv` run in
                 // a terminal can create or replace one.
-                return Task::batch([reprobe_project(app, i, runner), probe_every_venv(app)]);
+                return Task::batch([
+                    reprobe_project(app, i, runner),
+                    probe_every_venv(app),
+                    sweep_missing(app),
+                ]);
+            }
+            // Folders even with nothing selected: a re-mounted drive clears
+            // its warning without a click. Same debounce as above.
+            if app.selected.is_none()
+                && app.last_focus_refresh.is_none_or(|at| {
+                    now.saturating_duration_since(at) >= crate::busy::FOCUS_DEBOUNCE
+                })
+            {
+                app.last_focus_refresh = Some(now);
+                return sweep_missing(app);
             }
         }
         Message::Shortcut(s) => {
@@ -2089,6 +2239,11 @@ pub fn update(app: &mut App, message: Message, runner: Arc<dyn CommandRunner>) -
             if !can_start(app) {
                 return Task::none();
             }
+            if let Some(id) = app.add_local.as_ref().map(|d| d.project)
+                && refuse_while_running(app, id)
+            {
+                return Task::none();
+            }
             let Some(draft) = app.add_local.take() else {
                 return Task::none();
             };
@@ -2159,6 +2314,8 @@ pub fn update(app: &mut App, message: Message, runner: Arc<dyn CommandRunner>) -
             // The saved order as it was, to tell at the end whether anything
             // really moved.
             app.tab_drag = Some((tab, app.config.settings.layout.tab_order.clone(), None));
+            // A click on a tab arrives here, not as `TabSelected`.
+            return tab_opened(app);
         }
         Message::TabDragOver(target) => {
             // Tabs differ in width, so after a swap the pointer can sit over
@@ -2214,12 +2371,17 @@ pub fn update(app: &mut App, message: Message, runner: Arc<dyn CommandRunner>) -
         }
         Message::RefreshRequested => {
             if let Some(i) = app.selected.filter(|i| *i < app.config.projects.len()) {
-                return Task::batch([reprobe_project(app, i, runner), probe_every_venv(app)]);
+                return Task::batch([
+                    reprobe_project(app, i, runner),
+                    probe_every_venv(app),
+                    sweep_missing(app),
+                ]);
             }
         }
         Message::ProjectSelected(_) => {}
         Message::TabSelected(tab) => {
             app.tab = tab;
+            return tab_opened(app);
         }
         Message::SyncChecked { id, check } => {
             // A project removed while its check ran is not kept.
@@ -2255,6 +2417,13 @@ pub fn update(app: &mut App, message: Message, runner: Arc<dyn CommandRunner>) -
         // A stale probe result for a project that no longer exists.
         Message::VenvProbed { .. } => {}
         Message::DepsLoaded(i, fetch) if i < app.config.projects.len() => {
+            let check = match &fetch {
+                Ok(fetch) => {
+                    report_change(app, i, &fetch.installed);
+                    start_vuln_check(app, i, &fetch.installed)
+                }
+                Err(_) => Task::none(),
+            };
             // The failure is kept, not flattened into an empty tab: `deps::view`
             // renders it as the reason it is, which is the one thing an empty
             // tab could never say.
@@ -2262,6 +2431,7 @@ pub fn update(app: &mut App, message: Message, runner: Arc<dyn CommandRunner>) -
                 i,
                 fetch.map(|fetch| deps::build(&fetch.pyproject, &fetch.installed, fetch.tree)),
             ));
+            return check;
         }
         // A stale fetch for a project that no longer exists, or that the
         // user has since moved away from -- `view` only ever reads
@@ -2407,11 +2577,18 @@ pub fn update(app: &mut App, message: Message, runner: Arc<dyn CommandRunner>) -
             // for the project that was actually pressed.
             return Task::batch([
                 persist_edit(app, "env var change"),
+                selection_changed(app),
                 refresh_after_sync(app, runner),
             ]);
         }
         Message::SyncRequested(i) => {
             app.context_menu = None;
+            if let Some(id) = app.config.projects.get(i).map(|p| p.id)
+                && running(app, id)
+            {
+                app.confirm_stop = Some((id, Box::new(Message::SyncRequested(i))));
+                return Task::none();
+            }
             if refuse_missing(app, i) {
                 return Task::none();
             }
@@ -2809,6 +2986,20 @@ pub fn update(app: &mut App, message: Message, runner: Arc<dyn CommandRunner>) -
         }
         Message::SyncFinished { success, lines } => {
             let finished = app.busy.take();
+            let pruned = matches!(
+                finished.as_ref().map(|b| &b.action),
+                Some(crate::busy::Action::CachePrune)
+            );
+            // The selected project's Dependencies tab is re-read below; its
+            // new installed list is what this action changed.
+            let changed_selected = finished.as_ref().filter(|b| {
+                success
+                    && app
+                        .selected
+                        .and_then(|i| app.config.projects.get(i))
+                        .is_some_and(|p| p.id == b.project_id)
+            });
+            let awaiting = changed_selected.map(|b| b.project_id);
             // Already redacted on the job thread, where the composed
             // environment (and therefore the set of secret values) exists.
             // It cannot be done here: threading a secrets list through
@@ -2831,9 +3022,15 @@ pub fn update(app: &mut App, message: Message, runner: Arc<dyn CommandRunner>) -
                 None if success => "sync succeeded".to_string(),
                 None => "sync failed".to_string(),
             };
+            if let Some(id) = awaiting {
+                app.awaiting_change.insert(id, status.clone());
+            }
             // The drawer was cleared when this command started, so its
             // transcript is exactly this command's output.
             let diagnosis = match &finished {
+                // No project: nothing to remember a failure against, and no
+                // fix a button could apply.
+                Some(b) if matches!(b.action, crate::busy::Action::CachePrune) => None,
                 Some(b) if success => {
                     app.last_failure.remove(&b.project_id);
                     None
@@ -2877,7 +3074,14 @@ pub fn update(app: &mut App, message: Message, runner: Arc<dyn CommandRunner>) -
                     std::time::Instant::now(),
                 );
                 if let Some((id, d)) = diagnosis {
-                    app.toasts[0].fix = d.fixes.first().cloned().map(|fix| (id, fix));
+                    // The toast offers "Show output" itself; the doctor's
+                    // first other fix is the one worth a button.
+                    app.toasts[0].fix = d
+                        .fixes
+                        .iter()
+                        .find(|fix| **fix != bombadil_core::doctor::DoctorFix::ShowOutput)
+                        .cloned()
+                        .map(|fix| (id, fix));
                 }
             }
             drawer::set_idle(&mut app.drawer, status);
@@ -2899,6 +3103,14 @@ pub fn update(app: &mut App, message: Message, runner: Arc<dyn CommandRunner>) -
             // uv installs what it can resolve before it hits the package it
             // cannot, and the tab has to describe the environment as it now
             // is, not as it was before an attempt that partly landed.
+            if pruned {
+                // Measured again: the toast says what a successful prune
+                // freed; a failed one freed nothing worth saying.
+                if !success {
+                    app.disk.before_prune = None;
+                }
+                return measure_disk(app, runner, success);
+            }
             return refresh_after_sync(app, runner);
         }
         // A folder, not the pyproject.toml inside it: the folder is what
@@ -3135,6 +3347,7 @@ pub fn update(app: &mut App, message: Message, runner: Arc<dyn CommandRunner>) -
                 let index = app.config.projects.len() - 1;
                 app.selected = Some(index);
                 app.dep_filter.clear();
+                let opened = selection_changed(app);
                 // This path runs `uv sync -p <version>` too, so it claims the
                 // same single in-flight slot `SyncRequested` does. Without
                 // it, confirming the dialog -- which also selects the new
@@ -3156,7 +3369,8 @@ pub fn update(app: &mut App, message: Message, runner: Arc<dyn CommandRunner>) -
                         lines,
                         index,
                     },
-                );
+                )
+                .chain(opened);
             }
         }
         Message::AddProjectConfirmFinished {
@@ -3351,6 +3565,15 @@ pub fn update(app: &mut App, message: Message, runner: Arc<dyn CommandRunner>) -
                     Some(id) => iced::window::close(id),
                     None => Task::none(),
                 },
+                tray::WindowAction::Close if runs_live(app) => {
+                    app.confirm_quit = true;
+                    // Quit from the tray with the window closed to it: the
+                    // question needs a window to be asked in.
+                    match app.window {
+                        Some(_) => Task::none(),
+                        None => open_window(app),
+                    }
+                }
                 tray::WindowAction::Close => {
                     remember_window_size(app);
                     iced::exit()
@@ -3393,6 +3616,11 @@ pub fn update(app: &mut App, message: Message, runner: Arc<dyn CommandRunner>) -
             // the instant `update` returns rather than only once the
             // background persist lands.
             let removed = app.config.projects.remove(i);
+            // Unregistering a project ends what it was running.
+            if let Some(run) = app.runs.remove(&removed.id) {
+                run.cancel.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+            app.after_stop.remove(&removed.id);
             app.github.remove(&removed.id);
             app.github_in_flight.remove(&removed.id);
             app.dep_filter.clear();
@@ -3424,14 +3652,503 @@ pub fn update(app: &mut App, message: Message, runner: Arc<dyn CommandRunner>) -
 
             let config = app.config.clone();
             let persist = app.persist.clone();
-            return Task::perform(persist_config(config, persist), |success| {
-                Message::Persisted {
-                    what: "remove",
-                    success,
-                }
-            });
+            let opened = selection_changed(app);
+            return Task::batch([
+                Task::perform(persist_config(config, persist), |success| {
+                    Message::Persisted {
+                        what: "remove",
+                        success,
+                    }
+                }),
+                opened,
+            ]);
         }
         Message::RemoveProjectRequested(_) => {}
+        // --- Run lane ---
+        Message::RunRequested {
+            project,
+            label,
+            args,
+        } => {
+            let Some(i) = app.config.projects.iter().position(|p| p.id == project) else {
+                return Task::none();
+            };
+            if run_blocked(app, i).is_some() {
+                return Task::none();
+            }
+            let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            app.runs.insert(
+                project,
+                run_tab::Run {
+                    label,
+                    lines: Vec::new(),
+                    started: std::time::Instant::now(),
+                    cancel: cancel.clone(),
+                    end: None,
+                },
+            );
+            let target = app.config.projects[i].clone();
+            let config = app.config.clone();
+            return Task::stream(
+                job::stream_untimed(move |emit| {
+                    let end = run_program(
+                        &target,
+                        &config,
+                        &args,
+                        &KeyringSecretStore::new(),
+                        runner.as_ref(),
+                        &cancel,
+                        &mut |line| emit(Message::RunLine(project, line)),
+                    );
+                    emit(Message::RunFinished(project, end));
+                })
+                .map(move |result| match result {
+                    job::JobResult::Done(message) => message,
+                    job::JobResult::TimedOut | job::JobResult::Failed => Message::RunFinished(
+                        project,
+                        run_tab::RunEnd::Failed("the run ended unexpectedly".into()),
+                    ),
+                }),
+            );
+        }
+        Message::RunLine(id, line) => {
+            if let Some(run) = app.runs.get_mut(&id) {
+                run.push(line);
+            }
+        }
+        Message::RunFinished(id, end) => {
+            if let Some(run) = app.runs.get_mut(&id) {
+                run.end = Some(end);
+            }
+            if app.quitting && !app.runs.values().any(run_tab::Run::live) {
+                remember_window_size(app);
+                return iced::exit();
+            }
+            if let Some(next) = app.after_stop.remove(&id) {
+                return update(app, next, runner);
+            }
+        }
+        Message::RunStopRequested(id) => {
+            if let Some(run) = app.runs.get(&id) {
+                run.cancel.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+        Message::StopThenConfirmed => {
+            if let Some((id, next)) = app.confirm_stop.take() {
+                app.after_stop.insert(id, *next);
+                return update(app, Message::RunStopRequested(id), runner);
+            }
+        }
+        Message::StopThenCancelled => app.confirm_stop = None,
+        Message::QuitConfirmed => {
+            app.confirm_quit = false;
+            // The program may have ended while the question was open.
+            if !runs_live(app) {
+                remember_window_size(app);
+                return iced::exit();
+            }
+            app.quitting = true;
+            for run in app.runs.values() {
+                run.cancel.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+        Message::QuitCancelled => app.confirm_quit = false,
+        Message::VulnsChecked(venv, key, result) => {
+            app.vulns.insert(
+                venv,
+                VulnCheck {
+                    key,
+                    at: std::time::Instant::now(),
+                    result,
+                },
+            );
+        }
+        Message::DepDetailsToggled(i, name) => {
+            let Some(id) = app.config.projects.get(i).map(|p| p.id) else {
+                return Task::none();
+            };
+            if matches!(&app.dep_details, Some((p, n, _)) if *p == id && *n == name) {
+                app.dep_details = None;
+                return Task::none();
+            }
+            app.dep_details = Some((id, name.clone(), None));
+            let venv = app
+                .entries
+                .get(i)
+                .and_then(|e| e.environments.iter().find(|r| r.active))
+                .map(|r| r.path.clone());
+            let version = installed_version(app, i, &name);
+            let (Some(venv), Some(version)) = (venv, version) else {
+                return Task::none();
+            };
+            return Task::perform(
+                async move {
+                    let info = bombadil_core::metadata::read(&venv, &name, &version);
+                    (name, info)
+                },
+                move |(name, info)| Message::DepDetailsLoaded(id, name, info),
+            );
+        }
+        Message::DepDetailsLoaded(id, name, info) => {
+            if let Some((p, n, slot)) = &mut app.dep_details
+                && *p == id
+                && *n == name
+            {
+                *slot = info;
+            }
+        }
+        Message::DepPinRequested(i, name, version, group) => {
+            return add_requirement(app, i, format!("{name}=={version}"), group, runner);
+        }
+        Message::CheckVulnerabilitiesSelected(on) => {
+            app.config.settings.check_vulnerabilities = on;
+            if !on {
+                // Off means no answers either, not old ones left standing.
+                app.vulns.clear();
+            }
+            return persist_edit(app, "settings change");
+        }
+        // --- Disk ---
+        Message::DiskMeasured(mut measured, after_prune) => {
+            // Only the measurement the prune asked for says what it freed:
+            // one already under way when it started would compare the wrong
+            // sizes.
+            let before = if after_prune {
+                app.disk.before_prune.take()
+            } else {
+                None
+            };
+            if let Some(before) = before
+                && let Some((_, Some(after))) = &measured.cache
+            {
+                crate::busy::push(
+                    &mut app.toasts,
+                    crate::busy::ToastKind::Success,
+                    crate::disk::freed_text(before, *after),
+                    std::time::Instant::now(),
+                );
+            }
+            measured.confirm = app.disk.confirm.take();
+            measured.before_prune = app.disk.before_prune.take();
+            app.disk = measured;
+        }
+        Message::DiskDeleteRequested(delete) => {
+            if let crate::disk::Delete::Environment(id, _, _) = &delete {
+                let id = *id;
+                if refuse_while_running(app, id) {
+                    return Task::none();
+                }
+                if app.busy.as_ref().is_some_and(|b| b.project_id == id) {
+                    crate::busy::push(
+                        &mut app.toasts,
+                        crate::busy::ToastKind::Warning,
+                        "Wait for the current uv command to finish.".into(),
+                        std::time::Instant::now(),
+                    );
+                    return Task::none();
+                }
+            }
+            app.disk.confirm = Some(delete);
+        }
+        Message::DiskDeleteCancelled => app.disk.confirm = None,
+        Message::DiskDeleteConfirmed => {
+            let Some(delete) = app.disk.confirm.take() else {
+                return Task::none();
+            };
+            let config = app.config.clone();
+            let asked = delete.clone();
+            return Task::perform(
+                job::attempt(
+                    move || crate::disk::delete_blocking(&asked, &config),
+                    SYNC_TIMEOUT,
+                    "deleting the environment",
+                ),
+                move |result| Message::DiskDeleted(delete.clone(), result),
+            );
+        }
+        Message::DiskDeleted(delete, result) => {
+            let path = delete.path().display().to_string();
+            let save = match (&delete, &result) {
+                (crate::disk::Delete::Environment(id, location, _), Ok(())) => {
+                    if let Some(project) = app.config.projects.iter_mut().find(|p| p.id == *id) {
+                        project.environments.retain(|e| e.location != *location);
+                    }
+                    rebuild_entries(app);
+                    persist_edit(app, "env var change")
+                }
+                _ => Task::none(),
+            };
+            let (kind, text) = match result {
+                Ok(()) => (crate::busy::ToastKind::Success, format!("Deleted {path}")),
+                Err(why) => (
+                    crate::busy::ToastKind::Warning,
+                    format!("Could not delete {path}: {why}"),
+                ),
+            };
+            crate::busy::push(&mut app.toasts, kind, text, std::time::Instant::now());
+            return Task::batch([save, measure_disk(app, runner, false)]);
+        }
+        Message::CachePruneRequested => {
+            if !can_start(app) {
+                return Task::none();
+            }
+            app.disk.before_prune = app.disk.cache.as_ref().and_then(|(_, size)| *size);
+            app.busy = Some(crate::busy::Busy::new(
+                uuid::Uuid::nil(),
+                crate::busy::Action::CachePrune,
+            ));
+            drawer::start(&mut app.drawer, "cleaning uv's cache...".to_string());
+            let config = app.config.clone();
+            return Task::stream(sync_stream(
+                move |on_line| {
+                    let uv = match resolve_uv_for(&config, runner.as_ref()) {
+                        Ok(uv) => uv,
+                        Err(e) => return (false, vec![e]),
+                    };
+                    let spec = uv::command::cache_prune(&uv);
+                    match runner.stream(&spec, &mut |line| on_line(line.text().to_string())) {
+                        Ok(outcome) => (outcome.success(), Vec::new()),
+                        Err(e) => (false, vec![e.to_string()]),
+                    }
+                },
+                "cleaning uv's cache timed out",
+                "cleaning uv's cache failed unexpectedly",
+            ));
+        }
+        Message::MissingSwept(gone) => {
+            app.missing = gone
+                .into_iter()
+                .filter(|id| app.config.projects.iter().any(|p| p.id == *id))
+                .collect();
+        }
+        // --- Find package ---
+        Message::FindOpened => {
+            app.open_menu = None;
+            app.find = Some((String::new(), None));
+            let projects = app.config.projects.clone();
+            // Its own thread with a time limit: a project on a sleeping
+            // network drive must not hold one of the executor's threads.
+            return Task::perform(
+                async move {
+                    match job::run(
+                        move || crate::find_package::index_blocking(&projects),
+                        HEALTH_PROBE_TIMEOUT,
+                    )
+                    .await
+                    {
+                        job::JobResult::Done(index) => index,
+                        job::JobResult::TimedOut | job::JobResult::Failed => Vec::new(),
+                    }
+                },
+                Message::FindIndexed,
+            );
+        }
+        Message::FindIndexed(index) => {
+            if let Some((_, slot)) = &mut app.find {
+                *slot = Some(index);
+            }
+        }
+        Message::FindQuery(query) => {
+            if let Some((q, _)) = &mut app.find {
+                *q = query;
+            }
+        }
+        Message::FindClosed => app.find = None,
+        Message::FindPicked(id, name) => {
+            app.find = None;
+            let Some(i) = app.config.projects.iter().position(|p| p.id == id) else {
+                return Task::none();
+            };
+            app.tab = Tab::Dependencies;
+            let selected = update(app, Message::ProjectSelected(i), runner);
+            app.dep_filter = name;
+            return selected;
+        }
+        // --- New project ---
+        Message::NewProjectRequested => {
+            app.new_project = Some(crate::new_project::Draft {
+                name: String::new(),
+                location: crate::new_project::default_location(&app.config.projects, &home_dir()),
+                kind: crate::new_project::InitKind::App,
+                python: None,
+                git: true,
+                error: None,
+            });
+            return probe_installed_pythons(app.config.clone());
+        }
+        Message::NewProjectName(v) => {
+            if let Some(d) = &mut app.new_project {
+                d.name = v;
+                d.error = None;
+            }
+        }
+        Message::NewProjectBrowse => {
+            return Task::perform(pick_folder(), Message::NewProjectLocation);
+        }
+        Message::NewProjectLocation(None) => {}
+        Message::NewProjectLocation(Some(dir)) => {
+            if let Some(d) = &mut app.new_project {
+                d.location = dir;
+                d.error = None;
+            }
+        }
+        Message::NewProjectKind(kind) => {
+            if let Some(d) = &mut app.new_project {
+                d.kind = kind;
+            }
+        }
+        Message::NewProjectPython(python) => {
+            if let Some(d) = &mut app.new_project {
+                d.python = python;
+            }
+        }
+        Message::NewProjectGit(on) => {
+            if let Some(d) = &mut app.new_project {
+                d.git = on;
+            }
+        }
+        Message::NewProjectCancelled => {
+            if !app.creating_project {
+                app.new_project = None;
+            }
+        }
+        Message::NewProjectCreate => {
+            let Some(draft) = app.new_project.clone() else {
+                return Task::none();
+            };
+            if app.creating_project || crate::new_project::name_error(&draft.name).is_some() {
+                return Task::none();
+            }
+            app.creating_project = true;
+            let config = app.config.clone();
+            return Task::perform(
+                job::attempt(
+                    move || crate::new_project::init_blocking(&draft, &config, runner.as_ref()),
+                    SYNC_TIMEOUT,
+                    "creating the project",
+                ),
+                Message::NewProjectCreated,
+            );
+        }
+        Message::NewProjectCreated(result) => {
+            app.creating_project = false;
+            match result {
+                Ok(manifest) => {
+                    app.new_project = None;
+                    return update(
+                        app,
+                        Message::AddProjectManifestPicked(Some(manifest)),
+                        runner,
+                    );
+                }
+                Err(e) => {
+                    if let Some(d) = &mut app.new_project {
+                        d.error = Some(e);
+                    }
+                }
+            }
+        }
+        // --- Run tab ---
+        Message::EntryPointsLoaded(id, names) => app.entry_points = Some((id, names)),
+        Message::CommandDraftLabel(v) => app.command_draft.label = v,
+        Message::CommandDraftCommand(v) => app.command_draft.command = v,
+        Message::CommandEdit(row) => {
+            if let Some(c) = app
+                .selected
+                .and_then(|i| app.config.projects.get(i)?.commands.get(row))
+            {
+                app.command_draft = run_tab::CommandDraft {
+                    label: c.label.clone(),
+                    command: c.command.clone(),
+                    editing: Some(row),
+                };
+            }
+        }
+        Message::CommandSaved => {
+            let draft = std::mem::take(&mut app.command_draft);
+            let command = draft.command.trim().to_string();
+            let Some(project) = app.selected.and_then(|i| app.config.projects.get_mut(i)) else {
+                return Task::none();
+            };
+            if command.is_empty() {
+                app.command_draft = draft;
+                return Task::none();
+            }
+            let label = match draft.label.trim() {
+                "" => command.clone(),
+                l => l.to_string(),
+            };
+            let saved = bombadil_core::model::SavedCommand { label, command };
+            match draft.editing.filter(|row| *row < project.commands.len()) {
+                Some(row) => project.commands[row] = saved,
+                None => project.commands.push(saved),
+            }
+            return persist_edit(app, "saved command");
+        }
+        Message::CommandRemoved(row) => {
+            if let Some(project) = app.selected.and_then(|i| app.config.projects.get_mut(i))
+                && row < project.commands.len()
+            {
+                project.commands.remove(row);
+                app.command_draft = run_tab::CommandDraft::default();
+                return persist_edit(app, "saved command");
+            }
+        }
+        Message::RunFileRequested => {
+            let Some(project) = app.selected.and_then(|i| app.config.projects.get(i)) else {
+                return Task::none();
+            };
+            let id = project.id;
+            let dir = project
+                .pyproject_path
+                .parent()
+                .map(Path::to_path_buf)
+                .unwrap_or_default();
+            return Task::perform(
+                async move {
+                    rfd::AsyncFileDialog::new()
+                        .set_directory(dir)
+                        .add_filter("Python", &["py"])
+                        .pick_file()
+                        .await
+                        .map(|handle| handle.path().to_path_buf())
+                },
+                move |file| Message::RunFilePicked(id, file),
+            );
+        }
+        Message::RunFilePicked(_, None) => {}
+        Message::RunFilePicked(id, Some(file)) => {
+            let Some(project) = app.config.projects.iter_mut().find(|p| p.id == id) else {
+                return Task::none();
+            };
+            let dir = project
+                .pyproject_path
+                .parent()
+                .map(Path::to_path_buf)
+                .unwrap_or_default();
+            let command = run_tab::file_command(&dir, &file);
+            let label = file
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| command.clone());
+            if !project.commands.iter().any(|c| c.command == command) {
+                project.commands.push(bombadil_core::model::SavedCommand {
+                    label: label.clone(),
+                    command: command.clone(),
+                });
+            }
+            let save = persist_edit(app, "saved command");
+            let run = update(
+                app,
+                Message::RunRequested {
+                    project: id,
+                    label,
+                    args: run_tab::split_command(&command),
+                },
+                runner,
+            );
+            return Task::batch([save, run]);
+        }
         Message::LocateRequested(id) => {
             return Task::perform(pick_pyproject(), move |picked| {
                 Message::LocatePicked(id, picked)
@@ -3767,6 +4484,12 @@ pub fn update(app: &mut App, message: Message, runner: Arc<dyn CommandRunner>) -
         // way, like every other action taken from it.
         Message::RecreateVenvRequested(i) => {
             app.context_menu = None;
+            if let Some(id) = app.config.projects.get(i).map(|p| p.id)
+                && running(app, id)
+            {
+                app.confirm_stop = Some((id, Box::new(Message::RecreateVenvRequested(i))));
+                return Task::none();
+            }
             if let Some(project) = app.config.projects.get(i)
                 && let Some(environment) = project.active_environment()
                 && let Ok(venv_path) =
@@ -3900,6 +4623,9 @@ pub fn update(app: &mut App, message: Message, runner: Arc<dyn CommandRunner>) -
             if section == preferences::Section::Pycharm {
                 return detect_pycharm(runner);
             }
+            if section == preferences::Section::Disk {
+                return measure_disk(app, runner, false);
+            }
             if section == preferences::Section::GitHub && app.github_source.is_none() {
                 return check_github(app.config.settings.github_account.clone());
             }
@@ -3940,6 +4666,9 @@ pub fn update(app: &mut App, message: Message, runner: Arc<dyn CommandRunner>) -
             // upgrade since the last look should show up.
             if section == preferences::Section::Pycharm {
                 return detect_pycharm(runner);
+            }
+            if section == preferences::Section::Disk {
+                return measure_disk(app, runner, false);
             }
             if section == preferences::Section::GitHub && app.github_source.is_none() {
                 return check_github(app.config.settings.github_account.clone());
@@ -4208,7 +4937,8 @@ pub fn update(app: &mut App, message: Message, runner: Arc<dyn CommandRunner>) -
                 | preferences::Section::EnvVars
                 | preferences::Section::Indexes
                 | preferences::Section::GitHub
-                | preferences::Section::Backup => return Task::none(),
+                | preferences::Section::Backup
+                | preferences::Section::Disk => return Task::none(),
             }
             return persist_edit(app, "env var change");
         }
@@ -4826,6 +5556,12 @@ pub fn should_refresh_on_focus(app: &App, now: std::time::Instant) -> bool {
 /// Whether anything on screen moves: the spinner or a success toast's
 /// countdown. A failure toast waits for the user and needs no frames. The
 /// frame subscription exists only while this is true.
+/// Whether any project has a program running: its elapsed time is shown,
+/// so the clock has to keep moving -- once a second, not every frame.
+pub fn runs_live(app: &App) -> bool {
+    app.runs.values().any(run_tab::Run::live)
+}
+
 pub fn animating(app: &App) -> bool {
     app.busy.is_some() || app.toasts.iter().any(|t| t.expires.is_some())
 }
@@ -4938,6 +5674,9 @@ fn add_requirement(
     let Some(project) = app.config.projects.get(i).cloned() else {
         return Task::none();
     };
+    if refuse_while_running(app, project.id) {
+        return Task::none();
+    }
     if !can_start(app) {
         return Task::none();
     }
@@ -5118,6 +5857,9 @@ fn start_upgrade(
     let Some(project) = app.config.projects.get(i).cloned() else {
         return Task::none();
     };
+    if refuse_while_running(app, project.id) {
+        return Task::none();
+    }
     if !can_start(app) {
         return Task::none();
     }
@@ -5197,6 +5939,9 @@ pub fn project_findings(app: &App, i: usize) -> Vec<crate::health::Finding> {
         pr,
         installed: app.installed_pythons.as_deref(),
         missing: app.missing.contains(&project.id),
+        vulnerable: current_vulns(app, i)
+            .and_then(|r| r.as_ref().ok())
+            .map_or(0, std::collections::BTreeMap::len),
     })
 }
 
@@ -5363,6 +6108,10 @@ fn escape_message(app: &App) -> Option<Message> {
         (app.modal.is_some(), Message::ModalClosed),
         (app.preferences.is_some(), Message::PreferencesClosed),
         (app.open_menu.is_some(), Message::MenuDismissed),
+        (app.confirm_quit, Message::QuitCancelled),
+        (app.confirm_stop.is_some(), Message::StopThenCancelled),
+        (app.new_project.is_some(), Message::NewProjectCancelled),
+        (app.find.is_some(), Message::FindClosed),
         (
             app.confirm_member_sync.is_some(),
             Message::MembersSyncCancelled,
@@ -5676,6 +6425,9 @@ fn dispatch_members_sync(
     discovered: Vec<bombadil_core::members::DiscoveredMember>,
     runner: Arc<dyn CommandRunner>,
 ) -> Task<Message> {
+    if refuse_while_running(app, project.id) {
+        return Task::none();
+    }
     let config = app.config.clone();
     app.busy = Some(crate::busy::Busy::new(
         project.id,
@@ -5774,6 +6526,266 @@ async fn pick_bombadil_open() -> Option<PathBuf> {
         .map(|handle| handle.path().to_path_buf())
 }
 
+/// Everything that follows the selected project, for every path that moves
+/// the selection -- a click, adding a project, removing one, pressing one of
+/// its environments: the Run tab's form starts empty, and its entry points
+/// are read for the project now shown.
+fn selection_changed(app: &mut App) -> Task<Message> {
+    app.command_draft = run_tab::CommandDraft::default();
+    app.dep_details = None;
+    app.last_change = None;
+    tab_opened(app)
+}
+
+/// What the tab just opened needs read: the Run tab's entry points.
+fn tab_opened(app: &App) -> Task<Message> {
+    match app.selected.and_then(|i| app.config.projects.get(i)) {
+        Some(project) if app.tab == Tab::Run => load_entry_points(project),
+        _ => Task::none(),
+    }
+}
+
+/// The Dependencies tab's extras for project `i`: its environment's
+/// vulnerabilities, the open details panel, and its last change.
+fn deps_extras<'e>(
+    app: &'e App,
+    i: usize,
+    tab: &Result<deps::DepsTab, String>,
+) -> deps::Extras<'e> {
+    let Some(project) = app.config.projects.get(i) else {
+        return deps::Extras::default();
+    };
+    let vulns = current_vulns(app, i);
+    let details = match (&app.dep_details, tab) {
+        (Some((id, name, info)), Ok(tab)) if *id == project.id => Some(deps::Details {
+            name,
+            info: info.as_ref(),
+            why: deps::why_installed(tab, name),
+        }),
+        _ => None,
+    };
+    let last_change = app
+        .last_change
+        .as_ref()
+        .filter(|(id, _)| *id == project.id)
+        .map(|(_, s)| s.as_str());
+    deps::Extras {
+        vulns,
+        details,
+        last_change,
+    }
+}
+
+/// Keeps project `i`'s installed list and, when an action is waiting on it,
+/// says what that action changed: appended to its success toast, line by
+/// line in the drawer, and on the Dependencies tab.
+fn report_change(app: &mut App, i: usize, installed: &[uv::results::InstalledPackage]) {
+    let Some(id) = app.config.projects.get(i).map(|p| p.id) else {
+        return;
+    };
+    let before = app.installed.insert(id, installed.to_vec());
+    let Some(toast_text) = app.awaiting_change.remove(&id) else {
+        return;
+    };
+    let changes = crate::changes::diff(before.as_deref(), installed);
+    let summary = crate::changes::summary(changes.as_deref(), installed.len());
+    for line in crate::changes::drawer_lines(changes.as_deref().unwrap_or(&[])) {
+        drawer::push_line(&mut app.drawer, &line, &[]);
+    }
+    let text = format!("{toast_text}: {summary}");
+    match app.toasts.iter_mut().find(|t| t.text == toast_text) {
+        Some(toast) => toast.text = text,
+        None => crate::busy::push(
+            &mut app.toasts,
+            crate::busy::ToastKind::Success,
+            text,
+            std::time::Instant::now(),
+        ),
+    }
+    app.last_change = Some((id, summary));
+}
+
+/// The installed version of `name` in project `i`'s loaded Dependencies tab.
+fn installed_version(app: &App, i: usize, name: &str) -> Option<String> {
+    let (j, Ok(tab)) = app.deps.as_ref()? else {
+        return None;
+    };
+    if *j != i {
+        return None;
+    }
+    let want = deps::normalise(name);
+    tab.groups
+        .iter()
+        .flat_map(|g| &g.rows)
+        .find(|r| deps::normalise(&r.name) == want)
+        .and_then(|r| r.version.clone())
+}
+
+/// One environment's vulnerability check: what it was made for, when, and
+/// what it found (vulnerable packages only), or why it couldn't be made.
+#[derive(Debug, Clone)]
+pub struct VulnCheck {
+    pub key: String,
+    pub at: std::time::Instant,
+    pub result:
+        Result<std::collections::BTreeMap<String, Vec<bombadil_core::osv::Finding>>, String>,
+}
+
+/// Project `i`'s vulnerability check, only when it was made for the
+/// packages installed now: an answer about the list before an upgrade
+/// would warn about, and offer fixes for, versions that are gone.
+fn current_vulns(app: &App, i: usize) -> Option<&VulnResult> {
+    let project = app.config.projects.get(i)?;
+    let venv = &app
+        .entries
+        .get(i)?
+        .environments
+        .iter()
+        .find(|r| r.active)?
+        .path;
+    let check = app.vulns.get(venv)?;
+    let installed = app.installed.get(&project.id)?;
+    (check.key == vuln_key(installed)).then_some(&check.result)
+}
+
+/// What a check found: the vulnerable packages, or why it couldn't tell.
+type VulnResult =
+    Result<std::collections::BTreeMap<String, Vec<bombadil_core::osv::Finding>>, String>;
+
+/// How long a check of an unchanged environment stands.
+const VULN_CHECK_FRESH: Duration = Duration::from_secs(24 * 3600);
+
+/// What is asked of osv.dev: published packages only. A package installed
+/// editable is the person's own project or a workspace member -- its name
+/// is theirs to keep, and osv.dev knows nothing about it anyway.
+fn vuln_packages(installed: &[uv::results::InstalledPackage]) -> Vec<(String, String)> {
+    installed
+        .iter()
+        .filter(|p| p.editable_project_location.is_none())
+        .map(|p| (p.name.clone(), p.version.clone()))
+        .collect()
+}
+
+/// The installed list as one string: a check is redone when this changes.
+fn vuln_key(installed: &[uv::results::InstalledPackage]) -> String {
+    let mut pairs: Vec<String> = vuln_packages(installed)
+        .iter()
+        .map(|(name, version)| format!("{}=={version}", deps::normalise(name)))
+        .collect();
+    pairs.sort();
+    pairs.join(",")
+}
+
+/// Whether `venv` should be checked now: the setting is on, and there is no
+/// check for this exact installed list from the last day.
+fn vuln_check_due(app: &App, venv: &Path, key: &str, now: std::time::Instant) -> bool {
+    app.config.settings.check_vulnerabilities
+        && !app.vulns.get(venv).is_some_and(|c| {
+            // A failed check is no answer: the next load tries again.
+            c.result.is_ok()
+                && c.key == key
+                && now.saturating_duration_since(c.at) < VULN_CHECK_FRESH
+        })
+}
+
+/// Asks osv.dev about project `i`'s active environment, when due.
+fn start_vuln_check(
+    app: &App,
+    i: usize,
+    installed: &[uv::results::InstalledPackage],
+) -> Task<Message> {
+    let Some(venv) = app
+        .entries
+        .get(i)
+        .and_then(|e| e.environments.iter().find(|r| r.active))
+        .map(|r| r.path.clone())
+    else {
+        return Task::none();
+    };
+    let key = vuln_key(installed);
+    if !vuln_check_due(app, &venv, &key, std::time::Instant::now()) {
+        return Task::none();
+    }
+    let packages = vuln_packages(installed);
+    let http = app.osv.clone();
+    let known = app.vuln_details.clone();
+    Task::perform(
+        job::attempt(
+            move || {
+                let mut known = known.lock().unwrap_or_else(|p| p.into_inner());
+                bombadil_core::osv::check(http.as_ref(), &packages, &mut known)
+            },
+            SYNC_TIMEOUT,
+            "checking for vulnerabilities",
+        ),
+        move |result| Message::VulnsChecked(venv.clone(), key.clone(), result),
+    )
+}
+
+/// Reads a project's `[project.scripts]` off the render thread.
+fn load_entry_points(project: &Project) -> Task<Message> {
+    let id = project.id;
+    let path = project.pyproject_path.clone();
+    Task::perform(
+        async move {
+            std::fs::read_to_string(&path)
+                .map(|text| bombadil_core::pyproject::entry_points(&text))
+                .unwrap_or_default()
+        },
+        move |names| Message::EntryPointsLoaded(id, names),
+    )
+}
+
+/// Why project `i` cannot start a run now, for the disabled buttons'
+/// tooltips; `None` when it can.
+fn run_blocked(app: &App, i: usize) -> Option<&'static str> {
+    let project = app.config.projects.get(i)?;
+    if running(app, project.id) {
+        return Some("Already running. Stop it first.");
+    }
+    if app
+        .busy
+        .as_ref()
+        .is_some_and(|b| b.project_id == project.id)
+    {
+        return Some("Wait for the current uv command to finish.");
+    }
+    if app.missing.contains(&project.id) {
+        return Some(FOLDER_MISSING);
+    }
+    let has_venv = app.entries.get(i).is_some_and(|e| {
+        e.environments
+            .iter()
+            .any(|row| row.active && row.python_version.is_some())
+    });
+    if !has_venv {
+        return Some("Sync first to create the environment.");
+    }
+    None
+}
+
+/// Whether a uv command that changes project `id`'s environment must wait
+/// for its running program, saying so in a warning toast. uv would replace
+/// files the program holds open; on Windows that fails half way.
+fn refuse_while_running(app: &mut App, id: uuid::Uuid) -> bool {
+    if !running(app, id) {
+        return false;
+    }
+    let label = project_label(app, id).unwrap_or("This project").to_string();
+    crate::busy::push(
+        &mut app.toasts,
+        crate::busy::ToastKind::Warning,
+        format!("{label} is running a program. Stop it on the Run tab first."),
+        std::time::Instant::now(),
+    );
+    true
+}
+
+/// Whether project `id` has a run that has not ended.
+fn running(app: &App, id: uuid::Uuid) -> bool {
+    app.runs.get(&id).is_some_and(run_tab::Run::live)
+}
+
 /// The picker behind "Locate…", async for the same reason as `pick_folder`.
 async fn pick_pyproject() -> Option<PathBuf> {
     rfd::AsyncFileDialog::new()
@@ -5784,6 +6796,62 @@ async fn pick_pyproject() -> Option<PathBuf> {
 }
 
 pub(crate) const FOLDER_MISSING: &str = "This project's folder isn't on this computer";
+
+/// Measures what the Disk section shows, off the render thread.
+fn measure_disk(app: &mut App, runner: Arc<dyn CommandRunner>, after_prune: bool) -> Task<Message> {
+    app.disk.measuring = true;
+    let config = app.config.clone();
+    Task::perform(
+        async move {
+            match job::run(
+                move || crate::disk::measure_blocking(&config, runner.as_ref()),
+                SYNC_TIMEOUT,
+            )
+            .await
+            {
+                job::JobResult::Done(state) => state,
+                job::JobResult::TimedOut | job::JobResult::Failed => crate::disk::State::default(),
+            }
+        },
+        move |state| Message::DiskMeasured(state, after_prune),
+    )
+}
+
+/// Looks for every project's `pyproject.toml` off the render thread -- a
+/// sleeping network drive can take seconds to answer -- so a lost folder is
+/// flagged without the project being clicked first.
+pub fn sweep_missing(app: &App) -> Task<Message> {
+    let exists = app.path_exists;
+    let projects: Vec<(uuid::Uuid, PathBuf)> = app
+        .config
+        .projects
+        .iter()
+        .map(|p| (p.id, p.pyproject_path.clone()))
+        .collect();
+    // A drive that never answers keeps the marks there are, rather than
+    // clearing them or holding one of the executor's few threads.
+    let current: Vec<uuid::Uuid> = app.missing.iter().copied().collect();
+    Task::perform(
+        async move {
+            match job::run(
+                move || {
+                    projects
+                        .into_iter()
+                        .filter(|(_, path)| !exists(path))
+                        .map(|(id, _)| id)
+                        .collect::<Vec<_>>()
+                },
+                VENV_PROBE_TIMEOUT,
+            )
+            .await
+            {
+                job::JobResult::Done(gone) => gone,
+                job::JobResult::TimedOut | job::JobResult::Failed => current,
+            }
+        },
+        Message::MissingSwept,
+    )
+}
 
 /// Whether project `i`'s `pyproject.toml` is gone. Records the answer in
 /// `app.missing`, which the detail pane and the sidebar's warning read.
@@ -5959,7 +7027,10 @@ fn sync_project(
 /// it unconditionally. The error is pre-stringified because every caller
 /// does the same thing with it: surface `uv::resolve`'s own actionable text
 /// verbatim rather than a generic "could not resolve uv."
-fn resolve_uv_for(config: &Config, runner: &dyn CommandRunner) -> Result<uv::ResolvedUv, String> {
+pub(crate) fn resolve_uv_for(
+    config: &Config,
+    runner: &dyn CommandRunner,
+) -> Result<uv::ResolvedUv, String> {
     let bundled = || -> Result<PathBuf, String> {
         let data_dir =
             bombadil_core::store::paths::default_data_dir().map_err(|e| e.to_string())?;
@@ -6151,28 +7222,11 @@ fn run_in_project(
     runner: &dyn CommandRunner,
     on_line: &mut dyn FnMut(String),
 ) -> (bool, Vec<String>) {
-    let Some(project_dir) = project
-        .pyproject_path
-        .parent()
-        .filter(|p| !p.as_os_str().is_empty())
-    else {
-        return (false, vec!["no project directory to run uv in".to_string()]);
-    };
-    let Some(environment) = project.active_environment().cloned() else {
-        return (false, vec!["this project has no environment".to_string()]);
-    };
-    let venv_path = match venv_path::resolve(project, &environment, &config.settings) {
-        Ok(path) => path,
-        Err(err) => return (false, vec![err.to_string()]),
-    };
-    let resolved_uv = match resolve_uv_for(config, runner) {
-        Ok(resolved) => resolved,
+    let (resolved_uv, ctx) = match project_target(project, config, runner) {
+        Ok(target) => target,
         Err(err) => return (false, vec![err]),
     };
-    let ctx = uv::command::ProjectContext {
-        project_dir: project_dir.to_path_buf(),
-        venv_path: venv_path.clone(),
-    };
+    let venv_path = ctx.venv_path.clone();
     // In order, stopping at the first failure: a workspace add is `uv add
     // --no-sync` then the member-aware sync, and the sync must not run
     // after an add uv refused.
@@ -6186,6 +7240,75 @@ fn run_in_project(
         }
     }
     (true, transcript)
+}
+
+/// The uv and the folder and environment a project-scoped uv command runs
+/// against: the project's directory and its active environment.
+fn project_target(
+    project: &Project,
+    config: &Config,
+    runner: &dyn CommandRunner,
+) -> Result<(uv::ResolvedUv, uv::command::ProjectContext), String> {
+    let Some(project_dir) = project
+        .pyproject_path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+    else {
+        return Err("no project directory to run uv in".to_string());
+    };
+    let Some(environment) = project.active_environment().cloned() else {
+        return Err("this project has no environment".to_string());
+    };
+    let venv_path = venv_path::resolve(project, &environment, &config.settings)
+        .map_err(|err| err.to_string())?;
+    let resolved_uv = resolve_uv_for(config, runner)?;
+    let ctx = uv::command::ProjectContext {
+        project_dir: project_dir.to_path_buf(),
+        venv_path,
+    };
+    Ok((resolved_uv, ctx))
+}
+
+/// The blocking half of a Run-tab run: `uv run --no-sync <args>` in the
+/// project's folder and active environment, composed exactly as a terminal
+/// is, streamed line by line and stoppable through `cancel`.
+fn run_program(
+    project: &Project,
+    config: &Config,
+    args: &[String],
+    store: &dyn SecretStore,
+    runner: &dyn CommandRunner,
+    cancel: &std::sync::atomic::AtomicBool,
+    on_line: &mut dyn FnMut(String),
+) -> run_tab::RunEnd {
+    use run_tab::RunEnd;
+    let (resolved_uv, ctx) = match project_target(project, config, runner) {
+        Ok(target) => target,
+        Err(e) => return RunEnd::Failed(e),
+    };
+    let spec = uv::command::run(&resolved_uv, &ctx, args);
+    let (mut spec, secrets) = match composed(spec, project, config, &ctx.venv_path, store, runner) {
+        Ok(c) => c,
+        Err(e) => return RunEnd::Failed(e),
+    };
+    // Piped, Python holds its output back until 8 KB or exit, and on Windows
+    // writes cp1252: a progress line a second would show nothing, and an
+    // emoji would crash. A value the project set itself wins.
+    for (key, value) in [("PYTHONUNBUFFERED", "1"), ("PYTHONIOENCODING", "utf-8")] {
+        spec.env
+            .entry(key.to_string())
+            .or_insert_with(|| value.to_string());
+    }
+    let result = runner.stream_cancellable(
+        &spec,
+        &mut |line| on_line(envspec::redact(line.text().to_string(), &secrets)),
+        cancel,
+    );
+    match result {
+        Ok(_) if cancel.load(std::sync::atomic::Ordering::SeqCst) => RunEnd::Stopped,
+        Ok(outcome) => RunEnd::Exited(outcome.status),
+        Err(e) => RunEnd::Failed(envspec::redact(e.to_string(), &secrets)),
+    }
 }
 
 /// A Dependencies-tab change: upgrade one package or all, or an add whose
@@ -6573,7 +7696,7 @@ fn run_confirm_add_project(
 /// `on_line` never saw -- the errors that happen *instead* of a run, so a
 /// caller that shows both does not show uv's output twice.
 fn compose_and_stream(
-    mut spec: bombadil_core::process::CommandSpec,
+    spec: bombadil_core::process::CommandSpec,
     project: &Project,
     config: &Config,
     venv_path: &Path,
@@ -6581,24 +7704,10 @@ fn compose_and_stream(
     runner: &dyn CommandRunner,
     on_line: &mut dyn FnMut(String),
 ) -> (bool, Vec<String>) {
-    let inputs = EnvInputs {
-        parent: std::env::vars().collect(),
-        config: config.clone(),
-        project: project.clone(),
-        venv_path: venv_path.to_path_buf(),
+    let (spec, secrets) = match composed(spec, project, config, venv_path, store, runner) {
+        Ok(c) => c,
+        Err(err) => return (false, vec![err]),
     };
-    let env = match envspec::compose(&inputs, store, runner) {
-        // `compose` already scrubs its own errors of the secrets it resolved.
-        Ok(env) => env,
-        Err(err) => return (false, vec![err.to_string()]),
-    };
-    let secrets = secret_values(&inputs, &env);
-
-    spec.env = env;
-    // `clear_env`, the discipline plan 2b established and the spec builders
-    // leave off: the composition is authoritative, not a layer on top of
-    // whatever launched Bombadil.
-    spec.clear_env = true;
 
     match runner.stream(&spec, &mut |line| {
         on_line(envspec::redact(line.text().to_string(), &secrets))
@@ -6608,6 +7717,33 @@ fn compose_and_stream(
         Ok(outcome) => (outcome.success(), Vec::new()),
         Err(err) => (false, vec![envspec::redact(err.to_string(), &secrets)]),
     }
+}
+
+/// `spec` with the project's composed environment, ready to run, and the
+/// secret values its output must be scrubbed of.
+fn composed(
+    mut spec: bombadil_core::process::CommandSpec,
+    project: &Project,
+    config: &Config,
+    venv_path: &Path,
+    store: &dyn SecretStore,
+    runner: &dyn CommandRunner,
+) -> Result<(bombadil_core::process::CommandSpec, Vec<String>), String> {
+    let inputs = EnvInputs {
+        parent: std::env::vars().collect(),
+        config: config.clone(),
+        project: project.clone(),
+        venv_path: venv_path.to_path_buf(),
+    };
+    // `compose` already scrubs its own errors of the secrets it resolved.
+    let env = envspec::compose(&inputs, store, runner).map_err(|err| err.to_string())?;
+    let secrets = secret_values(&inputs, &env);
+    spec.env = env;
+    // `clear_env`, the discipline plan 2b established and the spec builders
+    // leave off: the composition is authoritative, not a layer on top of
+    // whatever launched Bombadil.
+    spec.clear_env = true;
+    Ok((spec, secrets))
 }
 
 /// Run one of the streaming halves above and gather what it streamed, for the
@@ -7232,6 +8368,7 @@ pub fn view(app: &App) -> iced::Element<'_, Message> {
                     .filter(|(j, _)| j == i)
                     .and_then(|(_, r)| r.as_ref().ok())
                     .map_or(&[][..], Vec::as_slice),
+                &deps_extras(app, *i, tab),
             ),
             _ => iced::widget::text("").into(),
         },
@@ -7278,6 +8415,27 @@ pub fn view(app: &App) -> iced::Element<'_, Message> {
             None => iced::widget::text("").into(),
         },
         // This project's open pull request and its checks, when there is one.
+        Tab::Run => match app
+            .selected
+            .and_then(|i| app.config.projects.get(i).map(|p| (i, p)))
+        {
+            Some((i, project)) => {
+                let names = match &app.entry_points {
+                    Some((id, names)) if *id == project.id => names.as_slice(),
+                    _ => &[],
+                };
+                run_tab::view(
+                    project,
+                    i,
+                    names,
+                    app.runs.get(&project.id),
+                    &app.command_draft,
+                    run_blocked(app, i),
+                    app.now,
+                )
+            }
+            None => iced::widget::text("").into(),
+        },
         Tab::GitHub => match app.selected.and_then(|i| app.config.projects.get(i)) {
             Some(project) => crate::github_tab::view(
                 project.id,
@@ -7448,6 +8606,14 @@ pub fn view(app: &App) -> iced::Element<'_, Message> {
             .size(theme::LABEL)
             .style(theme::text_muted),
         iced::widget::Space::new().width(iced::Length::Fill),
+        theme::tip(
+            iced::widget::button(iced::widget::text("New").size(theme::LABEL))
+                .on_press(Message::NewProjectRequested)
+                .padding([theme::SPACE_1, theme::SPACE_2])
+                .style(theme::button_secondary),
+            "Create a new project",
+            iced::widget::tooltip::Position::Bottom,
+        ),
         // Labelled "Add", not a bare `+`: an icon-only control with no icon
         // set behind it is a glyph the user has to guess at.
         match waiting {
@@ -7478,6 +8644,7 @@ pub fn view(app: &App) -> iced::Element<'_, Message> {
             Some(Message::SidebarToggled),
         ),
     ]
+    .spacing(theme::SPACE_1)
     .align_y(iced::Alignment::Center);
 
     let dirs: Vec<PathBuf> = app
@@ -7492,6 +8659,12 @@ pub fn view(app: &App) -> iced::Element<'_, Message> {
         })
         .collect();
     let shown = sidebar::visible(&app.entries, &dirs, &app.project_filter, app.selected);
+    let running_ids: std::collections::HashSet<uuid::Uuid> = app
+        .runs
+        .iter()
+        .filter(|(_, run)| run.live())
+        .map(|(id, _)| *id)
+        .collect();
     let sidebar_body: iced::Element<'_, Message> = if app.entries.is_empty() {
         iced::widget::text("None yet")
             .size(theme::DATA)
@@ -7502,6 +8675,7 @@ pub fn view(app: &App) -> iced::Element<'_, Message> {
             .map(|i| project_findings(app, i))
             .collect();
         iced::widget::scrollable(sidebar::view(
+            &running_ids,
             &app.entries,
             &findings,
             app.selected,
@@ -7739,6 +8913,41 @@ pub fn view(app: &App) -> iced::Element<'_, Message> {
     if app.confirm_member_sync.is_some() {
         layers = layers.push(shell::overlay_layer(confirm_member_sync_view));
     }
+    if let Some((query, index)) = &app.find {
+        layers = layers.push(shell::overlay_layer(crate::find_package::view(
+            query,
+            index.as_deref(),
+        )));
+    }
+    if let Some(draft) = &app.new_project {
+        layers = layers.push(shell::overlay_layer(crate::new_project::view(
+            draft,
+            app.installed_pythons.as_deref().unwrap_or(&[]),
+            app.creating_project,
+        )));
+    }
+    if let Some((id, _)) = &app.confirm_stop {
+        let label = project_label(app, *id).unwrap_or("This project");
+        layers = layers.push(shell::overlay_layer(run_tab::confirm_view(
+            format!("{label} is running. Stop the run and continue?"),
+            "Stop and continue",
+            Message::StopThenConfirmed,
+            Message::StopThenCancelled,
+        )));
+    }
+    if app.confirm_quit {
+        let live = app.runs.values().filter(|r| r.live()).count();
+        let text = match live {
+            1 => "A program is still running. Stop it and quit?".to_string(),
+            n => format!("{n} programs are still running. Stop them and quit?"),
+        };
+        layers = layers.push(shell::overlay_layer(run_tab::confirm_view(
+            text,
+            "Stop and quit",
+            Message::QuitConfirmed,
+            Message::QuitCancelled,
+        )));
+    }
     if !app.toasts.is_empty() {
         layers = layers.push(toast_layer(&app.toasts));
     }
@@ -7765,6 +8974,8 @@ pub fn view(app: &App) -> iced::Element<'_, Message> {
             app.github_accounts.as_ref(),
             app.github_login.as_ref(),
             &app.backup,
+            &app.disk,
+            app.busy.is_none(),
         ));
     }
     if let Some(modal) = app.modal {
@@ -7774,7 +8985,7 @@ pub fn view(app: &App) -> iced::Element<'_, Message> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use bombadil_core::model::Config;
     use bombadil_core::process::FakeCommandRunner;
@@ -8619,7 +9830,7 @@ mod tests {
 
     /// A uv that resolves through `UvSource::Custom`, which probes the given
     /// path through `runner` and never touches PATH or the filesystem.
-    fn fake_uv_settings() -> bombadil_core::model::Settings {
+    pub(crate) fn fake_uv_settings() -> bombadil_core::model::Settings {
         bombadil_core::model::Settings {
             uv_source: bombadil_core::model::UvSource::Custom {
                 path: PathBuf::from("/fake/bin/uv"),
@@ -8628,7 +9839,7 @@ mod tests {
         }
     }
 
-    fn version_probe(runner: &FakeCommandRunner) {
+    pub(crate) fn version_probe(runner: &FakeCommandRunner) {
         runner.expect(
             "uv",
             &["--version"],
@@ -8903,7 +10114,8 @@ mod tests {
                 Tab::EnvVars,
                 Tab::Indexes,
                 Tab::GitHub,
-                Tab::Doctor
+                Tab::Doctor,
+                Tab::Run
             ],
             "unknown and repeated keys go; missing tabs follow in built-in order"
         );
@@ -10668,6 +11880,1101 @@ mod tests {
         );
     }
 
+    fn start_run(app: &mut App, args: &[&str]) -> Task<Message> {
+        app.entries[0].environments[0].python_version = Some("3.12.0".into());
+        let id = first_id(app);
+        update(
+            app,
+            Message::RunRequested {
+                project: id,
+                label: "demo".into(),
+                args: args.iter().map(|s| s.to_string()).collect(),
+            },
+            unused_runner(),
+        )
+    }
+
+    #[test]
+    fn a_created_project_opens_the_add_dialog_on_its_manifest() {
+        let mut app = App::new(Config::default());
+        let _ = update(&mut app, Message::NewProjectRequested, unused_runner());
+        assert!(app.new_project.is_some());
+        let manifest = PathBuf::from("/w/demo/pyproject.toml");
+        let task = update(
+            &mut app,
+            Message::NewProjectCreated(Ok(manifest)),
+            unused_runner(),
+        );
+        assert!(app.new_project.is_none());
+        assert!(
+            task.units() > 0,
+            "the manifest is loaded for the Add project dialog"
+        );
+    }
+
+    #[test]
+    fn a_failed_create_keeps_the_dialog_and_says_why() {
+        let mut app = App::new(Config::default());
+        let _ = update(&mut app, Message::NewProjectRequested, unused_runner());
+        app.creating_project = true;
+        let _ = update(
+            &mut app,
+            Message::NewProjectCreated(Err("error: boom".into())),
+            unused_runner(),
+        );
+        let draft = app.new_project.as_ref().unwrap();
+        assert_eq!(draft.error.as_deref(), Some("error: boom"));
+        assert!(!app.creating_project);
+        assert!(app.config.projects.is_empty(), "nothing registered");
+    }
+
+    #[test]
+    fn create_waits_for_a_valid_name() {
+        let mut app = App::new(Config::default());
+        let _ = update(&mut app, Message::NewProjectRequested, unused_runner());
+        let _ = update(
+            &mut app,
+            Message::NewProjectName("bad name".into()),
+            unused_runner(),
+        );
+        let task = update(&mut app, Message::NewProjectCreate, unused_runner());
+        assert_eq!(task.units(), 0);
+        assert!(!app.creating_project);
+    }
+
+    fn venv_of(app: &App) -> PathBuf {
+        app.entries[0]
+            .environments
+            .iter()
+            .find(|r| r.active)
+            .unwrap()
+            .path
+            .clone()
+    }
+
+    fn deps_loaded_with(
+        app: &mut App,
+        installed: Vec<bombadil_core::uv::results::InstalledPackage>,
+    ) -> Task<Message> {
+        let fetch = DepsFetch {
+            pyproject: Default::default(),
+            installed,
+            tree: no_tree(),
+        };
+        update(app, Message::DepsLoaded(0, Ok(fetch)), unused_runner())
+    }
+
+    fn installed(list: &[(&str, &str)]) -> Vec<bombadil_core::uv::results::InstalledPackage> {
+        list.iter()
+            .map(|(n, v)| bombadil_core::uv::results::InstalledPackage {
+                name: n.to_string(),
+                version: v.to_string(),
+                editable_project_location: None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn loading_dependencies_starts_a_check() {
+        let mut app = one_project();
+        app.selected = Some(0);
+        let task = deps_loaded_with(&mut app, installed(&[("jinja2", "2.4.1")]));
+        assert!(task.units() > 0, "the check was dispatched");
+    }
+
+    #[test]
+    fn turning_the_check_off_sends_nothing() {
+        let mut app = one_project();
+        app.selected = Some(0);
+        app.config.settings.check_vulnerabilities = false;
+        assert!(!vuln_check_due(
+            &app,
+            &venv_of(&app),
+            "x==1",
+            std::time::Instant::now()
+        ));
+        let task = deps_loaded_with(&mut app, installed(&[("jinja2", "2.4.1")]));
+        assert_eq!(task.units(), 0);
+    }
+
+    #[test]
+    fn an_unchanged_environment_is_not_checked_twice_a_day() {
+        let mut app = one_project();
+        let venv = venv_of(&app);
+        let now = std::time::Instant::now();
+        let _ = update(
+            &mut app,
+            Message::VulnsChecked(venv.clone(), "x==1".into(), Ok(Default::default())),
+            unused_runner(),
+        );
+        assert!(!vuln_check_due(&app, &venv, "x==1", now));
+        assert!(
+            vuln_check_due(&app, &venv, "x==2", now),
+            "a changed environment is"
+        );
+        assert!(vuln_check_due(
+            &app,
+            &venv,
+            "x==1",
+            now + std::time::Duration::from_secs(25 * 3600)
+        ));
+    }
+
+    #[test]
+    fn findings_only_show_for_the_list_they_were_made_for() {
+        let mut app = one_project();
+        app.selected = Some(0);
+        let venv = venv_of(&app);
+        let _ = deps_loaded_with(&mut app, installed(&[("jinja2", "2.4.1")]));
+        let finding = bombadil_core::osv::Finding {
+            id: "GHSA-1".into(),
+            summary: "x".into(),
+            severity: None,
+            fixed: Some("2.10.1".into()),
+        };
+        let key = vuln_key(&installed(&[("jinja2", "2.4.1")]));
+        let _ = update(
+            &mut app,
+            Message::VulnsChecked(
+                venv,
+                key,
+                Ok([("jinja2".to_string(), vec![finding])].into()),
+            ),
+            unused_runner(),
+        );
+        assert!(
+            project_findings(&app, 0)
+                .iter()
+                .any(|f| f.text.contains("vulnerab"))
+        );
+        // Upgraded: the old answer no longer describes this environment.
+        let _ = deps_loaded_with(&mut app, installed(&[("jinja2", "3.1.6")]));
+        assert!(
+            !project_findings(&app, 0)
+                .iter()
+                .any(|f| f.text.contains("vulnerab"))
+        );
+    }
+
+    #[test]
+    fn switching_the_check_off_forgets_its_findings() {
+        let mut app = one_project();
+        app.selected = Some(0);
+        let venv = venv_of(&app);
+        let list = installed(&[("jinja2", "2.4.1")]);
+        let _ = deps_loaded_with(&mut app, list.clone());
+        let finding = bombadil_core::osv::Finding {
+            id: "GHSA-1".into(),
+            summary: "x".into(),
+            severity: None,
+            fixed: None,
+        };
+        let _ = update(
+            &mut app,
+            Message::VulnsChecked(
+                venv,
+                vuln_key(&list),
+                Ok([("jinja2".to_string(), vec![finding])].into()),
+            ),
+            unused_runner(),
+        );
+        let _ = update(
+            &mut app,
+            Message::CheckVulnerabilitiesSelected(false),
+            unused_runner(),
+        );
+        assert!(
+            !project_findings(&app, 0)
+                .iter()
+                .any(|f| f.text.contains("vulnerab"))
+        );
+    }
+
+    #[test]
+    fn local_projects_never_leave_the_machine() {
+        let mut list = installed(&[("jinja2", "2.4.1"), ("acme-billing-internal", "0.1.0")]);
+        list[1].editable_project_location = Some(PathBuf::from("/w/billing"));
+        assert_eq!(
+            vuln_packages(&list),
+            [("jinja2".to_string(), "2.4.1".to_string())]
+        );
+        assert!(!vuln_key(&list).contains("acme"));
+    }
+
+    #[test]
+    fn a_failed_check_is_retried_on_the_next_load() {
+        let mut app = one_project();
+        let venv = venv_of(&app);
+        let _ = update(
+            &mut app,
+            Message::VulnsChecked(venv.clone(), "x==1".into(), Err("offline".into())),
+            unused_runner(),
+        );
+        assert!(vuln_check_due(
+            &app,
+            &venv,
+            "x==1",
+            std::time::Instant::now()
+        ));
+    }
+
+    #[test]
+    fn findings_become_a_health_warning_and_a_failure_does_not() {
+        let mut app = one_project();
+        app.selected = Some(0);
+        let venv = venv_of(&app);
+        let list = installed(&[("jinja2", "2.4.1")]);
+        let _ = deps_loaded_with(&mut app, list.clone());
+        let finding = bombadil_core::osv::Finding {
+            id: "GHSA-1".into(),
+            summary: "x".into(),
+            severity: None,
+            fixed: Some("2".into()),
+        };
+        let _ = update(
+            &mut app,
+            Message::VulnsChecked(
+                venv.clone(),
+                vuln_key(&list),
+                Ok([("jinja2".to_string(), vec![finding])].into()),
+            ),
+            unused_runner(),
+        );
+        assert!(
+            project_findings(&app, 0)
+                .iter()
+                .any(|f| f.text == "1 package has a known vulnerability")
+        );
+        let _ = update(
+            &mut app,
+            Message::VulnsChecked(venv, vuln_key(&list), Err("offline".into())),
+            unused_runner(),
+        );
+        assert!(
+            !project_findings(&app, 0)
+                .iter()
+                .any(|f| f.text.contains("vulnerab"))
+        );
+    }
+
+    #[test]
+    fn clicking_a_package_opens_its_details_and_again_closes_them() {
+        let mut app = one_project();
+        app.selected = Some(0);
+        let id = first_id(&app);
+        let _ = deps_loaded_with(&mut app, installed(&[("jinja2", "2.4.1")]));
+        let task = update(
+            &mut app,
+            Message::DepDetailsToggled(0, "jinja2".into()),
+            unused_runner(),
+        );
+        assert!(matches!(&app.dep_details, Some((p, n, None)) if *p == id && n == "jinja2"));
+        assert!(task.units() > 0, "the METADATA is read");
+        let _ = update(
+            &mut app,
+            Message::DepDetailsToggled(0, "jinja2".into()),
+            unused_runner(),
+        );
+        assert!(app.dep_details.is_none());
+    }
+
+    #[test]
+    fn details_for_another_package_are_ignored_when_late() {
+        let mut app = one_project();
+        let id = first_id(&app);
+        let _ = update(
+            &mut app,
+            Message::DepDetailsToggled(0, "a".into()),
+            unused_runner(),
+        );
+        let _ = update(
+            &mut app,
+            Message::DepDetailsLoaded(id, "b".into(), Some(Default::default())),
+            unused_runner(),
+        );
+        assert!(matches!(&app.dep_details, Some((_, n, None)) if n == "a"));
+    }
+
+    #[test]
+    fn upgrade_to_the_fixed_version_installs_it() {
+        let mut app = one_project();
+        let task = update(
+            &mut app,
+            Message::DepPinRequested(0, "jinja2".into(), "2.10.1".into(), deps::GroupKind::Main),
+            unused_runner(),
+        );
+        assert!(task.units() > 0);
+        assert!(matches!(
+            app.busy.as_ref().map(|b| &b.action),
+            Some(crate::busy::Action::InstallVersion(r)) if r == "jinja2==2.10.1"
+        ));
+    }
+
+    #[test]
+    fn a_finished_sync_reports_what_changed() {
+        let mut app = one_project();
+        app.selected = Some(0);
+        let id = first_id(&app);
+        let _ = deps_loaded_with(
+            &mut app,
+            installed(&[("numpy", "2.1.0"), ("six", "1.16.0")]),
+        );
+        app.busy = Some(crate::busy::Busy::new(id, crate::busy::Action::Sync));
+        let _ = update(
+            &mut app,
+            Message::SyncFinished {
+                success: true,
+                lines: vec![],
+            },
+            unused_runner(),
+        );
+        assert_eq!(app.toasts[0].text, "Synced api");
+        let _ = deps_loaded_with(
+            &mut app,
+            installed(&[("numpy", "2.3.1"), ("polars", "1.9.0")]),
+        );
+        assert_eq!(
+            app.toasts[0].text,
+            "Synced api: numpy 2.1.0 → 2.3.1, added polars, removed six"
+        );
+        assert!(app.drawer.lines.iter().any(|l| l == "+ polars 1.9.0"));
+        assert_eq!(
+            app.last_change.as_ref().map(|(_, s)| s.as_str()),
+            Some("numpy 2.1.0 → 2.3.1, added polars, removed six")
+        );
+    }
+
+    #[test]
+    fn a_reload_without_an_action_reports_nothing() {
+        let mut app = one_project();
+        app.selected = Some(0);
+        let _ = deps_loaded_with(&mut app, installed(&[("a", "1")]));
+        let _ = deps_loaded_with(&mut app, installed(&[("a", "2")]));
+        assert!(app.toasts.is_empty());
+        assert!(app.last_change.is_none());
+    }
+
+    #[test]
+    fn a_failed_sync_reports_no_change() {
+        let mut app = one_project();
+        app.selected = Some(0);
+        let id = first_id(&app);
+        let _ = deps_loaded_with(&mut app, installed(&[("a", "1")]));
+        app.busy = Some(crate::busy::Busy::new(id, crate::busy::Action::Sync));
+        let _ = update(
+            &mut app,
+            Message::SyncFinished {
+                success: false,
+                lines: vec![],
+            },
+            unused_runner(),
+        );
+        assert!(!app.awaiting_change.contains_key(&id));
+    }
+
+    #[test]
+    fn a_failure_toast_offers_show_output_once() {
+        // The toast has its own "Show output"; the doctor's fix must not
+        // be a second one.
+        let mut app = one_project();
+        let id = first_id(&app);
+        app.busy = Some(crate::busy::Busy::new(id, crate::busy::Action::Sync));
+        let _ = update(
+            &mut app,
+            Message::SyncFinished {
+                success: false,
+                lines: vec!["  × The build backend returned an error".into()],
+            },
+            unused_runner(),
+        );
+        assert_eq!(app.toasts[0].kind, crate::busy::ToastKind::Failure);
+        assert_eq!(app.toasts[0].fix, None);
+    }
+
+    #[test]
+    fn opening_the_disk_section_measures() {
+        let mut app = one_project();
+        let task = update(
+            &mut app,
+            Message::PreferencesSectionOpened(preferences::Section::Disk),
+            unused_runner(),
+        );
+        assert!(task.units() > 0);
+        assert!(app.disk.measuring);
+    }
+
+    #[test]
+    fn a_delete_asks_first() {
+        let mut app = one_project();
+        let path = PathBuf::from("/central/old");
+        let task = update(
+            &mut app,
+            Message::DiskDeleteRequested(crate::disk::Delete::Leftover(path.clone())),
+            unused_runner(),
+        );
+        assert_eq!(task.units(), 0, "nothing deleted yet");
+        assert_eq!(app.disk.confirm, Some(crate::disk::Delete::Leftover(path)));
+        let _ = update(&mut app, Message::DiskDeleteCancelled, unused_runner());
+        assert!(app.disk.confirm.is_none());
+    }
+
+    #[test]
+    fn an_environment_in_use_is_not_deleted() {
+        let mut app = one_project();
+        let id = first_id(&app);
+        let _ = start_run(&mut app, &["demo"]);
+        let delete =
+            crate::disk::Delete::Environment(id, VenvLocation::Alongside, "/p/.venv".into());
+        let _ = update(
+            &mut app,
+            Message::DiskDeleteRequested(delete),
+            unused_runner(),
+        );
+        assert!(app.disk.confirm.is_none());
+        assert!(
+            app.toasts[0].text.contains("is running"),
+            "{}",
+            app.toasts[0].text
+        );
+    }
+
+    #[test]
+    fn a_deleted_extra_environment_leaves_the_project() {
+        let mut app = one_project();
+        let id = first_id(&app);
+        let extra = VenvLocation::Custom {
+            path: "/envs/extra".into(),
+        };
+        app.config.projects[0]
+            .environments
+            .push(bombadil_core::model::Environment {
+                location: extra.clone(),
+                python: Default::default(),
+            });
+        let delete = crate::disk::Delete::Environment(id, extra.clone(), "/envs/extra".into());
+        let task = update(
+            &mut app,
+            Message::DiskDeleted(delete, Ok(())),
+            unused_runner(),
+        );
+        assert!(
+            !app.config.projects[0]
+                .environments
+                .iter()
+                .any(|e| e.location == extra)
+        );
+        assert!(task.units() > 0, "saved and measured again");
+        assert!(app.toasts[0].text.starts_with("Deleted"));
+    }
+
+    #[test]
+    fn pruning_the_cache_takes_the_one_command_slot() {
+        let mut app = one_project();
+        app.disk.cache = Some(("/c".into(), Some(100)));
+        let task = update(&mut app, Message::CachePruneRequested, unused_runner());
+        assert!(task.units() > 0);
+        assert!(matches!(
+            app.busy.as_ref().map(|b| &b.action),
+            Some(crate::busy::Action::CachePrune)
+        ));
+        assert_eq!(app.disk.before_prune, Some(100));
+    }
+
+    #[test]
+    fn a_remeasure_after_a_prune_says_what_it_freed() {
+        let mut app = one_project();
+        app.disk.before_prune = Some(3_000_000);
+        let measured = crate::disk::State {
+            cache: Some(("/c".into(), Some(1_741_825))),
+            ..Default::default()
+        };
+        // Another measurement landing mid-prune is not the answer.
+        let _ = update(
+            &mut app,
+            Message::DiskMeasured(measured.clone(), false),
+            unused_runner(),
+        );
+        assert!(app.toasts.is_empty());
+        assert_eq!(app.disk.before_prune, Some(3_000_000));
+        let _ = update(
+            &mut app,
+            Message::DiskMeasured(measured, true),
+            unused_runner(),
+        );
+        assert_eq!(app.toasts[0].text, "Freed 1.2 MB");
+        assert!(app.disk.before_prune.is_none());
+    }
+
+    #[test]
+    fn a_failed_prune_reports_no_space_freed() {
+        let mut app = one_project();
+        app.disk.before_prune = Some(100);
+        app.busy = Some(crate::busy::Busy::new(
+            uuid::Uuid::nil(),
+            crate::busy::Action::CachePrune,
+        ));
+        let _ = update(
+            &mut app,
+            Message::SyncFinished {
+                success: false,
+                lines: vec!["error: no".into()],
+            },
+            unused_runner(),
+        );
+        assert!(app.disk.before_prune.is_none());
+        assert!(app.toasts[0].fix.is_none(), "no project to fix it in");
+        assert!(!app.last_failure.contains_key(&uuid::Uuid::nil()));
+    }
+
+    #[test]
+    fn the_boot_sweep_is_a_background_task() {
+        let mut app = two_projects();
+        app.path_exists = |_| false;
+        let task = sweep_missing(&app);
+        assert!(task.units() > 0);
+        assert!(
+            app.missing.is_empty(),
+            "the render thread never looks at the disk"
+        );
+    }
+
+    #[test]
+    fn focus_rechecks_folders_with_nothing_selected() {
+        let mut app = two_projects();
+        app.selected = None;
+        let task = update(&mut app, Message::WindowFocused, unused_runner());
+        assert!(task.units() > 0, "a re-mounted drive clears its warning");
+    }
+
+    #[test]
+    fn a_sweep_marks_and_clears() {
+        let mut app = two_projects();
+        let id = first_id(&app);
+        let _ = update(&mut app, Message::MissingSwept(vec![id]), unused_runner());
+        assert!(app.missing.contains(&id));
+        let _ = update(&mut app, Message::MissingSwept(vec![]), unused_runner());
+        assert!(app.missing.is_empty());
+    }
+
+    #[test]
+    fn a_sweep_ignores_removed_projects() {
+        let mut app = one_project();
+        let gone = uuid::Uuid::new_v4();
+        let _ = update(&mut app, Message::MissingSwept(vec![gone]), unused_runner());
+        assert!(app.missing.is_empty());
+    }
+
+    #[test]
+    fn opening_find_indexes_in_the_background() {
+        let mut app = one_project();
+        let task = update(&mut app, Message::FindOpened, unused_runner());
+        assert!(task.units() > 0);
+        assert!(matches!(&app.find, Some((q, None)) if q.is_empty()));
+    }
+
+    #[test]
+    fn picking_a_hit_selects_opens_and_filters() {
+        let mut app = two_projects();
+        app.find = Some(("req".into(), Some(Vec::new())));
+        let id = app.config.projects[1].id;
+        let task = update(
+            &mut app,
+            Message::FindPicked(id, "requests".into()),
+            unused_runner(),
+        );
+        assert_eq!(app.selected, Some(1));
+        assert_eq!(app.tab, Tab::Dependencies);
+        assert_eq!(app.dep_filter, "requests");
+        assert!(app.find.is_none());
+        assert!(task.units() > 0, "the project is read as a click would");
+    }
+
+    #[test]
+    fn the_vulnerability_switch_is_saved() {
+        let mut app = App::new(Config::default());
+        let task = update(
+            &mut app,
+            Message::CheckVulnerabilitiesSelected(false),
+            unused_runner(),
+        );
+        assert!(!app.config.settings.check_vulnerabilities);
+        assert!(task.units() > 0);
+    }
+
+    #[test]
+    fn saving_a_command_adds_it_and_persists() {
+        let mut app = one_project();
+        app.selected = Some(0);
+        let _ = update(
+            &mut app,
+            Message::CommandDraftLabel("tests".into()),
+            unused_runner(),
+        );
+        let _ = update(
+            &mut app,
+            Message::CommandDraftCommand("pytest -q".into()),
+            unused_runner(),
+        );
+        let task = update(&mut app, Message::CommandSaved, unused_runner());
+        assert_eq!(app.config.projects[0].commands[0].command, "pytest -q");
+        assert_eq!(app.config.projects[0].commands[0].label, "tests");
+        assert!(task.units() > 0, "persisted");
+        assert_eq!(app.command_draft.command, "", "the form clears");
+    }
+
+    #[test]
+    fn editing_replaces_in_place() {
+        let mut app = one_project();
+        app.selected = Some(0);
+        app.config.projects[0].commands = vec![
+            bombadil_core::model::SavedCommand {
+                label: "a".into(),
+                command: "x".into(),
+            },
+            bombadil_core::model::SavedCommand {
+                label: "b".into(),
+                command: "y".into(),
+            },
+        ];
+        let _ = update(&mut app, Message::CommandEdit(0), unused_runner());
+        assert_eq!(app.command_draft.command, "x");
+        let _ = update(
+            &mut app,
+            Message::CommandDraftCommand("z".into()),
+            unused_runner(),
+        );
+        let _ = update(&mut app, Message::CommandSaved, unused_runner());
+        assert_eq!(app.config.projects[0].commands[0].command, "z");
+        assert_eq!(app.config.projects[0].commands.len(), 2);
+    }
+
+    #[test]
+    fn removing_a_command_persists() {
+        let mut app = one_project();
+        app.selected = Some(0);
+        app.config.projects[0].commands = vec![bombadil_core::model::SavedCommand {
+            label: "a".into(),
+            command: "x".into(),
+        }];
+        let task = update(&mut app, Message::CommandRemoved(0), unused_runner());
+        assert!(app.config.projects[0].commands.is_empty());
+        assert!(task.units() > 0);
+    }
+
+    #[test]
+    fn a_blank_command_is_not_saved() {
+        let mut app = one_project();
+        app.selected = Some(0);
+        let _ = update(
+            &mut app,
+            Message::CommandDraftCommand("   ".into()),
+            unused_runner(),
+        );
+        let task = update(&mut app, Message::CommandSaved, unused_runner());
+        assert!(app.config.projects[0].commands.is_empty());
+        assert_eq!(task.units(), 0);
+    }
+
+    #[test]
+    fn a_picked_file_is_saved_and_run() {
+        let mut app = one_project();
+        app.entries[0].environments[0].python_version = Some("3.12.0".into());
+        let id = first_id(&app);
+        let file = app.config.projects[0]
+            .pyproject_path
+            .parent()
+            .unwrap()
+            .join("main.py");
+        let task = update(
+            &mut app,
+            Message::RunFilePicked(id, Some(file)),
+            unused_runner(),
+        );
+        assert_eq!(app.config.projects[0].commands[0].command, "python main.py");
+        assert!(app.runs[&id].live());
+        assert!(task.units() > 0);
+    }
+
+    #[test]
+    fn clicking_the_run_tab_reads_the_entry_points() {
+        // A click on a tab arrives as the start of a drag.
+        let mut app = one_project();
+        app.selected = Some(0);
+        let task = update(&mut app, Message::TabDragStarted(Tab::Run), unused_runner());
+        assert!(task.units() > 0);
+    }
+
+    #[test]
+    fn opening_the_run_tab_reads_the_entry_points() {
+        let mut app = one_project();
+        app.selected = Some(0);
+        let task = update(&mut app, Message::TabSelected(Tab::Run), unused_runner());
+        assert!(task.units() > 0);
+    }
+
+    #[test]
+    fn a_live_run_keeps_the_clock_ticking() {
+        let mut app = one_project();
+        assert!(!runs_live(&app));
+        let id = first_id(&app);
+        let _ = start_run(&mut app, &["demo"]);
+        assert!(runs_live(&app), "the elapsed time has to move");
+        let _ = update(
+            &mut app,
+            Message::RunFinished(id, run_tab::RunEnd::Exited(Some(0))),
+            unused_runner(),
+        );
+        assert!(!runs_live(&app));
+    }
+
+    #[test]
+    fn a_run_takes_the_projects_lane_not_the_busy_slot() {
+        let mut app = one_project();
+        let task = start_run(&mut app, &["demo"]);
+        assert!(task.units() > 0);
+        assert!(app.busy.is_none(), "another project can still sync");
+        assert!(app.runs[&first_id(&app)].live());
+    }
+
+    #[test]
+    fn a_second_run_of_the_same_project_is_refused() {
+        let mut app = one_project();
+        let _ = start_run(&mut app, &["demo"]);
+        let task = start_run(&mut app, &["other"]);
+        assert_eq!(task.units(), 0);
+        assert_eq!(app.runs[&first_id(&app)].label, "demo");
+    }
+
+    #[test]
+    fn a_run_cannot_start_while_its_project_syncs() {
+        let mut app = one_project();
+        app.busy = Some(crate::busy::Busy::new(
+            first_id(&app),
+            crate::busy::Action::Sync,
+        ));
+        app.entries[0].environments[0].python_version = Some("3.12.0".into());
+        assert!(run_blocked(&app, 0).is_some());
+        let task = start_run(&mut app, &["demo"]);
+        assert_eq!(task.units(), 0);
+        assert!(app.runs.is_empty());
+    }
+
+    #[test]
+    fn a_run_waits_for_an_environment() {
+        let app = one_project();
+        assert_eq!(
+            run_blocked(&app, 0),
+            Some("Sync first to create the environment.")
+        );
+    }
+
+    #[test]
+    fn lines_and_the_end_land_on_the_run() {
+        let mut app = one_project();
+        let id = first_id(&app);
+        let _ = start_run(&mut app, &["demo"]);
+        let _ = update(&mut app, Message::RunLine(id, "hi".into()), unused_runner());
+        let _ = update(
+            &mut app,
+            Message::RunFinished(id, run_tab::RunEnd::Exited(Some(0))),
+            unused_runner(),
+        );
+        let run = &app.runs[&id];
+        assert_eq!(run.lines, ["hi"]);
+        assert!(!run.live());
+    }
+
+    #[test]
+    fn stop_sets_the_cancel_flag() {
+        let mut app = one_project();
+        let id = first_id(&app);
+        let _ = start_run(&mut app, &["demo"]);
+        let _ = update(&mut app, Message::RunStopRequested(id), unused_runner());
+        assert!(
+            app.runs[&id]
+                .cancel
+                .load(std::sync::atomic::Ordering::SeqCst)
+        );
+    }
+
+    #[test]
+    fn syncing_a_running_project_asks_first() {
+        let mut app = one_project();
+        let id = first_id(&app);
+        let _ = start_run(&mut app, &["demo"]);
+        let task = update(&mut app, Message::SyncRequested(0), unused_runner());
+        assert_eq!(task.units(), 0);
+        assert!(app.busy.is_none());
+        assert!(
+            matches!(&app.confirm_stop, Some((p, m)) if *p == id && matches!(**m, Message::SyncRequested(0)))
+        );
+        let _ = update(&mut app, Message::StopThenConfirmed, unused_runner());
+        assert!(
+            app.runs[&id]
+                .cancel
+                .load(std::sync::atomic::Ordering::SeqCst)
+        );
+        assert!(app.confirm_stop.is_none());
+        let task = update(
+            &mut app,
+            Message::RunFinished(id, run_tab::RunEnd::Stopped),
+            unused_runner(),
+        );
+        assert!(task.units() > 0, "the queued sync was dispatched");
+    }
+
+    #[test]
+    fn recreating_a_running_project_asks_first() {
+        let mut app = one_project();
+        let id = first_id(&app);
+        let _ = start_run(&mut app, &["demo"]);
+        let _ = update(&mut app, Message::RecreateVenvRequested(0), unused_runner());
+        assert!(app.confirm_recreate.is_none());
+        assert!(matches!(&app.confirm_stop, Some((p, _)) if *p == id));
+    }
+
+    #[test]
+    fn removing_a_project_stops_its_run() {
+        let mut app = one_project();
+        let id = first_id(&app);
+        let _ = start_run(&mut app, &["demo"]);
+        let cancel = app.runs[&id].cancel.clone();
+        let _ = update(
+            &mut app,
+            Message::RemoveProjectRequested(0),
+            unused_runner(),
+        );
+        assert!(cancel.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(!app.runs.contains_key(&id));
+    }
+
+    #[test]
+    fn quitting_with_a_run_asks_then_stops_it() {
+        let mut app = one_project();
+        let id = first_id(&app);
+        let _ = start_run(&mut app, &["demo"]);
+        let _ = update(
+            &mut app,
+            Message::Tray(crate::tray::TrayCommand::Quit),
+            unused_runner(),
+        );
+        assert!(app.confirm_quit, "asked before anything was stopped");
+        assert!(
+            !app.runs[&id]
+                .cancel
+                .load(std::sync::atomic::Ordering::SeqCst)
+        );
+        let _ = update(&mut app, Message::QuitConfirmed, unused_runner());
+        assert!(app.quitting);
+        assert!(
+            app.runs[&id]
+                .cancel
+                .load(std::sync::atomic::Ordering::SeqCst)
+        );
+        let task = update(
+            &mut app,
+            Message::RunFinished(id, run_tab::RunEnd::Stopped),
+            unused_runner(),
+        );
+        assert!(task.units() > 0, "exits once nothing is running");
+    }
+
+    #[test]
+    fn quitting_from_the_tray_with_the_window_hidden_shows_the_question() {
+        let mut app = one_project();
+        let _ = start_run(&mut app, &["demo"]);
+        app.window = None;
+        let task = update(
+            &mut app,
+            Message::Tray(crate::tray::TrayCommand::Quit),
+            unused_runner(),
+        );
+        assert!(app.confirm_quit);
+        assert!(task.units() > 0, "a window opens to ask in");
+    }
+
+    #[test]
+    fn quit_confirmed_after_the_run_ended_on_its_own_exits() {
+        let mut app = one_project();
+        let id = first_id(&app);
+        let _ = start_run(&mut app, &["demo"]);
+        let _ = update(
+            &mut app,
+            Message::Tray(crate::tray::TrayCommand::Quit),
+            unused_runner(),
+        );
+        let _ = update(
+            &mut app,
+            Message::RunFinished(id, run_tab::RunEnd::Exited(Some(0))),
+            unused_runner(),
+        );
+        let task = update(&mut app, Message::QuitConfirmed, unused_runner());
+        assert!(task.units() > 0, "nothing left to wait for");
+    }
+
+    #[test]
+    fn dependency_changes_wait_for_a_running_program() {
+        // uv would replace files the running program holds open -- on
+        // Windows that fails half way and leaves the environment mixed.
+        let mut app = one_project();
+        let _ = start_run(&mut app, &["demo"]);
+        let task = start_upgrade(&mut app, 0, None, unused_runner());
+        assert_eq!(task.units(), 0);
+        assert!(app.busy.is_none());
+        assert!(
+            app.toasts[0].text.contains("is running"),
+            "{}",
+            app.toasts[0].text
+        );
+        app.toasts.clear();
+        let task = add_requirement(
+            &mut app,
+            0,
+            "six==1.16.0".into(),
+            deps::GroupKind::Main,
+            unused_runner(),
+        );
+        assert_eq!(task.units(), 0);
+        assert!(app.busy.is_none());
+        assert!(app.toasts[0].text.contains("is running"));
+    }
+
+    #[test]
+    fn output_is_capped() {
+        let mut app = one_project();
+        let id = first_id(&app);
+        let _ = start_run(&mut app, &["demo"]);
+        for n in 0..run_tab::MAX_LINES + 5 {
+            let _ = update(
+                &mut app,
+                Message::RunLine(id, n.to_string()),
+                unused_runner(),
+            );
+        }
+        let run = &app.runs[&id];
+        assert_eq!(run.lines.len(), run_tab::MAX_LINES);
+        assert_eq!(
+            run.lines.last().unwrap(),
+            &(run_tab::MAX_LINES + 4).to_string()
+        );
+    }
+
+    #[test]
+    fn a_run_streams_through_the_cancellable_path_and_reports_its_exit() {
+        let project = project("api");
+        let config = Config {
+            projects: vec![project.clone()],
+            settings: fake_uv_settings(),
+            ..Config::default()
+        };
+        let runner = FakeCommandRunner::new();
+        version_probe(&runner);
+        runner.expect(
+            "uv",
+            &["run", "--no-sync", "demo"],
+            bombadil_core::process::CommandOutcome {
+                status: Some(3),
+                stdout: "hello\n".into(),
+                stderr: String::new(),
+            },
+        );
+        let mut lines = Vec::new();
+        let end = run_program(
+            &project,
+            &config,
+            &["demo".into()],
+            &bombadil_core::secrets::InMemorySecretStore::new(),
+            &runner,
+            &std::sync::atomic::AtomicBool::new(false),
+            &mut |l| lines.push(l),
+        );
+        assert_eq!(end, run_tab::RunEnd::Exited(Some(3)));
+        assert_eq!(lines, ["hello"]);
+        assert_eq!(runner.cancellable_calls(), 1, "a run must be stoppable");
+    }
+
+    #[test]
+    fn a_run_asks_python_for_unbuffered_utf8_output() {
+        // Piped, Python holds its output until 8 KB or exit, and on Windows
+        // writes cp1252 -- a progress line every second would show nothing.
+        let mut project = project("api");
+        project.env.push(bombadil_core::model::EnvVar {
+            key: "PYTHONIOENCODING".into(),
+            value: "latin-1".into(),
+            secret: false,
+        });
+        let config = Config {
+            projects: vec![project.clone()],
+            settings: fake_uv_settings(),
+            ..Config::default()
+        };
+        let runner = FakeCommandRunner::new();
+        version_probe(&runner);
+        runner.expect(
+            "uv",
+            &["run"],
+            bombadil_core::process::CommandOutcome {
+                status: Some(0),
+                stdout: String::new(),
+                stderr: String::new(),
+            },
+        );
+        let _ = run_program(
+            &project,
+            &config,
+            &["x".into()],
+            &bombadil_core::secrets::InMemorySecretStore::new(),
+            &runner,
+            &std::sync::atomic::AtomicBool::new(false),
+            &mut |_| {},
+        );
+        let run = runner
+            .calls()
+            .into_iter()
+            .find(|c| c.args.first().map(String::as_str) == Some("run"))
+            .unwrap();
+        assert_eq!(
+            run.env.get("PYTHONUNBUFFERED").map(String::as_str),
+            Some("1")
+        );
+        assert_eq!(
+            run.env.get("PYTHONIOENCODING").map(String::as_str),
+            Some("latin-1"),
+            "the project's own choice wins"
+        );
+    }
+
+    #[test]
+    fn a_cancelled_run_ends_as_stopped() {
+        let project = project("api");
+        let config = Config {
+            projects: vec![project.clone()],
+            settings: fake_uv_settings(),
+            ..Config::default()
+        };
+        let runner = FakeCommandRunner::new();
+        version_probe(&runner);
+        runner.expect(
+            "uv",
+            &["run"],
+            bombadil_core::process::CommandOutcome {
+                status: None,
+                stdout: String::new(),
+                stderr: String::new(),
+            },
+        );
+        let end = run_program(
+            &project,
+            &config,
+            &["x".into()],
+            &bombadil_core::secrets::InMemorySecretStore::new(),
+            &runner,
+            &std::sync::atomic::AtomicBool::new(true),
+            &mut |_| {},
+        );
+        assert_eq!(end, run_tab::RunEnd::Stopped);
+    }
+
     #[test]
     fn a_new_version_is_installed_with_uv_add_in_the_rows_own_group() {
         // Without the group flag, uv adds a second copy of the requirement to
@@ -10978,9 +13285,9 @@ mod tests {
         }
         assert_eq!(
             Tab::ALL.len(),
-            7,
-            "Dependencies, Members, Env vars, Scripts, Indexes, GitHub, Doctor -- and Settings \
-             deliberately not, since it has no per-project half"
+            8,
+            "Dependencies, Members, Env vars, Scripts, Indexes, GitHub, Doctor, Run -- and \
+             Settings deliberately not, since it has no per-project half"
         );
     }
 
@@ -12607,6 +14914,41 @@ mod tests {
         assert_eq!(initial_size(&layout), Some(iced::Size::new(640.0, 420.0)));
         layout.window = Some((1280, 800));
         assert_eq!(initial_size(&layout), Some(iced::Size::new(1280.0, 800.0)));
+    }
+
+    #[test]
+    fn adding_a_project_resets_the_run_form_for_it() {
+        // Selected without a click: the Run tab's form and entry points must
+        // follow, or Save would write into the wrong project.
+        let mut app = App::new(Config::default());
+        app.tab = Tab::Run;
+        app.command_draft = run_tab::CommandDraft {
+            label: "x".into(),
+            command: "y".into(),
+            editing: Some(3),
+        };
+        app.add_project = Some(manifest_draft(
+            "[project]\nname = \"my-api\"\nrequires-python = \">=3.11\"\n",
+        ));
+        let _ = update(&mut app, Message::AddProjectConfirmed, unused_runner());
+        assert_eq!(app.command_draft.editing, None);
+        assert!(app.command_draft.command.is_empty());
+    }
+
+    #[test]
+    fn removing_the_selected_project_resets_the_run_form() {
+        let mut app = two_projects();
+        app.selected = Some(0);
+        app.command_draft.editing = Some(0);
+        let _ = update(
+            &mut app,
+            Message::RemoveProjectRequested(0),
+            unused_runner(),
+        );
+        assert_eq!(
+            app.command_draft.editing, None,
+            "Save must not edit the next project"
+        );
     }
 
     #[test]
@@ -15842,6 +18184,7 @@ mod tests {
         bombadil_core::members::WorkspaceKind::Workspace {
             member_globs: globs.iter().map(|s| s.to_string()).collect(),
             exclude_globs: Vec::new(),
+            root_project: None,
         }
     }
 
@@ -17075,7 +19418,9 @@ mod tests {
     #[test]
     fn the_github_tab_has_a_stable_key_and_comes_before_the_doctor_by_default() {
         assert_eq!(Tab::GitHub.key(), "github");
-        assert_eq!(tab_order(&[]).iter().rev().nth(1), Some(&Tab::GitHub));
+        let order = tab_order(&[]);
+        let at = |t: Tab| order.iter().position(|x| *x == t).unwrap();
+        assert_eq!(at(Tab::GitHub) + 1, at(Tab::Doctor));
     }
 
     #[test]
@@ -17540,7 +19885,11 @@ mod tests {
         assert_eq!(Tab::Doctor.key(), "doctor");
         assert_eq!(Tab::Doctor.label(), "Doctor");
         assert!(tab_order(&[]).contains(&Tab::Doctor));
-        assert_eq!(*Tab::ALL.last().unwrap(), Tab::Doctor);
+        assert_eq!(
+            Tab::ALL[Tab::ALL.len() - 2],
+            Tab::Doctor,
+            "then Run, the newest"
+        );
     }
 
     #[test]

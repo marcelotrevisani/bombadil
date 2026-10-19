@@ -258,6 +258,7 @@ pub fn state(entry: &Entry) -> State {
 /// More, which opens the right-click menu -- so nothing depends on knowing
 /// to right-click.
 pub fn view<'a>(
+    running: &std::collections::HashSet<uuid::Uuid>,
     entries: &[Entry],
     findings: &[Vec<crate::health::Finding>],
     selected: Option<usize>,
@@ -299,6 +300,22 @@ pub fn view<'a>(
                 .size(theme::DATA)
                 .style(theme::text_muted)
                 .into(),
+        };
+
+        // A program from the Run tab is live: said beside the version, in
+        // words, because a glyph here would collide with the state glyphs.
+        let version_line: iced::Element<'_, Message> = if running.contains(&entry.id) {
+            iced::widget::row![
+                version_line,
+                iced::widget::text("running")
+                    .font(theme::FONT_PROSE)
+                    .size(theme::DATA)
+                    .style(theme::text_muted),
+            ]
+            .spacing(theme::SPACE_2)
+            .into()
+        } else {
+            version_line
         };
 
         // The disclosure control. A project with one environment still shows

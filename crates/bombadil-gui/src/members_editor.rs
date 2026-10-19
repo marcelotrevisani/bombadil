@@ -240,7 +240,18 @@ pub fn sync_plan(
     if !effective.is_empty() && effective.iter().all(|m| m.selected) {
         SyncPlan::AllPackages
     } else {
-        SyncPlan::Named(members::selected_package_names(&effective))
+        let mut names = members::selected_package_names(&effective);
+        // `uv sync --package <member>` installs only what it names: without
+        // the root project, its own dependencies are uninstalled.
+        if let WorkspaceKind::Workspace {
+            root_project: Some(root),
+            ..
+        } = kind
+            && !names.contains(root)
+        {
+            names.insert(0, root.clone());
+        }
+        SyncPlan::Named(names)
     }
 }
 
@@ -420,6 +431,7 @@ mod tests {
         WorkspaceKind::Workspace {
             member_globs: globs.iter().map(|s| s.to_string()).collect(),
             exclude_globs: exclude.iter().map(|s| s.to_string()).collect(),
+            root_project: None,
         }
     }
 
@@ -637,6 +649,33 @@ mod tests {
             }
             other => panic!("expected Named, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn a_partial_member_sync_keeps_the_root_project() {
+        // `uv sync --package <member>` installs that member and nothing of
+        // the root's own: the root's dependencies were uninstalled by every
+        // partial member sync (verified with uv 0.12.19).
+        let discovered_members = [
+            discovered("packages/alpha", Some("alpha"), true),
+            discovered("packages/beta", Some("beta"), true),
+        ];
+        let kind = WorkspaceKind::Workspace {
+            member_globs: vec!["packages/*".into()],
+            exclude_globs: vec![],
+            root_project: Some("pipeline".into()),
+        };
+        let mut selection = MemberSelection::default();
+        toggle(
+            &mut selection,
+            &discovered_members,
+            &kind,
+            Path::new("packages/alpha"),
+        );
+        assert_eq!(
+            sync_plan(&selection, &kind, &discovered_members),
+            SyncPlan::Named(vec!["pipeline".into(), "beta".into()])
+        );
     }
 
     #[test]

@@ -21,6 +21,7 @@ pub struct FakeCommandRunner {
     calls: Mutex<Vec<CommandSpec>>,
     blocking: Mutex<usize>,
     streaming: Mutex<usize>,
+    cancellable: Mutex<usize>,
 }
 
 impl FakeCommandRunner {
@@ -65,6 +66,12 @@ impl FakeCommandRunner {
     /// that buffers, and the whole point of streaming would be unprovable.
     pub fn streaming_calls(&self) -> usize {
         *self.streaming.lock().unwrap()
+    }
+
+    /// How many calls arrived through `stream_cancellable`: a run the user
+    /// can Stop, as opposed to a sync that cannot be called off.
+    pub fn cancellable_calls(&self) -> usize {
+        *self.cancellable.lock().unwrap()
     }
 
     /// Record the call and answer it from the programmed rules. Shared by
@@ -123,5 +130,48 @@ impl CommandRunner for FakeCommandRunner {
             on_line(OutputLine::Stderr(line.to_string()));
         }
         Ok(outcome)
+    }
+
+    fn stream_cancellable(
+        &self,
+        spec: &CommandSpec,
+        on_line: &mut dyn FnMut(OutputLine),
+        _cancel: &std::sync::atomic::AtomicBool,
+    ) -> Result<CommandOutcome, CommandError> {
+        *self.cancellable.lock().unwrap() += 1;
+        self.stream(spec, on_line)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cancellable_streams_are_counted_apart() {
+        let fake = FakeCommandRunner::new();
+        fake.expect(
+            "uv",
+            &["run"],
+            CommandOutcome {
+                status: Some(0),
+                stdout: String::new(),
+                stderr: String::new(),
+            },
+        );
+        let spec = CommandSpec::new("uv").arg("run");
+        fake.stream_cancellable(
+            &spec,
+            &mut |_| {},
+            &std::sync::atomic::AtomicBool::new(false),
+        )
+        .unwrap();
+        assert_eq!(fake.cancellable_calls(), 1);
+        fake.stream(&spec, &mut |_| {}).unwrap();
+        assert_eq!(
+            fake.cancellable_calls(),
+            1,
+            "a plain stream is not cancellable"
+        );
     }
 }

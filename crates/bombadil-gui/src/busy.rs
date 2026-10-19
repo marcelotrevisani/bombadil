@@ -20,6 +20,8 @@ pub enum Action {
     Upgrade(Option<String>),
     /// A local package, by its name or folder name.
     AddLocal(String),
+    /// `uv cache prune`: no project of its own.
+    CachePrune,
 }
 
 #[derive(Debug, Clone)]
@@ -76,6 +78,7 @@ impl Action {
             Action::Upgrade(Some(name)) => format!("Upgrading {name}"),
             Action::Upgrade(None) => format!("Upgrading all packages{}", of(p)),
             Action::AddLocal(name) => format!("Adding {name}"),
+            Action::CachePrune => "Cleaning uv's cache".into(),
         }
     }
 
@@ -92,6 +95,7 @@ impl Action {
             Action::Upgrade(Some(name)) => format!("Upgraded {name}"),
             Action::Upgrade(None) => format!("Upgraded all packages{}", of(p)),
             Action::AddLocal(name) => format!("Added {name}"),
+            Action::CachePrune => "Cleaned uv's cache".into(),
         }
     }
 
@@ -108,6 +112,7 @@ impl Action {
             Action::Upgrade(Some(name)) => format!("Could not upgrade {name}"),
             Action::Upgrade(None) => format!("Could not upgrade the packages{}", of(p)),
             Action::AddLocal(name) => format!("Could not add {name}"),
+            Action::CachePrune => "Could not clean uv's cache".into(),
         }
     }
 }
@@ -268,6 +273,16 @@ mod tests {
         assert!(
             (quarter - std::f32::consts::FRAC_PI_2).abs() < 1e-3,
             "{quarter}"
+        );
+    }
+
+    #[test]
+    fn cleaning_the_cache_has_its_own_words() {
+        assert_eq!(Action::CachePrune.present(None), "Cleaning uv's cache");
+        assert_eq!(Action::CachePrune.done(None), "Cleaned uv's cache");
+        assert_eq!(
+            Action::CachePrune.failed(None),
+            "Could not clean uv's cache"
         );
     }
 

@@ -40,6 +40,58 @@ fn project_spec(uv: &ResolvedUv, ctx: &ProjectContext) -> CommandSpec {
         .env("UV_PROJECT_ENVIRONMENT", ctx.venv_path.to_string_lossy())
 }
 
+/// What `uv init` makes: something you run, or something other code imports.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InitKind {
+    App,
+    Lib,
+}
+
+/// `uv run --no-sync <args…>`. Never syncs: a sync can rebuild the
+/// environment on another interpreter, and that stays behind Bombadil's own
+/// Sync and its confirmation.
+pub fn run(uv: &ResolvedUv, ctx: &ProjectContext, args: &[String]) -> CommandSpec {
+    project_spec(uv, ctx)
+        .args(["run", "--no-sync"])
+        .args(args.iter().cloned())
+}
+
+/// `uv cache dir`: where uv keeps its cache.
+pub fn cache_dir(uv: &ResolvedUv) -> CommandSpec {
+    CommandSpec::new(&uv.path).args(["cache", "dir"])
+}
+
+/// `uv cache prune`: removes cache entries nothing refers to.
+pub fn cache_prune(uv: &ResolvedUv) -> CommandSpec {
+    CommandSpec::new(&uv.path).args(["cache", "prune"])
+}
+
+/// `uv init` for a new project folder `<parent>/<name>`.
+pub fn init(
+    uv: &ResolvedUv,
+    parent: &Path,
+    name: &str,
+    kind: InitKind,
+    python: Option<&str>,
+    git: bool,
+) -> CommandSpec {
+    let mut spec = CommandSpec::new(&uv.path)
+        .cwd(parent)
+        .arg("init")
+        .arg(match kind {
+            InitKind::App => "--app",
+            InitKind::Lib => "--lib",
+        })
+        .args(["--name", name]);
+    if let Some(version) = python {
+        spec = spec.args(["--python", version]);
+    }
+    if !git {
+        spec = spec.args(["--vcs", "none"]);
+    }
+    spec.arg(name)
+}
+
 pub fn sync(uv: &ResolvedUv, ctx: &ProjectContext) -> CommandSpec {
     project_spec(uv, ctx).arg("sync")
 }
@@ -246,6 +298,42 @@ mod tests {
             project_dir: PathBuf::from("/proj/my-api"),
             venv_path: PathBuf::from("/envs/my-api-3f9c1a"),
         }
+    }
+
+    #[test]
+    fn cache_commands() {
+        assert_eq!(cache_dir(&uv()).args, ["cache", "dir"]);
+        assert_eq!(cache_prune(&uv()).args, ["cache", "prune"]);
+    }
+
+    #[test]
+    fn run_never_syncs_and_passes_the_args_through() {
+        let spec = run(
+            &uv(),
+            &ctx(),
+            &["pytest".into(), "-k".into(), "not slow".into()],
+        );
+        assert_eq!(spec.args, ["run", "--no-sync", "pytest", "-k", "not slow"]);
+        assert_eq!(spec.cwd.as_deref(), Some(ctx().project_dir.as_path()));
+        assert!(spec.env.contains_key("UV_PROJECT_ENVIRONMENT"));
+    }
+
+    #[test]
+    fn init_builds_each_option() {
+        let parent = Path::new("/w");
+        let app = init(&uv(), parent, "weather", InitKind::App, Some("3.12"), true);
+        assert_eq!(
+            app.args,
+            [
+                "init", "--app", "--name", "weather", "--python", "3.12", "weather"
+            ]
+        );
+        assert_eq!(app.cwd.as_deref(), Some(parent));
+        let lib = init(&uv(), parent, "tools", InitKind::Lib, None, false);
+        assert_eq!(
+            lib.args,
+            ["init", "--lib", "--name", "tools", "--vcs", "none", "tools"]
+        );
     }
 
     #[test]
