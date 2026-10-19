@@ -244,6 +244,41 @@ fn project_dir(project: &Project) -> PathBuf {
 /// The project view for a project with no environment: its name, its
 /// folder, and a way to add one. Sync, the terminal, PyCharm, the status
 /// tiles and the tabs all act on an environment, so none of them is shown.
+/// In place of the header and tabs when a project's folder isn't on this
+/// computer: where it was, and the two ways out.
+pub fn missing_folder_view<'a>(
+    project: &bombadil_core::model::Project,
+    index: usize,
+) -> iced::Element<'a, Message> {
+    iced::widget::column![
+        iced::widget::text(project.label.clone())
+            .font(theme::FONT_PROSE_SEMIBOLD)
+            .size(theme::DISPLAY),
+        iced::widget::text(project.pyproject_path.display().to_string())
+            .font(theme::FONT_DATA)
+            .size(theme::DATA)
+            .style(theme::text_muted),
+        iced::widget::Space::new().height(theme::SPACE_4),
+        iced::widget::text(crate::app::FOLDER_MISSING).size(theme::BODY),
+        iced::widget::text("Point Bombadil at its pyproject.toml, or remove it from the list.")
+            .size(theme::BODY)
+            .style(theme::text_muted),
+        iced::widget::row![
+            iced::widget::button(iced::widget::text("Locate\u{2026}").size(theme::BODY))
+                .on_press(Message::LocateRequested(project.id))
+                .padding([theme::SPACE_1, theme::SPACE_3])
+                .style(theme::button_primary),
+            iced::widget::button(iced::widget::text("Remove").size(theme::BODY))
+                .on_press(Message::RemoveProjectRequested(index))
+                .padding([theme::SPACE_1, theme::SPACE_3])
+                .style(theme::button_secondary),
+        ]
+        .spacing(theme::SPACE_2),
+    ]
+    .spacing(theme::SPACE_2)
+    .into()
+}
+
 pub fn no_environment_view<'a>(
     project: &bombadil_core::model::Project,
     index: usize,

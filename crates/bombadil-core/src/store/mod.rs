@@ -1,4 +1,5 @@
 pub mod atomic;
+pub mod merge;
 pub mod paths;
 
 use crate::error::StoreError;
@@ -186,7 +187,11 @@ impl Store {
                 };
                 let text = toml::to_string_pretty(&config)
                     .map_err(|source| StoreError::Serialize { source })?;
-                atomic::write_atomic(&self.path, &text)
+                // Laid onto the file already there, so comments a person
+                // wrote by hand survive the save. A missing or unreadable
+                // file gives `text` unchanged.
+                let old = std::fs::read_to_string(&self.path).unwrap_or_default();
+                atomic::write_atomic(&self.path, &laid_onto(&old, &text, &config))
             }
             Writability::TooNew { found } => Err(StoreError::ReadOnly {
                 path: self.path.clone(),
@@ -198,6 +203,22 @@ impl Store {
                 message: message.clone(),
             }),
         }
+    }
+
+    /// Copies the config file to `<file>.bak-<stamp>` beside it, before an
+    /// import replaces it. `Ok(None)` when there is no file to copy.
+    pub fn backup_copy(&self, stamp: &str) -> Result<Option<PathBuf>, StoreError> {
+        if !self.path.exists() {
+            return Ok(None);
+        }
+        let mut name = self.path.file_name().unwrap_or_default().to_os_string();
+        name.push(format!(".bak-{stamp}"));
+        let copy = self.path.with_file_name(name);
+        std::fs::copy(&self.path, &copy).map_err(|source| StoreError::Io {
+            path: copy.clone(),
+            source,
+        })?;
+        Ok(Some(copy))
     }
 }
 
@@ -240,6 +261,41 @@ pub fn migrate(mut config: Config) -> Config {
     config
 }
 
+/// `text` laid onto `old` by [`merge::merge`], kept only when it reads back
+/// as exactly `config`; otherwise `text` itself. Comments are worth keeping,
+/// never at the price of a file that means something else.
+fn laid_onto(old: &str, text: &str, config: &Config) -> String {
+    let merged = merge::merge(old, text);
+    match toml::from_str::<Config>(&merged) {
+        Ok(back) if back == *config => merged,
+        _ => text.to_string(),
+    }
+}
+
+/// `t` as `YYYYMMDD-HHMMSS` in UTC, for backup file names. Hinnant's
+/// days-to-civil, so no date crate is needed for one file name.
+pub fn stamp(t: std::time::SystemTime) -> String {
+    let secs = t
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let (days, rem) = ((secs / 86_400) as i64, secs % 86_400);
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = yoe + era * 400 + i64::from(m <= 2);
+    format!(
+        "{y:04}{m:02}{d:02}-{:02}{:02}{:02}",
+        rem / 3600,
+        rem % 3600 / 60,
+        rem % 60
+    )
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -698,5 +754,78 @@ mod tests {
         }
 
         assert_eq!(std::fs::read_to_string(&path).unwrap(), garbage);
+    }
+    #[test]
+    fn saving_keeps_a_hand_written_comment() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let (store, _) = Store::open(path.clone());
+        store.save(&Config::default()).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        std::fs::write(&path, format!("# keep me\n{text}")).unwrap();
+        let (store, loaded) = Store::open(path.clone());
+        let mut config = loaded.config().clone();
+        config.settings.theme = crate::model::ThemeChoice::Dark;
+        store.save(&config).unwrap();
+        let after = std::fs::read_to_string(&path).unwrap();
+        assert!(after.starts_with("# keep me"), "{after}");
+        assert_eq!(
+            toml::from_str::<Config>(&after).unwrap().settings.theme,
+            crate::model::ThemeChoice::Dark
+        );
+    }
+
+    #[test]
+    fn a_too_new_file_is_still_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "schema_version = 999\n# note\n").unwrap();
+        let (store, _) = Store::open(path.clone());
+        assert!(store.save(&Config::default()).is_err());
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "schema_version = 999\n# note\n"
+        );
+    }
+
+    #[test]
+    fn a_merge_that_reads_back_differently_is_not_written() {
+        let old = "# note\nschema_version = 2\n";
+        let text = toml::to_string_pretty(&Config::default()).unwrap();
+        let mut other = Config::default();
+        other.settings.theme = crate::model::ThemeChoice::Dark;
+        assert_eq!(
+            laid_onto(old, &text, &other),
+            text,
+            "falls back to the plain text"
+        );
+        assert!(laid_onto(old, &text, &Config::default()).starts_with("# note"));
+    }
+
+    #[test]
+    fn stamp_is_utc_date_and_time() {
+        let at = |s| std::time::UNIX_EPOCH + std::time::Duration::from_secs(s);
+        assert_eq!(stamp(at(0)), "19700101-000000");
+        assert_eq!(stamp(at(1_760_000_000)), "20251009-085320");
+        assert_eq!(stamp(at(951_782_400)), "20000229-000000");
+    }
+
+    #[test]
+    fn backup_copy_copies_the_file_beside_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let (store, _) = Store::open(path.clone());
+        assert_eq!(
+            store.backup_copy("20251009-085320").unwrap(),
+            None,
+            "nothing to copy yet"
+        );
+        std::fs::write(&path, "schema_version = 2\n").unwrap();
+        let copy = store.backup_copy("20251009-085320").unwrap().unwrap();
+        assert_eq!(copy, dir.path().join("config.toml.bak-20251009-085320"));
+        assert_eq!(
+            std::fs::read_to_string(copy).unwrap(),
+            "schema_version = 2\n"
+        );
     }
 }

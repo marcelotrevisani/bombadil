@@ -64,11 +64,22 @@ const DEPS_TREE_DEPTH: u32 = 20;
 /// the real one in after `boot`.
 pub trait ConfigPersist: Send + Sync {
     fn save(&self, config: &Config) -> Result<(), String>;
+
+    /// Copies the config file aside before an import replaces it.
+    /// `Ok(None)` when there is nothing to copy.
+    fn backup(&self) -> Result<Option<PathBuf>, String> {
+        Ok(None)
+    }
 }
 
 impl ConfigPersist for bombadil_core::store::Store {
     fn save(&self, config: &Config) -> Result<(), String> {
         bombadil_core::store::Store::save(self, config).map_err(|e| e.to_string())
+    }
+
+    fn backup(&self) -> Result<Option<PathBuf>, String> {
+        self.backup_copy(&bombadil_core::store::stamp(std::time::SystemTime::now()))
+            .map_err(|e| e.to_string())
     }
 }
 
@@ -204,6 +215,13 @@ pub struct App {
     /// object, not a bare `Store`, so a test can substitute a fake -- see
     /// `ConfigPersist`.
     pub persist: Arc<dyn ConfigPersist>,
+    /// Whether a path exists. `|_| true` until `lib.rs` wires the real
+    /// check, so tests with made-up paths still select and probe.
+    pub path_exists: fn(&std::path::Path) -> bool,
+    /// Projects whose `pyproject.toml` was gone when last looked at.
+    pub missing: std::collections::HashSet<uuid::Uuid>,
+    /// Preferences > Backup: the export passphrase and an import in progress.
+    pub backup: crate::backup_panel::State,
     /// The open context menu (spec §8: right-click a project), if any.
     /// `None` before the first right-click and after it closes -- there is
     /// nothing else for the menu to show in either state, the same shape
@@ -792,8 +810,43 @@ pub enum Message {
     /// future edit from wiring it in. `RecreateVenvConfirmed` is the only
     /// message that may reach it.
     RemoveProjectRequested(usize),
-    /// The background persist for a removal finished.
-    RemoveProjectFinished {
+    /// "Locate…" on a project whose folder is missing: opens a file picker.
+    LocateRequested(uuid::Uuid),
+    /// The picked `pyproject.toml`, or `None` when the picker was cancelled.
+    LocatePicked(uuid::Uuid, Option<PathBuf>),
+    // --- Move to another computer (Preferences > Backup) ---
+    BackupPassphraseChanged(index_editor::CredentialInput),
+    BackupConfirmChanged(index_editor::CredentialInput),
+    BackupExportRequested,
+    BackupExportPicked(Option<PathBuf>),
+    BackupExportFinished(Result<bombadil_core::backup::Exported, String>),
+    BackupImportRequested,
+    BackupImportPicked(Option<PathBuf>),
+    BackupImportRead(PathBuf, Result<bombadil_core::backup::Bundle, String>),
+    BackupUnlockChanged(index_editor::CredentialInput),
+    BackupUnlockRequested,
+    /// The file it was unlocked for, so a late result never lands on another.
+    BackupUnlocked(PathBuf, Result<bombadil_core::backup::Secrets, String>),
+    BackupMapChanged(usize, String),
+    BackupMapBrowse(usize),
+    BackupMapPicked(usize, Option<PathBuf>),
+    BackupModeSelected(bombadil_core::backup::import::Mode),
+    BackupImportConfirmed,
+    BackupImportFinished(
+        Result<
+            (
+                Config,
+                bombadil_core::backup::import::Report,
+                Option<PathBuf>,
+            ),
+            String,
+        >,
+    ),
+    BackupImportCancelled,
+    /// A background save of `config.toml` finished. `what` names the edit
+    /// in the drawer line a failure leaves: "<what> failed to persist".
+    Persisted {
+        what: &'static str,
         success: bool,
     },
     /// "Recreate venv" was picked for `projects[usize]` (spec §8). Opens the
@@ -909,13 +962,9 @@ pub enum Message {
     /// closure by ordinary move semantics inside `update`, never through this
     /// message. See `env_editor`'s module doc.
     EnvVarSecretToggled(env_editor::EnvScope, usize),
-    /// The background half of a plain env var edit finished: just the persist.
-    EnvVarPersistFinished {
-        success: bool,
-    },
     /// A secret toggle's keychain write (or delete) plus persist finished.
     ///
-    /// Separate from [`Message::EnvVarPersistFinished`] because this one is
+    /// Separate from [`Message::Persisted`] because this one is
     /// not a report -- it is the instruction to apply the toggle to
     /// `app.config`, which deliberately has not been touched until now.
     /// Carries the row it belongs to, and no value: what the keychain now
@@ -945,10 +994,6 @@ pub enum Message {
     ScriptMovedUp(scripts_editor::ScriptScope, usize),
     /// A row's "down" button was pressed: the mirror of `ScriptMovedUp`.
     ScriptMovedDown(scripts_editor::ScriptScope, usize),
-    /// The background half of a script edit finished: persisting the config.
-    ScriptPersistFinished {
-        success: bool,
-    },
     /// The Indexes tab's "Add index" button was pressed (spec §7, Task 4).
     IndexAdded,
     /// A row's "remove" button was pressed.
@@ -999,12 +1044,6 @@ pub enum Message {
         index: usize,
         success: bool,
     },
-    /// The background half of an index edit finished: a plain field edit's
-    /// persist, a credential save's keychain write plus persist, or a
-    /// project's selection toggle's persist.
-    IndexPersistFinished {
-        success: bool,
-    },
     /// A project index checkbox was toggled: `usize` is the project's index
     /// in `app.config.projects`/`app.config.projects`, `String` the index name
     /// (criterion 3). Adds or removes the association only -- never reaches
@@ -1022,10 +1061,6 @@ pub enum Message {
     /// selection through `members_editor::toggle` (criterion 3: that
     /// function is the only place the flip is decided) and persists.
     MemberToggled(usize, PathBuf),
-    /// The background half of a member selection edit: persisting the config.
-    MembersPersistFinished {
-        success: bool,
-    },
     /// The Members tab's "Sync members" button was pressed for
     /// `projects[usize]`. If nothing selected is currently installed and
     /// about to be dropped, syncs immediately; otherwise opens
@@ -1055,11 +1090,6 @@ pub enum Message {
     /// `MIN_UV_VERSION` -- only updates what the tab shows, so a bad path
     /// never reaches `config.toml`.
     SettingsUvCustomValidated(Result<uv::ResolvedUv, String>),
-    /// The background half of a Settings persist (a `uv_source` choice, or a
-    /// validated custom binary) finished.
-    SettingsPersistFinished {
-        success: bool,
-    },
     /// "Alongside each project" was pressed for `default_venv_location`
     /// (criterion 3): applies immediately and persists. Never touches any
     /// project's existing venv -- see `settings_editor`'s module doc.
@@ -1157,6 +1187,9 @@ impl App {
             window_settings: iced::window::Settings::default(),
             add_project: None,
             persist: Arc::new(NullPersist),
+            path_exists: |_| true,
+            missing: Default::default(),
+            backup: Default::default(),
             context_menu: None,
             confirm_recreate: None,
             confirm_pin_change: None,
@@ -1762,19 +1795,15 @@ async fn load_deps(
     config: Config,
     runner: Arc<dyn CommandRunner>,
 ) -> Result<DepsFetch, String> {
-    match job::run(
+    // Reported rather than degraded to an empty tab, for the reason
+    // `fetch_deps_blocking`'s own doc gives: an empty tab is a claim about
+    // the environment, and a timeout is not in a position to make one.
+    job::attempt(
         move || fetch_deps_blocking(&project, &config, runner.as_ref()),
         SYNC_TIMEOUT,
+        "reading dependencies",
     )
     .await
-    {
-        job::JobResult::Done(fetch) => fetch,
-        // Reported rather than degraded to an empty tab, for the reason
-        // `fetch_deps_blocking`'s own doc gives: an empty tab is a claim about
-        // the environment, and a timeout is not in a position to make one.
-        job::JobResult::TimedOut => Err("reading dependencies timed out".to_string()),
-        job::JobResult::Failed => Err("reading dependencies failed unexpectedly".to_string()),
-    }
 }
 
 /// Dispatches a Dependencies fetch for `projects[index]`, tagging the result
@@ -1944,6 +1973,9 @@ pub fn update(app: &mut App, message: Message, runner: Arc<dyn CommandRunner>) -
             app.selected = Some(i);
             app.dep_edit = None;
             app.dep_filter.clear();
+            if folder_missing(app, i) {
+                return Task::none();
+            }
             // Re-read on every selection: commits and checkouts happen
             // outside Bombadil, and this is the moment the user looks.
             return reprobe_project(app, i, runner);
@@ -2151,7 +2183,7 @@ pub fn update(app: &mut App, message: Message, runner: Arc<dyn CommandRunner>) -
         Message::SidebarToggled => {
             let layout = &mut app.config.settings.layout;
             layout.sidebar_collapsed = !layout.sidebar_collapsed;
-            return persist_settings_edit(app);
+            return persist_edit(app, "settings change");
         }
         Message::SidebarDragStarted => app.sidebar_drag = true,
         Message::SidebarDragged(x) => {
@@ -2177,7 +2209,7 @@ pub fn update(app: &mut App, message: Message, runner: Arc<dyn CommandRunner>) -
                 None => false,
             };
             if resized || reordered {
-                return persist_settings_edit(app);
+                return persist_edit(app, "settings change");
             }
         }
         Message::RefreshRequested => {
@@ -2337,7 +2369,7 @@ pub fn update(app: &mut App, message: Message, runner: Arc<dyn CommandRunner>) -
             if let Some(entry) = app.entries.get_mut(i) {
                 entry.expanded = project.expanded;
             }
-            return persist_env_edit(app);
+            return persist_edit(app, "env var change");
         }
         Message::EnvironmentActivated(i, location) => {
             let Some(project) = app.config.projects.get_mut(i) else {
@@ -2373,10 +2405,16 @@ pub fn update(app: &mut App, message: Message, runner: Arc<dyn CommandRunner>) -
             // The tabs describe the active environment, so they are re-read
             // for the same reason a finished sync re-reads them -- and now
             // for the project that was actually pressed.
-            return Task::batch([persist_env_edit(app), refresh_after_sync(app, runner)]);
+            return Task::batch([
+                persist_edit(app, "env var change"),
+                refresh_after_sync(app, runner),
+            ]);
         }
         Message::SyncRequested(i) => {
             app.context_menu = None;
+            if refuse_missing(app, i) {
+                return Task::none();
+            }
             if can_start(app)
                 && let Some(project) = sync_target(app, i)
             {
@@ -2484,11 +2522,11 @@ pub fn update(app: &mut App, message: Message, runner: Arc<dyn CommandRunner>) -
         }
         Message::CloseToTraySelected(keep) => {
             app.config.settings.close_to_tray = keep;
-            return persist_settings_edit(app);
+            return persist_edit(app, "settings change");
         }
         Message::ThemeChoiceSelected(choice) => {
             app.config.settings.theme = choice;
-            return persist_settings_edit(app);
+            return persist_edit(app, "settings change");
         }
         Message::SystemThemeChanged(mode) => {
             // "No preference" is what stock GNOME reports with its dark-style
@@ -2592,7 +2630,7 @@ pub fn update(app: &mut App, message: Message, runner: Arc<dyn CommandRunner>) -
         }
         Message::GitHubWatchSelected(on) => {
             app.config.settings.watch_github = on;
-            let persist = persist_settings_edit(app);
+            let persist = persist_edit(app, "settings change");
             // Look now rather than at the next two-minute tick.
             let tick = if on {
                 update(app, Message::GitHubTick, runner)
@@ -2638,7 +2676,7 @@ pub fn update(app: &mut App, message: Message, runner: Arc<dyn CommandRunner>) -
         Message::GitHubAccountSelected(login) => {
             app.config.settings.github_account = Some(login);
             app.github_source = None;
-            let persist = persist_settings_edit(app);
+            let persist = persist_edit(app, "settings change");
             let tick = update(app, Message::GitHubTick, runner);
             return Task::batch([
                 persist,
@@ -3387,13 +3425,342 @@ pub fn update(app: &mut App, message: Message, runner: Arc<dyn CommandRunner>) -
             let config = app.config.clone();
             let persist = app.persist.clone();
             return Task::perform(persist_config(config, persist), |success| {
-                Message::RemoveProjectFinished { success }
+                Message::Persisted {
+                    what: "remove",
+                    success,
+                }
             });
         }
         Message::RemoveProjectRequested(_) => {}
-        Message::RemoveProjectFinished { success } => {
+        Message::LocateRequested(id) => {
+            return Task::perform(pick_pyproject(), move |picked| {
+                Message::LocatePicked(id, picked)
+            });
+        }
+        // --- Move to another computer ---
+        Message::BackupPassphraseChanged(v) => app.backup.passphrase = v.0,
+        Message::BackupConfirmChanged(v) => app.backup.confirm = v.0,
+        Message::BackupExportRequested => {
+            let (p, c) = (&app.backup.passphrase, &app.backup.confirm);
+            let problem = if p != c {
+                Some("The passphrases don't match")
+            } else if !p.is_empty() && p.chars().count() < 8 {
+                Some("Use at least 8 characters for the passphrase")
+            } else {
+                None
+            };
+            if let Some(text) = problem {
+                crate::busy::push(
+                    &mut app.toasts,
+                    crate::busy::ToastKind::Warning,
+                    text.into(),
+                    std::time::Instant::now(),
+                );
+                return Task::none();
+            }
+            return Task::perform(pick_bombadil_save(), Message::BackupExportPicked);
+        }
+        Message::BackupExportPicked(None) => {}
+        Message::BackupExportPicked(Some(path)) => {
+            let config = app.config.clone();
+            let passphrase = app.backup.passphrase.clone();
+            return Task::perform(
+                async move {
+                    job::attempt(
+                        move || {
+                            crate::backup_panel::export_blocking(
+                                &config,
+                                &KeyringSecretStore::new(),
+                                &passphrase,
+                                bombadil_core::backup::crypto::Kdf::DEFAULT,
+                                &home_dir(),
+                                &path,
+                            )
+                        },
+                        SYNC_TIMEOUT,
+                        "exporting",
+                    )
+                    .await
+                },
+                Message::BackupExportFinished,
+            );
+        }
+        Message::BackupExportFinished(Ok(out)) => {
+            app.backup.passphrase.clear();
+            app.backup.confirm.clear();
+            let mut text = format!(
+                "Exported {}, {}, {}",
+                crate::health::plural(app.config.projects.len(), "project", "projects"),
+                crate::health::plural(app.config.indexes.len(), "index", "indexes"),
+                crate::health::plural(out.secrets, "secret", "secrets"),
+            );
+            if !out.missing.is_empty() {
+                let n = out.missing.len();
+                text.push_str(&format!(
+                    ". {} in the keychain",
+                    crate::health::plural(n, "secret wasn't", "secrets weren't")
+                ));
+            }
+            crate::busy::push(
+                &mut app.toasts,
+                crate::busy::ToastKind::Success,
+                text,
+                std::time::Instant::now(),
+            );
+        }
+        Message::BackupExportFinished(Err(e)) => {
+            crate::busy::push(
+                &mut app.toasts,
+                crate::busy::ToastKind::Warning,
+                format!("Could not export: {e}"),
+                std::time::Instant::now(),
+            );
+        }
+        Message::BackupImportRequested => {
+            return Task::perform(pick_bombadil_open(), Message::BackupImportPicked);
+        }
+        Message::BackupImportPicked(None) => {}
+        Message::BackupImportPicked(Some(path)) => {
+            return Task::perform(
+                async move {
+                    let read = std::fs::read_to_string(&path)
+                        .map_err(|e| e.to_string())
+                        .and_then(|t| bombadil_core::backup::read(&t).map_err(|e| e.to_string()));
+                    (path, read)
+                },
+                |(path, read)| Message::BackupImportRead(path, read),
+            );
+        }
+        Message::BackupImportRead(_, Err(e)) => {
+            crate::busy::push(
+                &mut app.toasts,
+                crate::busy::ToastKind::Warning,
+                format!("Could not open: {e}"),
+                std::time::Instant::now(),
+            );
+        }
+        Message::BackupImportRead(path, Ok(bundle)) => {
+            let maps =
+                bombadil_core::backup::mapping::suggest(&bundle.config, &bundle.home, &home_dir());
+            let secrets = bundle
+                .secrets
+                .is_none()
+                .then(bombadil_core::backup::Secrets::default);
+            app.backup.import = Some(crate::backup_panel::Import {
+                path,
+                bundle,
+                passphrase: String::new(),
+                secrets,
+                maps,
+                mode: None,
+                error: None,
+            });
+        }
+        Message::BackupUnlockChanged(v) => {
+            if let Some(import) = &mut app.backup.import {
+                import.passphrase = v.0;
+            }
+        }
+        Message::BackupUnlockRequested => {
+            if let Some(import) = &app.backup.import {
+                let bundle = import.bundle.clone();
+                let passphrase = import.passphrase.clone();
+                let path = import.path.clone();
+                return Task::perform(
+                    async move {
+                        match job::run(
+                            move || {
+                                bombadil_core::backup::unlock(&bundle, &passphrase)
+                                    .map_err(|e| e.to_string())
+                            },
+                            SYNC_TIMEOUT,
+                        )
+                        .await
+                        {
+                            job::JobResult::Done(r) => r,
+                            _ => Err("unlocking failed unexpectedly".into()),
+                        }
+                    },
+                    move |result| Message::BackupUnlocked(path.clone(), result),
+                );
+            }
+        }
+        Message::BackupUnlocked(path, result) => {
+            if let Some(import) = &mut app.backup.import
+                && import.path == path
+            {
+                match result {
+                    Ok(secrets) => {
+                        import.secrets = Some(secrets);
+                        import.error = None;
+                        import.passphrase.clear();
+                    }
+                    Err(e) => import.error = Some(e),
+                }
+            }
+        }
+        Message::BackupMapChanged(row, text) => {
+            if let Some(map) = app.backup.import.as_mut().and_then(|i| i.maps.get_mut(row)) {
+                map.to = PathBuf::from(text);
+            }
+        }
+        Message::BackupMapBrowse(row) => {
+            return Task::perform(pick_folder(), move |folder| {
+                Message::BackupMapPicked(row, folder)
+            });
+        }
+        Message::BackupMapPicked(_, None) => {}
+        Message::BackupMapPicked(row, Some(folder)) => {
+            if let Some(map) = app.backup.import.as_mut().and_then(|i| i.maps.get_mut(row)) {
+                map.to = folder;
+            }
+        }
+        Message::BackupModeSelected(mode) => {
+            if let Some(import) = &mut app.backup.import {
+                import.mode = Some(mode);
+            }
+        }
+        Message::BackupImportCancelled => app.backup.import = None,
+        Message::BackupImportConfirmed => {
+            let Some(import) = &app.backup.import else {
+                return Task::none();
+            };
+            let (Some(secrets), Some(mode)) = (import.secrets.clone(), import.mode) else {
+                return Task::none();
+            };
+            let incoming =
+                bombadil_core::backup::mapping::apply(import.bundle.config.clone(), &import.maps);
+            let current = app.config.clone();
+            let persist = app.persist.clone();
+            let exists = app.path_exists;
+            return Task::perform(
+                async move {
+                    job::attempt(
+                        move || {
+                            crate::backup_panel::import_blocking(
+                                &current,
+                                incoming,
+                                secrets,
+                                mode,
+                                persist.as_ref(),
+                                &KeyringSecretStore::new(),
+                                exists,
+                            )
+                        },
+                        SYNC_TIMEOUT,
+                        "importing",
+                    )
+                    .await
+                },
+                Message::BackupImportFinished,
+            );
+        }
+        Message::BackupImportFinished(Err(e)) => {
+            crate::busy::push(
+                &mut app.toasts,
+                crate::busy::ToastKind::Warning,
+                format!("Could not import: {e}"),
+                std::time::Instant::now(),
+            );
+        }
+        Message::BackupImportFinished(Ok((config, report, copy))) => {
+            app.config = config;
+            app.backup.import = None;
+            app.entries = sidebar::entries(&app.config);
+            // Index rows and env drafts are keyed by position in lists the
+            // import just replaced: re-seeded the way `App::new` does, or an
+            // edit to row 0 would move the old index's credential over the
+            // imported one.
+            app.index_credential_drafts = vec![String::new(); app.config.indexes.len()];
+            app.index_credential_names =
+                app.config.indexes.iter().map(|i| i.name.clone()).collect();
+            app.env_value_drafts.clear();
+            app.missing = app
+                .config
+                .projects
+                .iter()
+                .filter(|p| !(app.path_exists)(&p.pyproject_path))
+                .map(|p| p.id)
+                .collect();
+            let mut text = format!(
+                "Imported {}, {}, {}",
+                crate::health::plural(report.projects, "project", "projects"),
+                crate::health::plural(report.indexes, "index", "indexes"),
+                crate::health::plural(report.secrets, "secret", "secrets"),
+            );
+            if report.skipped > 0 {
+                text.push_str(&format!(". Skipped {} already here", report.skipped));
+            }
+            if !report.not_found.is_empty() {
+                text.push_str(&format!(
+                    ". {} not found, use Locate",
+                    crate::health::plural(
+                        report.not_found.len(),
+                        "project folder",
+                        "project folders"
+                    )
+                ));
+            }
+            if let Some(copy) = copy {
+                text.push_str(&format!(". Old settings saved as {}", copy.display()));
+            }
+            if let Some(e) = &report.secrets_error {
+                text.push_str(&format!(". The secrets weren't saved: {e}"));
+            }
+            crate::busy::push(
+                &mut app.toasts,
+                match report.secrets_error {
+                    Some(_) => crate::busy::ToastKind::Warning,
+                    None => crate::busy::ToastKind::Success,
+                },
+                text,
+                std::time::Instant::now(),
+            );
+            // Tabs are tagged by index, and the list they were read for is
+            // gone: dropped, then the first project is selected the way a
+            // click does, which re-reads it.
+            app.deps = None;
+            app.dep_edit = None;
+            app.members = None;
+            app.selected = None;
+            let venvs = probe_every_venv(app);
+            if app.config.projects.is_empty() {
+                return venvs;
+            }
+            return Task::batch([venvs, update(app, Message::ProjectSelected(0), runner)]);
+        }
+
+        Message::LocatePicked(_, None) => {}
+        Message::LocatePicked(id, Some(path)) => {
+            let Some(i) = app.config.projects.iter().position(|p| p.id == id) else {
+                return Task::none();
+            };
+            app.config.projects[i].pyproject_path = path;
+            app.missing.remove(&id);
+            // The sidebar caches each environment's resolved path, which
+            // hangs off the project's folder.
+            rebuild_entries(app);
+            let config = app.config.clone();
+            let persist = app.persist.clone();
+            let save = Task::perform(persist_config(config, persist), |success| {
+                Message::Persisted {
+                    what: "settings change",
+                    success,
+                }
+            });
+            let venvs = probe_every_venv(app);
+            if app.selected == Some(i) {
+                return Task::batch([
+                    save,
+                    venvs,
+                    update(app, Message::ProjectSelected(i), runner),
+                ]);
+            }
+            return Task::batch([save, venvs]);
+        }
+        Message::Persisted { what, success } => {
             if !success {
-                drawer::set_idle(&mut app.drawer, "remove failed to persist".to_string());
+                drawer::set_idle(&mut app.drawer, format!("{what} failed to persist"));
             }
         }
         // Opens the confirmation and nothing else. The menu closes either
@@ -3419,6 +3786,13 @@ pub fn update(app: &mut App, message: Message, runner: Arc<dyn CommandRunner>) -
             app.confirm_pin_change = None;
         }
         Message::PinChangeConfirmed => {
+            if let Some(i) =
+                confirmed_index(app, app.confirm_pin_change.as_ref().map(|c| c.project_id))
+                && refuse_missing(app, i)
+            {
+                app.confirm_pin_change = None;
+                return Task::none();
+            }
             // `take` unconditionally: whether or not work is dispatched, the
             // user has answered and the dialog is done. Re-resolved by id,
             // not by an index, for the reason `ConfirmRecreate` documents.
@@ -3441,6 +3815,13 @@ pub fn update(app: &mut App, message: Message, runner: Arc<dyn CommandRunner>) -
             }
         }
         Message::RecreateVenvConfirmed => {
+            if let Some(i) =
+                confirmed_index(app, app.confirm_recreate.as_ref().map(|c| c.project_id))
+                && refuse_missing(app, i)
+            {
+                app.confirm_recreate = None;
+                return Task::none();
+            }
             // `take` unconditionally: whether or not the work is dispatched,
             // the user has answered the question and the dialog is done.
             // Re-resolved by id, not by the index the press carried: the
@@ -3571,11 +3952,11 @@ pub fn update(app: &mut App, message: Message, runner: Arc<dyn CommandRunner>) -
         Message::PycharmPicked(None) => {}
         Message::PycharmPicked(Some(path)) => {
             app.config.settings.pycharm = Some(path);
-            return persist_settings_edit(app);
+            return persist_edit(app, "settings change");
         }
         Message::PycharmAutomatic => {
             app.config.settings.pycharm = None;
-            return persist_settings_edit(app);
+            return persist_edit(app, "settings change");
         }
         Message::PreferencesPythonPinChanged(scope, version) => {
             let pin = preferences::pin_from_input(&version);
@@ -3609,7 +3990,7 @@ pub fn update(app: &mut App, message: Message, runner: Arc<dyn CommandRunner>) -
                     project.environments[index].python = pin;
                 }
             }
-            return persist_env_edit(app);
+            return persist_edit(app, "env var change");
         }
         Message::PreferencesUvSourceOverridden(scope, source) => {
             // The raw scope -- see `PreferencesPythonPinChanged`.
@@ -3622,7 +4003,7 @@ pub fn update(app: &mut App, message: Message, runner: Arc<dyn CommandRunner>) -
                     project.uv_source = Override::Set(source);
                 }
             }
-            return persist_env_edit(app);
+            return persist_edit(app, "env var change");
         }
         Message::PreferencesTerminalOverridden(scope, choice) => {
             let os = Os::host();
@@ -3638,7 +4019,7 @@ pub fn update(app: &mut App, message: Message, runner: Arc<dyn CommandRunner>) -
                     project.terminals.insert(os, choice);
                 }
             }
-            return persist_env_edit(app);
+            return persist_edit(app, "env var change");
         }
         Message::EnvironmentAdded(id) => {
             return Task::perform(pick_folder(), move |path| {
@@ -3674,7 +4055,7 @@ pub fn update(app: &mut App, message: Message, runner: Arc<dyn CommandRunner>) -
                     python: seed,
                 });
             rebuild_entries(app);
-            return Task::batch([persist_env_edit(app), probe_every_venv(app)]);
+            return Task::batch([persist_edit(app, "env var change"), probe_every_venv(app)]);
         }
         Message::EnvironmentPinChanged(id, location, version) => {
             let pin = preferences::pin_from_input(&version);
@@ -3691,7 +4072,7 @@ pub fn update(app: &mut App, message: Message, runner: Arc<dyn CommandRunner>) -
             environment.python = pin;
             // The row shows its own pin, and drift is judged against it.
             rebuild_entries(app);
-            return persist_env_edit(app);
+            return persist_edit(app, "env var change");
         }
         Message::EnvironmentRemoveRequested(id, location) => {
             let Some(project) = app.config.projects.iter().find(|p| p.id == id) else {
@@ -3746,7 +4127,7 @@ pub fn update(app: &mut App, message: Message, runner: Arc<dyn CommandRunner>) -
                     .unwrap_or_default();
             }
             rebuild_entries(app);
-            return Task::batch([persist_env_edit(app), probe_every_venv(app)]);
+            return Task::batch([persist_edit(app, "env var change"), probe_every_venv(app)]);
         }
         Message::EnvironmentLocationSelected(id, from, to) => {
             let Some(project) = app.config.projects.iter_mut().find(|p| p.id == id) else {
@@ -3779,7 +4160,7 @@ pub fn update(app: &mut App, message: Message, runner: Arc<dyn CommandRunner>) -
             // Re-probed: the sidebar's glyph describes wherever an
             // environment last resolved, and this moved that.
             rebuild_entries(app);
-            return Task::batch([persist_env_edit(app), probe_every_venv(app)]);
+            return Task::batch([persist_edit(app, "env var change"), probe_every_venv(app)]);
         }
         Message::EnvironmentPickFolderRequested(id, from) => {
             return Task::perform(pick_folder(), move |path| {
@@ -3826,15 +4207,16 @@ pub fn update(app: &mut App, message: Message, runner: Arc<dyn CommandRunner>) -
                 | preferences::Section::Scripts
                 | preferences::Section::EnvVars
                 | preferences::Section::Indexes
-                | preferences::Section::GitHub => return Task::none(),
+                | preferences::Section::GitHub
+                | preferences::Section::Backup => return Task::none(),
             }
-            return persist_env_edit(app);
+            return persist_edit(app, "env var change");
         }
         Message::EnvVarAdded(scope) => {
             if let Some(vars) = env_editor::vars_mut(&mut app.config, scope) {
                 env_editor::add_var(vars);
             }
-            return persist_env_edit(app);
+            return persist_edit(app, "env var change");
         }
         Message::EnvVarRemoved(scope, index) => {
             // Resolved before the row goes -- see `env_removal_secret_key`.
@@ -3852,16 +4234,19 @@ pub fn update(app: &mut App, message: Message, runner: Arc<dyn CommandRunner>) -
                 let config = app.config.clone();
                 let persist = app.persist.clone();
                 return Task::perform(unmark_secret_job(key, config, persist), |success| {
-                    Message::EnvVarPersistFinished { success }
+                    Message::Persisted {
+                        what: "env var change",
+                        success,
+                    }
                 });
             }
-            return persist_env_edit(app);
+            return persist_edit(app, "env var change");
         }
         Message::EnvVarKeyChanged(scope, index, key) => {
             if let Some(vars) = env_editor::vars_mut(&mut app.config, scope) {
                 env_editor::set_key(vars, index, key);
             }
-            return persist_env_edit(app);
+            return persist_edit(app, "env var change");
         }
         // Draft only: no `Config` write and no persist, so a value the user is
         // still deciding whether to mark secret never transits `config.toml`.
@@ -3881,7 +4266,7 @@ pub fn update(app: &mut App, message: Message, runner: Arc<dyn CommandRunner>) -
                 None => false,
             };
             if committed {
-                return persist_env_edit(app);
+                return persist_edit(app, "env var change");
             }
         }
         Message::EnvVarSecretToggled(scope, index) => {
@@ -3939,14 +4324,6 @@ pub fn update(app: &mut App, message: Message, runner: Arc<dyn CommandRunner>) -
                 None => {}
             }
         }
-        Message::EnvVarPersistFinished { success } => {
-            if !success {
-                drawer::set_idle(
-                    &mut app.drawer,
-                    "env var change failed to persist".to_string(),
-                );
-            }
-        }
         // Applies to `app.config` what the job already wrote to the keychain
         // and to disk, and only then. Re-deriving the direction from the row's
         // *current* state is what keeps this arm honest: `app.config` has not
@@ -3986,45 +4363,37 @@ pub fn update(app: &mut App, message: Message, runner: Arc<dyn CommandRunner>) -
             if let Some(scripts) = scripts_editor::scripts_mut(&mut app.config, scope) {
                 scripts_editor::add_script(scripts, path);
             }
-            return persist_script_edit(app);
+            return persist_edit(app, "script change");
         }
         Message::ScriptRemoved(scope, index) => {
             if let Some(scripts) = scripts_editor::scripts_mut(&mut app.config, scope) {
                 scripts_editor::remove_script(scripts, index);
             }
-            return persist_script_edit(app);
+            return persist_edit(app, "script change");
         }
         Message::ScriptEnabledToggled(scope, index) => {
             if let Some(scripts) = scripts_editor::scripts_mut(&mut app.config, scope) {
                 scripts_editor::toggle_enabled(scripts, index);
             }
-            return persist_script_edit(app);
+            return persist_edit(app, "script change");
         }
         Message::ScriptMovedUp(scope, index) => {
             if let Some(scripts) = scripts_editor::scripts_mut(&mut app.config, scope) {
                 scripts_editor::move_up(scripts, index);
             }
-            return persist_script_edit(app);
+            return persist_edit(app, "script change");
         }
         Message::ScriptMovedDown(scope, index) => {
             if let Some(scripts) = scripts_editor::scripts_mut(&mut app.config, scope) {
                 scripts_editor::move_down(scripts, index);
             }
-            return persist_script_edit(app);
-        }
-        Message::ScriptPersistFinished { success } => {
-            if !success {
-                drawer::set_idle(
-                    &mut app.drawer,
-                    "script change failed to persist".to_string(),
-                );
-            }
+            return persist_edit(app, "script change");
         }
         Message::IndexAdded => {
             index_editor::add_index(&mut app.config.indexes);
             app.index_credential_drafts.push(String::new());
             app.index_credential_names.push(String::new());
-            return persist_index_edit(app);
+            return persist_edit(app, "index change");
         }
         Message::IndexRemoved(i) => {
             // Resolved before the row goes: `SecretKey::Index` is keyed on
@@ -4044,10 +4413,13 @@ pub fn update(app: &mut App, message: Message, runner: Arc<dyn CommandRunner>) -
                 let config = app.config.clone();
                 let persist = app.persist.clone();
                 return Task::perform(unmark_secret_job(key, config, persist), |success| {
-                    Message::IndexPersistFinished { success }
+                    Message::Persisted {
+                        what: "index change",
+                        success,
+                    }
                 });
             }
-            return persist_index_edit(app);
+            return persist_edit(app, "index change");
         }
         // The three typed fields write in-memory only: no persist, and -- for
         // the name -- no keychain call. `IndexEditCommitted` is where both
@@ -4140,19 +4512,11 @@ pub fn update(app: &mut App, message: Message, runner: Arc<dyn CommandRunner>) -
                 }
             }
         }
-        Message::IndexPersistFinished { success } => {
-            if !success {
-                drawer::set_idle(
-                    &mut app.drawer,
-                    "index change failed to persist".to_string(),
-                );
-            }
-        }
         Message::ProjectIndexToggled(project_index, name) => {
             if let Some(project) = app.config.projects.get_mut(project_index) {
                 index_editor::toggle_selected(&mut project.index_names, &name);
             }
-            return persist_index_edit(app);
+            return persist_edit(app, "index change");
         }
         Message::MemberToggled(i, path) => {
             // Only reachable when this project's Members fetch is the one
@@ -4164,15 +4528,7 @@ pub fn update(app: &mut App, message: Message, runner: Arc<dyn CommandRunner>) -
                 && let Some(project) = app.config.projects.get_mut(i)
             {
                 members_editor::toggle(&mut project.members, &fetch.discovered, &fetch.kind, &path);
-                return persist_members_edit(app);
-            }
-        }
-        Message::MembersPersistFinished { success } => {
-            if !success {
-                drawer::set_idle(
-                    &mut app.drawer,
-                    "member selection failed to persist".to_string(),
-                );
+                return persist_edit(app, "member selection");
             }
         }
         Message::MembersSyncRequested(i) => {
@@ -4231,7 +4587,7 @@ pub fn update(app: &mut App, message: Message, runner: Arc<dyn CommandRunner>) -
             // A stale result from a previous Custom validation no longer
             // describes the current source.
             app.uv_custom_validation = None;
-            return persist_settings_edit(app);
+            return persist_edit(app, "settings change");
         }
         Message::SettingsUvCustomPathChanged(text) => {
             app.uv_custom_path_draft = text;
@@ -4251,7 +4607,7 @@ pub fn update(app: &mut App, message: Message, runner: Arc<dyn CommandRunner>) -
                 path: resolved.path.clone(),
             };
             app.uv_custom_validation = Some(Ok(resolved.version.to_string()));
-            return persist_settings_edit(app);
+            return persist_edit(app, "settings change");
         }
         // A refused path -- including one below `MIN_UV_VERSION`, reported
         // through `UvResolveError::TooOld`'s own text -- only updates what
@@ -4259,14 +4615,6 @@ pub fn update(app: &mut App, message: Message, runner: Arc<dyn CommandRunner>) -
         // never reaches `config.toml`.
         Message::SettingsUvCustomValidated(Err(message)) => {
             app.uv_custom_validation = Some(Err(message));
-        }
-        Message::SettingsPersistFinished { success } => {
-            if !success {
-                drawer::set_idle(
-                    &mut app.drawer,
-                    "settings change failed to persist".to_string(),
-                );
-            }
         }
         Message::SettingsDefaultVenvLocationAlongsideSelected => {
             settings_editor::apply_default_venv_location(
@@ -4276,7 +4624,7 @@ pub fn update(app: &mut App, message: Message, runner: Arc<dyn CommandRunner>) -
             // Re-probed, not just persisted: the sidebar's venv status
             // describes wherever each project resolved when it was last
             // probed, and this just moved that. See `probe_every_venv`.
-            return Task::batch([persist_settings_edit(app), probe_every_venv(app)]);
+            return Task::batch([persist_edit(app, "settings change"), probe_every_venv(app)]);
         }
         Message::SettingsDefaultVenvLocationPickFolderRequested => {
             return Task::perform(
@@ -4291,7 +4639,7 @@ pub fn update(app: &mut App, message: Message, runner: Arc<dyn CommandRunner>) -
                 &mut app.config.settings,
                 DefaultVenvLocation::Central { path },
             );
-            return Task::batch([persist_settings_edit(app), probe_every_venv(app)]);
+            return Task::batch([persist_edit(app, "settings change"), probe_every_venv(app)]);
         }
     }
     Task::none()
@@ -4848,6 +5196,7 @@ pub fn project_findings(app: &App, i: usize) -> Vec<crate::health::Finding> {
         git: entry.git.as_ref(),
         pr,
         installed: app.installed_pythons.as_deref(),
+        missing: app.missing.contains(&project.id),
     })
 }
 
@@ -5233,10 +5582,13 @@ fn commit_index_edit(app: &mut App, i: usize) -> Task<Message> {
         let persist = app.persist.clone();
         return Task::perform(
             rename_index_credential_job(from, to, config, persist),
-            |success| Message::IndexPersistFinished { success },
+            |success| Message::Persisted {
+                what: "index change",
+                success,
+            },
         );
     }
-    persist_index_edit(app)
+    persist_edit(app, "index change")
 }
 
 /// The keychain account a removed env var row owes a delete of, if any.
@@ -5302,15 +5654,13 @@ fn members_context(
 }
 
 /// Dispatches a background persist of `app.config` as it stands right now,
-/// for a member selection edit (a checkbox toggle). Mirrors
-/// `persist_env_edit`/`persist_script_edit`/`persist_index_edit` exactly --
-/// this never touches the keychain, so a plain `persist_config` is the whole
-/// job.
-fn persist_members_edit(app: &App) -> Task<Message> {
+/// for an edit that needs no keychain call. `what` names the edit in the
+/// drawer line a failure leaves.
+fn persist_edit(app: &App, what: &'static str) -> Task<Message> {
     let config = app.config.clone();
     let persist = app.persist.clone();
-    Task::perform(persist_config(config, persist), |success| {
-        Message::MembersPersistFinished { success }
+    Task::perform(persist_config(config, persist), move |success| {
+        Message::Persisted { what, success }
     })
 }
 
@@ -5398,6 +5748,78 @@ async fn scan_folder(dir: PathBuf, registered: Vec<PathBuf>) -> (usize, Vec<Path
         job::JobResult::Done(found) => found,
         job::JobResult::TimedOut | job::JobResult::Failed => (0, Vec::new()),
     }
+}
+
+/// The save dialog for an export, suggesting `bombadil-<YYYY-MM-DD>.bombadil`.
+async fn pick_bombadil_save() -> Option<PathBuf> {
+    let s = bombadil_core::store::stamp(std::time::SystemTime::now());
+    rfd::AsyncFileDialog::new()
+        .set_file_name(format!(
+            "bombadil-{}-{}-{}.bombadil",
+            &s[..4],
+            &s[4..6],
+            &s[6..8]
+        ))
+        .add_filter("Bombadil export", &["bombadil"])
+        .save_file()
+        .await
+        .map(|handle| handle.path().to_path_buf())
+}
+
+async fn pick_bombadil_open() -> Option<PathBuf> {
+    rfd::AsyncFileDialog::new()
+        .add_filter("Bombadil export", &["bombadil"])
+        .pick_file()
+        .await
+        .map(|handle| handle.path().to_path_buf())
+}
+
+/// The picker behind "Locate…", async for the same reason as `pick_folder`.
+async fn pick_pyproject() -> Option<PathBuf> {
+    rfd::AsyncFileDialog::new()
+        .add_filter("pyproject.toml", &["toml"])
+        .pick_file()
+        .await
+        .map(|handle| handle.path().to_path_buf())
+}
+
+pub(crate) const FOLDER_MISSING: &str = "This project's folder isn't on this computer";
+
+/// Whether project `i`'s `pyproject.toml` is gone. Records the answer in
+/// `app.missing`, which the detail pane and the sidebar's warning read.
+fn folder_missing(app: &mut App, i: usize) -> bool {
+    let Some(project) = app.config.projects.get(i) else {
+        return false;
+    };
+    let id = project.id;
+    let gone = !(app.path_exists)(&project.pyproject_path);
+    if gone {
+        app.missing.insert(id);
+    } else {
+        app.missing.remove(&id);
+    }
+    gone
+}
+
+/// [`folder_missing`], saying so in a warning toast: for an action that
+/// cannot start without the folder.
+fn refuse_missing(app: &mut App, i: usize) -> bool {
+    let gone = folder_missing(app, i);
+    if gone {
+        crate::busy::push(
+            &mut app.toasts,
+            crate::busy::ToastKind::Warning,
+            FOLDER_MISSING.into(),
+            std::time::Instant::now(),
+        );
+    }
+    gone
+}
+
+/// The index of the project an open confirmation names, by id.
+fn confirmed_index(app: &App, id: Option<uuid::Uuid>) -> Option<usize> {
+    let id = id?;
+    app.config.projects.iter().position(|p| p.id == id)
 }
 
 /// Opens the async folder picker. Never the blocking `rfd::FileDialog`: a
@@ -5593,16 +6015,12 @@ async fn list_interpreters(
     config: Config,
     runner: Arc<dyn CommandRunner>,
 ) -> Result<Vec<Interpreter>, String> {
-    match job::run(
+    job::attempt(
         move || list_interpreters_blocking(&config, runner.as_ref()),
         SYNC_TIMEOUT,
+        "listing interpreters",
     )
     .await
-    {
-        job::JobResult::Done(result) => result,
-        job::JobResult::TimedOut => Err("listing interpreters timed out".to_string()),
-        job::JobResult::Failed => Err("listing interpreters failed unexpectedly".to_string()),
-    }
 }
 
 /// The blocking half of installing an interpreter: resolve uv and run `uv
@@ -6386,7 +6804,7 @@ async fn open_pycharm(
     config: Config,
     runner: Arc<dyn CommandRunner>,
 ) -> Result<Option<String>, String> {
-    match job::run(
+    job::attempt(
         move || {
             // Read here, at the boundary, so no test reaches the real home
             // directory -- the same discipline `KeyringSecretStore::new()`
@@ -6402,13 +6820,9 @@ async fn open_pycharm(
             )
         },
         VENV_PROBE_TIMEOUT,
+        "opening PyCharm",
     )
     .await
-    {
-        job::JobResult::Done(result) => result,
-        job::JobResult::TimedOut => Err("opening PyCharm timed out".to_string()),
-        job::JobResult::Failed => Err("opening PyCharm failed unexpectedly".to_string()),
-    }
 }
 
 /// This user's home directory, or an empty path when the platform will not
@@ -6463,7 +6877,7 @@ async fn open_terminal(
     config: Config,
     runner: Arc<dyn CommandRunner>,
 ) -> Result<(), String> {
-    match job::run(
+    job::attempt(
         move || {
             // A Bombadil-owned scratch directory for the re-assertion init
             // file `terminal::open::open` writes -- namespaced per-project
@@ -6481,13 +6895,9 @@ async fn open_terminal(
             )
         },
         VENV_PROBE_TIMEOUT,
+        "opening the terminal",
     )
     .await
-    {
-        job::JobResult::Done(result) => result,
-        job::JobResult::TimedOut => Err("opening the terminal timed out".to_string()),
-        job::JobResult::Failed => Err("opening the terminal failed unexpectedly".to_string()),
-    }
 }
 
 /// The blocking half of Open folder: show the project's own directory --
@@ -6523,16 +6933,12 @@ async fn open_folder(
     project: Project,
     runner: Arc<dyn CommandRunner>,
 ) -> Result<(), String> {
-    match job::run(
+    job::attempt(
         move || run_open_folder(os, &project, runner.as_ref()),
         VENV_PROBE_TIMEOUT,
+        "opening the folder",
     )
     .await
-    {
-        job::JobResult::Done(result) => result,
-        job::JobResult::TimedOut => Err("opening the folder timed out".to_string()),
-        job::JobResult::Failed => Err("opening the folder failed unexpectedly".to_string()),
-    }
 }
 
 /// The blocking half of persisting a config, with nothing else to do: just a
@@ -6542,61 +6948,6 @@ async fn open_folder(
 /// save -- a removal, and the plain (non-secret-toggling) env var edits.
 fn run_persist(config: &Config, persist: &dyn ConfigPersist) -> bool {
     persist.save(config).is_ok()
-}
-
-/// Dispatches a background persist of `app.config` as it stands right now
-/// (criterion 5). Shared by every plain env var edit (add, remove, rename,
-/// retype a non-secret value) -- none of them touch the keychain, so a plain
-/// `persist_config` is the whole job, unlike `EnvVarSecretToggled`, which
-/// also has a keychain call that must land in the same background step.
-fn persist_env_edit(app: &App) -> Task<Message> {
-    let config = app.config.clone();
-    let persist = app.persist.clone();
-    Task::perform(persist_config(config, persist), |success| {
-        Message::EnvVarPersistFinished { success }
-    })
-}
-
-/// Dispatches a background persist of `app.config` as it stands right now,
-/// for a script edit (add, remove, toggle enabled, reorder). Mirrors
-/// `persist_env_edit` exactly -- none of these edits touch the keychain, so a
-/// plain `persist_config` is the whole job.
-fn persist_script_edit(app: &App) -> Task<Message> {
-    let config = app.config.clone();
-    let persist = app.persist.clone();
-    Task::perform(persist_config(config, persist), |success| {
-        Message::ScriptPersistFinished { success }
-    })
-}
-
-/// Dispatches a background persist of `app.config` as it stands right now,
-/// for an index edit that does not touch the keychain (add, remove, a field
-/// edit, a project's selection toggle). Mirrors `persist_env_edit` and
-/// `persist_script_edit` exactly.
-///
-/// `IndexCredentialSaveRequested` does *not* go through this: a credential
-/// save's persist has to land in the same background job as the keychain
-/// write, the same pairing `EnvVarSecretToggled` needs -- see
-/// `mark_secret_job`, which it dispatches directly instead.
-fn persist_index_edit(app: &App) -> Task<Message> {
-    let config = app.config.clone();
-    let persist = app.persist.clone();
-    Task::perform(persist_config(config, persist), |success| {
-        Message::IndexPersistFinished { success }
-    })
-}
-
-/// Dispatches a background persist of `app.config` as it stands right now,
-/// for a Settings edit (spec §5, Task 6) that needs no keychain call --
-/// every one of them, since neither `uv_source` nor `default_venv_location`
-/// carries a secret. Mirrors `persist_env_edit`/`persist_script_edit`/
-/// `persist_index_edit` exactly.
-fn persist_settings_edit(app: &App) -> Task<Message> {
-    let config = app.config.clone();
-    let persist = app.persist.clone();
-    Task::perform(persist_config(config, persist), |success| {
-        Message::SettingsPersistFinished { success }
-    })
 }
 
 /// The blocking half of validating a candidate `uv_source: Custom { path }`
@@ -6626,16 +6977,12 @@ async fn validate_uv_source(
     config: Config,
     runner: Arc<dyn CommandRunner>,
 ) -> Result<uv::ResolvedUv, String> {
-    match job::run(
+    job::attempt(
         move || validate_uv_source_blocking(path, config, runner.as_ref()),
         SYNC_TIMEOUT,
+        "validating uv",
     )
     .await
-    {
-        job::JobResult::Done(result) => result,
-        job::JobResult::TimedOut => Err("validating uv timed out".to_string()),
-        job::JobResult::Failed => Err("validating uv failed unexpectedly".to_string()),
-    }
 }
 
 /// Runs off the render thread via `job::run`: persisting the config is a
@@ -7068,6 +7415,10 @@ pub fn view(app: &App) -> iced::Element<'_, Message> {
         )
         .into()
     } else if let Some((i, project)) = selected
+        && app.missing.contains(&project.id)
+    {
+        detail::missing_folder_view(project, i)
+    } else if let Some((i, project)) = selected
         && project.environments.is_empty()
     {
         detail::no_environment_view(project, i)
@@ -7413,6 +7764,7 @@ pub fn view(app: &App) -> iced::Element<'_, Message> {
             app.github_source.as_ref(),
             app.github_accounts.as_ref(),
             app.github_login.as_ref(),
+            &app.backup,
         ));
     }
     if let Some(modal) = app.modal {
@@ -9533,6 +9885,354 @@ mod tests {
             projects: vec![project("api")],
             ..Config::default()
         })
+    }
+
+    #[test]
+    fn selecting_a_project_whose_folder_is_gone_marks_it_and_reads_nothing() {
+        let mut app = one_project();
+        app.path_exists = |_| false;
+        let task = update(&mut app, Message::ProjectSelected(0), unused_runner());
+        let id = first_id(&app);
+        assert!(app.missing.contains(&id));
+        assert_eq!(
+            task.units(),
+            0,
+            "no git or uv probe on a folder that isn't there"
+        );
+    }
+
+    #[test]
+    fn a_sync_on_a_missing_folder_starts_nothing() {
+        let mut app = one_project();
+        app.path_exists = |_| false;
+        let _ = update(&mut app, Message::SyncRequested(0), unused_runner());
+        assert!(app.busy.is_none());
+        assert_eq!(
+            app.toasts[0].text,
+            "This project's folder isn't on this computer"
+        );
+    }
+
+    fn bundle_with(
+        projects: Vec<bombadil_core::model::Project>,
+        secrets: bool,
+    ) -> bombadil_core::backup::Bundle {
+        let config = Config {
+            projects,
+            ..Config::default()
+        };
+        let store = bombadil_core::secrets::InMemorySecretStore::new();
+        if secrets {
+            store
+                .set(&bombadil_core::secrets::SecretKey::GitHubToken, "gh")
+                .unwrap();
+        }
+        let out = bombadil_core::backup::export(
+            &config,
+            &store,
+            if secrets { "correct horse" } else { "" },
+            bombadil_core::backup::crypto::Kdf::FAST,
+            std::path::Path::new("/p"),
+        )
+        .unwrap();
+        bombadil_core::backup::read(&out.text).unwrap()
+    }
+
+    #[test]
+    fn export_needs_matching_passphrases() {
+        let mut app = one_project();
+        app.backup.passphrase = "correct horse".into();
+        app.backup.confirm = "correct horsf".into();
+        let _ = update(&mut app, Message::BackupExportRequested, unused_runner());
+        assert_eq!(app.toasts[0].text, "The passphrases don't match");
+    }
+
+    #[test]
+    fn a_short_passphrase_is_refused() {
+        let mut app = one_project();
+        app.backup.passphrase = "short".into();
+        app.backup.confirm = "short".into();
+        let _ = update(&mut app, Message::BackupExportRequested, unused_runner());
+        assert_eq!(
+            app.toasts[0].text,
+            "Use at least 8 characters for the passphrase"
+        );
+    }
+
+    #[test]
+    fn a_file_without_secrets_goes_straight_to_mapping() {
+        let mut app = App::new(Config::default());
+        let bundle = bundle_with(vec![project("api")], false);
+        let _ = update(
+            &mut app,
+            Message::BackupImportRead("/x.bombadil".into(), Ok(bundle)),
+            unused_runner(),
+        );
+        let import = app.backup.import.as_ref().unwrap();
+        assert_eq!(
+            import.secrets,
+            Some(bombadil_core::backup::Secrets::default())
+        );
+        assert_eq!(import.maps.len(), 1);
+    }
+
+    #[test]
+    fn a_wrong_passphrase_can_be_retried() {
+        let mut app = App::new(Config::default());
+        let bundle = bundle_with(vec![project("api")], true);
+        let _ = update(
+            &mut app,
+            Message::BackupImportRead("/x.bombadil".into(), Ok(bundle)),
+            unused_runner(),
+        );
+        assert_eq!(app.backup.import.as_ref().unwrap().secrets, None);
+        let _ = update(
+            &mut app,
+            Message::BackupUnlocked(
+                "/x.bombadil".into(),
+                Err("the passphrase is wrong, or the file was changed".into()),
+            ),
+            unused_runner(),
+        );
+        let import = app.backup.import.as_ref().unwrap();
+        assert!(import.error.is_some());
+        assert_eq!(import.maps.len(), 1, "mapping kept");
+        let _ = update(
+            &mut app,
+            Message::BackupUnlocked(
+                "/x.bombadil".into(),
+                Ok(bombadil_core::backup::Secrets::default()),
+            ),
+            unused_runner(),
+        );
+        let import = app.backup.import.as_ref().unwrap();
+        assert!(import.error.is_none());
+        assert!(import.secrets.is_some());
+    }
+
+    #[test]
+    fn an_unlock_for_another_file_is_ignored() {
+        let mut app = App::new(Config::default());
+        let bundle = bundle_with(vec![project("api")], true);
+        let _ = update(
+            &mut app,
+            Message::BackupImportRead("/b.bombadil".into(), Ok(bundle)),
+            unused_runner(),
+        );
+        let _ = update(
+            &mut app,
+            Message::BackupUnlocked(
+                "/a.bombadil".into(),
+                Ok(bombadil_core::backup::Secrets::default()),
+            ),
+            unused_runner(),
+        );
+        assert_eq!(app.backup.import.as_ref().unwrap().secrets, None);
+    }
+
+    #[test]
+    fn a_finished_import_becomes_the_running_config() {
+        let mut app = one_project();
+        let mut config = app.config.clone();
+        config.projects.push(project("cli"));
+        let report = bombadil_core::backup::import::Report {
+            projects: 1,
+            ..Default::default()
+        };
+        let _ = update(
+            &mut app,
+            Message::BackupImportFinished(Ok((config, report, None))),
+            unused_runner(),
+        );
+        assert_eq!(app.config.projects.len(), 2);
+        assert_eq!(app.entries.len(), 2, "the sidebar shows it");
+        assert!(app.backup.import.is_none());
+        assert_eq!(
+            app.toasts[0].text,
+            "Imported 1 project, 0 indexes, 0 secrets"
+        );
+    }
+
+    #[test]
+    fn a_finished_import_reselects_and_drops_tabs_read_for_the_old_list() {
+        let mut app = one_project();
+        app.selected = Some(0);
+        app.deps = Some((0, Err("read for the old list".into())));
+        app.dep_filter = "num".into();
+        let config = Config {
+            projects: vec![project("cli")],
+            ..Config::default()
+        };
+        let report = bombadil_core::backup::import::Report::default();
+        let task = update(
+            &mut app,
+            Message::BackupImportFinished(Ok((config, report, None))),
+            unused_runner(),
+        );
+        assert!(app.deps.is_none());
+        assert!(app.dep_filter.is_empty(), "selected the way a click does");
+        assert!(task.units() > 0);
+    }
+
+    #[test]
+    fn the_export_toast_counts_secrets_left_behind() {
+        let mut app = one_project();
+        let out = bombadil_core::backup::Exported {
+            text: String::new(),
+            secrets: 0,
+            missing: vec!["index/corp".into()],
+        };
+        let _ = update(
+            &mut app,
+            Message::BackupExportFinished(Ok(out)),
+            unused_runner(),
+        );
+        assert_eq!(
+            app.toasts[0].text,
+            "Exported 1 project, 0 indexes, 0 secrets. 1 secret wasn't in the keychain"
+        );
+    }
+
+    #[test]
+    fn an_import_reseeds_the_index_credential_rows() {
+        let index = |name: &str| bombadil_core::model::Index {
+            name: name.into(),
+            url: "https://x/simple".into(),
+            kind: bombadil_core::model::IndexKind::Extra,
+            default_for_new_projects: false,
+            auth: bombadil_core::model::IndexAuth::Token,
+        };
+        let mut app = App::new(Config {
+            indexes: vec![index("corp-old")],
+            ..Config::default()
+        });
+        app.env_value_drafts
+            .insert((env_editor::EnvScope::Global, 0), "half-typed".into());
+        let config = Config {
+            indexes: vec![index("corp"), index("extra")],
+            ..Config::default()
+        };
+        let report = bombadil_core::backup::import::Report::default();
+        let _ = update(
+            &mut app,
+            Message::BackupImportFinished(Ok((config, report, None))),
+            unused_runner(),
+        );
+        assert_eq!(app.index_credential_names, ["corp", "extra"]);
+        assert_eq!(app.index_credential_drafts.len(), 2);
+        assert_eq!(
+            index_rename_on_commit(&app, 0),
+            None,
+            "an edit must not move corp-old's credential over the imported one"
+        );
+        assert!(app.env_value_drafts.is_empty());
+    }
+
+    #[test]
+    fn unsaved_secrets_make_the_import_toast_stay() {
+        let mut app = one_project();
+        let report = bombadil_core::backup::import::Report {
+            secrets_error: Some("no Secret Service".into()),
+            ..Default::default()
+        };
+        let config = app.config.clone();
+        let _ = update(
+            &mut app,
+            Message::BackupImportFinished(Ok((config, report, None))),
+            unused_runner(),
+        );
+        assert_eq!(app.toasts[0].kind, crate::busy::ToastKind::Warning);
+        assert!(app.toasts[0].text.contains("no Secret Service"));
+    }
+
+    #[test]
+    fn a_replace_names_its_backup_and_missing_folders() {
+        let mut app = one_project();
+        let report = bombadil_core::backup::import::Report {
+            projects: 1,
+            not_found: vec!["cli".into()],
+            ..Default::default()
+        };
+        let config = app.config.clone();
+        let _ = update(
+            &mut app,
+            Message::BackupImportFinished(Ok((
+                config,
+                report,
+                Some("/c/config.toml.bak-1".into()),
+            ))),
+            unused_runner(),
+        );
+        let text = &app.toasts[0].text;
+        assert!(text.contains("1 project folder not found"), "{text}");
+        assert!(text.contains("config.toml.bak-1"), "{text}");
+    }
+
+    #[test]
+    fn cancelling_an_import_changes_nothing() {
+        let mut app = one_project();
+        let before = app.config.clone();
+        let bundle = bundle_with(vec![project("cli")], false);
+        let _ = update(
+            &mut app,
+            Message::BackupImportRead("/x.bombadil".into(), Ok(bundle)),
+            unused_runner(),
+        );
+        let _ = update(&mut app, Message::BackupImportCancelled, unused_runner());
+        assert!(app.backup.import.is_none());
+        assert_eq!(app.config, before);
+    }
+
+    #[test]
+    fn import_waits_for_a_mode() {
+        let mut app = App::new(Config::default());
+        let bundle = bundle_with(vec![project("api")], false);
+        let _ = update(
+            &mut app,
+            Message::BackupImportRead("/x.bombadil".into(), Ok(bundle)),
+            unused_runner(),
+        );
+        let _ = update(&mut app, Message::BackupImportConfirmed, unused_runner());
+        assert!(
+            app.backup.import.is_some(),
+            "nothing ran without Merge or Replace"
+        );
+    }
+
+    #[test]
+    fn a_confirmed_recreate_on_a_missing_folder_starts_nothing() {
+        let mut app = one_project();
+        app.path_exists = |_| false;
+        app.confirm_recreate = Some(context_menu::ConfirmRecreate {
+            project_id: first_id(&app),
+            label: "api".into(),
+            venv_path: PathBuf::from("/p/api/.venv"),
+        });
+        let _ = update(&mut app, Message::RecreateVenvConfirmed, unused_runner());
+        assert!(app.busy.is_none());
+        assert!(app.confirm_recreate.is_none());
+        assert_eq!(app.toasts[0].text, FOLDER_MISSING);
+    }
+
+    #[test]
+    fn locate_points_the_project_at_the_new_file_and_saves() {
+        let mut app = one_project();
+        let id = first_id(&app);
+        app.missing.insert(id);
+        let new = PathBuf::from("/q/api/pyproject.toml");
+        let task = update(
+            &mut app,
+            Message::LocatePicked(id, Some(new.clone())),
+            unused_runner(),
+        );
+        assert_eq!(app.config.projects[0].pyproject_path, new);
+        assert!(!app.missing.contains(&id));
+        assert!(task.units() > 0, "the new path is saved");
+        assert!(
+            app.entries[0].environments[0].path.starts_with("/q/api"),
+            "the cached venv path follows the project: {:?}",
+            app.entries[0].environments[0].path
+        );
     }
 
     #[test]
@@ -15025,8 +15725,14 @@ mod tests {
         let messages: Vec<Message> = vec![
             Message::IndexCredentialChanged(0, index_editor::CredentialInput(secret.to_string())),
             Message::IndexCredentialSaveRequested(0),
-            Message::IndexPersistFinished { success: true },
-            Message::IndexPersistFinished { success: false },
+            Message::Persisted {
+                what: "index change",
+                success: true,
+            },
+            Message::Persisted {
+                what: "index change",
+                success: false,
+            },
         ];
         for msg in &messages {
             let rendered = format!("{msg:?}");

@@ -36,6 +36,8 @@ pub struct Input<'a> {
     pub git: Option<&'a GitStatus>,
     pub pr: Option<&'a PrStatus>,
     pub installed: Option<&'a [String]>,
+    /// The project's `pyproject.toml` isn't on this computer.
+    pub missing: bool,
 }
 
 fn warning(text: String, fix: Option<Fix>) -> Finding {
@@ -54,7 +56,7 @@ fn note(text: String) -> Finding {
     }
 }
 
-fn plural(n: usize, one: &str, many: &str) -> String {
+pub(crate) fn plural(n: usize, one: &str, many: &str) -> String {
     format!("{n} {}", if n == 1 { one } else { many })
 }
 
@@ -72,6 +74,13 @@ fn minor(version: &str) -> Option<(u32, u32)> {
 }
 
 pub fn findings(input: &Input) -> Vec<Finding> {
+    // Nothing else can be checked on a folder that isn't there.
+    if input.missing {
+        return vec![warning(
+            "This project's folder isn't on this computer".into(),
+            None,
+        )];
+    }
     let mut out = Vec::new();
     if input.sync == Some(&SyncCheck::NoEnvironment) {
         out.push(warning("No environment yet".into(), Some(Fix::Sync)));
@@ -202,7 +211,19 @@ mod tests {
             git: None,
             pr: None,
             installed: None,
+            missing: false,
         }
+    }
+
+    #[test]
+    fn a_missing_folder_is_a_health_warning() {
+        let pin = PythonPin::Unpinned;
+        let f = findings(&Input {
+            missing: true,
+            ..input(&pin)
+        });
+        assert_eq!(texts(&f), ["This project's folder isn't on this computer"]);
+        assert_eq!(f[0].level, Level::Warning);
     }
     fn texts(f: &[Finding]) -> Vec<&str> {
         f.iter().map(|f| f.text.as_str()).collect()
