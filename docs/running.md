@@ -16,6 +16,30 @@ If the project's `pyproject.toml` has a `[project.scripts]` table, each name in
 it gets a button. Pressing one runs `uv run <name>`. A project made with
 **New project › App** has one from the start.
 
+## Just recipes
+
+If the project folder has a justfile (`justfile`, `Justfile` or `.justfile`),
+its recipes are listed with the comment above each one and their parameters.
+Private recipes (named with a leading `_`, or marked `[private]`) are left
+out.
+
+- **Show** opens the recipe's source under it, so you can read what it runs.
+- **Run** runs `just <recipe>` inside the project's environment: `python`,
+  `pytest` and the rest use the project's environment, with its variables,
+  secrets and pre-activate scripts.
+- A recipe with parameters has an **arguments** field. Type them as you
+  would after `just <recipe>`; quotes group words. Run stays off until every
+  parameter without a default has a value, and its tooltip says which.
+
+Bombadil comes with its own copy of `just`, so you don't need to install it.
+If `just` is on your `PATH`, Bombadil uses that one instead. You can change
+this in [Settings](settings.md#just). Above the recipes, the tab says which
+`just` it is using: "Using the bundled just 1.58.0", or "Using just from
+PATH" followed by its location. If you choose **from PATH** and `just`
+isn't on your `PATH`, the tab says so and links to how to install it. If the
+justfile has a mistake, the tab shows just's own message. On Windows, `just` runs recipes
+with `sh` unless the justfile sets `windows-shell`.
+
 ## Saved commands
 
 Save the commands you run often, such as `pytest -q` or `python main.py`. Give

@@ -16,7 +16,7 @@ pub use inherit::{Override, PythonPin};
 pub use member::{MemberOrigin, MemberRef, MemberSelection};
 pub use project::{Project, VenvLocation};
 pub use script::Script;
-pub use settings::{DefaultVenvLocation, Layout, Settings, ThemeChoice, UvSource};
+pub use settings::{DefaultVenvLocation, JustSource, Layout, Settings, ThemeChoice, UvSource};
 
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -113,6 +113,7 @@ mod tests {
                 close_to_tray: false,
                 watch_github: true,
                 check_vulnerabilities: false,
+                just_source: crate::model::JustSource::FromPath,
                 github_account: None,
                 pycharm: None,
             },

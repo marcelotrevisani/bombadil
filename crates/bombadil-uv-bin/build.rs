@@ -1,45 +1,58 @@
-//! Acquires the pinned uv binary for the *target* triple and places it in
-//! OUT_DIR for `include_bytes!`.
+//! Acquires the pinned uv and just binaries for the *target* triple and
+//! places them in OUT_DIR for `include_bytes!`.
 //!
 //! Network access happens here, at build time, never at runtime. Set
-//! BOMBADIL_UV_ARCHIVE to a pre-downloaded archive to build offline.
+//! BOMBADIL_UV_ARCHIVE and BOMBADIL_JUST_ARCHIVE to pre-downloaded archives
+//! to build offline.
 
 use sha2::{Digest, Sha256};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
 fn main() {
-    println!("cargo:rerun-if-changed=uv-manifest.toml");
     println!("cargo:rerun-if-changed=build.rs");
-    println!("cargo:rerun-if-env-changed=BOMBADIL_UV_ARCHIVE");
-
     let target = std::env::var("TARGET").expect("TARGET is set by cargo");
     let out_dir = PathBuf::from(std::env::var("OUT_DIR").expect("OUT_DIR is set by cargo"));
+    embed("uv", "astral-sh/uv", &target, &out_dir);
+    embed("just", "casey/just", &target, &out_dir);
+}
+
+/// Fetches (or reads from `BOMBADIL_<TOOL>_ARCHIVE`) the release archive
+/// pinned in `<tool>-manifest.toml` for `target`, checks its SHA-256, and
+/// writes the binary to OUT_DIR. Sets `BOMBADIL_<TOOL>_VERSION` and
+/// `BOMBADIL_<TOOL>_EXE_NAME`.
+fn embed(tool: &str, repo: &str, target: &str, out_dir: &Path) {
+    let upper = tool.to_uppercase();
+    let manifest_file = format!("{tool}-manifest.toml");
+    let archive_var = format!("BOMBADIL_{upper}_ARCHIVE");
+    println!("cargo:rerun-if-changed={manifest_file}");
+    println!("cargo:rerun-if-env-changed={archive_var}");
 
     let manifest: toml::Value = toml::from_str(
-        &std::fs::read_to_string("uv-manifest.toml").expect("uv-manifest.toml is readable"),
+        &std::fs::read_to_string(&manifest_file)
+            .unwrap_or_else(|e| panic!("{manifest_file} is not readable: {e}")),
     )
-    .expect("uv-manifest.toml parses");
+    .unwrap_or_else(|e| panic!("{manifest_file} does not parse: {e}"));
 
     let version = manifest["version"].as_str().expect("version is a string");
-    println!("cargo:rustc-env=BOMBADIL_UV_VERSION={version}");
+    println!("cargo:rustc-env=BOMBADIL_{upper}_VERSION={version}");
     let entry = manifest
         .get("targets")
-        .and_then(|t| t.get(&target))
+        .and_then(|t| t.get(target))
         .unwrap_or_else(|| {
             panic!(
-                "uv-manifest.toml has no entry for target {target}. \
-                 Add its asset name and sha256 from the uv release in `version`."
+                "{manifest_file} has no entry for target {target}. \
+                 Add its asset name and sha256 from the {tool} release in `version`."
             )
         });
     let asset = entry["asset"].as_str().expect("asset is a string");
     let expected_sha = entry["sha256"].as_str().expect("sha256 is a string");
 
-    let archive = match std::env::var("BOMBADIL_UV_ARCHIVE") {
+    let archive = match std::env::var(&archive_var) {
         Ok(path) => std::fs::read(&path)
-            .unwrap_or_else(|e| panic!("BOMBADIL_UV_ARCHIVE={path} could not be read: {e}")),
+            .unwrap_or_else(|e| panic!("{archive_var}={path} could not be read: {e}")),
         Err(_) => download(&format!(
-            "https://github.com/astral-sh/uv/releases/download/{version}/{asset}"
+            "https://github.com/{repo}/releases/download/{version}/{asset}"
         )),
     };
 
@@ -50,18 +63,19 @@ fn main() {
     );
 
     let exe_name = if target.contains("windows") {
-        "uv.exe"
+        format!("{tool}.exe")
     } else {
-        "uv"
+        tool.to_string()
     };
     let binary = if asset.ends_with(".zip") {
-        extract_from_zip(&archive, exe_name)
+        extract_from_zip(&archive, &exe_name)
     } else {
-        extract_from_tar_gz(&archive, exe_name)
+        extract_from_tar_gz(&archive, &exe_name)
     };
 
-    std::fs::write(out_dir.join(exe_name), &binary).expect("write uv to OUT_DIR");
-    println!("cargo:rustc-env=BOMBADIL_UV_EXE_NAME={exe_name}");
+    std::fs::write(out_dir.join(&exe_name), &binary)
+        .unwrap_or_else(|e| panic!("could not write {exe_name} to OUT_DIR: {e}"));
+    println!("cargo:rustc-env=BOMBADIL_{upper}_EXE_NAME={exe_name}");
 }
 
 fn hex(bytes: &[u8]) -> String {
@@ -86,7 +100,7 @@ const DOWNLOAD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120
 ///
 /// Trusting the platform is safe here specifically because it is not what
 /// makes the download trustworthy: the archive is checked against a SHA-256
-/// pinned in `uv-manifest.toml`, so a proxy -- or anything else in the path --
+/// pinned in the tool's manifest, so a proxy -- or anything else in the path --
 /// cannot substitute a different binary without failing that check. TLS is
 /// transport, the hash is the integrity guarantee, and they are independent.
 fn download(url: &str) -> Vec<u8> {
@@ -111,7 +125,7 @@ fn download(url: &str) -> Vec<u8> {
 }
 
 /// Match on file name, not on a hardcoded path: the archives wrap the binary
-/// in a top-level directory whose name has changed between uv releases.
+/// in a top-level directory whose name has changed between releases.
 fn matches_name(path: &Path, exe_name: &str) -> bool {
     path.file_name().map(|n| n == exe_name).unwrap_or(false)
 }
@@ -124,24 +138,28 @@ fn extract_from_tar_gz(archive: &[u8], exe_name: &str) -> Vec<u8> {
         let path = entry.path().expect("entry path").into_owned();
         if matches_name(&path, exe_name) {
             let mut bytes = Vec::new();
-            entry.read_to_end(&mut bytes).expect("read uv from tar");
+            entry
+                .read_to_end(&mut bytes)
+                .expect("read the binary from tar");
             return bytes;
         }
     }
-    panic!("no {exe_name} member found in the uv archive");
+    panic!("no {exe_name} member found in the archive");
 }
 
 fn extract_from_zip(archive: &[u8], exe_name: &str) -> Vec<u8> {
     let reader = std::io::Cursor::new(archive);
-    let mut zip = zip::ZipArchive::new(reader).expect("open uv zip");
+    let mut zip = zip::ZipArchive::new(reader).expect("open the zip");
     for i in 0..zip.len() {
         let mut entry = zip.by_index(i).expect("zip entry");
         let name = entry.name().expect("zip entry name").to_string();
         if matches_name(Path::new(&name), exe_name) {
             let mut bytes = Vec::new();
-            entry.read_to_end(&mut bytes).expect("read uv from zip");
+            entry
+                .read_to_end(&mut bytes)
+                .expect("read the binary from zip");
             return bytes;
         }
     }
-    panic!("no {exe_name} member found in the uv archive");
+    panic!("no {exe_name} member found in the archive");
 }

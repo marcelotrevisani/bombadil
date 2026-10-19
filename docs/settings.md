@@ -99,6 +99,17 @@ or **from PATH**. Use this for a project that has to stay on a particular uv.
 A specific binary can only be set globally, because it is checked before it
 is trusted.
 
+### just
+
+Which `just` runs a project's [recipes](running.md#just-recipes). Global
+only.
+
+| Choice | Behaviour |
+|---|---|
+| **auto** (default) | `just` from `PATH` if there is one, otherwise the copy bundled with Bombadil. |
+| **bundled** | Always the bundled copy. |
+| **from PATH** | Always `just` from `PATH`. If there is none, the Run tab says so instead of falling back. |
+
 ## Terminal
 
 ![Terminal](images/prefs-terminal.png)

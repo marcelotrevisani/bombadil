@@ -1,4 +1,4 @@
-//! The uv binary, embedded.
+//! The uv and just binaries, embedded.
 //!
 //! Separate from `bombadil-core` so that crate's tests neither link tens of
 //! megabytes nor need the network.
@@ -15,12 +15,50 @@ pub const BUNDLED_VERSION: &str = env!("BOMBADIL_UV_VERSION");
 /// section 4 requires. Surface this in an About dialog.
 pub const UV_LICENSE: &str = include_str!("../UV-LICENSE-APACHE");
 
-const EXE_NAME: &str = env!("BOMBADIL_UV_EXE_NAME");
+/// The just release embedded in this build.
+pub const JUST_BUNDLED_VERSION: &str = env!("BOMBADIL_JUST_VERSION");
+
+/// just's license text (CC0 1.0), shown beside uv's.
+pub const JUST_LICENSE: &str = include_str!("../JUST-LICENSE-CC0");
+
 const UV_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/", env!("BOMBADIL_UV_EXE_NAME")));
+const JUST_BYTES: &[u8] = include_bytes!(concat!(
+    env!("OUT_DIR"),
+    "/",
+    env!("BOMBADIL_JUST_EXE_NAME")
+));
+
+/// One embedded program and where it goes under the data directory.
+struct Embedded {
+    folder: &'static str,
+    version: &'static str,
+    exe_name: &'static str,
+    bytes: &'static [u8],
+    digest: &'static OnceLock<Vec<u8>>,
+}
+
+static UV_DIGEST: OnceLock<Vec<u8>> = OnceLock::new();
+static JUST_DIGEST: OnceLock<Vec<u8>> = OnceLock::new();
+
+const UV: Embedded = Embedded {
+    folder: "uv",
+    version: BUNDLED_VERSION,
+    exe_name: env!("BOMBADIL_UV_EXE_NAME"),
+    bytes: UV_BYTES,
+    digest: &UV_DIGEST,
+};
+
+const JUST: Embedded = Embedded {
+    folder: "just",
+    version: JUST_BUNDLED_VERSION,
+    exe_name: env!("BOMBADIL_JUST_EXE_NAME"),
+    bytes: JUST_BYTES,
+    digest: &JUST_DIGEST,
+};
 
 #[derive(Debug, thiserror::Error)]
 pub enum ExtractError {
-    #[error("could not write the bundled uv to {path}: {source}")]
+    #[error("could not write the bundled program to {path}: {source}")]
     Io {
         path: PathBuf,
         #[source]
@@ -32,26 +70,86 @@ fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
-/// The embedded binary's digest, hashed once per process rather than on every
-/// call: `UV_BYTES` is a `~35 MB` `const`, so it cannot change within a
-/// process, and re-hashing it on every `extraction_path`/`ensure_extracted`
-/// call added up to well over 100 MB of hashing per app launch. This is
-/// deliberately distinct from the digest of the *extracted* file on disk in
-/// `ensure_extracted`, which must stay live: self-repair of a truncated or
-/// tampered extraction depends on that one being recomputed every time.
-fn embedded_digest() -> &'static [u8] {
-    static DIGEST: OnceLock<Vec<u8>> = OnceLock::new();
-    DIGEST.get_or_init(|| Sha256::digest(UV_BYTES).to_vec())
+impl Embedded {
+    /// The embedded binary's digest, hashed once per process rather than on
+    /// every call: the bytes are a multi-megabyte `const`, so they cannot
+    /// change within a process, and re-hashing uv on every call added up to
+    /// well over 100 MB of hashing per app launch. This is deliberately
+    /// distinct from the digest of the *extracted* file on disk in
+    /// `ensure`, which must stay live: self-repair of a truncated or
+    /// tampered extraction depends on that one being recomputed every time.
+    fn digest(&self) -> &'static [u8] {
+        self.digest
+            .get_or_init(|| Sha256::digest(self.bytes).to_vec())
+    }
+
+    fn path(&self, data_dir: &Path) -> PathBuf {
+        let digest = hex(self.digest());
+        data_dir
+            .join(self.folder)
+            .join(format!("{}-{}", self.version, &digest[..12]))
+            .join(self.exe_name)
+    }
+
+    fn ensure(&self, data_dir: &Path) -> Result<PathBuf, ExtractError> {
+        let path = self.path(data_dir);
+
+        if let Ok(existing) = std::fs::read(&path)
+            && Sha256::digest(&existing).as_slice() == self.digest()
+        {
+            return Ok(path);
+        }
+
+        // `path` always joins a file name onto a directory, so there is a
+        // parent; an error rather than a panic if that ever stops being so.
+        let Some(parent) = path.parent() else {
+            return Err(ExtractError::Io {
+                path: path.clone(),
+                source: std::io::Error::other("the extraction path has no parent directory"),
+            });
+        };
+        std::fs::create_dir_all(parent).map_err(|source| ExtractError::Io {
+            path: parent.to_path_buf(),
+            source,
+        })?;
+
+        let mut tmp =
+            tempfile::NamedTempFile::new_in(parent).map_err(|source| ExtractError::Io {
+                path: parent.to_path_buf(),
+                source,
+            })?;
+        let tmp_path = tmp.path().to_path_buf();
+
+        tmp.write_all(self.bytes)
+            .map_err(|source| ExtractError::Io {
+                path: tmp_path.clone(),
+                source,
+            })?;
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            tmp.as_file()
+                .set_permissions(std::fs::Permissions::from_mode(0o755))
+                .map_err(|source| ExtractError::Io {
+                    path: tmp_path.clone(),
+                    source,
+                })?;
+        }
+
+        tmp.persist(&path).map_err(|e| ExtractError::Io {
+            path: tmp_path,
+            source: e.error,
+        })?;
+
+        Ok(path)
+    }
 }
 
-/// Where the extracted binary lives, keyed by version and content hash so a
-/// new build never reuses an old extraction.
+/// Where the extracted uv lives, keyed by version and content hash so a new
+/// build never reuses an old extraction.
 pub fn extraction_path(data_dir: &Path) -> PathBuf {
-    let digest = hex(embedded_digest());
-    data_dir
-        .join("uv")
-        .join(format!("{BUNDLED_VERSION}-{}", &digest[..12]))
-        .join(EXE_NAME)
+    UV.path(data_dir)
 }
 
 /// Write the embedded uv to disk if it is not already there with the right
@@ -65,55 +163,12 @@ pub fn extraction_path(data_dir: &Path) -> PathBuf {
 /// correctly-permissioned one, never a partial write or a not-yet-executable
 /// one.
 pub fn ensure_extracted(data_dir: &Path) -> Result<PathBuf, ExtractError> {
-    let path = extraction_path(data_dir);
+    UV.ensure(data_dir)
+}
 
-    if let Ok(existing) = std::fs::read(&path)
-        && Sha256::digest(&existing).as_slice() == embedded_digest()
-    {
-        return Ok(path);
-    }
-
-    // `extraction_path` always joins a file name onto a directory, so there
-    // is a parent; an error rather than a panic if that ever stops being so.
-    let Some(parent) = path.parent() else {
-        return Err(ExtractError::Io {
-            path: path.clone(),
-            source: std::io::Error::other("the extraction path has no parent directory"),
-        });
-    };
-    std::fs::create_dir_all(parent).map_err(|source| ExtractError::Io {
-        path: parent.to_path_buf(),
-        source,
-    })?;
-
-    let mut tmp = tempfile::NamedTempFile::new_in(parent).map_err(|source| ExtractError::Io {
-        path: parent.to_path_buf(),
-        source,
-    })?;
-    let tmp_path = tmp.path().to_path_buf();
-
-    tmp.write_all(UV_BYTES).map_err(|source| ExtractError::Io {
-        path: tmp_path.clone(),
-        source,
-    })?;
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        tmp.as_file()
-            .set_permissions(std::fs::Permissions::from_mode(0o755))
-            .map_err(|source| ExtractError::Io {
-                path: tmp_path.clone(),
-                source,
-            })?;
-    }
-
-    tmp.persist(&path).map_err(|e| ExtractError::Io {
-        path: tmp_path,
-        source: e.error,
-    })?;
-
-    Ok(path)
+/// [`ensure_extracted`] for the embedded just, under `<data_dir>/just/`.
+pub fn ensure_just_extracted(data_dir: &Path) -> Result<PathBuf, ExtractError> {
+    JUST.ensure(data_dir)
 }
 
 #[cfg(test)]
@@ -184,6 +239,32 @@ mod tests {
             1,
             "expected only the extracted binary, found {entries:?}"
         );
+    }
+
+    #[test]
+    fn the_just_license_is_cc0() {
+        assert!(
+            JUST_LICENSE.contains("CC0 1.0 Universal"),
+            "got:\n{JUST_LICENSE}"
+        );
+    }
+
+    #[test]
+    fn just_is_extracted_beside_uv_not_over_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let uv = ensure_extracted(dir.path()).unwrap();
+        let just = ensure_just_extracted(dir.path()).unwrap();
+
+        assert_ne!(uv.parent(), just.parent());
+        assert!(just.starts_with(dir.path().join("just")));
+        assert_eq!(std::fs::read(&just).unwrap(), JUST_BYTES);
+        assert_eq!(std::fs::read(&uv).unwrap().len(), UV_BYTES.len());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&just).unwrap().permissions().mode();
+            assert_eq!(mode & 0o111, 0o111, "extracted just must be executable");
+        }
     }
 
     #[test]

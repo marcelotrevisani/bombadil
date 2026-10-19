@@ -431,6 +431,7 @@ mod tests {
                 close_to_tray: false,
                 watch_github: true,
                 check_vulnerabilities: false,
+                just_source: crate::model::JustSource::FromPath,
                 github_account: None,
                 pycharm: None,
             },

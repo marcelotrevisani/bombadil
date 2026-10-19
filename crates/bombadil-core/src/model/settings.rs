@@ -30,6 +30,19 @@ pub enum UvSource {
     Custom { path: PathBuf },
 }
 
+/// Which `just` the Run tab uses for a project's recipes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum JustSource {
+    /// `just` from `PATH` when there is one, otherwise the bundled copy.
+    #[default]
+    Auto,
+    /// Always the embedded copy.
+    Bundled,
+    /// Always `just` from `PATH`; says so rather than falling back.
+    FromPath,
+}
+
 /// Light, dark, or whatever the desktop is using.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -97,6 +110,9 @@ pub struct Settings {
     /// vulnerabilities. Sends package names and versions, nothing else.
     #[serde(default = "yes")]
     pub check_vulnerabilities: bool,
+    /// Which `just` runs a project's recipes.
+    #[serde(default)]
+    pub just_source: JustSource,
     /// The `gh` account Bombadil looks pull requests up as. `None` follows
     /// whichever account `gh` has active; it never changes gh's own choice.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -122,6 +138,7 @@ impl Default for Settings {
             close_to_tray: true,
             watch_github: true,
             check_vulnerabilities: true,
+            just_source: JustSource::Auto,
             github_account: None,
             pycharm: None,
         }
@@ -136,6 +153,12 @@ mod tests {
     fn an_old_config_turns_the_check_on() {
         let settings: Settings = toml::from_str("theme = \"dark\"\n").unwrap();
         assert!(settings.check_vulnerabilities);
+    }
+
+    #[test]
+    fn an_old_config_finds_just_automatically() {
+        let settings: Settings = toml::from_str("theme = \"dark\"\n").unwrap();
+        assert_eq!(settings.just_source, JustSource::Auto);
     }
 
     #[test]

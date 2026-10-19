@@ -37,8 +37,10 @@ pub fn attribution() -> &'static str {
     static TEXT: OnceLock<String> = OnceLock::new();
     TEXT.get_or_init(|| {
         format!(
-            "Bundles uv {}, licensed under the Apache License, Version 2.0 (Apache-2.0).",
-            bombadil_uv_bin::BUNDLED_VERSION
+            "Bundles uv {}, licensed under the Apache License, Version 2.0 (Apache-2.0), \
+             and just {}, dedicated to the public domain under CC0 1.0.",
+            bombadil_uv_bin::BUNDLED_VERSION,
+            bombadil_uv_bin::JUST_BUNDLED_VERSION
         )
     })
 }
@@ -50,6 +52,11 @@ pub fn attribution() -> &'static str {
 /// thing the Licences modal actually renders.
 pub fn license() -> &'static str {
     bombadil_uv_bin::UV_LICENSE
+}
+
+/// just's CC0 1.0 text, as compiled into this executable.
+pub fn just_license() -> &'static str {
+    bombadil_uv_bin::JUST_LICENSE
 }
 
 /// A short notice naming both bundled fonts and their licence, mirroring
@@ -139,6 +146,17 @@ mod tests {
             text.contains("TERMS AND CONDITIONS"),
             "the full text must ship, not just a title line"
         );
+    }
+
+    #[test]
+    fn just_is_named_with_its_version_and_licence() {
+        let text = attribution();
+        assert!(
+            text.contains(&format!("just {}", bombadil_uv_bin::JUST_BUNDLED_VERSION)),
+            "got {text}"
+        );
+        assert!(text.contains("CC0"), "got {text}");
+        assert!(just_license().contains("CC0 1.0 Universal"));
     }
 
     #[test]
