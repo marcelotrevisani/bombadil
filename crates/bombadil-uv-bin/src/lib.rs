@@ -34,26 +34,23 @@ struct Embedded {
     version: &'static str,
     exe_name: &'static str,
     bytes: &'static [u8],
-    digest: &'static OnceLock<Vec<u8>>,
+    digest: OnceLock<Vec<u8>>,
 }
 
-static UV_DIGEST: OnceLock<Vec<u8>> = OnceLock::new();
-static JUST_DIGEST: OnceLock<Vec<u8>> = OnceLock::new();
-
-const UV: Embedded = Embedded {
+static UV: Embedded = Embedded {
     folder: "uv",
     version: BUNDLED_VERSION,
     exe_name: env!("BOMBADIL_UV_EXE_NAME"),
     bytes: UV_BYTES,
-    digest: &UV_DIGEST,
+    digest: OnceLock::new(),
 };
 
-const JUST: Embedded = Embedded {
+static JUST: Embedded = Embedded {
     folder: "just",
     version: JUST_BUNDLED_VERSION,
     exe_name: env!("BOMBADIL_JUST_EXE_NAME"),
     bytes: JUST_BYTES,
-    digest: &JUST_DIGEST,
+    digest: OnceLock::new(),
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -78,7 +75,7 @@ impl Embedded {
     /// distinct from the digest of the *extracted* file on disk in
     /// `ensure`, which must stay live: self-repair of a truncated or
     /// tampered extraction depends on that one being recomputed every time.
-    fn digest(&self) -> &'static [u8] {
+    fn digest(&self) -> &[u8] {
         self.digest
             .get_or_init(|| Sha256::digest(self.bytes).to_vec())
     }
