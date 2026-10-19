@@ -1,0 +1,5 @@
+error: Failed to add dependencies
+  cause: No solution found when resolving dependencies for split (markers: python_full_version >= '3.12')
+  cause: Because nmupyxxq was not found in the package registry and your project depends on nmupyxxq, we can conclude that your project's requirements are unsatisfiable.
+
+hint: If you want to add the package regardless of the failed resolution, provide the `--frozen` flag to skip locking and syncing

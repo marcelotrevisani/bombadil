@@ -1,0 +1,7 @@
+warning: Indexes specified via `--index-url` will not be persisted to the `pyproject.toml` file; use `--default-index` instead.
+error: Request failed after 3 retries in 3.4s
+  cause: Failed to fetch: `http://127.0.0.1:9/simple/six/`
+  cause: error sending request for url (http://127.0.0.1:9/simple/six/)
+  cause: client error (Connect)
+  cause: tcp connect error
+  cause: Connection refused (os error 111)

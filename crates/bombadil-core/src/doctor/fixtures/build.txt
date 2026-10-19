@@ -1,0 +1,5 @@
+error: The build backend returned an error
+  cause: Call to `setuptools.build_meta:__legacy__.get_requires_for_build_wheel` failed (exit status: 1)
+
+         [stderr]
+         boom: this package cannot be built

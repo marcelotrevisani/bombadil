@@ -1,0 +1,10 @@
+error: Failed to add dependencies
+  cause: No solution found when resolving dependencies for split (markers: python_full_version == '3.10.*')
+  cause: Because the requested Python version (>=3.10) does not satisfy Python>=3.11 and numpy==2.3.0 depends on Python>=3.11, we can conclude that numpy==2.3.0 cannot be used.
+         And because your project depends on numpy==2.3.0, we can conclude that your project's requirements are unsatisfiable.
+
+hint: While the active Python version is 3.14, the resolution failed for other Python versions supported by your project. Consider limiting your project's supported Python versions using `requires-python`.
+
+hint: The `requires-python` value (>=3.10) includes Python versions that are not supported by your dependencies (e.g., numpy==2.3.0 only supports >=3.11). Consider using a more restrictive `requires-python` value (like >=3.11).
+
+hint: If you want to add the package regardless of the failed resolution, provide the `--frozen` flag to skip locking and syncing
