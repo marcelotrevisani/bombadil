@@ -60,6 +60,7 @@ nav:
   - Using Bombadil:
       - The main window: main-window.md
       - Dependencies and sync: dependencies.md
+      - Running code: running.md
       - Workspace members: members.md
       - Environment variables and secrets: env-vars.md
       - Pre-activate scripts: scripts.md

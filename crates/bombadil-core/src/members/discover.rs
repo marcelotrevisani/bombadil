@@ -57,6 +57,7 @@ pub fn discover(project_dir: &Path, kind: &WorkspaceKind) -> Vec<DiscoveredMembe
     if let WorkspaceKind::Workspace {
         member_globs,
         exclude_globs,
+        ..
     } = kind
     {
         for member in &mut found {
@@ -242,6 +243,7 @@ mod tests {
         let kind = WorkspaceKind::Workspace {
             member_globs: vec!["packages/*".to_string()],
             exclude_globs: Vec::new(),
+            root_project: None,
         };
 
         let found = discover(dir.path(), &kind);
@@ -271,6 +273,7 @@ mod tests {
         let kind = WorkspaceKind::Workspace {
             member_globs: vec!["packages/*".to_string()],
             exclude_globs: vec!["packages/skipme".to_string()],
+            root_project: None,
         };
 
         let found = discover(dir.path(), &kind);

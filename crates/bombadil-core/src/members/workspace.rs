@@ -7,6 +7,9 @@ pub enum WorkspaceKind {
     Workspace {
         member_globs: Vec<String>,
         exclude_globs: Vec<String>,
+        /// The root's own `[project].name`; `None` for a virtual workspace.
+        /// A member-aware sync has to name it, or uv leaves it out.
+        root_project: Option<String>,
     },
     Loose,
 }
@@ -30,8 +33,14 @@ struct RawTool {
 }
 
 #[derive(Deserialize)]
+struct RawProject {
+    name: Option<String>,
+}
+
+#[derive(Deserialize)]
 struct RawRoot {
     tool: Option<RawTool>,
+    project: Option<RawProject>,
 }
 
 /// Classify a root `pyproject.toml`.
@@ -45,10 +54,12 @@ pub fn parse_workspace(pyproject_text: &str) -> WorkspaceKind {
         Err(_) => return WorkspaceKind::Loose,
     };
 
+    let root_project = raw.project.and_then(|p| p.name);
     match raw.tool.and_then(|t| t.uv).and_then(|u| u.workspace) {
         Some(ws) => WorkspaceKind::Workspace {
             member_globs: ws.members,
             exclude_globs: ws.exclude,
+            root_project,
         },
         None => WorkspaceKind::Loose,
     }
@@ -78,6 +89,25 @@ pub fn glob_matches(pattern: &str, candidate: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_root_that_is_a_project_is_named() {
+        let kind = parse_workspace(
+            "[project]\nname = \"pipeline\"\n\n[tool.uv.workspace]\nmembers = [\"packages/*\"]\n",
+        );
+        assert!(matches!(
+            kind,
+            WorkspaceKind::Workspace { root_project: Some(ref n), .. } if n == "pipeline"
+        ));
+        let virtual_root = parse_workspace("[tool.uv.workspace]\nmembers = [\"packages/*\"]\n");
+        assert!(matches!(
+            virtual_root,
+            WorkspaceKind::Workspace {
+                root_project: None,
+                ..
+            }
+        ));
+    }
 
     #[test]
     fn a_workspace_root_reports_its_member_globs() {

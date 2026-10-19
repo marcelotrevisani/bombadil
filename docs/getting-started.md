@@ -2,6 +2,19 @@
 
 This walks through adding a project, syncing it, and opening it.
 
+## Start a new project
+
+To start from nothing, click **New** at the top of the sidebar (or **New
+project** when the list is empty). Give the project a name, choose where it
+goes, and pick:
+
+- **App**: something you run. It gets a button on the [Run](running.md) tab.
+- **Library**: something other code imports.
+
+You can also choose a Python version and whether to start a Git repository.
+**Create** makes the folder with `uv init`, then opens the **Add project**
+dialog below on it, so you choose where its environment lives.
+
 ## 1. Add a project
 
 Click **Add** at the top of the sidebar, or press ++ctrl+n++

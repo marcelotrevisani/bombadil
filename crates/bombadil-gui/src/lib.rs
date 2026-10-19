@@ -33,14 +33,17 @@ mod app;
 mod backup_panel;
 mod banner;
 mod busy;
+mod changes;
 mod context_menu;
 mod deps;
 #[cfg(target_os = "linux")]
 mod desktop_entry;
 mod detail;
+mod disk;
 mod doctor_tab;
 mod drawer;
 mod env_editor;
+mod find_package;
 mod github_tab;
 mod glossary;
 mod health;
@@ -49,7 +52,9 @@ mod index_editor;
 mod interpreter;
 mod job;
 mod members_editor;
+mod new_project;
 mod preferences;
+mod run_tab;
 mod scripts_editor;
 mod settings_editor;
 mod shell;
@@ -190,6 +195,25 @@ fn github_ticker() -> iced::Subscription<app::Message> {
     })
 }
 
+/// A tick a second, for a running program's elapsed time: frames would
+/// redraw sixty times a second for as long as a server runs.
+fn seconds_ticker() -> iced::Subscription<app::Message> {
+    // Its own key, so iced never takes it for the GitHub ticker.
+    iced::Subscription::run_with("seconds", |_| {
+        let (mut sender, receiver) = futures::channel::mpsc::channel(1);
+        std::thread::spawn(move || {
+            loop {
+                std::thread::sleep(std::time::Duration::from_secs(1));
+                let tick = app::Message::Tick(std::time::Instant::now());
+                if sender.try_send(tick).is_err() && sender.is_closed() {
+                    break;
+                }
+            }
+        });
+        receiver
+    })
+}
+
 /// Turns the tray's commands into application messages.
 ///
 /// A `std::sync::mpsc::Receiver` is not a `Stream`, and blocking on one would
@@ -261,7 +285,10 @@ pub fn run() -> iced::Result {
             state.path_exists = |path| path.exists();
             state.tray_is_running = tray_is_running;
             let open = app::open_window(&state);
-            (state, iced::Task::batch([task, open]))
+            // After `path_exists` is the real check: a lost folder shows at
+            // start-up, not only once its project is clicked.
+            let sweep = app::sweep_missing(&state);
+            (state, iced::Task::batch([task, open, sweep]))
         },
         move |state: &mut app::App, message: app::Message| {
             #[cfg(target_os = "macos")]
@@ -309,6 +336,8 @@ pub fn run() -> iced::Result {
             // Frames only while something moves; idle, nothing redraws.
             if app::animating(state) {
                 iced::window::frames().map(app::Message::Tick)
+            } else if app::runs_live(state) {
+                seconds_ticker()
             } else {
                 iced::Subscription::none()
             },

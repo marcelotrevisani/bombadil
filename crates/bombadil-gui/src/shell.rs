@@ -153,7 +153,13 @@ pub fn topbar<'a>(open_menu: Option<TopMenu>) -> iced::Element<'a, Message> {
     // Toggles rather than opens: pressing the button that opened the menu is
     // how a user closes it again, and a press that did nothing would read as
     // a broken control.
-    let mut menus = iced::widget::row![].spacing(theme::SPACE_1);
+    let mut menus = iced::widget::row![
+        iced::widget::button(iced::widget::text("Find package").size(theme::BODY))
+            .on_press(Message::FindOpened)
+            .padding([theme::SPACE_1, theme::SPACE_2])
+            .style(theme::button_bare(theme::Swatch::Slate)),
+    ]
+    .spacing(theme::SPACE_1);
     for menu in TOP_MENUS {
         let open = open_menu == Some(menu);
         menus = menus.push(
@@ -456,17 +462,24 @@ pub fn empty_state<'a>() -> iced::Element<'a, Message> {
             .size(theme::BODY)
             .style(theme::text_muted)
             .width(420.0),
-            theme::tip(
-                iced::widget::button(iced::widget::text("Add project").size(theme::BODY))
-                    .on_press(Message::AddProjectPickManifestRequested)
-                    .padding([theme::SPACE_2, theme::SPACE_3])
-                    .style(theme::button_primary),
-                format!(
-                    "Choose a project folder ({})",
-                    crate::shortcuts::keys(crate::shortcuts::Shortcut::AddProject)
+            iced::widget::row![
+                theme::tip(
+                    iced::widget::button(iced::widget::text("Add project").size(theme::BODY))
+                        .on_press(Message::AddProjectPickManifestRequested)
+                        .padding([theme::SPACE_2, theme::SPACE_3])
+                        .style(theme::button_primary),
+                    format!(
+                        "Choose a project folder ({})",
+                        crate::shortcuts::keys(crate::shortcuts::Shortcut::AddProject)
+                    ),
+                    iced::widget::tooltip::Position::Bottom,
                 ),
-                iced::widget::tooltip::Position::Bottom,
-            ),
+                iced::widget::button(iced::widget::text("New project").size(theme::BODY))
+                    .on_press(Message::NewProjectRequested)
+                    .padding([theme::SPACE_2, theme::SPACE_3])
+                    .style(theme::button_secondary),
+            ]
+            .spacing(theme::SPACE_2),
         ]
         .spacing(theme::SPACE_3)
         .align_x(iced::Alignment::Start),

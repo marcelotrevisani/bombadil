@@ -95,6 +95,15 @@ pub enum VenvDeleteError {
     )]
     OutsideProject { path: PathBuf, expected: PathBuf },
 
+    /// Not directly inside the central venv folder, so not a leftover.
+    #[error("{path} is not directly inside {central}, so it will not be deleted")]
+    NotLeftover { path: PathBuf, central: PathBuf },
+
+    /// A project, or a folder holding a registered environment or project:
+    /// not a leftover.
+    #[error("{path} is still used by a project, so it will not be deleted")]
+    Registered { path: PathBuf },
+
     /// No `pyvenv.cfg`, so whatever is there was not created by uv or the
     /// stdlib `venv` module. A plausible name is not evidence.
     #[error(

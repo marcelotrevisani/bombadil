@@ -129,9 +129,9 @@ impl CommandRunner for SystemCommandRunner {
         let mut cancelled = false;
         loop {
             if cancel.load(std::sync::atomic::Ordering::SeqCst) {
-                // Killed, then not drained: a grandchild may still hold the
+                // Stopped, then not drained: a grandchild may still hold the
                 // pipes open, and waiting on it is what Cancel is to avoid.
-                let _ = child.kill();
+                stop_tree(&mut child);
                 cancelled = true;
                 break;
             }
@@ -164,6 +164,47 @@ impl CommandRunner for SystemCommandRunner {
             stderr: collected_stderr,
         })
     }
+}
+
+/// How long a stopped program gets to exit on its own before it is killed.
+#[cfg(unix)]
+const STOP_GRACE: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// Ends `child` and every process it started.
+///
+/// Never just `child.kill()` on Unix: that is SIGKILL, which `uv run` cannot
+/// forward, so the Python it started keeps running with nobody to stop it
+/// (verified with uv 0.12.19). SIGTERM is forwarded. On Windows `taskkill /T`
+/// walks the tree, whatever uv does with job objects.
+fn stop_tree(child: &mut std::process::Child) {
+    let pid = child.id().to_string();
+    #[cfg(unix)]
+    {
+        let _ = std::process::Command::new("kill")
+            .args(["-TERM", &pid])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+        let deadline = std::time::Instant::now() + STOP_GRACE;
+        while std::time::Instant::now() < deadline {
+            if matches!(child.try_wait(), Ok(Some(_))) {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        let _ = std::process::Command::new("taskkill")
+            .args(["/T", "/F", "/PID", &pid])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .creation_flags(CREATE_NO_WINDOW)
+            .status();
+    }
+    let _ = child.kill();
 }
 
 /// Read one pipe to EOF, sending each line as it lands.
@@ -226,5 +267,86 @@ mod tests {
         );
         assert_ne!(outcome.status, Some(0), "killed, not finished");
         assert!(outcome.stdout.contains("started"));
+    }
+
+    fn cancel_after(ms: u64) -> std::sync::Arc<AtomicBool> {
+        let flag = std::sync::Arc::new(AtomicBool::new(false));
+        let set = flag.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(ms));
+            set.store(true, Ordering::SeqCst);
+        });
+        flag
+    }
+
+    #[test]
+    fn stop_sends_term_first() {
+        // A child that exits 0 on TERM: SIGKILL would leave no exit code.
+        let spec = CommandSpec::new("sh")
+            .arg("-c")
+            .arg("trap 'exit 0' TERM; sleep 30 & wait");
+        let cancel = cancel_after(300);
+        let outcome = SystemCommandRunner
+            .stream_cancellable(&spec, &mut |_| {}, &cancel)
+            .unwrap();
+        assert_eq!(outcome.status, Some(0), "TERM reached the child");
+    }
+
+    #[test]
+    fn stop_kills_a_child_that_ignores_term() {
+        let spec = CommandSpec::new("sh")
+            .arg("-c")
+            .arg("trap '' TERM; sleep 30");
+        let cancel = cancel_after(300);
+        let started = std::time::Instant::now();
+        let outcome = SystemCommandRunner
+            .stream_cancellable(&spec, &mut |_| {}, &cancel)
+            .unwrap();
+        let took = started.elapsed();
+        assert_eq!(outcome.status, None, "killed, not exited");
+        assert!(
+            took >= std::time::Duration::from_secs(3),
+            "{took:?}: waited the grace"
+        );
+        assert!(took < std::time::Duration::from_secs(10), "{took:?}");
+    }
+}
+
+#[cfg(all(test, windows))]
+mod windows_tests {
+    use super::*;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    fn pings_running() -> bool {
+        let out = std::process::Command::new("tasklist")
+            .args(["/FI", "IMAGENAME eq PING.EXE", "/NH"])
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&out.stdout)
+            .to_ascii_lowercase()
+            .contains("ping.exe")
+    }
+
+    #[test]
+    fn stop_ends_the_grandchild_too() {
+        assert!(
+            !pings_running(),
+            "a ping was already running; the check would lie"
+        );
+        let spec = CommandSpec::new("cmd")
+            .arg("/C")
+            .arg("ping -n 60 127.0.0.1 > nul");
+        let cancel = Arc::new(AtomicBool::new(false));
+        let set = cancel.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_secs(2));
+            set.store(true, Ordering::SeqCst);
+        });
+        SystemCommandRunner
+            .stream_cancellable(&spec, &mut |_| {}, &cancel)
+            .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        assert!(!pings_running(), "the grandchild outlived Stop");
     }
 }

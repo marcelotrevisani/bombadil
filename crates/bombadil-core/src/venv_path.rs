@@ -161,6 +161,41 @@ pub fn delete(
     })
 }
 
+/// Delete a leftover environment: a folder directly inside the central
+/// venv folder that no registered environment uses. Refuses everything
+/// else, the same way [`delete`] does for a project's own environment.
+pub fn delete_leftover(
+    central: &Path,
+    path: &Path,
+    registered: &[PathBuf],
+) -> Result<(), VenvDeleteError> {
+    if path.parent() != Some(central) {
+        return Err(VenvDeleteError::NotLeftover {
+            path: path.to_path_buf(),
+            central: central.to_path_buf(),
+        });
+    }
+    if crate::housekeeping::in_use(path, registered) {
+        return Err(VenvDeleteError::Registered {
+            path: path.to_path_buf(),
+        });
+    }
+    if !std::fs::symlink_metadata(path).is_ok_and(|meta| meta.is_dir()) {
+        return Err(VenvDeleteError::NotADirectory {
+            path: path.to_path_buf(),
+        });
+    }
+    if probe(path).is_none() {
+        return Err(VenvDeleteError::NotAVenv {
+            path: path.to_path_buf(),
+        });
+    }
+    std::fs::remove_dir_all(path).map_err(|source| VenvDeleteError::Io {
+        path: path.to_path_buf(),
+        source,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::{central_dir_name, delete, probe, resolve};
@@ -608,5 +643,66 @@ mod tests {
             outside.contains(&venv.display().to_string()),
             "the refusal must also name where the venv actually is; got {outside}"
         );
+    }
+}
+
+#[cfg(test)]
+mod leftover_tests {
+    use super::*;
+
+    fn leftover_tree() -> (tempfile::TempDir, PathBuf) {
+        let central = tempfile::tempdir().unwrap();
+        let left = central.path().join("old-3f9a2c");
+        std::fs::create_dir(&left).unwrap();
+        std::fs::write(left.join("pyvenv.cfg"), "version_info = 3.12.0\n").unwrap();
+        (central, left)
+    }
+
+    #[test]
+    fn delete_leftover_deletes_a_leftover() {
+        let (central, left) = leftover_tree();
+        delete_leftover(central.path(), &left, &[]).unwrap();
+        assert!(!left.exists());
+    }
+
+    #[test]
+    fn delete_leftover_refuses_outside_non_venv_and_registered() {
+        let (central, left) = leftover_tree();
+        let elsewhere = tempfile::tempdir().unwrap();
+        assert!(delete_leftover(central.path(), elsewhere.path(), &[]).is_err());
+        let deeper = left.join("lib");
+        std::fs::create_dir(&deeper).unwrap();
+        assert!(
+            delete_leftover(central.path(), &deeper, &[]).is_err(),
+            "not a direct child"
+        );
+        let plain = central.path().join("plain");
+        std::fs::create_dir(&plain).unwrap();
+        assert!(
+            delete_leftover(central.path(), &plain, &[]).is_err(),
+            "not a venv"
+        );
+        assert!(delete_leftover(central.path(), &left, std::slice::from_ref(&left)).is_err());
+        assert!(left.exists());
+    }
+
+    #[test]
+    fn delete_leftover_refuses_a_project_folder() {
+        let (central, left) = leftover_tree();
+        std::fs::write(left.join("main.py"), "print()").unwrap();
+        assert!(delete_leftover(central.path(), &left, &[left.join(".venv")]).is_err());
+        std::fs::write(left.join("pyproject.toml"), "[project]\nname='x'\n").unwrap();
+        assert!(delete_leftover(central.path(), &left, &[]).is_err());
+        assert!(left.join("main.py").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn delete_leftover_refuses_a_symlink() {
+        let (central, left) = leftover_tree();
+        let link = central.path().join("link");
+        std::os::unix::fs::symlink(&left, &link).unwrap();
+        assert!(delete_leftover(central.path(), &link, &[]).is_err());
+        assert!(left.exists());
     }
 }

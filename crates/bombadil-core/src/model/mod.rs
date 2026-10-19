@@ -1,3 +1,4 @@
+mod command;
 mod env_var;
 mod environment;
 mod index;
@@ -7,6 +8,7 @@ mod project;
 mod script;
 mod settings;
 
+pub use command::SavedCommand;
 pub use env_var::EnvVar;
 pub use environment::Environment;
 pub use index::{Index, IndexAuth, IndexKind};
@@ -110,6 +112,7 @@ mod tests {
                 },
                 close_to_tray: false,
                 watch_github: true,
+                check_vulnerabilities: false,
                 github_account: None,
                 pycharm: None,
             },
@@ -177,6 +180,10 @@ mod tests {
                     path: PathBuf::from("./scripts/decrypt.sh"),
                     args: vec![],
                     enabled: false,
+                }],
+                commands: vec![crate::model::SavedCommand {
+                    label: "tests".into(),
+                    command: "pytest -q".into(),
                 }],
                 // Every field named on purpose: this fixture exists to prove
                 // a whole `Config` round-trips through TOML, and a

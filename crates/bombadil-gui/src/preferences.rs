@@ -52,12 +52,14 @@ pub enum Section {
     GitHub,
     /// Export this setup to a file, or import one: moving computers.
     Backup,
+    /// Environment and cache sizes, and the safe ways to free space.
+    Disk,
 }
 
 impl Section {
     /// Every section, in the order the list renders them: the four that decide
     /// how an environment is built and opened first, then the two lists.
-    pub const ALL: [Section; 11] = [
+    pub const ALL: [Section; 12] = [
         Section::Appearance,
         Section::Environments,
         Section::Python,
@@ -69,6 +71,7 @@ impl Section {
         Section::Indexes,
         Section::GitHub,
         Section::Backup,
+        Section::Disk,
     ];
 
     /// The Settings menu's wording, which has room to name the thing a user
@@ -87,6 +90,7 @@ impl Section {
             Section::Indexes => "Package indexes and auth",
             Section::GitHub => "GitHub pull requests",
             Section::Backup => "Move to another computer",
+            Section::Disk => "Disk usage",
         }
     }
 
@@ -103,6 +107,7 @@ impl Section {
             Section::Indexes => "Indexes",
             Section::GitHub => "GitHub",
             Section::Backup => "Backup",
+            Section::Disk => "Disk",
         }
     }
 }
@@ -192,7 +197,8 @@ pub fn inherited_label(section: Section, config: &Config, os: Os) -> String {
         | Section::EnvVars
         | Section::Indexes
         | Section::GitHub
-        | Section::Backup => String::new(),
+        | Section::Backup
+        | Section::Disk => String::new(),
     }
 }
 
@@ -221,6 +227,8 @@ pub fn view<'a>(
     github_accounts: Option<&Vec<bombadil_core::github::gh::Account>>,
     github_login: Option<&crate::github_tab::GitHubLogin>,
     backup: &'a crate::backup_panel::State,
+    disk: &'a crate::disk::State,
+    idle: bool,
 ) -> iced::Element<'a, Message> {
     let selected_project = match scope {
         Scope::Global => None,
@@ -291,6 +299,7 @@ pub fn view<'a>(
             github_login,
         ),
         (Section::Backup, _) => crate::backup_panel::view(backup),
+        (Section::Disk, _) => crate::disk::view(disk, idle),
     };
 
     let card = iced::widget::container(

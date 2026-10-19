@@ -7,6 +7,12 @@ left, the **project view** on the right, and the **drawer** along the bottom.
 
 ## Menu bar
 
+- **Find package** asks which of your projects use a package. Type part of a
+  name, such as `requests`: each project that has it is listed with the
+  version its `uv.lock` pins, and whether you declared it or another package
+  pulled it in. Click one to open that project's Dependencies tab filtered to
+  the package. Projects that haven't been synced yet have no `uv.lock`, and
+  are counted at the bottom.
 - **Settings** opens [Preferences](settings.md) at any of its sections.
 - **Help** has **Keyboard shortcuts**, **About Bombadil** and **Bundled
   licences**.
@@ -63,7 +69,7 @@ environment is marked **default**.
 
 The project view has a header with the project's name, action buttons and
 status tiles. Below that are the **path** of the project and of its default
-environment, then five tabs. You can drag the tabs to reorder them.
+environment, then the tabs. You can drag the tabs to reorder them.
 
 | Tab | What it is for |
 |---|---|
@@ -72,6 +78,7 @@ environment, then five tabs. You can drag the tabs to reorder them.
 | [Env vars](env-vars.md) | The project's environment variables and secrets. |
 | [Scripts](scripts.md) | Shell scripts to run before the environment is used. |
 | [Indexes](indexes.md) | Which private package indexes this project uses. |
+| [Run](running.md) | Run entry points, saved commands, a file or Jupyter. |
 
 ## Drawer
 

@@ -130,3 +130,28 @@ and asks first.
 Bombadil writes the whole file each time a setting changes, which would
 overwrite your edits. Quit Bombadil (including from the tray) before editing
 `config.toml`.
+
+## A program on the Run tab waits forever
+
+The Run tab can't send keystrokes to a program. One that asks a question, such
+as `input()`, waits for an answer that never comes. Press **Stop**, then use
+**Open terminal** to run it where you can type.
+
+## A run doesn't install new dependencies
+
+The Run tab never syncs (it runs `uv run --no-sync`), so a package you just
+added to `pyproject.toml` isn't there until you press **Sync**. This keeps a
+run from ever rebuilding the environment on another Python.
+
+## The vulnerability check needs the internet
+
+Bombadil asks osv.dev about installed packages. Offline, or behind a proxy
+that blocks it, the check is skipped and the Dependencies tab says
+"Couldn't check for vulnerabilities". Nothing else is affected.
+
+## A project shows a warning as soon as Bombadil starts
+
+Bombadil checks every project's folder when it starts and when its window
+comes back to the front. A folder on a drive that isn't connected, or one
+you moved, shows the warning straight away. Select the project to
+**Locate…** its `pyproject.toml` or **Remove** it from the list.

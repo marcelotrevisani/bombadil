@@ -125,6 +125,35 @@ where
     })
 }
 
+/// [`stream`] for work with no time limit, such as a program the person
+/// runs: it can be silent for hours. Never blocks the poller: [`stream`]
+/// waits on its channel inside `poll`, which would hold one of iced's few
+/// executor threads for as long as the program is quiet.
+pub fn stream_untimed<T, F>(work: F) -> impl futures::Stream<Item = JobResult<T>>
+where
+    T: Send + 'static,
+    F: FnOnce(&mut dyn FnMut(T)) + Send + 'static,
+{
+    use futures::StreamExt;
+    let (tx, rx) = futures::channel::mpsc::unbounded();
+    std::thread::spawn(move || {
+        let emitter = tx.clone();
+        work(&mut move |item| {
+            let _ = emitter.unbounded_send(Some(item));
+        });
+        // The end marker: its absence means the work panicked.
+        let _ = tx.unbounded_send(None);
+    });
+    futures::stream::unfold(Some(rx), |state| async move {
+        let mut rx = state?;
+        match rx.next().await {
+            Some(Some(item)) => Some((JobResult::Done(item), Some(rx))),
+            Some(None) => None,
+            None => Some((JobResult::Failed, None)),
+        }
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -150,6 +179,43 @@ mod tests {
             "exporting",
         ));
         assert_eq!(boom, Err("exporting failed unexpectedly".to_string()));
+    }
+
+    #[test]
+    fn a_stream_with_no_timeout_waits_past_silence() {
+        let items: Vec<_> = pollster_block(
+            stream_untimed(|emit| {
+                std::thread::sleep(Duration::from_millis(300));
+                emit(1);
+            })
+            .collect::<Vec<_>>(),
+        );
+        assert_eq!(items, [JobResult::Done(1)]);
+    }
+
+    #[test]
+    fn a_silent_untimed_stream_never_blocks_the_poller() {
+        // A server can say nothing for hours; polling it must not hold an
+        // executor thread for that long.
+        use futures::FutureExt;
+        let mut s = Box::pin(stream_untimed(|emit| {
+            std::thread::sleep(Duration::from_secs(2));
+            emit(1);
+        }));
+        let started = std::time::Instant::now();
+        assert!(s.next().now_or_never().is_none(), "nothing yet");
+        assert!(
+            started.elapsed() < Duration::from_millis(500),
+            "{:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn a_panicking_untimed_stream_reports_failed() {
+        let items: Vec<JobResult<i32>> =
+            pollster_block(stream_untimed(|_| panic!("boom")).collect::<Vec<_>>());
+        assert_eq!(items, [JobResult::Failed]);
     }
 
     #[test]

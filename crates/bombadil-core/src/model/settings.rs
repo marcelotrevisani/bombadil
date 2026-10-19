@@ -93,6 +93,10 @@ pub struct Settings {
     /// minutes and its checks announced.
     #[serde(default = "yes")]
     pub watch_github: bool,
+    /// Whether installed packages are checked against osv.dev for known
+    /// vulnerabilities. Sends package names and versions, nothing else.
+    #[serde(default = "yes")]
+    pub check_vulnerabilities: bool,
     /// The `gh` account Bombadil looks pull requests up as. `None` follows
     /// whichever account `gh` has active; it never changes gh's own choice.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -117,6 +121,7 @@ impl Default for Settings {
             layout: Layout::default(),
             close_to_tray: true,
             watch_github: true,
+            check_vulnerabilities: true,
             github_account: None,
             pycharm: None,
         }
@@ -126,6 +131,12 @@ impl Default for Settings {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_old_config_turns_the_check_on() {
+        let settings: Settings = toml::from_str("theme = \"dark\"\n").unwrap();
+        assert!(settings.check_vulnerabilities);
+    }
 
     #[test]
     fn pycharm_is_detected_unless_one_was_chosen() {

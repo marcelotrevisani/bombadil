@@ -430,6 +430,7 @@ mod tests {
                 },
                 close_to_tray: false,
                 watch_github: true,
+                check_vulnerabilities: false,
                 github_account: None,
                 pycharm: None,
             },
@@ -497,6 +498,10 @@ mod tests {
                     path: PathBuf::from("./scripts/decrypt.sh"),
                     args: vec![],
                     enabled: false,
+                }],
+                commands: vec![crate::model::SavedCommand {
+                    label: "tests".into(),
+                    command: "pytest -q".into(),
                 }],
                 members: MemberSelection {
                     all_discovered: false,
