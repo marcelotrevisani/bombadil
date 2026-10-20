@@ -680,6 +680,87 @@ fn terminal_panel<'a>(
         );
     }
 
+    // Terminals the user added by hand. The index is into the whole
+    // `custom_terminals` list, not this OS's slice of it, because that is
+    // what the messages address.
+    column = column.push(
+        iced::widget::text("Custom terminals")
+            .size(theme::BODY)
+            .font(theme::FONT_PROSE_SEMIBOLD),
+    );
+    for (index, custom) in config
+        .custom_terminals
+        .iter()
+        .enumerate()
+        .filter(|(_, c)| c.os == os)
+    {
+        let choice = TerminalChoice::Custom {
+            template: custom.template.clone(),
+        };
+        let selected = current.as_ref() == Some(&choice);
+        column = column.push(
+            iced::widget::column![
+                iced::widget::row![
+                    iced::widget::button(
+                        iced::widget::text(crate::context_menu::custom_name(custom))
+                            .size(theme::BODY)
+                    )
+                    .on_press_maybe(
+                        (!custom.template.trim().is_empty())
+                            .then_some(Message::PreferencesTerminalOverridden(scope, choice))
+                    )
+                    .width(iced::Length::Fill)
+                    .padding([theme::SPACE_1, theme::SPACE_2])
+                    .style(theme::button_choice(selected)),
+                    iced::widget::button(iced::widget::text("Remove").size(theme::BODY))
+                        .on_press(Message::CustomTerminalRemoved(index))
+                        .padding([theme::SPACE_1, theme::SPACE_3])
+                        .style(theme::button_quiet),
+                ]
+                .spacing(theme::SPACE_2)
+                .align_y(iced::Alignment::Center),
+                iced::widget::row![
+                    iced::widget::text_input("Name", &custom.name)
+                        .style(crate::theme::text_field)
+                        .on_input(move |name| Message::CustomTerminalNameChanged(index, name))
+                        .size(theme::BODY)
+                        .padding(theme::SPACE_2)
+                        .width(iced::Length::FillPortion(1)),
+                    iced::widget::text_input(
+                        "ghostty --working-directory={cwd} -e {shell}",
+                        &custom.template
+                    )
+                    .style(crate::theme::text_field)
+                    .on_input(move |template| Message::CustomTerminalTemplateChanged(
+                        index, template
+                    ))
+                    .font(theme::FONT_DATA)
+                    .size(theme::DATA)
+                    .padding(theme::SPACE_2)
+                    .width(iced::Length::FillPortion(3)),
+                ]
+                .spacing(theme::SPACE_2),
+            ]
+            .spacing(theme::SPACE_1),
+        );
+    }
+    column = column
+        .push(
+            iced::widget::button(iced::widget::text("Add custom terminal").size(theme::BODY))
+                .on_press(Message::CustomTerminalAdded)
+                .padding([theme::SPACE_1, theme::SPACE_3])
+                .style(theme::button_secondary),
+        )
+        .push(
+            iced::widget::text(
+                "For a terminal not listed above. {cwd} becomes the project folder and {shell} \
+                 your shell. Give {shell} a word of its own so the environment can be \
+                 activated after your shell config runs.",
+            )
+            .size(theme::LABEL)
+            .style(theme::text_muted),
+        );
+
     column
         .push(
             iced::widget::text(

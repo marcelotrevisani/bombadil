@@ -55,6 +55,9 @@ pub enum TerminalKind {
     WezTerm,
     Foot,
     Xterm,
+    Ptyxis,
+    Ghostty,
+    Terminator,
 }
 
 /// How much of the composed environment actually reaches the shell.
@@ -81,7 +84,8 @@ impl TerminalKind {
         match self {
             WindowsTerminal | PowerShell | Cmd | GitBash | Wsl => Os::Windows,
             TerminalApp | ITerm2 => Os::MacOs,
-            GnomeTerminal | Konsole | Kitty | Alacritty | WezTerm | Foot | Xterm => Os::Linux,
+            GnomeTerminal | Konsole | Kitty | Alacritty | WezTerm | Foot | Xterm | Ptyxis
+            | Ghostty | Terminator => Os::Linux,
         }
     }
 
@@ -95,8 +99,8 @@ impl TerminalKind {
         match self {
             // The emulator is handed our `shell` and `shell_args`, and the
             // spawn carries the composed environment: both halves arrive.
-            GnomeTerminal | Konsole | Kitty | Alacritty | WezTerm | Foot | Xterm
-            | WindowsTerminal => ActivationSupport::Full,
+            GnomeTerminal | Konsole | Kitty | Alacritty | WezTerm | Foot | Xterm | Ptyxis
+            | Ghostty | Terminator | WindowsTerminal => ActivationSupport::Full,
 
             // Launched as an ordinary child process, so `spec.env` reaches
             // them -- but none has a flag to hand it a specific shell binary
@@ -133,6 +137,9 @@ impl TerminalKind {
                 WezTerm,
                 Foot,
                 Xterm,
+                Ptyxis,
+                Ghostty,
+                Terminator,
             ],
         }
     }
@@ -169,12 +176,12 @@ mod tests {
         // support my setup" rather than as a bug.
         assert_eq!(TerminalKind::for_os(Os::Windows).len(), 5);
         assert_eq!(TerminalKind::for_os(Os::MacOs).len(), 2);
-        assert_eq!(TerminalKind::for_os(Os::Linux).len(), 7);
+        assert_eq!(TerminalKind::for_os(Os::Linux).len(), 10);
     }
 
     #[test]
     fn every_kind_is_pinned_to_the_activation_bucket_it_was_measured_in() {
-        // All fourteen, spelled out. The exhaustive match in
+        // All seventeen, spelled out. The exhaustive match in
         // `activation_support` makes a NEW variant a compile error, but
         // nothing stops someone quietly moving an existing kind between
         // buckets -- and the GUI's warning is only correct if these are.
@@ -191,6 +198,9 @@ mod tests {
             (WezTerm, Full),
             (Foot, Full),
             (Xterm, Full),
+            (Ptyxis, Full),
+            (Ghostty, Full),
+            (Terminator, Full),
             (WindowsTerminal, Full),
             (PowerShell, PathOnly),
             (Cmd, PathOnly),

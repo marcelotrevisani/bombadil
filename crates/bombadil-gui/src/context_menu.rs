@@ -19,18 +19,10 @@
 
 use crate::app::Message;
 use crate::theme;
-use bombadil_core::model::TerminalChoice;
+use bombadil_core::model::{CustomTerminal, TerminalChoice};
 use bombadil_core::terminal::{ActivationSupport, TerminalKind};
 use std::path::{Path, PathBuf};
 use uuid::Uuid;
-
-/// One entry in the "Open terminal" submenu: a detected kind, or the
-/// always-present Custom entry (spec §8).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum TerminalOption {
-    Detected(TerminalKind),
-    Custom,
-}
 
 /// Puts the configured default terminal first among the detected kinds,
 /// leaving the rest in `available`'s order. Criterion 2: an arbitrary order
@@ -38,7 +30,7 @@ pub enum TerminalOption {
 ///
 /// A `Custom` default has nothing to move to the front here -- it is not a
 /// `TerminalKind` at all, so `available`'s order is left untouched and the
-/// always-present Custom entry (see `submenu`) is where that choice actually
+/// custom entries (see `custom_entries`) are where that choice actually
 /// surfaces. A default that was never detected (uninstalled since it was
 /// configured) is likewise left alone -- there is nothing to move it to.
 pub fn ordered(
@@ -52,20 +44,6 @@ pub fn ordered(
         available.insert(0, kind);
     }
     available
-}
-
-/// The full "Open terminal" submenu: every detected kind, ordered by
-/// `ordered`, plus the Custom entry spec §8 always offers.
-pub fn submenu(
-    available: Vec<TerminalKind>,
-    default: Option<&TerminalChoice>,
-) -> Vec<TerminalOption> {
-    let mut entries: Vec<TerminalOption> = ordered(available, default)
-        .into_iter()
-        .map(TerminalOption::Detected)
-        .collect();
-    entries.push(TerminalOption::Custom);
-    entries
 }
 
 /// The warning suffix a degraded terminal's menu label carries. `Full` gets
@@ -108,7 +86,41 @@ pub fn terminal_name(kind: TerminalKind) -> &'static str {
         WezTerm => "WezTerm",
         Foot => "foot",
         Xterm => "xterm",
+        Ptyxis => "Ptyxis",
+        Ghostty => "Ghostty",
+        Terminator => "Terminator",
     }
+}
+
+/// The label a custom terminal is shown under: its name, or its command
+/// while it has none yet.
+pub fn custom_name(custom: &CustomTerminal) -> String {
+    [custom.name.trim(), custom.template.trim()]
+        .into_iter()
+        .find(|s| !s.is_empty())
+        .unwrap_or("Unnamed terminal")
+        .to_string()
+}
+
+/// The custom entries the menu offers on `os`: every saved terminal with a
+/// command, plus a configured `Custom` default that is not among them
+/// (deleted since, or set before terminals could be saved) under "Custom".
+pub fn custom_entries(
+    customs: &[CustomTerminal],
+    default: Option<&TerminalChoice>,
+    os: bombadil_core::terminal::Os,
+) -> Vec<(String, String)> {
+    let mut entries: Vec<(String, String)> = customs
+        .iter()
+        .filter(|c| c.os == os && !c.template.trim().is_empty())
+        .map(|c| (custom_name(c), c.template.clone()))
+        .collect();
+    if let Some(TerminalChoice::Custom { template }) = default
+        && !entries.iter().any(|(_, t)| t == template)
+    {
+        entries.push(("Custom".to_string(), template.clone()));
+    }
+    entries
 }
 
 /// What the detail header's one-press terminal button should do next.
@@ -378,6 +390,7 @@ pub fn view<'a>(
     menu: &ContextMenu,
     label: &str,
     default: Option<&TerminalChoice>,
+    customs: &[CustomTerminal],
     waiting: Option<&str>,
     has_environment: bool,
 ) -> iced::Element<'a, Message> {
@@ -418,38 +431,23 @@ pub fn view<'a>(
     }
     column = column.push(section_heading("Open terminal"));
 
-    for option in submenu(menu.terminals.clone(), default) {
-        match option {
-            TerminalOption::Detected(kind) => {
-                column = column.push(entry(
-                    terminal_name(kind),
-                    // The warning is a second line in `slate` rather than a
-                    // suffix on the label: appended, it made every row as
-                    // wide as the longest sentence in the file and turned the
-                    // menu into a paragraph.
-                    Some(activation_warning(kind)),
-                    Message::OpenTerminalRequested(index, TerminalChoice::Detected(kind)),
-                ));
-            }
-            // Only offered as a live choice once the user has actually
-            // configured a custom template -- an empty one is refused by
-            // `terminal::argv::build` anyway, so there is nothing useful to
-            // dispatch without it.
-            TerminalOption::Custom => {
-                if let Some(TerminalChoice::Custom { template }) = default {
-                    column = column.push(entry(
-                        "Custom",
-                        None,
-                        Message::OpenTerminalRequested(
-                            index,
-                            TerminalChoice::Custom {
-                                template: template.clone(),
-                            },
-                        ),
-                    ));
-                }
-            }
-        }
+    for kind in ordered(menu.terminals.clone(), default) {
+        column = column.push(entry(
+            terminal_name(kind),
+            // The warning is a second line in `slate` rather than a suffix on
+            // the label: appended, it made every row as wide as the longest
+            // sentence in the file and turned the menu into a paragraph.
+            Some(activation_warning(kind)),
+            Message::OpenTerminalRequested(index, TerminalChoice::Detected(kind)),
+        ));
+    }
+    // Custom terminals after the detected ones (spec §8).
+    for (name, template) in custom_entries(customs, default, bombadil_core::terminal::Os::host()) {
+        column = column.push(entry(
+            name,
+            None,
+            Message::OpenTerminalRequested(index, TerminalChoice::Custom { template }),
+        ));
     }
 
     column
@@ -510,7 +508,7 @@ fn section_heading<'a>(text: &'static str) -> iced::Element<'a, Message> {
 /// than a menu. A menu row fills its panel, reacts on hover, and reads as one
 /// of a list.
 fn entry<'a>(
-    label: &'a str,
+    label: impl iced::widget::text::IntoFragment<'a>,
     detail: Option<&'a str>,
     message: impl Into<Option<Message>>,
 ) -> iced::Element<'a, Message> {
@@ -574,6 +572,34 @@ mod tests {
     }
 
     #[test]
+    fn the_menu_offers_this_oss_saved_custom_terminals_and_an_unsaved_default() {
+        use bombadil_core::terminal::Os;
+        let custom = |os, name: &str, template: &str| CustomTerminal {
+            os,
+            name: name.into(),
+            template: template.into(),
+        };
+        let customs = [
+            custom(Os::Linux, "Ghostty nightly", "ghostty -e {shell}"),
+            custom(Os::Linux, "", "tilix -e {shell}"),
+            custom(Os::Linux, "Half-typed", "  "),
+            custom(Os::Windows, "Elsewhere", "conemu {shell}"),
+        ];
+        let default = TerminalChoice::Custom {
+            template: "old-term {shell}".into(),
+        };
+        let got = custom_entries(&customs, Some(&default), Os::Linux);
+        let names: Vec<&str> = got.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(names, ["Ghostty nightly", "tilix -e {shell}", "Custom"]);
+
+        // A default that is one of the saved ones is not listed twice.
+        let saved = TerminalChoice::Custom {
+            template: "ghostty -e {shell}".into(),
+        };
+        assert_eq!(custom_entries(&customs, Some(&saved), Os::Linux).len(), 2);
+    }
+
+    #[test]
     fn a_custom_default_does_not_touch_the_detected_order() {
         let available = vec![TerminalKind::GnomeTerminal, TerminalKind::Kitty];
         let default = TerminalChoice::Custom {
@@ -581,19 +607,6 @@ mod tests {
         };
         let got = ordered(available.clone(), Some(&default));
         assert_eq!(got, available);
-    }
-
-    #[test]
-    fn the_submenu_always_carries_a_custom_entry_last() {
-        let available = vec![TerminalKind::Kitty];
-        let entries = submenu(available, None);
-        assert_eq!(
-            entries,
-            vec![
-                TerminalOption::Detected(TerminalKind::Kitty),
-                TerminalOption::Custom
-            ]
-        );
     }
 
     #[test]

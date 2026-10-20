@@ -20,7 +20,7 @@ terminal for any environment, not only the default one.
 
 | OS | Terminals | Activation |
 |---|---|---|
-| Linux | GNOME Terminal, Konsole, kitty, Alacritty, WezTerm, foot, xterm | Full |
+| Linux | GNOME Terminal, Konsole, kitty, Alacritty, WezTerm, foot, xterm, Ptyxis, Ghostty, Terminator | Full |
 | Windows | Windows Terminal | Full |
 | Windows | PowerShell, Command Prompt, Git Bash | Environment on PATH only |
 | Windows | WSL | None |

@@ -39,7 +39,7 @@
 //! `WSLENV`, and a `C:\...\Scripts` path would be meaningless inside the
 //! distro regardless.
 //!
-//! **`ActivationSupport::Full`** is all seven Linux kinds plus
+//! **`ActivationSupport::Full`** is all ten Linux kinds plus
 //! `WindowsTerminal` -- the *only* Windows kind where activation works. The
 //! GUI should steer Windows users toward it, and must not report the venv as
 //! active for any of the six above.
@@ -60,7 +60,7 @@ pub fn build(
 ) -> Result<CommandSpec, TerminalError> {
     match choice {
         TerminalChoice::Detected(kind) => build_detected(*kind, os, cwd, shell, shell_args),
-        TerminalChoice::Custom { template } => build_custom(template, cwd, shell),
+        TerminalChoice::Custom { template } => build_custom(template, cwd, shell, shell_args),
     }
 }
 
@@ -116,6 +116,31 @@ fn build_detected(
             .arg("-e")
             .arg(shell)
             .args(shell_args.to_vec()),
+        // -s: a GApplication; without it an already-running Ptyxis opens the
+        // window from its own process and our environment never arrives.
+        // Verified against Ptyxis 50.1: cwd and env both reach the shell.
+        Ptyxis => CommandSpec::new("ptyxis")
+            .arg("-s")
+            .arg("--new-window")
+            .arg(format!("--working-directory={cwd_str}"))
+            .arg("--")
+            .arg(shell)
+            .args(shell_args.to_vec()),
+        // `-e` also turns off Ghostty's GTK single-instance mode, so the
+        // window belongs to this process and inherits its environment.
+        Ghostty => CommandSpec::new("ghostty")
+            .arg(format!("--working-directory={cwd_str}"))
+            .arg("-e")
+            .arg(shell)
+            .args(shell_args.to_vec()),
+        // -u (--no-dbus): same reason as Ptyxis's -s. `-x` takes the rest
+        // of the command line, so the shell's arguments survive as-is.
+        Terminator => CommandSpec::new("terminator")
+            .arg("-u")
+            .arg(format!("--working-directory={cwd_str}"))
+            .arg("-x")
+            .arg(shell)
+            .args(shell_args.to_vec()),
         TerminalApp => CommandSpec::new("open")
             .arg("-a")
             .arg("Terminal")
@@ -147,14 +172,27 @@ fn build_detected(
     Ok(spec.cwd(cwd.to_path_buf()))
 }
 
-fn build_custom(template: &str, cwd: &Path, shell: &str) -> Result<CommandSpec, TerminalError> {
+fn build_custom(
+    template: &str,
+    cwd: &Path,
+    shell: &str,
+    shell_args: &[String],
+) -> Result<CommandSpec, TerminalError> {
     // Tokenize first, then substitute into each token: substituting into the
     // whole template before splitting would split a cwd containing a space
     // (ordinary on Windows and macOS) into two arguments.
+    //
+    // A token that is exactly `{shell}` is followed by `shell_args`, so a
+    // custom terminal gets the same re-assertion a detected one does. Embedded
+    // in a larger token (`--command={shell}`) there is nowhere to put them.
     let cwd_str = cwd.to_string_lossy();
-    let mut tokens = template
-        .split_whitespace()
-        .map(|tok| tok.replace("{cwd}", &cwd_str).replace("{shell}", shell));
+    let mut tokens = template.split_whitespace().flat_map(|tok| {
+        if tok == "{shell}" {
+            [&[shell.to_string()][..], shell_args].concat()
+        } else {
+            vec![tok.replace("{cwd}", &cwd_str).replace("{shell}", shell)]
+        }
+    });
 
     let program = tokens.next().ok_or(TerminalError::EmptyTemplate)?;
 
@@ -343,6 +381,32 @@ mod tests {
         )
         .unwrap();
         assert_eq!(spec.args, vec!["--cd", "/proj/my api", "-e", "/bin/zsh"]);
+    }
+
+    #[test]
+    fn a_custom_templates_shell_carries_the_activation_arguments() {
+        // Without them the init file never runs and a custom terminal is
+        // silently degraded to PathOnly.
+        let spec = build(
+            &TerminalChoice::Custom {
+                template: "ghostty -e {shell} --cwd={cwd}".into(),
+            },
+            Os::Linux,
+            cwd(),
+            "/bin/bash",
+            &["--rcfile".to_string(), "/tmp/rc".to_string()],
+        )
+        .unwrap();
+        assert_eq!(
+            spec.args,
+            vec![
+                "-e",
+                "/bin/bash",
+                "--rcfile",
+                "/tmp/rc",
+                "--cwd=/proj/my-api"
+            ]
+        );
     }
 
     #[test]
