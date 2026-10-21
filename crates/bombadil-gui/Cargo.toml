@@ -13,8 +13,8 @@ categories.workspace = true
 readme = "../../README.md"
 
 [dependencies]
-bombadil-core = { path = "../bombadil-core", version = "0.5.0" }
-bombadil-uv-bin = { path = "../bombadil-uv-bin", version = "0.5.0" }
+bombadil-core = { path = "../bombadil-core", version = "0.5.1" }
+bombadil-uv-bin = { path = "../bombadil-uv-bin", version = "0.5.1" }
 iced = { version = "0.14", features = ["canvas"] }
 rfd = "0.17"
 # Already in Cargo.lock via iced; declared here for `Task::stream`, which
@@ -42,7 +42,7 @@ ttf-parser = "0.25"
 # for the same path dependency during test builds only, so `test-support`
 # never reaches a release build. Not a new dependency -- bombadil-core is
 # already depended on above.
-bombadil-core = { path = "../bombadil-core", version = "0.5.0", features = ["test-support"] }
+bombadil-core = { path = "../bombadil-core", version = "0.5.1", features = ["test-support"] }
 
 # The tray, split by platform on purpose. `ksni` speaks StatusNotifierItem over
 # D-Bus in pure Rust, which is the protocol GNOME/KDE actually use and costs
