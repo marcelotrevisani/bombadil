@@ -10,9 +10,9 @@
 //! nothing about whether the terminal actually opened -- that is handled
 //! later, at spawn time, not here.
 //!
-//! ## Known limitation: six terminals are degraded, in two different ways
+//! ## Known limitation: seven terminals are degraded, in two different ways
 //!
-//! Six kinds do not get full activation, and they do not all fail the same
+//! Seven kinds do not get full activation, and they do not all fail the same
 //! way. [`TerminalKind::activation_support`] is the machine-readable form of
 //! what follows, and the GUI should drive its warning off that rather than
 //! off this comment.
@@ -28,21 +28,34 @@
 //! and neither has an rc that re-prepends -- while `GitBash` runs an
 //! interactive login bash, whose rc reproduces the measured demotion.
 //!
-//! **`ActivationSupport::None` -- `TerminalApp`, `ITerm2`, `Wsl`.** These get
-//! no composed environment at all, so the venv is not merely demoted on
-//! `PATH`, it is absent from it. `open -a Terminal <cwd>` and `open -a iTerm
+//! **`ActivationSupport::VenvOnly` -- `Warp`.** Warp is single-instance: a
+//! second `warp-terminal` is a short-lived forwarder that hands the request to
+//! the already-running instance and exits, taking `spec.env` with it, and
+//! `warp-terminal --help` (verified against 0.2026.09.16) offers no
+//! `--working-directory` and no `-e`/`--` passthrough to opt out with. So the
+//! bare spawn below is only the *fallback*. What `open.rs` does instead is
+//! write a Tab Config into Warp's own data directory and spawn `warp-terminal
+//! warp://tab_config/<stem>`: an argument crosses the forwarding even though an
+//! environment does not, and the config's `commands` runs the activation inside
+//! the pane's shell after its rc. The venv ends up genuinely active, but the
+//! composed environment -- project variables, index credentials, secrets --
+//! still never arrives, which is why this is not `Full`. See `terminal/warp.rs`.
+//!
+//! **`ActivationSupport::None` -- `TerminalApp`, `ITerm2`, `Wsl`.**
+//! These get no composed environment at all, so the venv is not merely demoted
+//! on `PATH`, it is absent from it. `open -a Terminal <cwd>` and `open -a iTerm
 //! <cwd>` hand the request to LaunchServices, which does not propagate the
 //! calling process's environment -- that is precisely why `launchctl setenv`
 //! exists. `spec.env` and `spec.clear_env` are delivered to the `open` binary
 //! and discarded; `cwd` survives only because it is an argument. `wsl.exe`
 //! fails the same way across the WSL boundary: nothing crosses it except via
 //! `WSLENV`, and a `C:\...\Scripts` path would be meaningless inside the
-//! distro regardless.
+//! distro regardless. The `None` arm in `terminal/mod.rs` records the evidence.
 //!
-//! **`ActivationSupport::Full`** is all ten Linux kinds plus
+//! **`ActivationSupport::Full`** is all ten fully-activating Linux kinds plus
 //! `WindowsTerminal` -- the *only* Windows kind where activation works. The
 //! GUI should steer Windows users toward it, and must not report the venv as
-//! active for any of the six above.
+//! active for any of the seven above.
 
 use super::{Os, TerminalChoice, TerminalKind};
 use crate::error::TerminalError;
@@ -141,6 +154,23 @@ fn build_detected(
             .arg("-x")
             .arg(shell)
             .args(shell_args.to_vec()),
+        // The *fallback* argv for Warp; `open.rs` normally replaces this with
+        // `warp-terminal warp://tab_config/<stem>` (see `terminal/warp.rs`).
+        // It takes no arguments here because it has none to give us: verified
+        // against warp-terminal 0.2026.09.16, `warp-terminal --help` is
+        // `warp-terminal [OPTIONS] [COMMAND]` where every OPTION is
+        // agent-facing (--api-key, --output-format, --debug,
+        // --crash-recovery-mechanism) and every COMMAND is a subcommand
+        // (agent, mcp, login, ...), not a program to run. There is no
+        // --working-directory and no `-e`/`--` passthrough, and the desktop
+        // entry is bare `Exec=warp-terminal %U`. So the shell and its
+        // arguments are dropped rather than passed and ignored -- an invented
+        // flag would be rejected by Warp's parser, not skipped. Reaching this
+        // arm at all means the Tab Config could not be written, and then
+        // `cwd` below is the only part of the request that reaches the
+        // process, which Warp's single-instance forwarding discards on a warm
+        // start anyway.
+        Warp => CommandSpec::new("warp-terminal"),
         TerminalApp => CommandSpec::new("open")
             .arg("-a")
             .arg("Terminal")
@@ -304,7 +334,13 @@ mod tests {
                         "{kind:?} is Full but drops shell_args; got {:?}",
                         spec.args
                     ),
-                    ActivationSupport::PathOnly | ActivationSupport::None => assert!(
+                    // `VenvOnly` is included deliberately: Warp *does* run our
+                    // activation, but through a Tab Config written by `open.rs`
+                    // rather than through `shell_args` here, so this argv must
+                    // still not carry the marker.
+                    ActivationSupport::VenvOnly
+                    | ActivationSupport::PathOnly
+                    | ActivationSupport::None => assert!(
                         !carries,
                         "{kind:?} is degraded but carries shell_args -- if it can \
                          really run our init file it belongs in Full; got {:?}",
@@ -313,6 +349,28 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn warps_fallback_argv_is_bare_because_it_accepts_neither_a_directory_nor_a_shell() {
+        // Verified against warp-terminal 0.2026.09.16: `warp-terminal --help`
+        // exposes only agent-facing options and subcommands, so there is no
+        // --working-directory and no `-e`/`--` passthrough to build an argv
+        // from. An argument invented here would be rejected by Warp's parser
+        // rather than ignored, so this pins the *fallback* spawn as bare and
+        // leaves `cwd` (set by `build_detected` for every kind) as the only
+        // thing that reaches the process.
+        //
+        // The launch a Warp user normally gets is `warp-terminal
+        // warp://tab_config/<stem>`, substituted by `open.rs` once it has
+        // written the Tab Config; `open.rs`'s own tests pin that. If a future
+        // Warp grows a real directory or passthrough flag, this test fails and
+        // the `VenvOnly` bucket in `terminal/mod.rs` should be revisited in the
+        // same change -- the Tab Config would no longer be the only channel.
+        let spec = built(TerminalKind::Warp, Os::Linux);
+        assert_eq!(spec.program, std::path::PathBuf::from("warp-terminal"));
+        assert!(spec.args.is_empty(), "got {:?}", spec.args);
+        assert_eq!(spec.cwd, Some(std::path::PathBuf::from("/proj/my-api")));
     }
 
     #[test]

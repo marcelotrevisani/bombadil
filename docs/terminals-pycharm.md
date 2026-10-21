@@ -21,6 +21,7 @@ terminal for any environment, not only the default one.
 | OS | Terminals | Activation |
 |---|---|---|
 | Linux | GNOME Terminal, Konsole, kitty, Alacritty, WezTerm, foot, xterm, Ptyxis, Ghostty, Terminator | Full |
+| Linux | Warp | Environment activated only |
 | Windows | Windows Terminal | Full |
 | Windows | PowerShell, Command Prompt, Git Bash | Environment on PATH only |
 | Windows | WSL | None |
@@ -29,6 +30,15 @@ terminal for any environment, not only the default one.
 - **Full**: the environment is put at the front of `PATH` again after your
   shell's own startup files have run, so a `.bashrc` or `.zshrc` that changes
   `PATH` can't push it back.
+- **Environment activated only**: the environment is activated and kept at the
+  front of `PATH`, so `python` and `uv` use it — but your variables, secrets,
+  index settings and scripts are not applied. Warp is a single-instance
+  program: opening it again hands the request to the window that is already
+  open, and variables don't survive that trip. Bombadil works around it by
+  asking Warp to run the activation itself in the tab it opens. That tab is
+  titled `Bombadil: <project>`, and it also shows up in Warp's own **+** menu.
+  Use a **Full** terminal, or the [Run tab](running.md), when a command needs
+  your variables.
 - **Environment on PATH only**: the variables arrive, but a startup file that
   changes `PATH` can put another Python in front.
 - **None**: the terminal starts in the project folder without the

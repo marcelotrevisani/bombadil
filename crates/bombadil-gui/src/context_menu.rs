@@ -50,18 +50,23 @@ pub fn ordered(
 /// none -- the empty string -- so a caller can append it unconditionally
 /// without an extra branch.
 ///
-/// Criterion 3: `PathOnly` and `None` must read as different problems, not
-/// the same one. A `PathOnly` terminal still receives the composed
-/// environment and only fails to re-assert the venv's position on `PATH`
-/// after the user's shell rc runs; a `None` terminal receives no composed
+/// Criterion 3: `PathOnly`, `VenvOnly` and `None` must read as different
+/// problems, not the same one. A `PathOnly` terminal still receives the
+/// composed environment and only fails to re-assert the venv's position on
+/// `PATH` after the user's shell rc runs; a `VenvOnly` terminal does activate
+/// the venv but receives none of the composed environment, so project
+/// variables and secrets are missing; a `None` terminal receives no composed
 /// environment at all -- the venv is not on `PATH` in any position. A macOS
-/// user picking Terminal.app needs to see that it is the worse of the two,
+/// user picking Terminal.app needs to see that it is the worse of the three,
 /// not a warning indistinguishable from PowerShell's.
 pub fn activation_warning(kind: TerminalKind) -> &'static str {
     match kind.activation_support() {
         ActivationSupport::Full => "",
         ActivationSupport::PathOnly => {
             " (environment on PATH, not re-asserted after your shell config)"
+        }
+        ActivationSupport::VenvOnly => {
+            " (venv activated -- your project's environment variables do not reach this shell)"
         }
         ActivationSupport::None => " (not activated -- no environment reaches this shell)",
     }
@@ -89,6 +94,7 @@ pub fn terminal_name(kind: TerminalKind) -> &'static str {
         Ptyxis => "Ptyxis",
         Ghostty => "Ghostty",
         Terminator => "Terminator",
+        Warp => "Warp",
     }
 }
 
