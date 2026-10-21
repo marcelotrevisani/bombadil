@@ -4,6 +4,7 @@ pub mod activation;
 pub mod argv;
 pub mod detect;
 pub mod open;
+pub mod warp;
 
 pub use crate::model::TerminalChoice;
 
@@ -55,14 +56,19 @@ pub enum TerminalKind {
     WezTerm,
     Foot,
     Xterm,
+    Ptyxis,
+    Ghostty,
+    Terminator,
+    Warp,
 }
 
 /// How much of the composed environment actually reaches the shell.
 ///
-/// Three buckets, not two: a kind can fail to re-assert the venv's position
-/// on `PATH` (bad), or fail to receive the composed environment at all
-/// (worse -- the venv is not on `PATH` in any position). The GUI has no way
-/// to warn the user correctly without telling those apart.
+/// Four buckets, not two: a kind can fail to re-assert the venv's position on
+/// `PATH` (bad), deliver activation but none of the *composed* environment
+/// (bad differently), or fail to receive an environment at all (worse -- the
+/// venv is not on `PATH` in any position). The GUI has no way to warn the user
+/// correctly without telling those apart.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ActivationSupport {
     /// Everything arrives and the re-assertion runs.
@@ -70,6 +76,15 @@ pub enum ActivationSupport {
     /// The composed environment arrives, but nothing re-asserts it after the
     /// user's shell rc runs.
     PathOnly,
+    /// The venv is activated and its position on `PATH` is re-asserted, but
+    /// none of the *composed* environment -- project variables, index
+    /// credentials, keychain secrets -- reaches the shell.
+    ///
+    /// This is not a weaker `Full`: activation is executed inside the pane by
+    /// the terminal itself rather than inherited from the spawn, which is the
+    /// only channel available to a single-instance terminal that cannot be
+    /// handed an environment. See [`warp`].
+    VenvOnly,
     /// The emulator is launched in a way that does not carry an environment at
     /// all, so none of the composition reaches the shell.
     None,
@@ -81,7 +96,8 @@ impl TerminalKind {
         match self {
             WindowsTerminal | PowerShell | Cmd | GitBash | Wsl => Os::Windows,
             TerminalApp | ITerm2 => Os::MacOs,
-            GnomeTerminal | Konsole | Kitty | Alacritty | WezTerm | Foot | Xterm => Os::Linux,
+            GnomeTerminal | Konsole | Kitty | Alacritty | WezTerm | Foot | Xterm | Ptyxis
+            | Ghostty | Terminator | Warp => Os::Linux,
         }
     }
 
@@ -95,8 +111,8 @@ impl TerminalKind {
         match self {
             // The emulator is handed our `shell` and `shell_args`, and the
             // spawn carries the composed environment: both halves arrive.
-            GnomeTerminal | Konsole | Kitty | Alacritty | WezTerm | Foot | Xterm
-            | WindowsTerminal => ActivationSupport::Full,
+            GnomeTerminal | Konsole | Kitty | Alacritty | WezTerm | Foot | Xterm | Ptyxis
+            | Ghostty | Terminator | WindowsTerminal => ActivationSupport::Full,
 
             // Launched as an ordinary child process, so `spec.env` reaches
             // them -- but none has a flag to hand it a specific shell binary
@@ -106,6 +122,27 @@ impl TerminalKind {
             // re-prepends. `GitBash` runs `bash --login -i`, whose rc
             // reproduces the measured demotion.
             PowerShell | Cmd | GitBash => ActivationSupport::PathOnly,
+
+            // Warp cannot be handed an environment, but it can be handed a
+            // command. Single-instance forwarding kills `spec.env`: verified
+            // against warp-terminal 0.2026.09.16 on Linux, a second invocation
+            // is a short-lived forwarder that exits once the running instance
+            // has opened the window, and `warp-terminal --help` exposes no
+            // `--working-directory` and no `-e`/`--` passthrough, so unlike
+            // Ptyxis (`-s`), Terminator (`-u`) and Ghostty (`-e`) there is no
+            // flag that forces a dedicated process.
+            //
+            // What does cross is an argument, so `open.rs` writes a Tab Config
+            // into Warp's own data directory and launches `warp-terminal
+            // warp://tab_config/<stem>`. Warp then runs the activation command
+            // inside the pane's shell, after that shell's rc -- measured warm
+            // (the pane's parent was a `warp terminal-server` hours old) with
+            // `VIRTUAL_ENV` set, `python` resolving into the venv, and `PATH`
+            // leading with `.venv/bin`. A control pane launched with a sentinel
+            // on the forwarder's environment saw neither, which is what keeps
+            // this out of `Full`: activation arrives, the composed environment
+            // does not. See [`warp`].
+            Warp => ActivationSupport::VenvOnly,
 
             // `open -a Terminal <cwd>` / `open -a iTerm <cwd>` hand the
             // request to LaunchServices, which does not propagate the calling
@@ -133,6 +170,10 @@ impl TerminalKind {
                 WezTerm,
                 Foot,
                 Xterm,
+                Ptyxis,
+                Ghostty,
+                Terminator,
+                Warp,
             ],
         }
     }
@@ -169,12 +210,12 @@ mod tests {
         // support my setup" rather than as a bug.
         assert_eq!(TerminalKind::for_os(Os::Windows).len(), 5);
         assert_eq!(TerminalKind::for_os(Os::MacOs).len(), 2);
-        assert_eq!(TerminalKind::for_os(Os::Linux).len(), 7);
+        assert_eq!(TerminalKind::for_os(Os::Linux).len(), 11);
     }
 
     #[test]
     fn every_kind_is_pinned_to_the_activation_bucket_it_was_measured_in() {
-        // All fourteen, spelled out. The exhaustive match in
+        // All eighteen, spelled out. The exhaustive match in
         // `activation_support` makes a NEW variant a compile error, but
         // nothing stops someone quietly moving an existing kind between
         // buckets -- and the GUI's warning is only correct if these are.
@@ -191,10 +232,18 @@ mod tests {
             (WezTerm, Full),
             (Foot, Full),
             (Xterm, Full),
+            (Ptyxis, Full),
+            (Ghostty, Full),
+            (Terminator, Full),
             (WindowsTerminal, Full),
             (PowerShell, PathOnly),
             (Cmd, PathOnly),
             (GitBash, PathOnly),
+            // Warp is the one Linux kind that is neither `Full` nor `None`:
+            // its Tab Config executes activation inside the pane, but
+            // single-instance forwarding means the composed environment never
+            // arrives. See the `VenvOnly` arm above and `terminal/warp.rs`.
+            (Warp, VenvOnly),
             (TerminalApp, None),
             (ITerm2, None),
             (Wsl, None),

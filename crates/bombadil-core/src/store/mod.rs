@@ -532,6 +532,7 @@ mod tests {
                 )]),
             }],
             terminal_defaults: std::collections::BTreeMap::new(),
+            custom_terminals: Vec::new(),
         };
 
         // Field-by-field, not just `assert_eq!(got, expected)` on the whole

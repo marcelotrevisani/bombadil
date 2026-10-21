@@ -8,9 +8,10 @@
 //! ever rendered. Any error that can carry free text is routed through
 //! redaction before it reaches a caller.
 
-use super::activation::{ShellFamily, init_file};
+use super::activation::{ShellFamily, activate_command, init_file};
 use super::argv;
-use super::{Os, TerminalChoice};
+use super::warp;
+use super::{Os, TerminalChoice, TerminalKind};
 use crate::envspec::{EnvInputs, compose};
 use crate::error::EnvError;
 use crate::process::CommandRunner;
@@ -121,6 +122,37 @@ pub fn open(
     runner: &dyn CommandRunner,
     scratch_dir: &Path,
 ) -> Result<(), EnvError> {
+    open_with_warp_dir(
+        choice,
+        os,
+        inputs,
+        shell,
+        store,
+        runner,
+        scratch_dir,
+        warp::default_base().as_deref(),
+    )
+}
+
+/// [`open`], with Warp's Tab Config directory injectable.
+///
+/// Warp is the one kind whose launch has to write outside `scratch_dir`: it
+/// reads Tab Configs only from its own data directory (`warp::default_base`).
+/// Resolving that through `$XDG_DATA_HOME`/`$HOME` would make every Warp test
+/// write into the developer's real config directory -- and appear in their Warp
+/// `+` menu -- so the directory is a parameter instead. Nothing in the repo
+/// reads an environment variable from a test, and this keeps it that way.
+#[allow(clippy::too_many_arguments)]
+pub fn open_with_warp_dir(
+    choice: &TerminalChoice,
+    os: Os,
+    inputs: &EnvInputs,
+    shell: &str,
+    store: &dyn SecretStore,
+    runner: &dyn CommandRunner,
+    scratch_dir: &Path,
+    warp_dir: Option<&Path>,
+) -> Result<(), EnvError> {
     let env = compose(inputs, store, runner)?;
 
     let family = ShellFamily::detect(shell);
@@ -169,6 +201,30 @@ pub fn open(
     let cwd = project_dir(inputs);
     let mut spec = argv::build(choice, os, &cwd, shell, &shell_args)?;
 
+    // Warp cannot be handed the composed environment at all, so instead of a
+    // shell plus arguments we hand it a URI naming a Tab Config that runs the
+    // activation inside its own pane -- the only channel that survives
+    // single-instance forwarding. `terminal/warp.rs` carries the measurement.
+    //
+    // `prepare` returns `None` when the config could not be written, and then
+    // the bare `warp-terminal` argv built above stands. That is today's
+    // unactivated Warp rather than no terminal at all, matching this file's
+    // rule that losing activation is acceptable while refusing to open is not.
+    // It does mean `VenvOnly` describes the best case: the GUI cannot tell a
+    // Warp that activated from one that fell back.
+    if os == Os::Linux
+        && matches!(choice, TerminalChoice::Detected(TerminalKind::Warp))
+        && let Some(uri) = warp::prepare(
+            warp_dir,
+            inputs.project.id,
+            &inputs.project.label,
+            &cwd,
+            activate_command(family, &bin),
+        )
+    {
+        spec = warp::launch_spec(&uri, &cwd);
+    }
+
     let mut full_env = env.clone();
     full_env.extend(extra_env);
     spec.env = full_env;
@@ -211,7 +267,7 @@ mod tests {
 
     use crate::envspec::EnvInputs;
     use crate::model::{Config, EnvVar, Environment, Project, VenvLocation};
-    use crate::process::FakeCommandRunner;
+    use crate::process::{CommandSpec, FakeCommandRunner};
     use crate::secrets::InMemorySecretStore;
     use crate::terminal::TerminalKind;
     use std::collections::BTreeMap;
@@ -621,5 +677,170 @@ mod tests {
             args.contains(&format!("source {}", expected_file.display())),
             "got {args}"
         );
+    }
+
+    /// Open Warp and return the recorded spawns.
+    ///
+    /// `warp_dir` is where the Tab Config is written. It is injected rather
+    /// than resolved from `$XDG_DATA_HOME`/`$HOME` so that no test writes into
+    /// the developer's real Warp configuration -- a file there shows up in
+    /// their `+` tab menu and outlives the test run.
+    fn opened_warp(shell: &str, project: Project, warp_dir: Option<&Path>) -> Vec<CommandSpec> {
+        let store = InMemorySecretStore::new();
+        let runner = FakeCommandRunner::new();
+        runner.expect("warp-terminal", &[], success_outcome());
+        let tmp = tempfile::tempdir().unwrap();
+        open_with_warp_dir(
+            &TerminalChoice::Detected(TerminalKind::Warp),
+            Os::Linux,
+            &inputs(project),
+            shell,
+            &store,
+            &runner,
+            tmp.path(),
+            warp_dir,
+        )
+        .expect("opening must succeed");
+        runner.calls()
+    }
+
+    /// Read back `project()`'s written Tab Config as its first parsed pane.
+    ///
+    /// Parsed rather than substring-matched on the raw bytes: on Windows the
+    /// venv path holds a backslash, and the `toml` serializer then emits the
+    /// command as a `'''` multi-line literal string instead of a quoted one.
+    /// Asserting on the text would pin the serializer's quoting choice rather
+    /// than the value Warp actually receives.
+    fn written_pane(warp_dir: &Path) -> toml::Value {
+        let text = std::fs::read_to_string(warp::config_path(warp_dir, Uuid::from_u128(7)))
+            .expect("the tab config must exist");
+        let parsed: toml::Value = toml::from_str(&text).expect("must be valid TOML");
+        parsed["panes"][0].clone()
+    }
+
+    #[test]
+    fn warp_is_launched_through_a_tab_config_that_activates_the_venv() {
+        // Warp cannot be handed an environment at all -- single-instance
+        // forwarding drops it -- so the launch hands it a URI naming a Tab
+        // Config whose `commands` activate the venv inside Warp's own pane.
+        // Measured working against warp-terminal 0.2026.09.16, warm; see
+        // `terminal/warp.rs`.
+        let warp_dir = tempfile::tempdir().unwrap();
+        let calls = opened_warp("/bin/bash", project(), Some(warp_dir.path()));
+
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].program, PathBuf::from("warp-terminal"));
+        let uri = warp::deep_link(Uuid::from_u128(7));
+        assert_eq!(calls[0].args, vec![uri], "got {:?}", calls[0].args);
+
+        let pane = written_pane(warp_dir.path());
+        assert_eq!(pane["directory"].as_str().unwrap(), "/proj/my-api");
+        // Built through `venv_bin_dir` rather than written out: it is
+        // `cfg!(windows)`-based, so the Windows runner resolves `Scripts` and
+        // `\` even though this call passes `Os::Linux`.
+        let bin = venv_bin_dir(Path::new("/envs/my-api"));
+        assert_eq!(
+            pane["commands"][0].as_str().unwrap(),
+            format!("source '{}'", bin.join("activate").display())
+        );
+    }
+
+    #[test]
+    fn warp_falls_back_to_a_bare_spawn_when_its_tab_config_cannot_be_written() {
+        // Losing activation is acceptable; refusing to open a terminal is not
+        // (the rule `an_unknown_shell_still_opens_a_terminal` holds). No
+        // writable data directory must still produce a Warp window.
+        let calls = opened_warp("/bin/bash", project(), None);
+
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].program, PathBuf::from("warp-terminal"));
+        assert!(calls[0].args.is_empty(), "got {:?}", calls[0].args);
+    }
+
+    #[test]
+    fn warp_still_opens_in_the_right_directory_for_a_shell_it_cannot_activate() {
+        // An unknown shell gets no `commands` -- sourcing a POSIX activate into
+        // nushell would be a syntax error on every launch -- but the Tab Config
+        // still carries `directory`, which is more than the bare fallback
+        // manages on a warm start.
+        let warp_dir = tempfile::tempdir().unwrap();
+        let calls = opened_warp("/usr/bin/nu", project(), Some(warp_dir.path()));
+
+        assert_eq!(calls[0].args.len(), 1, "the deep link must still be used");
+        let pane = written_pane(warp_dir.path());
+        assert_eq!(pane["directory"].as_str().unwrap(), "/proj/my-api");
+        assert!(pane.get("commands").is_none(), "got {pane}");
+    }
+
+    #[test]
+    fn warps_tab_config_activates_fish_with_its_own_script() {
+        let warp_dir = tempfile::tempdir().unwrap();
+        opened_warp("/usr/local/bin/fish", project(), Some(warp_dir.path()));
+
+        let pane = written_pane(warp_dir.path());
+        let command = pane["commands"][0].as_str().unwrap();
+        // Ends-with, and parsed: the earlier raw-text check
+        // (`!written.contains("bin/activate'")`) never matched on Windows,
+        // where the separator is `\` and the venv dir is `Scripts`, so that
+        // half of the test passed without proving anything. The trailing quote
+        // is part of the expectation -- the command is `source '<script>'`.
+        assert!(command.ends_with("activate.fish'"), "got {command}");
+    }
+
+    #[test]
+    fn warps_tab_config_carries_no_part_of_the_composed_environment() {
+        // The Tab Config is a persistent file under the user's home that
+        // anything running as them can read, and it outlives the terminal it
+        // was opened for. It must carry activation and nothing from the
+        // composition: not a keychain secret, and not an ordinary project
+        // variable either. That gap is exactly what `VenvOnly` warns about.
+        let store = InMemorySecretStore::new();
+        store
+            .set(
+                &crate::secrets::SecretKey::ProjectEnv {
+                    project_id: Uuid::from_u128(7),
+                    key: "TOKEN".into(),
+                },
+                "s3cr3t-warp-value",
+            )
+            .unwrap();
+        let p = Project {
+            env: vec![
+                EnvVar {
+                    key: "TOKEN".into(),
+                    value: String::new(),
+                    secret: true,
+                },
+                EnvVar {
+                    key: "PLAIN".into(),
+                    value: "plain-marker-value".into(),
+                    secret: false,
+                },
+            ],
+            ..project()
+        };
+        let runner = FakeCommandRunner::new();
+        runner.expect("warp-terminal", &[], success_outcome());
+        let tmp = tempfile::tempdir().unwrap();
+        let warp_dir = tempfile::tempdir().unwrap();
+
+        open_with_warp_dir(
+            &TerminalChoice::Detected(TerminalKind::Warp),
+            Os::Linux,
+            &inputs(p),
+            "/bin/bash",
+            &store,
+            &runner,
+            tmp.path(),
+            Some(warp_dir.path()),
+        )
+        .expect("opening must succeed");
+
+        let written =
+            std::fs::read_to_string(warp::config_path(warp_dir.path(), Uuid::from_u128(7)))
+                .expect("the tab config must exist");
+        assert!(!written.contains("s3cr3t-warp-value"), "got {written}");
+        assert!(!written.contains("plain-marker-value"), "got {written}");
+        assert!(!written.contains("TOKEN"), "got {written}");
     }
 }

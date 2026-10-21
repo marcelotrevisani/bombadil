@@ -121,6 +121,19 @@ activated environment. The choice is saved per operating system, so a project
 shared between machines can use iTerm2 on macOS and Konsole on Linux. See
 [Terminals and PyCharm](terminals-pycharm.md#supported-terminals).
 
+For a terminal that isn't listed, click **Add custom terminal** and give it
+a name and a command, for example `tilix --working-directory={cwd} -e
+{shell}`. `{cwd}` becomes the project folder and `{shell}` your shell. Click
+the name to make it the one **Open terminal** launches. Every custom terminal
+also appears in the project menu's **Open terminal** list.
+
+Keep `{shell}` as a word of its own, as in the example. Bombadil then adds the
+arguments that put the environment back at the front of `PATH` after your
+shell's startup files run. Inside a longer word, such as `--command={shell}`,
+the variables still arrive but that last step is skipped.
+
+Custom terminals are saved per operating system, like the choice itself.
+
 ## PyCharm
 
 ![PyCharm](images/prefs-pycharm.png)

@@ -1040,6 +1040,15 @@ pub enum Message {
     PreferencesUvSourceOverridden(preferences::Scope, UvSource),
     /// The Terminal section's choice, in `scope`.
     PreferencesTerminalOverridden(preferences::Scope, TerminalChoice),
+    /// The Terminal section's "Add custom terminal": a blank entry for this OS.
+    CustomTerminalAdded,
+    /// A custom terminal's name, by index into `Config::custom_terminals`.
+    CustomTerminalNameChanged(usize, String),
+    /// A custom terminal's command template, by the same index.
+    CustomTerminalTemplateChanged(usize, String),
+    /// Delete a custom terminal. A choice that already uses it keeps working:
+    /// the template lives in the choice, not behind a reference.
+    CustomTerminalRemoved(usize),
     /// Move one environment to another location. Carries where it is now,
     /// because that is how an environment is identified.
     EnvironmentLocationSelected(uuid::Uuid, VenvLocation, VenvLocation),
@@ -4858,6 +4867,52 @@ pub fn update(app: &mut App, message: Message, runner: Arc<dyn CommandRunner>) -
                 }
             }
             return persist_edit(app, "env var change");
+        }
+        Message::CustomTerminalAdded => {
+            app.config
+                .custom_terminals
+                .push(bombadil_core::model::CustomTerminal {
+                    os: Os::host(),
+                    name: String::new(),
+                    template: String::new(),
+                });
+            return persist_edit(app, "settings change");
+        }
+        Message::CustomTerminalNameChanged(index, name) => {
+            let Some(custom) = app.config.custom_terminals.get_mut(index) else {
+                return Task::none();
+            };
+            custom.name = name;
+            return persist_edit(app, "settings change");
+        }
+        Message::CustomTerminalTemplateChanged(index, template) => {
+            let Some(custom) = app.config.custom_terminals.get_mut(index) else {
+                return Task::none();
+            };
+            // A choice stores the template by value, so every choice that
+            // picked this entry follows the edit -- otherwise typing in the
+            // selected entry silently deselects it, one keystroke in.
+            let old = TerminalChoice::Custom {
+                template: std::mem::replace(&mut custom.template, template.clone()),
+            };
+            let new = TerminalChoice::Custom { template };
+            let os = custom.os;
+            let choices = app.config.terminal_defaults.get_mut(&os).into_iter().chain(
+                app.config
+                    .projects
+                    .iter_mut()
+                    .filter_map(|p| p.terminals.get_mut(&os)),
+            );
+            for choice in choices.filter(|c| **c == old) {
+                *choice = new.clone();
+            }
+            return persist_edit(app, "settings change");
+        }
+        Message::CustomTerminalRemoved(index) => {
+            if index < app.config.custom_terminals.len() {
+                app.config.custom_terminals.remove(index);
+                return persist_edit(app, "settings change");
+            }
         }
         Message::EnvironmentAdded(id) => {
             return Task::perform(pick_folder(), move |path| {
@@ -8966,7 +9021,14 @@ pub fn view(app: &App) -> iced::Element<'_, Message> {
                 .projects
                 .get(menu.project_index)
                 .is_some_and(|project| !project.environments.is_empty());
-            context_menu::view(menu, label, default, waiting, has_environment)
+            context_menu::view(
+                menu,
+                label,
+                default,
+                &app.config.custom_terminals,
+                waiting,
+                has_environment,
+            )
         }
         None => iced::widget::text("").into(),
     };
@@ -16872,6 +16934,54 @@ pub(crate) mod tests {
             Override::Set(UvSource::FromPath)
         );
         assert_eq!(app.config.settings.uv_source, UvSource::Bundled);
+    }
+
+    #[test]
+    fn editing_a_selected_custom_terminal_keeps_it_selected() {
+        // The choice holds the template by value; without following the edit,
+        // the first keystroke in the selected entry would deselect it and
+        // leave Open terminal launching the half-typed old command.
+        let mut app = App::new(Config {
+            projects: vec![project("api")],
+            ..Config::default()
+        });
+        let id = app.config.projects[0].id;
+        let old = TerminalChoice::Custom {
+            template: "ghostty -e {shell}".into(),
+        };
+        let _ = update(&mut app, Message::CustomTerminalAdded, unused_runner());
+        let _ = update(
+            &mut app,
+            Message::CustomTerminalTemplateChanged(0, "ghostty -e {shell}".into()),
+            unused_runner(),
+        );
+        for scope in [preferences::Scope::Global, preferences::Scope::Project(id)] {
+            let _ = update(
+                &mut app,
+                Message::PreferencesTerminalOverridden(scope, old.clone()),
+                unused_runner(),
+            );
+        }
+
+        let _ = update(
+            &mut app,
+            Message::CustomTerminalTemplateChanged(0, "ghostty -e {shell} --x".into()),
+            unused_runner(),
+        );
+
+        let new = TerminalChoice::Custom {
+            template: "ghostty -e {shell} --x".into(),
+        };
+        assert_eq!(app.config.terminal_defaults.get(&Os::host()), Some(&new));
+        assert_eq!(
+            app.config.projects[0].terminals.get(&Os::host()),
+            Some(&new)
+        );
+
+        // Removing the entry leaves the choice working.
+        let _ = update(&mut app, Message::CustomTerminalRemoved(0), unused_runner());
+        assert!(app.config.custom_terminals.is_empty());
+        assert_eq!(app.config.terminal_defaults.get(&Os::host()), Some(&new));
     }
 
     #[test]

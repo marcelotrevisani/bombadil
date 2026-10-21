@@ -72,6 +72,10 @@ fn linux_binary_name(kind: TerminalKind) -> Option<&'static str> {
         WezTerm => "wezterm",
         Foot => "foot",
         Xterm => "xterm",
+        Ptyxis => "ptyxis",
+        Ghostty => "ghostty",
+        Terminator => "terminator",
+        Warp => "warp-terminal",
         _ => return None,
     })
 }

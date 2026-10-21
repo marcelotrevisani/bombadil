@@ -38,6 +38,19 @@ pub enum TerminalChoice {
     },
 }
 
+/// A terminal the user added by hand, for an emulator Bombadil does not
+/// detect. Picking it stores its template as a [`TerminalChoice::Custom`],
+/// so the choice keeps working even if the entry is later deleted.
+///
+/// Carries its `os` because templates are not portable: a config shared
+/// between machines must not offer a Linux command line on Windows.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CustomTerminal {
+    pub os: crate::terminal::Os,
+    pub name: String,
+    pub template: String,
+}
+
 /// Bumped only when a change cannot be expressed by adding `#[serde(default)]`
 /// fields. A config declaring a higher version opens read-only.
 ///
@@ -70,6 +83,8 @@ pub struct Config {
     pub projects: Vec<Project>,
     #[serde(default)]
     pub terminal_defaults: BTreeMap<crate::terminal::Os, TerminalChoice>,
+    #[serde(default)]
+    pub custom_terminals: Vec<CustomTerminal>,
 }
 
 impl Default for Config {
@@ -82,6 +97,7 @@ impl Default for Config {
             global_scripts: Vec::new(),
             projects: Vec::new(),
             terminal_defaults: BTreeMap::new(),
+            custom_terminals: Vec::new(),
         }
     }
 }
@@ -210,6 +226,11 @@ mod tests {
                     },
                 ),
             ]),
+            custom_terminals: vec![CustomTerminal {
+                os: crate::terminal::Os::Linux,
+                name: "Tilix".into(),
+                template: "tilix -w {cwd} -e {shell}".into(),
+            }],
         }
     }
 

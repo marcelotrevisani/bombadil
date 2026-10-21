@@ -48,6 +48,16 @@ fn sq(path: &Path) -> String {
     path.to_string_lossy().replace('\'', r"'\''")
 }
 
+/// Escape a path for single-quoted fish context.
+///
+/// fish's single quotes honour only `\\` and `\'`, so the POSIX `'\''` dance
+/// that [`sq`] produces would be inserted literally and break the command.
+fn sq_fish(path: &Path) -> String {
+    path.to_string_lossy()
+        .replace('\\', "\\\\")
+        .replace('\'', "\\'")
+}
+
 /// Build the startup file that puts the venv back at the front of `PATH`.
 ///
 /// Verified on a real machine: passing `PATH=<venv>/bin:$PATH` to an
@@ -139,6 +149,33 @@ pub fn init_file(family: ShellFamily, venv_bin: &Path) -> Option<InitFile> {
         }),
         ShellFamily::Unknown => None,
     }
+}
+
+/// A command that activates `venv_bin`'s venv from *inside* an already-running
+/// interactive shell, by sourcing the venv's own activate script.
+///
+/// This is the sibling of [`init_file`] for terminals that cannot be handed a
+/// shell binary plus arguments. `init_file` only works when the launch can
+/// pass `--rcfile`/`ZDOTDIR`/`-C`, because it has to run *before* the user's
+/// rc; this one runs *after* it, which is what a terminal that executes a
+/// startup command in its own pane gives us (see `terminal/warp.rs`). Order is
+/// still what makes it correct: sourcing after the rc means nothing can demote
+/// the venv afterwards.
+///
+/// Returns `None` for a shell we do not know. Sourcing the POSIX `activate`
+/// into nushell would be a syntax error on every launch, and an unactivated
+/// shell the user can still type into beats a broken one -- the same rule
+/// `init_file` follows.
+pub fn activate_command(family: ShellFamily, venv_bin: &Path) -> Option<String> {
+    let (script, escape): (PathBuf, fn(&Path) -> String) = match family {
+        ShellFamily::Bash | ShellFamily::Zsh | ShellFamily::PosixSh => {
+            (venv_bin.join("activate"), sq)
+        }
+        // fish cannot source the POSIX script; uv writes it a fish one.
+        ShellFamily::Fish => (venv_bin.join("activate.fish"), sq_fish),
+        ShellFamily::Unknown => return None,
+    };
+    Some(format!("source '{}'", escape(&script)))
 }
 
 #[cfg(test)]
@@ -283,5 +320,76 @@ mod tests {
         let prepend = file.contents.find("/envs/api/bin").expect("must prepend");
         assert!(src < prepend, "got {}", file.contents);
         assert_eq!(file.env.get("ENV").map(String::as_str), Some("{file}"));
+    }
+
+    #[test]
+    fn posix_shells_activate_by_sourcing_the_venvs_own_script() {
+        // The whole point of this sibling to `init_file`: no --rcfile/ZDOTDIR
+        // flag is needed, because the command is typed into a shell that has
+        // already read its rc. Verified end to end against warp-terminal
+        // 0.2026.09.16 -- see terminal/warp.rs.
+        //
+        // The expectation is built through `Path::join` rather than written out
+        // with `/`: on the Windows runner `join` produces `\`. Comparing the
+        // whole string is still safe here because `sq` escapes quotes only and
+        // leaves separators alone.
+        let bin = Path::new("/envs/api/bin");
+        let expected = format!("source '{}'", bin.join("activate").display());
+        for family in [ShellFamily::Bash, ShellFamily::Zsh, ShellFamily::PosixSh] {
+            let cmd = activate_command(family, bin).unwrap();
+            assert_eq!(cmd, expected);
+        }
+    }
+
+    #[test]
+    fn fish_activates_with_its_own_script_not_the_posix_one() {
+        // Sourcing the POSIX activate into fish fails: `export` is not fish
+        // syntax. uv writes activate.fish alongside activate, and picking the
+        // wrong one would look like a working launch and leave the venv
+        // inactive.
+        //
+        // Asserted by shape rather than by whole string, unlike the POSIX test
+        // above: `sq_fish` also doubles backslashes, so an exact expectation
+        // would have to encode this host's separator and would fail on Windows
+        // for a reason that has nothing to do with the script chosen.
+        let bin = Path::new("/envs/api/bin");
+        let cmd = activate_command(ShellFamily::Fish, bin).unwrap();
+        assert!(cmd.starts_with("source '"), "got {cmd}");
+        assert!(cmd.ends_with("activate.fish'"), "got {cmd}");
+        assert_ne!(
+            cmd,
+            activate_command(ShellFamily::Bash, bin).unwrap(),
+            "fish must not be handed the POSIX script"
+        );
+    }
+
+    #[test]
+    fn an_unknown_shell_gets_no_activation_command_rather_than_a_broken_one() {
+        assert!(activate_command(ShellFamily::Unknown, Path::new("/envs/api/bin")).is_none());
+    }
+
+    #[test]
+    fn a_quote_in_the_venv_path_is_escaped_for_posix_shells() {
+        let cmd = activate_command(ShellFamily::Bash, Path::new("/home/o'brien/env/bin")).unwrap();
+        // The '\'' dance closes the quote, emits a literal one and reopens it.
+        // Without it the shell sees an unterminated string and the launch
+        // fails every time -- but only for users whose path contains a quote,
+        // so this is worth pinning on its own.
+        assert!(cmd.contains(r"'\''"), "got {cmd}");
+        assert!(cmd.starts_with("source '"), "got {cmd}");
+        assert!(cmd.ends_with("activate'"), "got {cmd}");
+    }
+
+    #[test]
+    fn a_quote_in_the_venv_path_is_escaped_the_fish_way() {
+        // fish honours only \\ and \' inside single quotes, so the POSIX
+        // '\'' form would arrive literally and the source would fail.
+        let cmd = activate_command(ShellFamily::Fish, Path::new("/home/o'brien/env/bin")).unwrap();
+        assert!(cmd.contains(r"\'"), "got {cmd}");
+        assert!(
+            !cmd.contains(r"'\''"),
+            "the POSIX form is literal text in fish; got {cmd}"
+        );
+        assert!(cmd.ends_with("activate.fish'"), "got {cmd}");
     }
 }
