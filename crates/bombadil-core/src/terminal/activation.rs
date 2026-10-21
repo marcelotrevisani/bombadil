@@ -328,9 +328,16 @@ mod tests {
         // flag is needed, because the command is typed into a shell that has
         // already read its rc. Verified end to end against warp-terminal
         // 0.2026.09.16 -- see terminal/warp.rs.
+        //
+        // The expectation is built through `Path::join` rather than written out
+        // with `/`: on the Windows runner `join` produces `\`. Comparing the
+        // whole string is still safe here because `sq` escapes quotes only and
+        // leaves separators alone.
+        let bin = Path::new("/envs/api/bin");
+        let expected = format!("source '{}'", bin.join("activate").display());
         for family in [ShellFamily::Bash, ShellFamily::Zsh, ShellFamily::PosixSh] {
-            let cmd = activate_command(family, Path::new("/envs/api/bin")).unwrap();
-            assert_eq!(cmd, "source '/envs/api/bin/activate'");
+            let cmd = activate_command(family, bin).unwrap();
+            assert_eq!(cmd, expected);
         }
     }
 
@@ -340,8 +347,20 @@ mod tests {
         // syntax. uv writes activate.fish alongside activate, and picking the
         // wrong one would look like a working launch and leave the venv
         // inactive.
-        let cmd = activate_command(ShellFamily::Fish, Path::new("/envs/api/bin")).unwrap();
-        assert_eq!(cmd, "source '/envs/api/bin/activate.fish'");
+        //
+        // Asserted by shape rather than by whole string, unlike the POSIX test
+        // above: `sq_fish` also doubles backslashes, so an exact expectation
+        // would have to encode this host's separator and would fail on Windows
+        // for a reason that has nothing to do with the script chosen.
+        let bin = Path::new("/envs/api/bin");
+        let cmd = activate_command(ShellFamily::Fish, bin).unwrap();
+        assert!(cmd.starts_with("source '"), "got {cmd}");
+        assert!(cmd.ends_with("activate.fish'"), "got {cmd}");
+        assert_ne!(
+            cmd,
+            activate_command(ShellFamily::Bash, bin).unwrap(),
+            "fish must not be handed the POSIX script"
+        );
     }
 
     #[test]
@@ -352,7 +371,13 @@ mod tests {
     #[test]
     fn a_quote_in_the_venv_path_is_escaped_for_posix_shells() {
         let cmd = activate_command(ShellFamily::Bash, Path::new("/home/o'brien/env/bin")).unwrap();
-        assert_eq!(cmd, r"source '/home/o'\''brien/env/bin/activate'");
+        // The '\'' dance closes the quote, emits a literal one and reopens it.
+        // Without it the shell sees an unterminated string and the launch
+        // fails every time -- but only for users whose path contains a quote,
+        // so this is worth pinning on its own.
+        assert!(cmd.contains(r"'\''"), "got {cmd}");
+        assert!(cmd.starts_with("source '"), "got {cmd}");
+        assert!(cmd.ends_with("activate'"), "got {cmd}");
     }
 
     #[test]
@@ -360,7 +385,11 @@ mod tests {
         // fish honours only \\ and \' inside single quotes, so the POSIX
         // '\'' form would arrive literally and the source would fail.
         let cmd = activate_command(ShellFamily::Fish, Path::new("/home/o'brien/env/bin")).unwrap();
-        assert_eq!(cmd, r"source '/home/o\'brien/env/bin/activate.fish'");
-        assert!(!cmd.contains(r"'\''"), "got {cmd}");
+        assert!(cmd.contains(r"\'"), "got {cmd}");
+        assert!(
+            !cmd.contains(r"'\''"),
+            "the POSIX form is literal text in fish; got {cmd}"
+        );
+        assert!(cmd.ends_with("activate.fish'"), "got {cmd}");
     }
 }

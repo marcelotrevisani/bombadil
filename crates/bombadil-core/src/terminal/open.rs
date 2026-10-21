@@ -704,6 +704,20 @@ mod tests {
         runner.calls()
     }
 
+    /// Read back `project()`'s written Tab Config as its first parsed pane.
+    ///
+    /// Parsed rather than substring-matched on the raw bytes: on Windows the
+    /// venv path holds a backslash, and the `toml` serializer then emits the
+    /// command as a `'''` multi-line literal string instead of a quoted one.
+    /// Asserting on the text would pin the serializer's quoting choice rather
+    /// than the value Warp actually receives.
+    fn written_pane(warp_dir: &Path) -> toml::Value {
+        let text = std::fs::read_to_string(warp::config_path(warp_dir, Uuid::from_u128(7)))
+            .expect("the tab config must exist");
+        let parsed: toml::Value = toml::from_str(&text).expect("must be valid TOML");
+        parsed["panes"][0].clone()
+    }
+
     #[test]
     fn warp_is_launched_through_a_tab_config_that_activates_the_venv() {
         // Warp cannot be handed an environment at all -- single-instance
@@ -719,13 +733,15 @@ mod tests {
         let uri = warp::deep_link(Uuid::from_u128(7));
         assert_eq!(calls[0].args, vec![uri], "got {:?}", calls[0].args);
 
-        let written =
-            std::fs::read_to_string(warp::config_path(warp_dir.path(), Uuid::from_u128(7)))
-                .expect("the tab config must exist");
-        assert!(written.contains("/proj/my-api"), "got {written}");
-        assert!(
-            written.contains("source '/envs/my-api/bin/activate'"),
-            "got {written}"
+        let pane = written_pane(warp_dir.path());
+        assert_eq!(pane["directory"].as_str().unwrap(), "/proj/my-api");
+        // Built through `venv_bin_dir` rather than written out: it is
+        // `cfg!(windows)`-based, so the Windows runner resolves `Scripts` and
+        // `\` even though this call passes `Os::Linux`.
+        let bin = venv_bin_dir(Path::new("/envs/my-api"));
+        assert_eq!(
+            pane["commands"][0].as_str().unwrap(),
+            format!("source '{}'", bin.join("activate").display())
         );
     }
 
@@ -751,11 +767,9 @@ mod tests {
         let calls = opened_warp("/usr/bin/nu", project(), Some(warp_dir.path()));
 
         assert_eq!(calls[0].args.len(), 1, "the deep link must still be used");
-        let written =
-            std::fs::read_to_string(warp::config_path(warp_dir.path(), Uuid::from_u128(7)))
-                .expect("the tab config must exist");
-        assert!(written.contains("/proj/my-api"), "got {written}");
-        assert!(!written.contains("commands"), "got {written}");
+        let pane = written_pane(warp_dir.path());
+        assert_eq!(pane["directory"].as_str().unwrap(), "/proj/my-api");
+        assert!(pane.get("commands").is_none(), "got {pane}");
     }
 
     #[test]
@@ -763,14 +777,14 @@ mod tests {
         let warp_dir = tempfile::tempdir().unwrap();
         opened_warp("/usr/local/bin/fish", project(), Some(warp_dir.path()));
 
-        let written =
-            std::fs::read_to_string(warp::config_path(warp_dir.path(), Uuid::from_u128(7)))
-                .expect("the tab config must exist");
-        assert!(written.contains("activate.fish"), "got {written}");
-        assert!(
-            !written.contains("bin/activate'"),
-            "the POSIX script must not be handed to fish; got {written}"
-        );
+        let pane = written_pane(warp_dir.path());
+        let command = pane["commands"][0].as_str().unwrap();
+        // Ends-with, and parsed: the earlier raw-text check
+        // (`!written.contains("bin/activate'")`) never matched on Windows,
+        // where the separator is `\` and the venv dir is `Scripts`, so that
+        // half of the test passed without proving anything. The trailing quote
+        // is part of the expectation -- the command is `source '<script>'`.
+        assert!(command.ends_with("activate.fish'"), "got {command}");
     }
 
     #[test]
